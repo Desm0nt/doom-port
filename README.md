@@ -9,6 +9,17 @@ You bring the game: this repository contains no game content.
 > **Tested so far only on Adreno 750** (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) with the stock Qualcomm driver. Other GPUs
 > and devices are untested. Mesa Turnip is optional (settings → custom Vulkan driver) and runs slower there.
 
+## Screenshots
+
+Captured on the phone (Adreno 750, 1080p panel). With a gamepad connected, the on-screen controls hide themselves:
+
+| | |
+|---|---|
+| ![Mars surface, gamepad](docs/images/desert.jpg) | ![Fight with an imp, gamepad](docs/images/combat.jpg) |
+| ![Canyon, gamepad](docs/images/canyon.jpg) | ![On-screen controls over the controller settings](docs/images/touch_controls.jpg) |
+
+The last shot shows the on-screen controls, which appear when no gamepad is connected (the gear opens the port's settings).
+
 ## What it is, and what it is not
 
 **It is:**
