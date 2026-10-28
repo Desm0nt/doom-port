@@ -11,14 +11,42 @@ You bring the game: this repository contains no game content.
 
 ## Screenshots
 
-Captured on the phone (Adreno 750, 1080p panel). With a gamepad connected, the on-screen controls hide themselves:
+Captured on the phone (Adreno 750, Qualcomm driver). The counter in the top-left corner is the port's own FPS / frame
+time / GPU time overlay (it can be turned off in the settings).
+
+**On-screen controls** (shown while no gamepad is connected):
+
+| | |
+|---|---|
+| ![Desert, on-screen controls](docs/images/touch_desert.jpg) | ![Fight, on-screen controls](docs/images/touch_combat.jpg) |
+
+**With a gamepad** (Bluetooth / USB): the on-screen controls hide themselves and come back when it disconnects.
 
 | | |
 |---|---|
 | ![Mars surface, gamepad](docs/images/desert.jpg) | ![Fight with an imp, gamepad](docs/images/combat.jpg) |
-| ![Canyon, gamepad](docs/images/canyon.jpg) | ![On-screen controls over the controller settings](docs/images/touch_controls.jpg) |
+| ![Canyon, gamepad](docs/images/canyon.jpg) | ![Main menu in Russian, on-screen controls](docs/images/touch_controls.jpg) |
 
-The last shot shows the on-screen controls, which appear when no gamepad is connected (the gear opens the port's settings).
+## Port settings (gear button)
+
+The gear at the top of the screen opens the port's own settings, on top of the game's menus:
+
+![Port settings dialog](docs/images/settings.jpg)
+
+| Setting | Default | What it does |
+|---|---|---|
+| DOOM dynamic resolution | off | lets the game lower the 3D resolution under load (also in the game's Video menu) |
+| Turnip (Mesa) driver | off | uses a Turnip driver instead of the stock Qualcomm one (slower on Adreno 750 for now) |
+| Game language | system | text and voice: system language, Russian or English (next launch) |
+| Aim assist | 1 | strength of the game's aim assist; "Как на Switch" keeps the Switch behaviour (next launch) |
+| Rumble | off | controller / phone vibration (next launch; off to save battery) |
+| FPS and frame time counter | on | the overlay in the top-left corner |
+| 3D resolution | 100% (720p) | 85% / 75% / 67%; the HUD stays at 720p |
+| Sharpening (FSR RCAS) | off | weak / medium / strong |
+| Look sensitivity | 1.0 | swipe look and the look while FIRE is held |
+| Move stick dead-zone compensation | none | offsets the game's own move-stick dead zone |
+
+Graphics settings apply at the next launch, control settings at once. The dialog is in Russian for now.
 
 ## What it is, and what it is not
 
@@ -170,6 +198,9 @@ NVN воспроизводится через Vulkan. Основа — прое�
   стабильные 30-60 с chunked submit.
 - Экранный геймпад с обзором «как мышью», геймпады, гироскоп, aim assist, вибрация, русский язык (язык игры берётся из
   системы или задаётся в настройках), масштаб 3D-разрешения и резкость RCAS.
+- Шестерёнка вверху экрана открывает настройки порта: динамическое разрешение, драйвер Turnip, язык игры, сила
+  помощи в прицеливании, вибрация (по умолчанию выключена), счётчик FPS, разрешение 3D, резкость RCAS,
+  чувствительность обзора и компенсация мёртвой зоны стика (см. таблицу «Port settings» выше).
 - Известные ограничения: GPU-куллинг треугольников игры выключен (на нашем пути он терял видимые треугольники),
   динамическое разрешение выключено по умолчанию, поддерживается только обновление v262144, мультиплеер убран.
 - Подготовка файлов игры одной командой: `./setup.sh <база> <обновление> <prod.keys> [--push <serial>]`
