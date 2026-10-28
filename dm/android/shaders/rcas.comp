@@ -1,0 +1,27 @@
+#version 450
+// Robust contrast-adaptive sharpening (the RCAS pass of AMD FidelityFX Super Resolution 1.0, MIT, Copyright (c) 2021
+// Advanced Micro Devices, Inc.; see docs/THIRD_PARTY.md). Applied to the game's final frame at present (DM_GFX_SHARPEN).
+// The game upscales its own 3D view (rs_forceFraction + TAA), so only the sharpening half of FSR is needed here.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;
+layout(binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform Push { ivec2 size; float sharpness; } pc;   // sharpness = exp2(-stops), 1 = strongest
+const float RCAS_LIMIT = 0.25 - 1.0 / 16.0;
+vec3 at(ivec2 p) { return texelFetch(src, clamp(p, ivec2(0), pc.size - 1), 0).rgb; }
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, pc.size))) return;
+    //    b
+    //  d e f
+    //    h
+    vec3 b = at(p + ivec2(0, -1)), d = at(p + ivec2(-1, 0)), e = at(p), f = at(p + ivec2(1, 0)), h = at(p + ivec2(0, 1));
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+    // largest negative lobe that keeps the result inside the neighbourhood range (no ringing)
+    vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1e-5));
+    vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1e-5));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-RCAS_LIMIT, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.sharpness;
+    vec3 c = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+    imageStore(dst, p, vec4(clamp(c, 0.0, 1.0), 1.0));
+}
