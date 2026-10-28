@@ -1,0 +1,56 @@
+# 构建产物（Xcode 的派生数据目录，由 dm/ios 下的脚本生成）
+.iosdd/
+.iosdd_mac/
+.iosdd_*/
+.DS_Store
+# 安卓构建产物与本机配置 | Android build outputs and local configuration
+dm/android/local.properties
+dm/android/.gradle/
+dm/android/build/
+dm/android/app/build/
+dm/android/.kotlin/
+dm/android/app/.cxx/
+dm/android/.cxx/
+# 本地交付、游戏派生文件与签名材料不入库 | Keep local deliverables, game-derived files, and signing material out of Git.
+*.apk
+*.aab
+*.hap
+*.xgs
+*.d2s
+*.d2i
+*.keystore
+*.jks
+*.p12
+*.pfx
+/private/
+/artifacts/
+dm/android/local.env
+# DOOM Mobile: everything local stays out of Git -- build trees, logs, the player's game files and anything derived from
+# them (ExeFS, patched modules, RomFS, shaders), console keys, drivers and validation layers.
+/work/
+__pycache__/
+*.pyc
+local.properties
+*.idsig
+*.so
+*.nsp
+*.nsz
+*.nca
+*.ncz
+*.xci
+*.xcz
+*.patched.bin
+*.raw
+*.xgs
+*.spv
+*.pftrace
+*.keys
+prod.keys
+title.keys
+dev.keys
+*.resources
+*.pindex
+*.bik
+dm/android/doom/*.apk
+dm/gfx/tools/dmsh_xlate_doom/bin/
+dm/gfx/tools/dmsh_xlate_doom/obj/
