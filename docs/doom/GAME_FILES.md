@@ -13,7 +13,7 @@ Nothing here downloads game files, and your packages and keys never leave your m
 | `prod.keys` of your own console | Needed to decrypt your packages; read in memory only, never copied |
 | ~70 GB free on the PC with NSZ input (~45 GB with NSP / XCI), ~25 GB at the end; ~22 GB on the phone | |
 | Python 3.10+ with `cryptography`, `zstandard`, `lz4`, `capstone` | `pip install cryptography zstandard lz4 capstone` |
-| .NET SDK and SPIRV-Tools (`spirv-opt`, `spirv-val`) | for the shader translator; the Android NDK's `shader-tools/` are found automatically via `ANDROID_HOME` / `ANDROID_NDK_HOME` |
+| .NET 10 SDK and SPIRV-Tools (`spirv-opt`, `spirv-val`) | for the shader translator (it targets `net10.0`; `DOTNET=<dotnet executable>` picks a non-default install); the Android NDK's `shader-tools/` are found automatically via `ANDROID_HOME` / `ANDROID_NDK_HOME` |
 | adb | only for `--push` |
 
 **Dumping (on your Switch, homebrew):** dump the base game and the update with
@@ -80,4 +80,7 @@ python tools/build_dmsh_xlate_doom.py work/build/dmsh_xlate_doom
 XLATE=work/build/dmsh_xlate_doom/bin/dmsh_xlate python dm/gfx/tools/dmsh_vk_doom.py work/shaders-jobs "work/DOOM Mobile/dm/shaders"
 ```
 
-The key file is taken from `NX_PROD_KEYS` (default `~/.switch/prod.keys`) by the individual tools.
+The key file is taken from `NX_PROD_KEYS` (default `~/.switch/prod.keys`) by the individual tools. `setup_doom.py` also sets
+`PYTHONUTF8=1` (the patcher prints UTF-8), passes `DOTNET` to the translator build and `SPIRV_OPT` / `SPIRV_VAL` (found on
+`PATH` or in the NDK's `shader-tools/`) to the shader step; set them yourself when running the tools by hand. On Windows the
+translator is `dmsh_xlate.exe`.
