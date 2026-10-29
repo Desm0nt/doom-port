@@ -1010,7 +1010,7 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
         case 5: d.textureType = MTLTextureType2DMultisample; d.sampleCount = t->d.samples; d.mipmapLevelCount = 1; break;
         case 6: d.textureType = MTLTextureType2DMultisampleArray; d.sampleCount = t->d.samples; d.arrayLength = t->d.depth; d.mipmapLevelCount = 1; break;
         case 8: d.textureType = MTLTextureTypeCube; break;
-        case 9: d.textureType = MTLTextureTypeCubeArray; d.arrayLength = t->d.depth; break;
+        case 9: d.textureType = MTLTextureTypeCubeArray; d.arrayLength = t->d.depth >= 6 ? t->d.depth / 6 : 1; break;   // NVN depth = layer-faces; Metal counts cubes (nvn_tex.c shape)
         case 10: RED_ONCE(1, "缓冲贴图（TARGET_BUFFER）未实现"); return nil;
         default: d.textureType = MTLTextureType2D; break;
     }

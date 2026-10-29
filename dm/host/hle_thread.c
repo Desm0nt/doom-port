@@ -484,7 +484,25 @@ int thr_find_by_name(const char *name, pthread_t *out) {
 // State dump (called from crash.c on watchdog / crash; read-only, takes no lock): what each guest thread is waiting on and where its most recent SVC was issued from
 // During a state dump, take the backtrace of other guest threads: suspend → read registers → walk the frame pointer chain (both guest code and gate blocks keep the x29 chain) → resume; only main / sdk frames are printed
 static void thr_bt(thr_t *t) {
-    if (!t->mport || t->exited || t->mport == mach_thread_self()) return;
+    // [DOOM] The dumping thread itself (the on-demand dump runs inside nvnQueuePresentTexture on whichever guest thread presents):
+    // it cannot suspend itself, so walk its own x29 chain from here -- host frames first, then the guest frames that called the
+    // HLE. Without this the presenting thread had no backtrace at all (the yellow-screen hang: the main thread presenting from
+    // idRenderSystemLocal::EmergencyRender showed only "running/not waiting").
+    if (t->mport && !t->exited && t->mport == mach_thread_self()) {
+        char line[1024]; int p = snprintf(line, sizeof line, "[dm]   %#x 回溯（导出线程自身）:", t->handle), nf = 0;
+        uint64_t fp = (uint64_t)__builtin_frame_address(0);
+        for (int k = 0; k < 96 && fp && !(fp & 7) && nf < 24 && p < (int)sizeof line - 40; k++) {
+            uint64_t fr[2]; vm_size_t g2 = 0;
+            if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g2) || g2 != 16) break;
+            module_t *m = module_of((void *)fr[1]);
+            if (m) { p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, fr[1] - (uint64_t)m->base); nf++; }
+            if (fr[0] <= fp) break;
+            fp = fr[0];
+        }
+        fprintf(stderr, "%s\n", line);
+        return;
+    }
+    if (!t->mport || t->exited) return;
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
     arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) {

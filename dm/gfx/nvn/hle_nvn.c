@@ -51,6 +51,7 @@
 #endif
 #include <assert.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 // ---------- 槽表、跳板、未实现桩 ----------
 // ---------- Slot table, thunks, unimplemented stubs ----------
@@ -397,8 +398,20 @@ static void snap_drop(const void **pp, uint64_t ser, uint64_t snap_ser_off) {
     *pp = NULL;
     pthread_mutex_unlock(&g_snap_mu);
 }
+// [DOOM] Live texture storage (sum of GetStorageSize of initialized, not finalized textures) and the share of cube map arrays: the
+// game sub-allocates them from its own VRAM pools (idNvnVRamAllocator, TextureBuffer pool 1162.5 MB), so a size we overstate
+// fills that pool and the game stops on its yellow "out of TextureBuffer memory" screen. Logged with the 300-frame stats.
+static _Atomic uint64_t g_tex_live, g_tex_peak, g_tex_cube_live; static _Atomic int64_t g_tex_n;
+static void tex_live_add(const tex_t *o, int sign) {
+    if (!o->L.size) return;
+    uint64_t sz = o->L.size;
+    if (sign > 0) { uint64_t v = atomic_fetch_add(&g_tex_live, sz) + sz, pk = atomic_load(&g_tex_peak); while (v > pk && !atomic_compare_exchange_weak(&g_tex_peak, &pk, v)) {}
+                    atomic_fetch_add(&g_tex_n, 1); if (o->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) atomic_fetch_add(&g_tex_cube_live, sz); }
+    else { atomic_fetch_sub(&g_tex_live, sz); atomic_fetch_sub(&g_tex_n, 1); if (o->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) atomic_fetch_sub(&g_tex_cube_live, sz); }
+}
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
+    if (o->magic == MAGIC('T', 'E', 'X', 0)) tex_live_add(o, -1);   // re-initialized without Finalize
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
     o->has_layout = s->has_layout; memcpy(o->layout, s->layout, 8);
@@ -410,9 +423,12 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
     o->serial = nvn_new_serial();
     OLOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)t, o->d.width, o->d.height, o->d.depth,
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);
+    tex_live_add(o, 1);
+    { static _Atomic int ncube; if (o->d.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY && atomic_fetch_add(&ncube, 1) < 8)
+        LOG("[nvn] cube map array %ux%u layer-faces %u levels %u fmt %#x -> storage %.2f MB", o->d.width, o->d.height, o->d.depth, o->d.levels, o->d.format, o->L.size / 1048576.0); }
     return 1;
 }
-NVN(nvnTextureFinalize, void, NVNtexture *t) { snap_drop(&TX(t)->snap, TX(t)->serial, offsetof(tex_t, serial)); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
+NVN(nvnTextureFinalize, void, NVNtexture *t) { if (TX(t)->magic == MAGIC('T', 'E', 'X', 0)) tex_live_add(TX(t), -1); snap_drop(&TX(t)->snap, TX(t)->serial, offsetof(tex_t, serial)); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
 NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
 NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
 NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
@@ -1463,6 +1479,8 @@ static void tsummary(uint64_t frame) {
       pi = ci; pc = cc; pd = dr_; pf = frame; }
     uint64_t up, re, fa, pr; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr);
     LOG("[nvn] 预排布贴图 首传 %llu 张、池内容变化重传 %llu 次；写保护缺页 %llu 次、宿主写前解保护 %llu 页；漏检 %llu（累计）", up, re, fa, pr, mtl_pkg_miss());
+    LOG("[nvn] live textures %lld: %.1f MB (peak %.1f MB, cube map arrays %.1f MB) -- the game's TextureBuffer VRAM pool is 1162.5 MB",
+        (long long)atomic_load(&g_tex_n), atomic_load(&g_tex_live) / 1048576.0, atomic_load(&g_tex_peak) / 1048576.0, atomic_load(&g_tex_cube_live) / 1048576.0);
     memset(g_tn, 0, sizeof g_tn);
 }
 // DM_SLOWFRAME=1（测试开关，真机经日志端口读）：逐帧计时先存近 16 帧环；滞后 8 帧（GPU / 上屏时刻已回）判掉帧，
@@ -1650,6 +1668,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
 #ifdef DM_GAME_DOOM
     if (o->presents == 1 || o->presents % 300 == 0) LOG("[nvn] present #%llu (texture %d)", (unsigned long long)o->presents, idx);   // bring-up heartbeat
+    // [DOOM] On-demand dump while the game runs (e.g. stuck behind a loading screen): creating DM_RUNTIME_DIR/dump makes the next
+    // check (every 300 presents, ~5 s) print what every guest thread waits on plus the graphics wait points; the file is removed.
+    if (o->presents % 300 == 0) { static char dump_path[1200]; const char *rd = getenv("DM_RUNTIME_DIR");
+        if (rd && !dump_path[0]) snprintf(dump_path, sizeof dump_path, "%s/dump", rd);
+        // Only a regular file triggers it (and is removed): a stray directory named "dump" made it fire every ~5 s for a whole run.
+        struct stat dst; if (dump_path[0] && !stat(dump_path, &dst) && S_ISREG(dst.st_mode)) { unlink(dump_path); crash_dump_now("dm/dump"); } }
 #endif
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     // 第一次进局的读取画面：后台管线预热没跑完就在这里等它（读取画面多停一会儿），进局后不在提交线程现编管线。预热早已完成时一次判断即过

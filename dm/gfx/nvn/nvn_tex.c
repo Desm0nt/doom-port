@@ -54,7 +54,10 @@ static void shape(const nvn_texdesc *d, unsigned *dpl, int *layered, uint32_t *w
         case 2: *dpl = 3; break;                                        // 3D
         case 4: case 6: *dpl = 2; *layered = 1; break;                  // 2D_ARRAY / MS_ARRAY
         case 8: *dpl = 2; *z = 6; *layered = 1; break;                  // CUBEMAP
-        case 9: *dpl = 2; *z = d->depth * 6; *layered = 1; break;       // CUBEMAP_ARRAY
+        // CUBEMAP_ARRAY: NVN's depth is the layer-face count (a multiple of 6), as in GL. DOOM's idImage::AllocImage (base
+        // 0x1c30858) passes layers * 6 to SetSize3D itself; multiplying again made every cube array 6x too big, which ran the
+        // game's 1162.5 MB TextureBuffer VRAM pool dry at the mission 1 -> 2 transition (yellow DisplayOutOfMemory screen).
+        case 9: *dpl = 2; *z = d->depth; *layered = 1; break;           // CUBEMAP_ARRAY
         default: *dpl = 2; *z = 1; break;                               // 2D / MS / RECTANGLE
     }
     if (*z == 0) *z = 1;
