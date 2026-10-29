@@ -32,6 +32,9 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_DOOM_ADAPTIVE_TICK=0` | 1 | `com_fixedTic 1`, `com_adaptiveTick 1`, `com_adaptiveTickImmediateMode 1`, `com_adaptiveTickMinHz/MaxHz` | `=0` — исходный фиксированный тик 30 Гц (скорость игры = fps/30). Только для сравнения |
 | `DM_DOOM_TICK_MIN` / `DM_DOOM_TICK_MAX` | 30 / 60 | границы адаптивного тика | MIN=20 — попробовать тики ниже 30 Гц (не проверено) |
 | `DM_AA_STRENGTH=<s>` | 1 | добавляет `+set aa_DESIGN_override 1`; в `hle_hid.c` выключает MP-методы aim assist и держит SP-значения оружия × s | `=0` — слабый MP-ассист игры; >1 — сильнее |
+| `DM_DOOM_WIDE` | **0 (выкл)** | `1` — широкий вывод Hor+: до разбора командной строки (`hle_args.c doom_wide`) таблица `r_mode` в .rodata (`main+0x39f1b10`, было {1280,720},{1920,1080}) → {W,720},{1.5W,1080}; W = 720 × соотношение экрана (`front_game_res(0)`, кратно 16, 1280..2160), только если экран шире 16:9; 2400×1080 → 1600×720. Пул RenderTarget растёт с шириной (см. `DM_DOOM_POOL_MARGIN`: 204 МБ при 1600; без запаса — минимум ⌈117·W/1280⌉+4 = 151). Лог `[wide] r_mode table ...` | `=<ширина>` (≥1280) — явно, напр. `1440`. Выкл по умолчанию после diag30 (белый экран = переполнен пул RenderTarget, BUGS §2.10); включать после проверки на телефоне. +25 % пикселей при 1600 — компенсировать `DM_DOOM_RES` |
+| `DM_DOOM_WIDE_LIVE` | **0 (выкл)** | `1` — галочка «Широкий экран» в шестерёнке переключается на лету (BUGS §2.12): игра всегда рисует W×720 (как `DM_DOOM_WIDE=1`, пул RenderTarget по широкому размеру), «выкл» = презентер показывает центральные 16:9 кадра (`vulkan_present.cpp crop169`; Hor+ → та же картинка, что у 16:9). Java `nativeWideLive` → `dm_doom_wide_live()` + `dm_present_crop169`; лог `[wide] live switch ...`, `dm-vulkan [wide] live: ...`. Без него — «со следующего запуска». Цена: в режиме «выкл» рисуется 1600×720 (+25 % пикселей); игры путь смены размера на лету не имеет (vid_restart — пустая заглушка) | — |
+| `DM_DOOM_POOL_MARGIN` | 1 | пулы VRAM игры с запасом (`+set nvn_VRAM*HeapSizeMB`, `hle_args.c doom_pools_args`): TextureBuffer 1162.5→**1536**, RenderTarget 117→**160** (1.35×max(117, ⌈117·W/1280⌉+4), до кратного 4; 204 при W=1600), Uncached 22.5→**34**, Shader 5.5→**9**, Dynamic 23→**35** (+443.5 МБ; +487.5 при 1600). Пул приложения (`hle_svc.c app_pool`) +прирост пулов +512 МБ запаса кучи = **+956 МБ** (4241 МБ; 4285 при 1600), если `DM_APP_POOL_ADD_MB` не задан; резерв адресного пространства гостя растёт до пул+1.25 ГБ (5632 МБ). Лог `[pools] VRAM MB: ...` и `app pool: ... MB reported` | `0` — стоковые размеры (с `DM_DOOM_WIDE` только минимальный RenderTarget и пул +разница). Резидентно +~444 МБ сразу (пулы обнуляются и с zero-copy — это dma-buf), запас кучи 512 МБ — только по мере использования |
 | `DM_DOOM_ARGS="..."` | пусто | любые `+set` | Изоляция проходов при диагностике (см. §7) |
 
 `g_argv` — 128 слотов (умолчания занимают ~60).
@@ -46,6 +49,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_GFX_DEPTH_FEEDBACK` | **2** | чтение depth-attachment открытого прохода: `2` — без разрыва только пока проход не писал глубину (фикс мигания теней); `1` — старый shortcut (чтение и после записи); `0` — shortcut выкл | `1` вернёт мигание теней; `0` — дороже |
 | `DM_GFX_GSCULL_FIX` (маска) | **0x61** (1\|32\|64) | 1 — GS со subgroup-идиомой всегда lone-lane (Turnip); 32 — записываемые storage-диапазоны с запасом до слова; 64 — CPU-запись (COPY_B2B/UPDATE_UB) разрешает pending GPU-результат; диагностика: 2/4/8/16 — выключить тесты occlusion/small/backface/frustum, 0x100 — проверка count, 0x200 — identity-компакция, 0x400 — стартовый count=0, 0x800 — index carrier, 0x1000 — CAS int temps | только вместе с `DM_DOOM_GEOMCULL=1` для бисекта дыр |
 | `DM_GFX_GS_PASSTHRU` | **1** (с 28.10) | draw без GS-стадии, если culling-GS доказанно pass-through (`r_geometryCulling 0`) | `0` — для сравнения/если появятся дыры |
+| `DM_GFX_GS_PASSTHRU_VARY` | **1** (с 29.10) | матчер pass-through принимает и GS, пробрасывающие varyings (копия входа той же Location); на телефоне без этого отбрасывался только `703f1fcc`, остальные 5 culling-GS работали как GS и рвали проходы (BUGS_AND_FIXES §3.4) | `0` — старое правило «только gl_Position»; A/B velocity/TAA-артефактов |
 | `DM_GFX_MEMO_SIMG` | **1** (с 28.10) | descriptor memo и для наборов со storage image (VT feedback) | `0` — для сравнения |
 | `DM_GFX_VT_FIX` (маска) | **1** (с 28.10) | копия VT-feedback в конце guest-submit, а не на present | `0` — старый путь (страницы чёткими приходят медленнее) |
 | `DM_GFX_VT_ATOMIC` | 0 | mutex между `WriteTexels` и частичной перезаливкой (гонка рваных страниц) | A/B мерцания земли; по умолчанию выкл (эффект не подтверждён) |
@@ -64,6 +68,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_GFX_ZC_INDEX` | 0 | индексы indirect-draw прямо из AHB | `1` ронял драйвер Adreno |
 | `DM_GFX_ZC_UBO_MIN`, `DM_GFX_ZC_RACE` | 0 | эксперименты zero-copy UBO (гипотеза теней, отвергнута) | — |
 | `DM_GFX_PARTIAL_TEX` | 1 | частичная перезаливка изменённых GOB-блоков больших текстур (VT-кэши) | `0` — полная перезаливка (очень медленно) |
+| `DM_GFX_PARTIAL_PROLOGUE` | **1** (с 29.10) | partial upload в пролог-буфер слота, если образ ещё не использовался в этом submit (как `gfx-upload-prologue`); иначе — старый путь (конец прохода + 2 полных барьера) | `0` — старый путь; A/B мерцания VT-страниц. Нужен `DM_GFX_UPLOAD_PROLOGUE=1` (APK) |
 | `DM_GFX_GPU_INDIRECT` | 1 | indirect-draw из GPU-копий аргументов | **`0` больше не использовать**: CPU-путь вешал игру (SyncWait) |
 | `DM_GFX_STORAGE_CHAIN` | 1 | передавать тот же SSBO дальше вместо копии | — |
 | `DM_GFX_GUEST_BARRIER` | 0 | соблюдать каждый guest-барьер NVN (~118/кадр) | `1` — контроль хазардов (дорого) |
@@ -73,7 +78,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_GFX_QUAD_DERIVATIVES` | 1 (APK) | quad-рерайт производных | A/B мерцания земли |
 | `DM_GFX_SHARPEN=<stops>` | не задан | FSR RCAS при выводе (`rcas.comp`); ⚙: 1.0 / 0.5 / 0.2 | вместе с `DM_DOOM_RES` |
 | `DM_GFX_PERF_SAMPLE` | 0 (APK) | строки `NVN PERF` (4 — каждый кадр окнами по 60) | всегда в замерах |
-| `DM_GFX_PASS_PROF="from period count"` | выкл | per-pass GPU timestamp профиль (`NVN GPASS`), разбор `tools/gpass_report.py` | `1` = `300 600 0` |
+| `DM_GFX_PASS_PROF="from period count"` | выкл | per-pass GPU timestamp профиль (`NVN GPASS`, с 29.10 поле `end=L<строка>` — кто закрыл проход), разбор `tools/gpass_report.py` (печатает и разбивку по `end=`) | `1` = `300 600 0` |
 | `DM_GFX_ALIAS_LOG` | 0 | логи алиасинга storage/копий | отладка |
 | Наследие D2R (APK): `DM_GFX_WB_SKIP 1`, `DM_GFX_PIPE_MEMO 1`, `DM_GFX_NATIVE_BC 1`, `DM_GFX_WARP32 1`, `DM_GFX_LDC_FOLD 1`, `DM_GFX_FORWARD_TEMPS 1`, `DM_GFX_NAN_MINMAX 1`, `DM_GFX_DEFER_EVENTS 2`, `DM_GFX_READ_PREFLIGHT 0`, `DM_GFX_XVIEW_GUARD 1`, `DM_GFX_UPLOAD_PROLOGUE 1`, `DM_GFX_SHADER_REUSE 1`, `DM_GFX_VCACHE 1`, `DM_GFX_TEX_DIRTY 1`, `DM_GFX_ASYNC_POOL_RESET 1`, `DM_3D_SCALE 0.85` | | для DOOM отдельно не исследовались; `DM_GFX_NATIVE_BC=0` падал на лимите 256 МБ; `TEX_DIRTY=0`/`VCACHE=0` нужны только на LDPlayer (houdini). Влияние `DM_3D_SCALE` на DOOM не подтверждено (таргеты 1280×720 честные) | |
 
@@ -96,6 +101,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_NVN_COUNT=1` | 0 | счётчики вызовов NVN | диагностика |
 | `DM_PRESENT_INTERVAL` | display | `game` — следовать интервалу игры (2 → 30 fps; точная скорость, но кап 30) | — |
 | `DM_PRESENT_HZ` | 60 (авто) | кап present | — |
+| `DM_PRESENT_STRETCH` | 0 | `1` — растянуть картинку на весь экран (старое поведение); по умолчанию буфер в пропорциях окна, картинка с полосами там, где её соотношение уже экрана (с `DM_DOOM_WIDE=1` полос нет) | — |
 
 ## 4. HLE, потоки, ввод
 
@@ -121,7 +127,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 ## 5. Патчи бинарника игры (CUTS, `dm/tools/patch_nso.py`, build-id `2847991952b3d7abd228624fcd3b0779`)
 
 Генерация: `DM_TARGET=android PYTHONUTF8=1 python dm/tools/patch_nso.py work/exefs-update/main work/patched main` →
-`work/patched/main.patched.bin` + `main.cuts.tsv`; на телефон в `DOOM Mobile/dm/out/`. Сейчас 17 записей:
+`work/patched/main.patched.bin` + `main.cuts.tsv`; на телефон в `DOOM Mobile/dm/out/`. Сейчас 18 записей:
 
 | Адрес | Что |
 |---|---|
@@ -134,6 +140,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `0x107bf48` | Shell::HandleEvent: без проверки master device |
 | `0x10e7c50/54/60/64`, `0x10e0fc4/cc`, строки `0x35d6d52`, `0x39cd272` | Video: Chromatic Aberration → «Dynamic Resolution» (`rs_enable`, GOT `0x48d53b0`) |
 | `0xf187d0` | главное меню без MULTIPLAYER |
+| `0xcfaac` | `idDTLSWorkerThread::Run`: один раунд recv/yield за пробуждение в 1 мс вместо 9 (поток «DTLS port 27016» больше не жжёт ~9 % ядра) |
 | (`0x1f08e3c`, закомментирован) | пропуск заставки — ломал экран загрузки |
 
 OBS-гейты (наблюдение без изменения логики) для того же build-id — там же, таблица `OBS`.
