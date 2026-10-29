@@ -138,7 +138,8 @@ The script reads every tool path from the environment (`ANDROID_HOME`, `JAVA_HOM
    ```
 
    On Windows: `setup.bat` with the same arguments. Details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
-3. Install the APK and copy `work/DOOM Mobile` to the phone's `Download` folder (or let `--push` / `./setup.sh push
+3. Install the APK (from [Releases](https://github.com/Desm0nt/doom-port/releases), or build it yourself, see
+   *Building*) and copy `work/DOOM Mobile` to the phone's `Download` folder (or let `--push` / `./setup.sh push
    <serial>` do it over adb).
 4. Start *DOOM Mobile* and allow *All files access* when asked.
 
