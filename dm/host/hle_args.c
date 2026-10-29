@@ -1,7 +1,10 @@
 // [DOOM] Command line for the game (nn::os::GetHostArgc / GetHostArgv). id Tech 6 parses "+set <cvar> <value>" from it at
 // startup, which is how options reach the renderer without patching code:
 //   DM_DOOM_RES=<0.5..1>   3D render fraction (rs_forceFractionX / Y): the game renders the 3D view at that fraction of
-//                          1280x720 and upscales it itself (with its TAA); the UI stays at full resolution. 0.75 = 960x540.
+//                          the output size (1280x720, or W x 720 with DM_DOOM_WIDE) and upscales it itself (with its TAA);
+//                          the UI stays at full resolution. 0.75 = 960x540 at 16:9.
+//   DM_DOOM_WIDE=1|0|<w>   widescreen Hor+ output W x 720 (default off; 1 = screen aspect; see doom_wide below).
+//   DM_DOOM_WIDE_LIVE=1    always render wide; the gear checkbox switches live (off = presenter 16:9 centre crop; BUGS 2.12).
 //   DM_DOOM_DRS=1          keep DOOM's dynamic resolution (rs_enable) on; default off (+set rs_enable 0).
 //   DM_DOOM_GEOMCULL=1     keep DOOM's triangle culling (default off: it drops visible triangles on our GPU path).
 //   DM_DOOM_ADAPTIVE_TICK=0  keep the fixed 30 Hz game tic (default: adaptive tick, game time follows real frame time).
@@ -11,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #ifdef DM_GAME_DOOM
 static char *g_argv[128];   // ~60 used by the defaults below (sticks + tick cvars), room for DM_DOOM_ARGS
@@ -18,9 +22,123 @@ static int g_argc = -1;
 
 static void add(const char *s) { if (g_argc < 127) g_argv[g_argc++] = strdup(s); }
 
+// [DOOM] Widescreen output (DM_DOOM_WIDE, default OFF until the EmergencyRender at 1600x720 is solved, BUGS_AND_FIXES 2.10). How the game picks its resolution (update main, build id 2847991952b3d7ab):
+// there is no display-resolution query (no nn::oe::GetDefaultDisplayResolution import). Renderer init (0x1c05450, and the cold-start
+// branch of EmergencyRender 0x1c06c70 at 0x1c071e4, taken only when the renderer is not up yet) reads r_mode ("0 == 720p, 1 == 1080p - Forces a certain resolution", default "0", registered at
+// 0x1c2ea24, idCVar at GOT 0x48d4fe0) and, for r_mode 0 / 1, takes {u32 width, u32 height} from the rodata table at 0x39f1b10
+// ({1280,720},{1920,1080}; any other r_mode -> immediate 1280x720), storing it in the one display-size global 0x573d1b0 (GOT 0x48d4fc0).
+// Every size getter of the render system reads that global (0x1c04aa0 / 0x1c04ab0 GetWidth/GetHeight, 0x1c04ac0 / 0x1c04ad0 scanout
+// width/height; GetPixelAspect is a constant 1.0), and from them come the window textures, the render targets, the per-frame
+// gameFrameParms_t width/height (idCommonLocal::GameFrameParms -> idGameLocal+0x2bb398) and the GUI virtual size.
+// Projection is Hor+ by construction: idView::SetFovXandY / CalcFovXandY / CalculateFovXandY take g_fov as the horizontal FOV *at
+// 16:9* (vfov = 2*atan(tan(g_fov/2) * 0.5625)), then fovX = 2*atan(tan(vfov/2) * w/h) with w/h clamped to [1, 3] -- a wider output
+// keeps the vertical FOV and shows more on the sides. idSWF::RenderInternal scales the 1280x720 Flash stage uniformly by
+// min(w/stageW, h/stageH) and centres it, so menus / HUD are not stretched (centred, with the side space for anchored elements).
+// So widening needs only the table: entry 0 becomes {W, 720} (and entry 1 {1.5 W, 1080} for an explicit r_mode 1), written before
+// the game's renderer init reads it (the command line is fetched first). The table lives in .rodata, which the Android loader
+// leaves writable (only [0, text_end) and the patch area are sealed). The presenter then gets a W x 720 image that fills the
+// screen without side bars.
+//   DM_DOOM_WIDE=1           W = 720 x screen aspect (front_game_res(0), rounded to 16), only when the screen is wider than 16:9
+//   DM_DOOM_WIDE unset / 0   original 1280x720 (the presenter letterboxes it with side bars)
+//   DM_DOOM_WIDE=<width>     explicit width (>= 1280, rounded to 16)
+// W is clamped to [1280, 2160]: 2160 = 720 x 3, the game's aspect clamp in its FOV math.
+uint64_t front_game_res(int docked);
+// [DOOM] DM_DOOM_WIDE_LIVE=1 (default off until phone-tested, BUGS_AND_FIXES 2.12): the gear dialog's "wide" checkbox switches live.
+// The game has no runtime path that changes its output size (vid_restart = empty stub 0x1c06c40, the operation-mode message 30
+// only re-tunes quality cvars in 0x1c064c0), so with this switch the game always renders W x 720 and "wide off" is the presenter
+// cropping the centre 16:9 of it (vulkan_present.cpp dm_present_crop169) -- identical geometry, since the projection is Hor+ (same
+// vertical FOV) and the SWF stage is centred at scale 1.
+static int dm_doom_wide_live_env(void) { const char *e = getenv("DM_DOOM_WIDE_LIVE"); return e && *e == '1'; }
+static int g_wide_patched;   // the r_mode table really holds the wide size (doom_wide succeeded)
+// Output width for DM_DOOM_WIDE, or 0 = off (16:9). Pure computation from env + screen size, cached; also used by hle_svc.c app_pool()
+// (called earlier than the command line) through doom_pool_plan.
+unsigned dm_doom_wide_w(void) {
+    static int done; static unsigned w;
+    if (done) return w;
+    done = 1;
+    const char *e = getenv("DM_DOOM_WIDE");
+    if (!e || !*e || (*e == '0' && !e[1])) {
+        if (!dm_doom_wide_live_env()) return w = 0;   // default OFF (diag30 29.10: white EmergencyRender = RenderTarget pool full; now sized below)
+        e = "1";   // DM_DOOM_WIDE_LIVE=1: always render at the screen aspect; "off" is a 16:9 centre crop in the presenter (BUGS 2.12)
+    }
+    long want = atol(e);
+    unsigned v;
+    if (want >= 1280) v = (unsigned)want;
+    else {   // DM_DOOM_WIDE=1: same height, widened to the screen aspect (the d2r-mobile rule, front_android.c)
+        const char *gr = getenv("DM_GAME_RES"); unsigned gw, gh;
+        if (gr && sscanf(gr, "%ux%u", &gw, &gh) == 2 && gh) v = (unsigned)(720.0 * gw / gh + 0.5);   // DM_GAME_RES only as an aspect here
+        else { uint64_t r = front_game_res(0); v = (uint32_t)(r >> 32) == 720 ? (uint32_t)r : 1280; }
+    }
+    v = (v + 8) / 16 * 16; if (v < 1280) v = 1280; if (v > 2160) v = 2160;
+    return w = v == 1280 ? 0 : v;
+}
+// [DOOM] The game's NVN VRAM pools (idNvnVRamAllocator; cvars registered at 0x1c4a040..0x1c4a150, read once by the VRAM allocator
+// init 0x1c305e0, which renderer init calls at 0x1c054dc -- after the command line's +set are applied). Each pool is carved out of the
+// game heap (heap = app pool - image, hle_svc.c) and zeroed; with zero-copy (xbg_game.cpp map_pool) it becomes AHardwareBuffer
+// (dma-buf) memory, i.e. resident from the start. Stock sizes (MB) and what fills them:
+//   TextureBuffer 1162.5  textures, VT pages, vertex/index/constant buffers -- the yellow EmergencyRender of BUGS 2.9
+//   RenderTarget  117     screen-sized targets (~133 bytes per output pixel at 1280x720) + fixed atlases -- white EmergencyRender at 1600
+//   Uncached      22.5    CPU-visible uncached (readbacks, queries)        -- magenta
+//   Shader        5.5     shader code                                      -- blue
+//   Dynamic       23      per-frame dynamic data                           -- green
+// DM_DOOM_POOL_MARGIN (default 1; 16 GB phone): TextureBuffer 1536, RenderTarget 1.35 x max(117, 117*W/1280+4) rounded up to 4 MB,
+// the three small pools x1.5 rounded up; hle_svc.c app_pool() adds the total increase + 512 MB of plain game-heap headroom (unless
+// DM_APP_POOL_ADD_MB is set). DM_DOOM_POOL_MARGIN=0: stock sizes; DM_DOOM_WIDE then still raises RenderTarget to 117*W/1280+4 (the minimum
+// that fits the wider targets) and the app pool by that difference only.
+typedef struct { double tb, rt, unc, sh, dyn; int pool_add_mb; } doom_pools;
+static const doom_pools g_stock_pools = {1162.5, 117, 22.5, 5.5, 23, 0};
+static int margin_on(void) { const char *e = getenv("DM_DOOM_POOL_MARGIN"); return !(e && *e == '0' && !e[1]); }
+static doom_pools doom_pool_plan(void) {
+    doom_pools p = g_stock_pools; unsigned w = dm_doom_wide_w();
+    double rt_min = w ? (117u * w + 1279) / 1280 + 4 : 117;   // minimum for the output width
+    if (margin_on()) {
+        p.tb = 1536; p.rt = ceil(rt_min * 1.35 / 4) * 4; p.unc = ceil(22.5 * 1.5); p.sh = ceil(5.5 * 1.5); p.dyn = ceil(23 * 1.5);
+    } else p.rt = rt_min;
+    double extra = (p.tb - g_stock_pools.tb) + (p.rt - g_stock_pools.rt) + (p.unc - g_stock_pools.unc) + (p.sh - g_stock_pools.sh) + (p.dyn - g_stock_pools.dyn);
+    p.pool_add_mb = (int)ceil(extra) + (margin_on() ? 512 : 0);
+    return p;
+}
+// hle_svc.c app_pool(): MB to add to the reported application pool (VRAM pool increase + heap headroom).
+int dm_doom_pool_add_mb(void) { return doom_pool_plan().pool_add_mb; }
+static void doom_pools_args(void) {
+    doom_pools p = doom_pool_plan(), s = g_stock_pools;
+    static const char *const names[5] = {"nvn_VRAMTextureBufferHeapSizeMB", "nvn_VRAMRenderTargetHeapSizeMB", "nvn_VRAMUncachedHeapSizeMB",
+                                         "nvn_VRAMShaderHeapSizeMB", "nvn_VRAMDynamicHeapSizeMB"};
+    const double v[5] = {p.tb, p.rt, p.unc, p.sh, p.dyn}, o[5] = {s.tb, s.rt, s.unc, s.sh, s.dyn};
+    for (int i = 0; i < 5; i++) if (v[i] != o[i]) { char b[24]; snprintf(b, sizeof b, "%g", v[i]); add("+set"); add(names[i]); add(b); }
+    LOG("[pools] VRAM MB: TextureBuffer %g RenderTarget %g Uncached %g Shader %g Dynamic %g (stock 1162.5/117/22.5/5.5/23; "
+        "DM_DOOM_POOL_MARGIN=%d, wide %u); app pool +%d MB%s", p.tb, p.rt, p.unc, p.sh, p.dyn, margin_on(), dm_doom_wide_w(), p.pool_add_mb,
+        getenv("DM_APP_POOL_ADD_MB") ? " (overridden by DM_APP_POOL_ADD_MB)" : "");
+}
+static void doom_wide(void) {
+    unsigned w = dm_doom_wide_w();
+    if (!w) { LOG("[wide] DM_DOOM_WIDE off (or screen not wider than 16:9): 16:9 output 1280x720"); return; }
+    uint8_t *mb = NULL; size_t msz = 0;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mb = g_mod[i].base; msz = g_mod[i].size; }
+    enum { TAB = 0x39f1b10, STR_RMODE = 0x39a107e, STR_RTPOOL = 0x395b436 };   // (the pool cvar name is checked so a wrong build does not widen without its pool)
+    static const uint32_t orig[4] = {1280, 720, 1920, 1080};
+    if (!mb || msz < TAB + 16 || memcmp(mb + STR_RMODE, "r_mode", 7) || memcmp(mb + STR_RTPOOL, "nvn_VRAMRenderTargetHeapSizeMB", 31) ||
+        memcmp(mb + TAB, orig, sizeof orig)) {
+        LOG("[wide] main is not the expected update build (r_mode table not found): output stays 1280x720"); return; }
+    uint32_t t[4] = {w, 720, (w * 3 / 2 + 8) / 16 * 16, 1080};
+    memcpy(mb + TAB, t, sizeof t);
+    g_wide_patched = 1;
+    LOG("[wide] r_mode table main+%#x -> r_mode 0 = %ux720 (r_mode 1 = %ux1080); RenderTarget pool: see [pools]", TAB, t[0], t[2]);
+}
+
+// JNI (jni_android.c nativeWideLive): 1 = the live switch is available (DM_DOOM_WIDE_LIVE=1 and the game renders wide), so the
+// presenter crop can follow the checkbox; 0 = the change applies at the next launch.
+int dm_doom_wide_live(void) {
+    int ok = dm_doom_wide_live_env() && g_wide_patched;
+    LOG("[wide] live switch %s (DM_DOOM_WIDE_LIVE=%d, wide output %u)", ok ? "available" : "not available: next launch", dm_doom_wide_live_env(), g_wide_patched ? dm_doom_wide_w() : 0);
+    return ok;
+}
+
 static void build(void) {
     if (g_argc >= 0) return;
     g_argc = 0; add("doom");
+    doom_wide();         // r_mode table (DM_DOOM_WIDE)
+    doom_pools_args();   // +set nvn_VRAM*HeapSizeMB (DM_DOOM_POOL_MARGIN, and the wide RenderTarget minimum)
     const char *res = getenv("DM_DOOM_RES");
     if (res && *res) {
         double f = atof(res);
@@ -96,4 +214,6 @@ static void build(void) {
 
 HLE_FORCE("_ZN2nn2os11GetHostArgcEv", "命令行：DM_DOOM_RES / DM_DOOM_ARGS 变成 id Tech 的 +set 参数", int, h_os_GetHostArgc, void) { build(); return g_argc; }
 HLE_FORCE("_ZN2nn2os11GetHostArgvEv", "命令行：与 GetHostArgc 配对", char **, h_os_GetHostArgv, void) { build(); return g_argv; }
+#else
+int dm_doom_wide_live(void) { return 0; }
 #endif

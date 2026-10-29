@@ -67,6 +67,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native boolean nativePadKey(int device, int keyCode, boolean down);
     static native void nativePadAxes(int device, float x, float y, float z, float rz, float lt, float rt, float hatX, float hatY);
     static native void nativePadRemoved(int device);
+    static native boolean nativeWideLive(boolean on);   // [DOOM] live widescreen switch (DM_DOOM_WIDE_LIVE=1); false = applies at the next launch
 
     private static WeakReference<DmActivity> current = new WeakReference<>(null);
     private static volatile int bootFailure;
@@ -271,6 +272,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             Os.setenv("DM_AA_STRENGTH", String.valueOf(p.getFloat("aa", 1.0f)), true);
             // Rumble (haptics_android.c): off by default since 28.10 (owner: it only drains the battery); DM_RUMBLE=0 hides the vibration devices.
             Os.setenv("DM_RUMBLE", p.getBoolean("rumble", false) ? "1" : "0", true);
+            // Widescreen (hle_args.c doom_wide): the game renders at the screen aspect (e.g. 1600x720) with a wider Hor+ view; on by default.
+            Os.setenv("DM_DOOM_WIDE", p.getBoolean("wide", true) ? "1" : "0", true);
             String lang = p.getString("lang", "");
             if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
             String drv = p.getString("driver", "");
@@ -311,6 +314,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             RadioGroup aaG = new RadioGroup(this); aaG.setOrientation(RadioGroup.HORIZONTAL);
             for (int i = 0; i < AA_STRENGTHS.length; i++) { RadioButton r = new RadioButton(this); r.setText(AA_LABELS[i]); r.setId(6000 + i); aaG.addView(r); }
             aaG.check(6000 + nearest(AA_STRENGTHS, p.getFloat("aa", 1.0f))); box.addView(aaG);
+            CheckBox wide = new CheckBox(this); wide.setText("Широкий экран: обзор шире вместо полос (со следующего запуска)"); wide.setChecked(p.getBoolean("wide", true)); box.addView(wide);
             CheckBox rumble = new CheckBox(this); rumble.setText("Вибрация (со следующего запуска)"); rumble.setChecked(p.getBoolean("rumble", false)); box.addView(rumble);
             CheckBox fps = new CheckBox(this); fps.setText("Счётчик FPS и времени кадра");
             fps.setChecked(getSharedPreferences("doom_controls", MODE_PRIVATE).getBoolean("fps", true)); box.addView(fps);
@@ -336,12 +340,18 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
             new AlertDialog.Builder(this).setTitle("Графика").setView(scroll)
                 .setPositiveButton("Сохранить", (d, w) -> {
-                    p.edit().putBoolean("drs", drs.isChecked()).putString("driver", turnip.isChecked() ? "turnip" : "").putBoolean("rumble", rumble.isChecked()).putFloat("aa", AA_STRENGTHS[Math.min(Math.max(0, aaG.getCheckedRadioButtonId() - 6000), AA_STRENGTHS.length - 1)]).putString("lang", LANG_CODES[Math.min(Math.max(0, langG.getCheckedRadioButtonId() - 5000), LANG_CODES.length - 1)])
+                    boolean wideChanged = wide.isChecked() != p.getBoolean("wide", true);
+                    p.edit().putBoolean("drs", drs.isChecked()).putString("driver", turnip.isChecked() ? "turnip" : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked()).putFloat("aa", AA_STRENGTHS[Math.min(Math.max(0, aaG.getCheckedRadioButtonId() - 6000), AA_STRENGTHS.length - 1)]).putString("lang", LANG_CODES[Math.min(Math.max(0, langG.getCheckedRadioButtonId() - 5000), LANG_CODES.length - 1)])
                         .putInt("res", Math.max(0, res.getCheckedRadioButtonId() - 1000)).putInt("sharpen", Math.max(0, sh.getCheckedRadioButtonId() - 2000)).apply();
                     int li = Math.max(0, look.getCheckedRadioButtonId() - 3000), di = Math.max(0, dz.getCheckedRadioButtonId() - 4000);
                     getSharedPreferences("doom_controls", MODE_PRIVATE).edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[Math.min(li, LOOK_GAINS.length - 1)])
                         .putFloat("move_dz", DEADZONES[Math.min(di, DEADZONES.length - 1)]).apply();
                     if (doomPad != null) doomPad.reloadSettings();
+                    if (wideChanged) {   // [DOOM] BUGS_AND_FIXES 2.12: native answers whether it switched live (needs DM_DOOM_WIDE_LIVE=1)
+                        boolean live = false;
+                        try { live = libraryLoaded && nativeWideLive(wide.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeWideLive: " + t); }
+                        android.widget.Toast.makeText(this, live ? "Широкий экран: применено" : "Широкий экран: со следующего запуска", android.widget.Toast.LENGTH_SHORT).show();
+                    }
                 })
                 .setNegativeButton("Отмена", null).show();
         });

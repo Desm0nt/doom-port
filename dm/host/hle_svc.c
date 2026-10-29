@@ -32,11 +32,17 @@ int dm_guest_heap_readable(uint64_t a, size_t n) { uint64_t b = (uint64_t)(uintp
 static uint8_t *g_alias; static size_t g_alias_cap;
 static uint8_t *g_stack; static size_t g_stack_cap;
 
+static uint64_t app_pool_want(void);
 static void mem_init(void) {
     if (g_as) return;
     // 从 5120 MiB 起逐档降级（每档减 128 MiB），下限 4864 MiB（堆容量 = reserve − 1 GB ≥ 3728 MB + 余量）
     // Step down from 5120 MiB (128 MiB per step), floor 4864 MiB (heap capacity = reserve − 1 GB ≥ 3728 MB + margin)
-    const size_t start = 5ull << 30, step = 128ull << 20, limit = 4864ull << 20;
+    size_t start = 5ull << 30; const size_t step = 128ull << 20, limit = 4864ull << 20;
+#ifdef DM_GAME_DOOM
+    // [DOOM] enlarged pools (hle_args.c DM_DOOM_POOL_MARGIN): the heap region (reserve - 1 GB) must hold pool - image; reserve that much
+    // + 256 MB (address space only; Android arm64 has >= 39-bit user VA, so 5-6 GB is no issue). Steps down to the floor as before.
+    { uint64_t need = app_pool_want() + (1ull << 30) + (256ull << 20); need = (need + step - 1) / step * step; if (need > start) start = (size_t)need; }
+#endif
     for (size_t sz = start; sz >= limit; sz -= step) {
         g_as = mmap(NULL, sz, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
         if (g_as != MAP_FAILED) { g_reserve = sz; break; }
@@ -78,7 +84,26 @@ static void mem_init(void) {
 #else
 #define APP_POOL_ADD_MB 512
 #endif
-static uint64_t app_pool(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_APP_POOL_ADD_MB"); long add = e ? atol(e) : APP_POOL_ADD_MB; v = APP_POOL + ((uint64_t)add << 20); if (e) LOG("DM_APP_POOL_ADD_MB：应用内存池报 %llu MB（Switch 的 3285 MB %+ld）", (unsigned long long)(v >> 20), add); } return v; }
+#ifdef DM_GAME_DOOM
+int dm_doom_pool_add_mb(void);   // hle_args.c: enlarged NVN VRAM pools (DM_DOOM_POOL_MARGIN / DM_DOOM_WIDE) + heap headroom; the pools come out of the game heap
+#define APP_POOL_EXTRA_MB() dm_doom_pool_add_mb()
+#else
+#define APP_POOL_EXTRA_MB() 0
+#endif
+// The pool we would like to report (no cache: mem_init sizes the reservation from it before app_pool() exists).
+static uint64_t app_pool_want(void) { const char *e = getenv("DM_APP_POOL_ADD_MB"); long add = e ? atol(e) : APP_POOL_ADD_MB + APP_POOL_EXTRA_MB(); return APP_POOL + ((uint64_t)(int64_t)add << 20); }
+static size_t image_bytes(void);
+// Reported pool, capped so that pool - image fits the heap region (reserve - 1 GB): above that SetHeapSize would answer OutOfMemory
+// instead of LimitReached and the game's 2 MB step-down start would not apply.
+static uint64_t app_pool(void) {
+    static uint64_t v; if (v) return v;
+    uint64_t want = app_pool_want(), cap = g_heap_cap ? g_heap_cap + image_bytes() : want;
+    v = want < cap ? want : cap;
+    const char *e = getenv("DM_APP_POOL_ADD_MB");
+    LOG("app pool: %llu MB reported (Switch 3285 MB %+lld MB%s%s)", (unsigned long long)(v >> 20), (long long)((int64_t)(v >> 20) - 3285),
+        e ? ", DM_APP_POOL_ADD_MB" : ", VRAM pools + headroom", want > cap ? "; capped by the guest heap region" : "");
+    return v;
+}
 static size_t image_bytes(void) { size_t n = 0; for (int i = 0; i < g_nmod; i++) n += g_mod[i].size; return (n + 0x1fffff) & ~(size_t)0x1fffff; }
 
 // 游戏主堆读数：主堆 = main+0x32137a0 那个 nn::mem::StandardAllocator（启动时把整块堆交给它）。申请失败返回空，原版多处不判空直接写

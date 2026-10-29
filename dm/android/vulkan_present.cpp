@@ -264,15 +264,28 @@ bool record(VkCommandBuffer cmd,unsigned f,VkImage source,VkFormat format,uint32
     return true;
 }
 }
+// [DOOM] Live widescreen switch (DM_DOOM_WIDE_LIVE=1, BUGS_AND_FIXES 2.12): the game always renders W x 720 and "wide off" shows its
+// centre 16:9 (the Hor+ projection keeps the vertical FOV, so the centre crop is exactly the 16:9 view; the SWF HUD is centred at
+// scale 1). -1 = not decided yet: at the first frame, crop when DM_DOOM_WIDE_LIVE=1 and the gear option is off (DM_DOOM_WIDE=0).
+static std::atomic<int> crop169{-1};
 int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t){
     std::lock_guard<std::mutex> render_lock(render_mutex);
     pin_update();
     VkFormatProperties sp;vkGetPhysicalDeviceFormatProperties(physical,source_format,&sp);if(!(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT))return VK_ERROR_FORMAT_NOT_SUPPORTED;
     int x=0,y=0,w=int(width),h=int(height);if(crop&&crop[2]>0&&crop[3]>0){x=std::clamp(crop[0],0,w);y=std::clamp(crop[1],0,h);w=std::min(crop[2],int(width)-x);h=std::min(crop[3],int(height)-y);}if(w<=0||h<=0)return VK_ERROR_INITIALIZATION_FAILED;
+    {int c=crop169.load(std::memory_order_relaxed);
+        if(c<0){const char*l=getenv("DM_DOOM_WIDE_LIVE"),*e=getenv("DM_DOOM_WIDE");c=(l&&*l=='1'&&(!e||!*e||(e[0]=='0'&&!e[1])))?1:0;int u=-1;crop169.compare_exchange_strong(u,c);c=crop169.load(std::memory_order_relaxed);}
+        if(c>0&&int64_t(w)*9>int64_t(h)*16+9){int nw=int((int64_t(h)*16/9)&~1);x+=(w-nw)/2;w=nw;}}   // wider than 16:9 by more than a pixel
     for(;;){
-    if(present_native && surface && active && (native_w!=w || native_h!=h)){   // the next swapchain takes this size (currentExtent follows the buffer geometry)
-        int g=ANativeWindow_setBuffersGeometry(active,w,h,0);native_w=w;native_h=h;swap_dirty=true;
-        __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present at the game's output size %dx%d result=%d (marker gfx-present-native)",w,h,g);}
+    // [DOOM] The buffer keeps the window's aspect ratio: a 16:9 buffer on a 20:9 screen was stretched sideways by the
+    // compositor (round HUD prompts looked squashed). It keeps the game's height, so the blit below adds side bars.
+    // DM_PRESENT_STRETCH=1 restores the old fill-the-screen stretch.
+    int bw=w,bh=h;{static int stretch=-1;if(stretch<0){const char*e=getenv("DM_PRESENT_STRETCH");stretch=e&&*e=='1';}
+        int ww=active?ANativeWindow_getWidth(active):0,wh=active?ANativeWindow_getHeight(active):0;
+        if(!stretch&&ww>0&&wh>0){if(int64_t(ww)*h>int64_t(wh)*w)bw=int((int64_t(h)*ww/wh+1)&~1);else bh=int((int64_t(w)*wh/ww+1)&~1);}}
+    if(present_native && surface && active && (native_w!=bw || native_h!=bh)){   // the next swapchain takes this size (currentExtent follows the buffer geometry)
+        int g=ANativeWindow_setBuffersGeometry(active,bw,bh,0);native_w=bw;native_h=bh;swap_dirty=true;
+        __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present at the game's output size %dx%d in a %dx%d buffer result=%d (marker gfx-present-native)",w,h,bw,bh,g);}
     // 后台等待释放UI锁；保留同一源帧，恢复并真正呈现后才返回成功。
     // Suspend without the UI lock; keep this source frame until it is presented.
     wait_window();
@@ -362,6 +375,8 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     }
 }
 }
+// [DOOM] JNI nativeWideLive (jni_android.c): 1 = show the centre 16:9 of the wide frame, 0 = the whole wide frame. Takes effect at the next present.
+extern "C" void dm_present_crop169(int on){crop169.store(on?1:0,std::memory_order_relaxed);__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","[wide] live: %s",on?"centre 16:9 crop":"full wide frame");}
 extern "C" void dm_android_vk_set_window(ANativeWindow *window){if(window)ANativeWindow_acquire(window);{std::lock_guard<std::mutex> l(window_mutex);if(desired)ANativeWindow_release(desired);desired=window;++generation;}window_cv.notify_all();}
 extern "C" int dm_android_vk_has_window(){return has_window(nullptr);}
 extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t bytes){
@@ -421,7 +436,10 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     if(ahb && foreign){dext.push_back(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);dext.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);}
     // Diagnostic (marker gfx-pipe-stats): the driver's per-pipeline statistics (VK_KHR_pipeline_executable_properties).
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pef{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
-    if(FILE *ps=[&]{std::string dir=path;size_t cut=dir.find_last_of('/');return fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");}()){fclose(ps);dext.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);pef.pipelineExecutableInfo=VK_TRUE;pef.pNext=draw.pNext;draw.pNext=&pef;}
+    // [perf4] also DM_GFX_PIPE_STATS (env) — the engine logs the statistics of the hottest pipelines per window.
+    auto pipe_stats_env=[]{const char *e=getenv("DM_GFX_PIPE_STATS");return e && *e && *e!='0';};
+    bool pe=false;for(const auto &x:available)if(!strcmp(x.extensionName,VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))pe=true;
+    if(FILE *ps=[&]{std::string dir=path;size_t cut=dir.find_last_of('/');FILE *f=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");if(!f && pe && pipe_stats_env())f=fopen("/proc/self/stat","rb");return f;}()){fclose(ps);dext.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);pef.pipelineExecutableInfo=VK_TRUE;pef.pNext=draw.pNext;draw.pNext=&pef;}
     float priority=1;VkDeviceQueueCreateInfo qc{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qc.queueFamilyIndex=family;qc.queueCount=1;qc.pQueuePriorities=&priority;VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};dc.pNext=&draw;dc.pEnabledFeatures=&features.features;dc.queueCreateInfoCount=1;dc.pQueueCreateInfos=&qc;dc.enabledExtensionCount=uint32_t(dext.size());dc.ppEnabledExtensionNames=dext.data();if((r=vkCreateDevice(physical,&dc,nullptr,&device)))return fail("vkCreateDevice",r);vkGetDeviceQueue(device,family,0,&queue);
     for(;;){
         wait_window();

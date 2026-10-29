@@ -181,6 +181,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     int n = link_romfs(romfs);
     LOG("boot: 资源链接 %d 个文件", n);
 #endif
+    setenv("DM_RUNTIME_DIR", g_runtime, 1);   // [DOOM] hle_nvn.c polls <it>/dump for an on-demand thread dump
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
 #ifdef DM_ANDROID_DEBUG_ENV
     debug_environment();
@@ -401,4 +402,15 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeFrameStats(JNIEnv
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativePadRemoved(JNIEnv *env, jclass cls, jint device) {
     (void)env; (void)cls;
     front_android_pad_removed(device);
+}
+// [DOOM] Gear dialog, "wide" checkbox changed (DmActivity save): live widescreen switch (DM_DOOM_WIDE_LIVE=1, BUGS_AND_FIXES 2.12).
+// The game always renders wide under that switch; "off" is the presenter's centre 16:9 crop. Returns false when the switch is not
+// available (the change then applies at the next launch through DM_DOOM_WIDE).
+int dm_doom_wide_live(void);           // hle_args.c
+void dm_present_crop169(int on);       // vulkan_present.cpp
+JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeWideLive(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls;
+    if (!dm_doom_wide_live()) return JNI_FALSE;
+    dm_present_crop169(on ? 0 : 1);
+    return JNI_TRUE;
 }
