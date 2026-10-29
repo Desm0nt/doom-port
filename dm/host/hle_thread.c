@@ -192,7 +192,11 @@ static void note_runnable(thr_t *t) {
     t->hand[t->nhand].by = self; t->hand[t->nhand++].epoch = self->hand_epoch;
     for (int i = 0; i < self->nhand && t->nhand < 4; i++)
         if (self->hand[i].by != t && self->hand[i].by->hand_epoch == self->hand[i].epoch) t->hand[t->nhand++] = self->hand[i];   // only handoffs still in progress
-    if (t->prio < self->prio && t->mask == 1ull << (self->core & 63)) self->yield_pending = 1;
+    // [perf4] DM_HANDOFF_PINNED=1 (default 1 since 29.10): only a waker pinned to that single core yields. Horizon would migrate a waker
+    // whose mask allows other cores (WorkerThread_00/01: mask 0x7, ideal core 0) instead of letting it wait for the
+    // woken main thread (mask 0x1); ~420 handoffs/s, ~1.7-2.1 ms blocked each in the thread-dump logs.
+    static int pinned_only = -1; if (pinned_only < 0) { const char *e = getenv("DM_HANDOFF_PINNED"); pinned_only = e ? (atoi(e) ? 1 : 0) : 1; }   // default on since the 29.10 A/B (heavy scenes 33 -> 35 fps, <30 fps windows 39% -> 26%)
+    if (t->prio < self->prio && t->mask == 1ull << (self->core & 63) && (!pinned_only || self->mask == 1ull << (self->core & 63))) self->yield_pending = 1;
 #else
     (void)t;
 #endif

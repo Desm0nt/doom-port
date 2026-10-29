@@ -202,7 +202,9 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     setenv("DM_3D_SCALE", "0.85", 0);
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
-    setenv("DM_NVN_SYNC", "1", 0);
+    // [DOOM] 29.10 A/B (round 2): translation on its own thread beats translating on the game's render thread (heavy scenes
+    // 25 -> 33 fps); DM_NVN_SYNC=1 restores the synchronous path.
+    setenv("DM_NVN_SYNC", "0", 0);
     // BC 贴图按原格式采样（引擎的 gfx-native-bc；设备支持时；标记文件仍优先）：Redmi K50 Ultra 营地 GPU 少 0.5 ms，图像内存 827 → 320 MB。
     // BC textures sampled in their own formats where the device can (the engine's gfx-native-bc; a marker file still wins):
     // on the Redmi K50 Ultra camp GPU -0.5 ms and live image memory 827 -> 320 MB.
