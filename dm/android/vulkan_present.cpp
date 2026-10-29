@@ -461,6 +461,9 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
      pin_mask=fastest_cores();pin_ab=0;pin_state=-1;pin_have_original=false;pin_presents=pin_drifts=0;
      if(FILE *p=open_marker("/gfx-pin-cpu")){if(fscanf(p,"%x",&pin_mask)!=1)pin_mask=0;fclose(p);}
      if(FILE *n=open_marker("/gfx-no-pin")){pin_mask=0;fclose(n);}
+     // [perf4] DM_GFX_PIN_CPU=<hex mask> (env; 0 = no pin): same as the gfx-pin-cpu marker, e.g. f0 = X4 + all A720 instead of
+     // the X4 alone (the present thread is also the translation thread with DM_NVN_SYNC=1).
+     if(const char *e=getenv("DM_GFX_PIN_CPU");e && *e){unsigned v=0;if(sscanf(e,"%x",&v)==1)pin_mask=v;}
      if(FILE *t=open_marker("/gfx-ab-target")){char target[16]={0};if(fscanf(t,"%15s",target)==1 && !strcmp(target,"pin"))if(FILE *a=open_marker("/gfx-ab-toggle")){if(fscanf(a,"%d",&pin_ab)!=1)pin_ab=0;fclose(a);}fclose(t);}
      __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN pin mask=%x ab=%d (markers gfx-no-pin, gfx-pin-cpu, gfx-ab-target=pin)",pin_mask,pin_ab);
      if(FILE *b=open_marker("/gfx-membench")){fclose(b);membench();}}

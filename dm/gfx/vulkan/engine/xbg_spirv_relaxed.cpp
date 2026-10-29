@@ -22,7 +22,7 @@ enum : uint32_t {
 // declared before the functions or carries no value.
 bool has_result(uint32_t op) {
     switch (op) {
-    case OpStore: case 247: case 248: case 249: case 250: case 251: case 252: case 253: case 254: case 246: case 218: case 219:
+    case OpStore: case 63: case 228: case 255: case 247: case 248: case 249: case 250: case 251: case 252: case 253: case 254: case 246: case 218: case 219:
     case 99: /* ImageWrite */ case 224: case 225: /* barriers */ case 56: /* FunctionEnd */ case 8: case 317: case OpDecorate:
     case OpMemberDecorate: case 16: case OpEntryPoint: case 17: case 14: case 3: case 4: case 5: case 6: case 7: case 10: case 11:
         return false;

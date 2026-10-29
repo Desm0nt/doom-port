@@ -47,6 +47,7 @@ def main():
         print('no NVN GPASS pass lines (DM_GFX_PASS_PROF not set?)')
         return 1
     sig_us = collections.Counter(); sig_n = collections.Counter(); sig_draws = collections.Counter(); used = 0
+    end_n = collections.Counter(); end_us = collections.Counter(); one_draw = collections.Counter()   # perf4: end=L<line> of each pass
     print('frame   total_ms  ' + '  '.join(f'{c:>11}' for c in ('gs-prepass', 'shadow', 'main', 'post/small', 'compute')) + '  passes draws')
     for fr in sorted(frames):
         recs = frames[fr]
@@ -61,12 +62,20 @@ def main():
             sig = f'{kind} {m.group(1)} first={m.group(3)} last={m.group(4)}' if m else f'{kind} {rest[:90]}'
             d = int(m.group(2)) if m else 0; draws += d
             sig_us[sig] += us; sig_n[sig] += 1; sig_draws[sig] += d
+            e = re.search(r' end=L(\d+)', rest)
+            if e and kind == 'pass':
+                end_n[e.group(1)] += 1; end_us[e.group(1)] += us
+                if d <= 1: one_draw[e.group(1)] += 1
         print(f'{fr:6} {total/1000:9.2f}  ' + '  '.join(f'{cls[c]/1000:11.2f}' for c in ('gs-prepass', 'shadow', 'main', 'post/small', 'compute')) + f'  {len(recs):6} {draws:5}')
     if not used:
         print('no frame above --min-us'); return 1
     print(f'\ntop pass signatures over {used} frame(s): mean ms per frame, passes per frame, draws per pass')
     for sig, us in sig_us.most_common(a.top):
         print(f'{us/used/1000:7.2f} ms  x{sig_n[sig]/used:5.1f}  draws/pass {sig_draws[sig]/max(1,sig_n[sig]):6.1f}  {sig[:200]}')
+    if end_n:
+        print('\npass ends by call site (end=L<line> of this build): passes per frame, of them with <=1 draw, mean ms per frame')
+        for line, n in end_n.most_common(12):
+            print(f'  L{line:>5}  x{n/used:6.1f}  <=1 draw x{one_draw[line]/used:6.1f}  {end_us[line]/used/1000:6.2f} ms')
     return 0
 
 if __name__ == '__main__':
