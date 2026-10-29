@@ -12,7 +12,8 @@ You bring the game: this repository contains no game content.
 ## Screenshots
 
 Captured on the phone (Adreno 750, Qualcomm driver). The counter in the top-left corner is the port's own FPS / frame
-time / GPU time overlay (it can be turned off in the settings).
+time / GPU time overlay (it can be turned off in the settings). These shots predate the aspect-ratio fix: they show the
+16:9 image stretched to the 20:9 screen; current builds render 1600×720 widescreen (or 16:9 with side bars).
 
 **On-screen controls** (shown while no gamepad is connected):
 
@@ -68,7 +69,8 @@ Graphics settings apply at the next launch, control settings at once. The dialog
   contains none. You dump DOOM from a Switch you own and convert it on your PC ([docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md)).
   What the repository knows about the game (patch addresses, cvar names, shader identifiers…) is listed in
   [docs/doom/DERIVED.md](docs/doom/DERIVED.md).
-- Online. The MULTIPLAYER entry is removed from the main menu; the campaign runs fully offline.
+- Online. The MULTIPLAYER entry is removed from the main menu and every network / account service answers like a
+  console without a connection; the campaign runs fully offline.
 - Affiliated with id Software, Bethesda, ZeniMax, Panic Button or Nintendo.
 
 ## Current state
@@ -79,14 +81,17 @@ Snapdragon devices may work; other GPUs are untested.
 - The campaign is playable from the main menu through gameplay. Output is **1600×720 widescreen** by default on a
   20:9 screen (same height as the Switch's handheld 720p, with a wider Hor+ view: more on the sides, nothing
   stretched); the original **1280×720 (16:9)** with side bars is optional in the settings and ~25% lighter on the GPU.
-- Performance on Adreno 750 with the stock driver: **~45 fps typical**, ~35-43 fps in the big desert scenes; with
-  chunked submit (default) frame pacing holds a steady 30-60 fps. The game's adaptive tick keeps game speed equal to
-  real time at any frame rate.
+- Performance on Adreno 750 with the stock driver (1600×720): **45–60 fps** in most of the campaign; the heaviest
+  areas still drop to 20–35 fps, most of all on the first visit while textures stream in. GPU and CPU optimisation is
+  ongoing (the latest round removed about a third of the render passes per frame). The game's adaptive tick keeps game
+  speed equal to real time at any frame rate.
+- Memory: the game's VRAM pools get headroom over the console sizes (e.g. textures 1536 MB instead of 1162.5 MB); the
+  app uses about 2 GB of RAM.
 - Input: on-screen pad (left stick, mouse-like look on the right half, FIRE that also looks while held, R3),
   Bluetooth / USB controllers (the on-screen pad hides while one is connected), gyro aiming, aim assist with adjustable
   strength, rumble.
-- Settings (gear button): 3D render resolution, the game's dynamic resolution, RCAS sharpening, Turnip / custom Vulkan
-  driver, game language, aim assist strength, frame counter. The in-game Video menu's *Chromatic Aberration* entry is
+- Settings (gear button): widescreen, 3D render resolution, the game's dynamic resolution, RCAS sharpening, Turnip /
+  custom Vulkan driver, game language, aim assist strength, rumble, frame counter, look sensitivity. The in-game Video menu's *Chromatic Aberration* entry is
   repurposed as *Dynamic Resolution*.
 
 ### Known issues
@@ -96,6 +101,8 @@ Snapdragon devices may work; other GPUs are untested.
 - Dynamic resolution is off by default (it looked worse than a fixed lower resolution); enable it in the Video menu.
 - Only update **v262144** is supported; the patches and addresses are tied to its build id.
 - Mesa Turnip works through libadrenotools but is optional and slower than the stock driver on Adreno 750.
+- The heaviest scenes are still below 60 fps (see above).
+- The port's settings dialog is in Russian for now.
 - Many renderer fixes are still behind switches for A/B testing; see [docs/doom/SWITCHES.md](docs/doom/SWITCHES.md).
 
 ## Building
@@ -140,7 +147,8 @@ The script reads every tool path from the environment (`ANDROID_HOME`, `JAVA_HOM
    ./setup.sh <base .nsp/.nsz/.xci> <update .nsp/.nsz> <prod.keys> [--push <adb serial>]
    ```
 
-   On Windows: `setup.bat` with the same arguments. Details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
+   On Windows: `setup.bat` with the same arguments. Needs Python 3, the **.NET 10 SDK** (shader translator) and ~70 GB
+   of free space while unpacking NSZ. Details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
 3. Install the APK (from [Releases](https://github.com/Desm0nt/doom-port/releases), or build it yourself, see
    *Building*) and copy `work/DOOM Mobile` to the phone's `Download` folder (or let `--push` / `./setup.sh push
    <serial>` do it over adb).
@@ -198,8 +206,8 @@ NVN воспроизводится через Vulkan. Основа — прое�
 - **Игры в репозитории нет.** Нужна своя копия DOOM для Switch (база + обновление v262144) и свои ключи консоли;
   подготовка файлов описана в [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md) (англ.).
 - Проверено пока только на Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra); другие GPU и устройства не проверялись,
-  Turnip — опционально и медленнее. На нём: обычно ~45 fps, ~35-43 в больших сценах пустыни,
-  стабильные 30-60 с chunked submit.
+  Turnip — опционально и медленнее. Производительность (1600×720): 45–60 fps на большей части кампании, в самых
+  тяжёлых зонах пока 20–35 fps (сильнее всего при первом заходе, пока догружаются текстуры); оптимизация продолжается.
 - Вывод по умолчанию широкий **1600×720** (Hor+: шире обзор по бокам, без растяжения); классические **1280×720 (16:9)**
   с полосами — галочкой «Широкий экран» в настройках (со следующего запуска, на ~25 % легче для GPU).
 - Экранный геймпад с обзором «как мышью», геймпады, гироскоп, aim assist, вибрация, русский язык (язык игры берётся из
@@ -208,9 +216,11 @@ NVN воспроизводится через Vulkan. Основа — прое�
   помощи в прицеливании, вибрация (по умолчанию выключена), счётчик FPS, разрешение 3D, резкость RCAS,
   чувствительность обзора и компенсация мёртвой зоны стика (см. таблицу «Port settings» выше).
 - Известные ограничения: GPU-куллинг треугольников игры выключен (на нашем пути он терял видимые треугольники),
-  динамическое разрешение выключено по умолчанию, поддерживается только обновление v262144, мультиплеер убран.
+  динамическое разрешение выключено по умолчанию, поддерживается только обновление v262144, мультиплеер убран, сетевые
+  сервисы отвечают как у консоли без сети, окно настроек пока только на русском.
 - Подготовка файлов игры одной командой: `./setup.sh <база> <обновление> <prod.keys> [--push <serial>]`
-  (на Windows — `setup.bat`), проверка без изменений — `./setup.sh check`.
+  (на Windows — `setup.bat`), проверка без изменений — `./setup.sh check`. Нужны Python 3, **.NET 10 SDK** и ~70 ГБ
+  свободного места на время распаковки NSZ. Готовый APK — в [Releases](https://github.com/Desm0nt/doom-port/releases).
 - Сборка: `cmake -S dm/android -B work/build-android … -DDM_GAME=doom`, затем `build.bat` / `tools/build_apk.ps1` (см. «Building»).
 
 Подробности о состоянии порта, переключателях и истории исправлений — в [docs/doom/](docs/doom/) и [docs/research/](docs/research/).
