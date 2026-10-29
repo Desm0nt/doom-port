@@ -39,6 +39,7 @@ The gear at the top of the screen opens the port's own settings, on top of the g
 | Turnip (Mesa) driver | off | uses a Turnip driver instead of the stock Qualcomm one (slower on Adreno 750 for now) |
 | Game language | system | text and voice: system language, Russian or English (next launch) |
 | Aim assist | 1 | strength of the game's aim assist; "Как на Switch" keeps the Switch behaviour (next launch) |
+| Widescreen | on | 1600×720 (screen aspect, wider view) instead of 1280×720 16:9 with side bars (next launch; turn it off on weaker devices) |
 | Rumble | off | controller / phone vibration (next launch; off to save battery) |
 | FPS and frame time counter | on | the overlay in the top-left corner |
 | 3D resolution | 100% (720p) | 85% / 75% / 67%; the HUD stays at 720p |
@@ -75,7 +76,9 @@ Graphics settings apply at the next launch, control settings at once. The dialog
 Target device: **Snapdragon 8 Gen 3 / Adreno 750** (Xiaomi 14 Ultra) — the only device tested so far. Other
 Snapdragon devices may work; other GPUs are untested.
 
-- The campaign is playable from the main menu through gameplay at 1280×720 (the Switch's handheld resolution).
+- The campaign is playable from the main menu through gameplay. Output is **1600×720 widescreen** by default on a
+  20:9 screen (same height as the Switch's handheld 720p, with a wider Hor+ view: more on the sides, nothing
+  stretched); the original **1280×720 (16:9)** with side bars is optional in the settings and ~25% lighter on the GPU.
 - Performance on Adreno 750 with the stock driver: **~45 fps typical**, ~35-43 fps in the big desert scenes; with
   chunked submit (default) frame pacing holds a steady 30-60 fps. The game's adaptive tick keeps game speed equal to
   real time at any frame rate.
@@ -197,6 +200,8 @@ NVN воспроизводится через Vulkan. Основа — прое�
 - Проверено пока только на Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra); другие GPU и устройства не проверялись,
   Turnip — опционально и медленнее. На нём: обычно ~45 fps, ~35-43 в больших сценах пустыни,
   стабильные 30-60 с chunked submit.
+- Вывод по умолчанию широкий **1600×720** (Hor+: шире обзор по бокам, без растяжения); классические **1280×720 (16:9)**
+  с полосами — галочкой «Широкий экран» в настройках (со следующего запуска, на ~25 % легче для GPU).
 - Экранный геймпад с обзором «как мышью», геймпады, гироскоп, aim assist, вибрация, русский язык (язык игры берётся из
   системы или задаётся в настройках), масштаб 3D-разрешения и резкость RCAS.
 - Шестерёнка вверху экрана открывает настройки порта: динамическое разрешение, драйвер Turnip, язык игры, сила
