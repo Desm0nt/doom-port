@@ -70,10 +70,9 @@ static void load_driver(void) {
         drv = path[0] ? path : NULL;
     }
     if (drv && *drv && hooks && *hooks) {
-        // Turnip renders our passes far faster straight to memory than through its GMEM tiles (28.10: 25 vs 11 fps, GPU 25 vs
-        // 57 ms with TU_DEBUG=sysmem), so that is the default unless TU_DEBUG is set (dm/env).
-        if (!getenv("TU_DEBUG")) setenv("TU_DEBUG", "sysmem", 0);
-        LOG("[vk] TU_DEBUG=%s (Turnip reads it when the driver loads)", getenv("TU_DEBUG"));
+        // TU_DEBUG is left to the user (dm/env): with Turnip v27 (Mesa main, 29.10) its own GMEM/sysmem choice matched forced
+        // sysmem on Adreno 750 (both ~ the Qualcomm driver); the old Turnip needed TU_DEBUG=sysmem (28.10: 25 vs 11 fps).
+        LOG("[vk] TU_DEBUG=%s (Turnip reads it when the driver loads)", getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "(unset)");
         const char *slash = strrchr(drv, '/');
         char dir[1024], hookdir[1024];
         snprintf(hookdir, sizeof hookdir, "%s/", hooks);

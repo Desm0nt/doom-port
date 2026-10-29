@@ -260,11 +260,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             int sh = p.getInt("sharpen", 0);
             if (sh > 0 && sh < SHARPEN_STOPS.length) Os.setenv("DM_GFX_SHARPEN", SHARPEN_STOPS[sh], true); else Os.unsetenv("DM_GFX_SHARPEN");
             // Vulkan driver (vk_driver.c): adrenotools packages under <data>/drivers/<name>/ (meta.json + the library) are copied to
-            // private storage (a driver must be loaded from there); "turnip" chosen in the dialog sets DM_VK_DRIVER, which dm/env
+            // private storage (a driver must be loaded from there); the package chosen in the dialog sets DM_VK_DRIVER, which dm/env
             // can also set (DM_VK_DRIVER=<name>). The hooks adrenotools loads live in nativeLibraryDir.
             Os.setenv("DM_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir, true);
             File drivers = new File(getFilesDir(), "drivers");
             Os.setenv("DM_DRIVERS_DIR", drivers.getAbsolutePath(), true);
+            extractBundledDrivers(drivers);   // the APK's default driver (Turnip, assets/drivers/<name>/)
             importDrivers(new File(Environment.getExternalStorageDirectory(), "Download/DOOM Mobile/drivers"), drivers);
             // Game language (DOOM takes it from the system like on the Switch: hle_oe.c GetDesiredLanguage reads DM_LANG; jni sets
             // DM_LANG from the phone locale only when it is unset). "" = follow the phone.
@@ -276,9 +277,51 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             Os.setenv("DM_DOOM_WIDE", p.getBoolean("wide", true) ? "1" : "0", true);
             String lang = p.getString("lang", "");
             if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
-            String drv = p.getString("driver", "");
+            String drv = p.getString("driver", defaultDriver());
             if (!drv.isEmpty()) Os.setenv("DM_VK_DRIVER", drv, true); else Os.unsetenv("DM_VK_DRIVER");
         } catch (ErrnoException e) { android.util.Log.e("dm", "doom settings: " + e); }
+    }
+
+    // [DOOM] Default Vulkan driver: the bundled Turnip package when the APK has it (vk_driver.c falls back to the system driver
+    // when it does not load or sees no Vulkan 1.1 GPU, e.g. on non-Adreno phones); "" = the system driver.
+    static final String DEFAULT_DRIVER = "turnip27";
+    private String defaultDriver() { return new File(new File(getFilesDir(), "drivers"), DEFAULT_DRIVER).isDirectory() ? DEFAULT_DRIVER : ""; }
+    // Copy assets/drivers/<name>/* to <dst>/<name>/ when missing or of another size.
+    private void extractBundledDrivers(File dst) {
+        try {
+            String[] names = getAssets().list("drivers"); if (names == null) return;
+            for (String n : names) {
+                String[] files = getAssets().list("drivers/" + n); if (files == null || files.length == 0) continue;
+                File out = new File(dst, n); out.mkdirs();
+                for (String f : files) {
+                    File o = new File(out, f);
+                    try (java.io.InputStream in = getAssets().open("drivers/" + n + "/" + f)) {
+                        long size = -1; try (android.content.res.AssetFileDescriptor fd = getAssets().openFd("drivers/" + n + "/" + f)) { size = fd.getLength(); } catch (java.io.IOException e) { /* compressed asset: size unknown */ }
+                        if (o.isFile() && (size < 0 ? o.length() > 0 : o.length() == size)) continue;
+                        try (java.io.OutputStream os = new java.io.FileOutputStream(o)) { byte[] buf = new byte[1 << 16]; int k; while ((k = in.read(buf)) > 0) os.write(buf, 0, k); }
+                        android.util.Log.i("dm", "bundled driver " + n + ": " + f + " extracted");
+                    }
+                }
+            }
+        } catch (java.io.IOException e) { android.util.Log.e("dm", "bundled drivers: " + e); }
+    }
+
+    // Driver packages in private storage (imported at launch from Download/DOOM Mobile/drivers), sorted by folder name.
+    private String[] driverPackages() {
+        File[] dirs = new File(getFilesDir(), "drivers").listFiles(); java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        if (dirs != null) for (File d : dirs) { File[] fs = d.isDirectory() ? d.listFiles() : null; if (fs == null) continue;
+            for (File f : fs) if (f.getName().endsWith(".so")) { out.add(d.getName()); break; } }
+        java.util.Collections.sort(out); return out.toArray(new String[0]);
+    }
+    // "<meta.json name> (<folder>)", or just the folder name when there is no readable meta.json.
+    private String driverLabel(String name) {
+        File m = new File(new File(new File(getFilesDir(), "drivers"), name), "meta.json");
+        try (java.io.FileInputStream in = new java.io.FileInputStream(m)) {
+            byte[] b = new byte[(int) Math.min(m.length(), 65536)]; int n = in.read(b);
+            String t = new org.json.JSONObject(new String(b, 0, Math.max(n, 0), "UTF-8")).optString("name", "");
+            if (!t.isEmpty()) return t + " (" + name + ")";
+        } catch (Exception e) { /* no or unreadable meta.json */ }
+        return name;
     }
 
     // Copy every driver package <src>/<name>/{meta.json, library} into <dst>/<name>/ when missing or of another size.
@@ -303,8 +346,15 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             SharedPreferences p = doomPrefs();
             LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(48, 24, 48, 0);
             CheckBox drs = new CheckBox(this); drs.setText("Динамическое разрешение DOOM (снижает 3D при нагрузке)"); drs.setChecked(p.getBoolean("drs", false)); box.addView(drs);
-            CheckBox turnip = new CheckBox(this); turnip.setText("Драйвер Turnip (Mesa) вместо драйвера Qualcomm");
-            turnip.setChecked("turnip".equals(p.getString("driver", ""))); box.addView(turnip);
+            // Vulkan driver: the system one, or any adrenotools package found under Download/DOOM Mobile/drivers/<name>/ (one folder
+            // per package, e.g. Turnip builds for different Adreno generations), labelled with the name from its meta.json.
+            TextView drvL = new TextView(this); drvL.setText("Драйвер Vulkan (со следующего запуска):"); drvL.setPadding(0, 24, 0, 0); box.addView(drvL);
+            RadioGroup drvG = new RadioGroup(this); drvG.setOrientation(RadioGroup.VERTICAL);
+            final String[] drvNames = driverPackages();
+            { RadioButton r = new RadioButton(this); r.setText("Системный (драйвер производителя; запасной, если Turnip не запустился)"); r.setId(7000); drvG.addView(r); }
+            for (int i = 0; i < drvNames.length; i++) { RadioButton r = new RadioButton(this); r.setText(driverLabel(drvNames[i])); r.setId(7001 + i); drvG.addView(r); }
+            { String cur = p.getString("driver", defaultDriver()); int di = -1; for (int i = 0; i < drvNames.length; i++) if (drvNames[i].equals(cur)) di = i; drvG.check(7000 + di + 1); }
+            box.addView(drvG);
             TextView langL = new TextView(this); langL.setText("Язык игры (тексты и озвучка, со следующего запуска):"); langL.setPadding(0, 24, 0, 0); box.addView(langL);
             RadioGroup langG = new RadioGroup(this); langG.setOrientation(RadioGroup.HORIZONTAL);
             for (int i = 0; i < LANG_CODES.length; i++) { RadioButton r = new RadioButton(this); r.setText(LANG_LABELS[i]); r.setId(5000 + i); langG.addView(r); }
@@ -341,7 +391,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             new AlertDialog.Builder(this).setTitle("Графика").setView(scroll)
                 .setPositiveButton("Сохранить", (d, w) -> {
                     boolean wideChanged = wide.isChecked() != p.getBoolean("wide", true);
-                    p.edit().putBoolean("drs", drs.isChecked()).putString("driver", turnip.isChecked() ? "turnip" : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked()).putFloat("aa", AA_STRENGTHS[Math.min(Math.max(0, aaG.getCheckedRadioButtonId() - 6000), AA_STRENGTHS.length - 1)]).putString("lang", LANG_CODES[Math.min(Math.max(0, langG.getCheckedRadioButtonId() - 5000), LANG_CODES.length - 1)])
+                    p.edit().putBoolean("drs", drs.isChecked()).putString("driver", drvG.getCheckedRadioButtonId() > 7000 && drvG.getCheckedRadioButtonId() - 7001 < drvNames.length ? drvNames[drvG.getCheckedRadioButtonId() - 7001] : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked()).putFloat("aa", AA_STRENGTHS[Math.min(Math.max(0, aaG.getCheckedRadioButtonId() - 6000), AA_STRENGTHS.length - 1)]).putString("lang", LANG_CODES[Math.min(Math.max(0, langG.getCheckedRadioButtonId() - 5000), LANG_CODES.length - 1)])
                         .putInt("res", Math.max(0, res.getCheckedRadioButtonId() - 1000)).putInt("sharpen", Math.max(0, sh.getCheckedRadioButtonId() - 2000)).apply();
                     int li = Math.max(0, look.getCheckedRadioButtonId() - 3000), di = Math.max(0, dz.getCheckedRadioButtonId() - 4000);
                     getSharedPreferences("doom_controls", MODE_PRIVATE).edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[Math.min(li, LOOK_GAINS.length - 1)])

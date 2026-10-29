@@ -57,6 +57,9 @@ android {
     }
     if (!prebuilt) externalNativeBuild { cmake { path '../CMakeLists.txt'; version '3.31.6' } }
     if (prebuilt) sourceSets { main { jniLibs.srcDirs = [prebuilt] } }
+    // [DOOM] -PdmDriverAssets=<dir>: bundle <dir>/drivers/<name>/ (Turnip package from tools/fetch_turnip.py) as APK assets
+    def driverAssets = project.findProperty('dmDriverAssets')
+    if (driverAssets) sourceSets { main { assets.srcDirs += [driverAssets] } }
     sourceSets { main { res.srcDir(startupStrings.get().asFile); res.srcDir(launcherIcon.get().asFile) } }
     packaging { jniLibs { useLegacyPackaging true;   // extracted: adrenotools loads its hooks from nativeLibraryDir
          keepDebugSymbols += ['**/*.so'] } }

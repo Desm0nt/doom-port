@@ -46,7 +46,11 @@ if ($Validation) {
 } elseif (Test-Path $vvl) { Remove-Item $vvl }
 
 $jni = (Resolve-Path work/jni).Path -replace '\\', '/'
-& $gradle -p dm/android :app:assembleDebug '-PdmGame=doom' '-PdmAppId=org.doom.port' "-PdmPython=$python" "-PdmPrebuiltJni=$jni" --console plain *> work/logs/gradle-apk.log
+# Default Vulkan driver bundled as assets: Turnip (Mesa, MIT) fetched by tools/fetch_turnip.py with a pinned SHA-256;
+# without it the APK simply uses the system driver.
+& $python tools/fetch_turnip.py *> work/logs/fetch-turnip.log
+$drv = if (Test-Path work/driver-assets/drivers) { '-PdmDriverAssets=' + ((Resolve-Path work/driver-assets).Path -replace '\', '/') } else { '-PdmNoDriverAssets=1' }
+& $gradle -p dm/android :app:assembleDebug '-PdmGame=doom' '-PdmAppId=org.doom.port' "-PdmPython=$python" "-PdmPrebuiltJni=$jni" --console plain $drv *> work/logs/gradle-apk.log
 if ($LASTEXITCODE) { throw 'APK build failed (work/logs/gradle-apk.log)' }
 if (-not (Test-Path $keystore)) { throw "Keystore not found: $keystore (set DM_KEYSTORE)" }
 & $apksigner sign --ks $keystore --ks-pass "pass:$kspass" --key-pass "pass:$kspass" --ks-key-alias $alias --out work/DOOM-port-debug.apk dm/android/app/build/outputs/apk/debug/app-debug.apk
