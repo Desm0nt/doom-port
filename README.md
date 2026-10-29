@@ -6,8 +6,9 @@ You bring the game: this repository contains no game content.
 
 Русский: [ниже](#по-русски).
 
-> **Tested so far only on Adreno 750** (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) with the stock Qualcomm driver. Other GPUs
-> and devices are untested. Mesa Turnip is optional (settings → custom Vulkan driver) and runs slower there.
+> **Tested so far only on Adreno 750** (Snapdragon 8 Gen 3, Xiaomi 14 Ultra). Other GPUs and devices are untested. The
+> APK uses the bundled Mesa **Turnip** Vulkan driver by default and falls back to the phone's own driver when Turnip
+> does not load; other driver packages can be picked in the settings (see *Vulkan drivers*).
 
 ## Screenshots
 
@@ -37,7 +38,7 @@ The gear at the top of the screen opens the port's own settings, on top of the g
 | Setting | Default | What it does |
 |---|---|---|
 | DOOM dynamic resolution | off | lets the game lower the 3D resolution under load (also in the game's Video menu) |
-| Turnip (Mesa) driver | off | uses a Turnip driver instead of the stock Qualcomm one (slower on Adreno 750 for now) |
+| Vulkan driver | Turnip v27 (bundled) | the bundled Turnip, the phone's system driver, or any driver package in `Download/DOOM Mobile/drivers` (next launch) |
 | Game language | system | text and voice: system language, Russian or English (next launch) |
 | Aim assist | 1 | strength of the game's aim assist; "Как на Switch" keeps the Switch behaviour (next launch) |
 | Widescreen | on | 1600×720 (screen aspect, wider view) instead of 1280×720 16:9 with side bars (next launch; turn it off on weaker devices) |
@@ -90,8 +91,8 @@ Snapdragon devices may work; other GPUs are untested.
 - Input: on-screen pad (left stick, mouse-like look on the right half, FIRE that also looks while held, R3),
   Bluetooth / USB controllers (the on-screen pad hides while one is connected), gyro aiming, aim assist with adjustable
   strength, rumble.
-- Settings (gear button): widescreen, 3D render resolution, the game's dynamic resolution, RCAS sharpening, Turnip /
-  custom Vulkan driver, game language, aim assist strength, rumble, frame counter, look sensitivity. The in-game Video menu's *Chromatic Aberration* entry is
+- Settings (gear button): widescreen, 3D render resolution, the game's dynamic resolution, RCAS sharpening, Vulkan
+  driver (bundled Turnip, system or your own package), game language, aim assist strength, rumble, frame counter, look sensitivity. The in-game Video menu's *Chromatic Aberration* entry is
   repurposed as *Dynamic Resolution*.
 
 ### Known issues
@@ -100,7 +101,8 @@ Snapdragon devices may work; other GPUs are untested.
   path it dropped visible triangles. Turning it on (`DM_DOOM_GEOMCULL=1`) is for debugging only.
 - Dynamic resolution is off by default (it looked worse than a fixed lower resolution); enable it in the Video menu.
 - Only update **v262144** is supported; the patches and addresses are tied to its build id.
-- Mesa Turnip works through libadrenotools but is optional and slower than the stock driver on Adreno 750.
+- Turnip is the default driver and matches or beats the stock Qualcomm driver on Adreno 750; on other Adreno
+  generations you may need another Turnip build (see *Vulkan drivers*); non-Adreno GPUs use the system driver.
 - The heaviest scenes are still below 60 fps (see above).
 - The port's settings dialog is in Russian for now.
 - Many renderer fixes are still behind switches for A/B testing; see [docs/doom/SWITCHES.md](docs/doom/SWITCHES.md).
@@ -154,6 +156,19 @@ The script reads every tool path from the environment (`ANDROID_HOME`, `JAVA_HOM
    <serial>` do it over adb).
 4. Start *DOOM Mobile* and allow *All files access* when asked.
 
+## Vulkan drivers
+
+The APK bundles **Mesa Turnip v27** (an adrenotools build of Mesa main for Adreno 6xx/7xx) and uses it by default; it
+falls back to the phone's own driver when Turnip does not load or finds no supported GPU. On Adreno 750 Turnip v27 is
+as fast as the Qualcomm driver or slightly faster.
+
+To try another driver, put an adrenotools package (a folder with `meta.json` and the driver `.so`, e.g. unpacked from a
+release of [Banners-Turnip](https://github.com/The412Banner/Banners-Turnip/releases)) into
+`Download/DOOM Mobile/drivers/<name>/`, then pick it in the gear dialog (*Драйвер Vulkan*) and restart the game. Builds
+exist for other Adreno generations (A710/A720, A8xx / Snapdragon 8 Elite, A740 on newer One UI firmware); pick the one
+for your GPU. *Системный* selects the phone's own driver. `TU_DEBUG` (Turnip's debug options, e.g. `sysmem`) can be set
+in `Download/DOOM Mobile/dm/env`.
+
 ## Repository layout
 
 | Path | What |
@@ -183,7 +198,10 @@ DOOM Mobile stands on the work of others — thank you:
 - **[libadrenotools](https://github.com/bylaws/libadrenotools)** by Billy Laws (BSD-2-Clause).
 - **Ryujinx** shader translator (Ryujinx Team and Contributors, MIT), vendored by d2r-mobile in `dm/third_party/ryujinx`.
 - **[AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)** RCAS (MIT).
-- Mesa **Turnip** (MIT) and the Khronos **Vulkan validation layers** (Apache-2.0) — used, not redistributed.
+- **[Mesa](https://mesa3d.org) Turnip** (MIT) — the default Vulkan driver, bundled in the APK as the adrenotools build
+  by **[The412Banner](https://github.com/The412Banner/Banners-Turnip)** (Mesa main). Not stored in this repository:
+  `tools/fetch_turnip.py` downloads it at build time with a pinned SHA-256.
+- Khronos **Vulkan validation layers** (Apache-2.0) — used for debugging, not redistributed.
 
 Details per file: [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
 
@@ -206,13 +224,13 @@ NVN воспроизводится через Vulkan. Основа — прое�
 - **Игры в репозитории нет.** Нужна своя копия DOOM для Switch (база + обновление v262144) и свои ключи консоли;
   подготовка файлов описана в [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md) (англ.).
 - Проверено пока только на Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra); другие GPU и устройства не проверялись,
-  Turnip — опционально и медленнее. Производительность (1600×720): 45–60 fps на большей части кампании, в самых
+  по умолчанию используется встроенный драйвер Turnip (Mesa), запасной — системный. Производительность (1600×720): 45–60 fps на большей части кампании, в самых
   тяжёлых зонах пока 20–35 fps (сильнее всего при первом заходе, пока догружаются текстуры); оптимизация продолжается.
 - Вывод по умолчанию широкий **1600×720** (Hor+: шире обзор по бокам, без растяжения); классические **1280×720 (16:9)**
   с полосами — галочкой «Широкий экран» в настройках (со следующего запуска, на ~25 % легче для GPU).
 - Экранный геймпад с обзором «как мышью», геймпады, гироскоп, aim assist, вибрация, русский язык (язык игры берётся из
   системы или задаётся в настройках), масштаб 3D-разрешения и резкость RCAS.
-- Шестерёнка вверху экрана открывает настройки порта: динамическое разрешение, драйвер Turnip, язык игры, сила
+- Шестерёнка вверху экрана открывает настройки порта: динамическое разрешение, драйвер Vulkan (встроенный Turnip, системный или свой пакет), язык игры, сила
   помощи в прицеливании, вибрация (по умолчанию выключена), счётчик FPS, разрешение 3D, резкость RCAS,
   чувствительность обзора и компенсация мёртвой зоны стика (см. таблицу «Port settings» выше).
 - Известные ограничения: GPU-куллинг треугольников игры выключен (на нашем пути он терял видимые треугольники),

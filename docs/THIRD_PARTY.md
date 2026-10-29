@@ -25,7 +25,7 @@ Not redistributed, only used at run time or during development if the user insta
 
 | Component | License | Notes |
 |---|---|---|
-| **Mesa Turnip** (Vulkan driver for Adreno) | MIT | The user supplies a driver package (e.g. an adrenotools Turnip build) and picks it in the settings. No driver binary is in this repository or the APK. |
+| **Mesa Turnip** (Vulkan driver for Adreno) | MIT, Copyright The Mesa 3D project contributors | The APK bundles the adrenotools package `Turnip-v27.0.0-20261029.zip` built from Mesa main (git 1c3a936) by The412Banner (https://github.com/The412Banner/Banners-Turnip), unmodified; `tools/fetch_turnip.py` downloads it at build time (pinned SHA-256), no driver binary is stored in this repository. Users can add other driver packages and pick them in the settings. |
 | **Khronos Vulkan validation layers** | Apache-2.0 | Packaged only for local diagnostics (`tools/build_apk.ps1 -Validation`) from a download the developer makes. |
 | Vulkan headers (Android NDK) | Apache-2.0 / MIT | From the NDK. |
 
