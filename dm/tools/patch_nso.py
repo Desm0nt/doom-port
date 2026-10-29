@@ -88,6 +88,12 @@ CUTS = {
         # root list as AddChild(campaign [+0x1c8]); AddChild(multiplayer [+0x1d0], action 0x1a). Skip the second add; the demo path
         # (b 0xf187d8) still reaches its own AddChild. SnapMap has no root entry in this build.
         (0xf187d0, '60de40f9', '03000014', 'idMenuScreen_Shell_Root::Refresh: ldr x0,[x19,#0x1b8] -> b #0xf187dc (do not add the MULTIPLAYER button to the main list)'),
+        # idDTLSWorkerThread::Run (update 0xcf670, thread "DTLS port 27016", started by idLobbyPortSecure::InitPort): each 1 ms wake
+        # (Sys_Sleep(1) at 0xcf938) ran up to 9 rounds of {send queue, non-blocking recvfrom drain, timers, nn::os::YieldThread}
+        # (counter w26, cmp #8 at 0xcfaa8) -- ~9k yields + ~9k EAGAIN recvfroms a second, ~9 % of a core, with nothing to receive
+        # offline. One round per wake: the drain inside a round already empties the socket (up to 127 packets), the 1 ms wake
+        # period, the shutdown check at 0xcfaf8 and the port itself are unchanged.
+        (0xcfaac, '6c020054', '13000014', 'idDTLSWorkerThread::Run: b.gt #0xcfaf8 -> b #0xcfaf8 (one recv/yield round per 1 ms wake instead of 9)'),
     ],
     'db0507f36b84200ac05f75d76ed5026f': [
     # （放进所有产物共用的基础改写）：游戏显存分配器预算 260 MB → 512 MB
