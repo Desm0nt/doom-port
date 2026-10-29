@@ -10,23 +10,27 @@
 
 namespace {
 enum : uint32_t {
-    OpLine = 8, OpEntryPoint = 15, OpExecutionMode = 16, OpConstant = 43, OpTypeArray = 28, OpTypePointer = 32, OpFunction = 54, OpVariable = 59,
+    OpLine = 8, OpEntryPoint = 15, OpExecutionMode = 16, OpTypeInt = 21, OpTypeFloat = 22, OpTypeVector = 23, OpConstant = 43, OpTypeArray = 28,
+    OpTypePointer = 32, OpFunction = 54, OpVariable = 59,
     OpLoad = 61, OpStore = 62, OpAccessChain = 65, OpInBoundsAccessChain = 66, OpDecorate = 71, OpMemberDecorate = 72,
     OpBitcast = 124, OpLogicalNot = 168, OpINotEqual = 171, OpEmitVertex = 218, OpEndPrimitive = 219, OpSelectionMerge = 247,
     OpLabel = 248, OpBranchConditional = 250, OpReturn = 253, OpNoLine = 317,
     ScInput = 1, ScUniform = 2, ScOutput = 3, ScFunction = 7,
     ModeInvocations = 0, ModeTriangles = 22, ModeOutputVertices = 26, ModeOutputTriangleStrip = 29,
-    DecBuiltIn = 11, DecBinding = 33, DecSet = 34, DecOffset = 35, BuiltInPosition = 0,
+    DecBuiltIn = 11, DecLocation = 30, DecComponent = 31, DecBinding = 33, DecSet = 34, DecOffset = 35, BuiltInPosition = 0,
 };
 const uint32_t kNone = ~0u;
 }
 
-bool xbg_spirv_gs_passthru_gate(const uint32_t *w, size_t n, XbgGsPassGate *gate) {
+bool xbg_spirv_gs_passthru_gate(const uint32_t *w, size_t n, XbgGsPassGate *gate, bool varyings) {
     if (!w || n < 5 || w[0] != 0x07230203u) return false;
     const uint32_t bound = w[3];
     if (!bound || bound > (1u << 22)) return false;
     std::vector<uint32_t> cval(bound, kNone), ptr_pointee(bound, kNone), binding(bound, kNone), set(bound, 0), off0(bound, kNone), arr_elem(bound, kNone);
     std::vector<uint8_t> is_const(bound, 0), sc(bound, 0xff), pos_member0(bound, 0);
+    // [perf4] varyings: Location / Component / BuiltIn of variables, component count of vector and scalar types.
+    std::vector<uint32_t> location(bound, kNone), component(bound, 0);std::vector<uint8_t> builtin_var(bound, 0), ncomp(bound, 0);
+    std::vector<uint32_t> out_vars;
     uint32_t entry = kNone, invocations = 1, out_vertices = 0, outputs = 0, out_var = kNone;
     bool tri_in = false, strip_out = false;
     size_t fn = 0;
@@ -44,22 +48,37 @@ bool xbg_spirv_gs_passthru_gate(const uint32_t *w, size_t n, XbgGsPassGate *gate
         } else if (op == OpConstant && wc == 4 && id(p[1])) { cval[p[1]] = p[2]; is_const[p[1]] = 1; }
         else if (op == OpTypePointer && wc == 4 && id(p[0])) ptr_pointee[p[0]] = p[2];
         else if (op == OpTypeArray && wc == 4 && id(p[0])) arr_elem[p[0]] = p[1];
+        else if (op == OpTypeVector && wc == 4 && id(p[0])) ncomp[p[0]] = uint8_t(p[2] <= 4 ? p[2] : 0);
+        else if ((op == OpTypeInt || op == OpTypeFloat) && wc >= 3 && id(p[0])) ncomp[p[0]] = 1;
         else if (op == OpMemberDecorate && wc >= 5 && id(p[0]) && p[1] == 0) {
             if (p[2] == DecBuiltIn && p[3] == BuiltInPosition) pos_member0[p[0]] = 1;
             else if (p[2] == DecOffset) off0[p[0]] = p[3];
         } else if (op == OpDecorate && wc >= 4 && id(p[0])) {
             if (p[1] == DecBinding) binding[p[0]] = p[2];
             else if (p[1] == DecSet) set[p[0]] = p[2];
+            else if (p[1] == DecLocation) location[p[0]] = p[2];
+            else if (p[1] == DecComponent) component[p[0]] = p[2];
+            else if (p[1] == DecBuiltIn) builtin_var[p[0]] = 1;
         } else if (op == OpVariable && wc >= 4 && id(p[1])) {
             sc[p[1]] = uint8_t(p[2] < 0xff ? p[2] : 0xfe);
-            if (p[2] == ScOutput) { ++outputs; out_var = p[1]; }
+            if (p[2] == ScOutput) { ++outputs; out_vars.push_back(p[1]); }
             if (id(p[0])) ptr_pointee[p[1]] = ptr_pointee[p[0]];   // variable -> its pointee type
         } else if (op == OpFunction && wc >= 5 && p[1] == entry && !fn) fn = i + wc;
         i += wc;
     }
     if (entry == kNone || !fn || invocations != 1 || out_vertices != 3 || !tri_in || !strip_out) return false;
-    // gl_Position is the only output: the fragment shader reads nothing the geometry stage would have produced.
-    if (outputs != 1 || ptr_pointee[out_var] >= bound || !pos_member0[ptr_pointee[out_var]]) return false;
+    // Outputs: the gl_PerVertex block (member 0 Position) and, with `varyings`, plain Location variables (a vector or scalar,
+    // no BuiltIn). Each varying must be the copy of the input of the same Location/Component (checked below), so the
+    // fragment shader reads, without the stage, exactly what the vertex shader wrote there. Without `varyings` gl_Position
+    // is the only output (the original rule).
+    std::vector<uint32_t> out_key(bound, kNone), out_n(bound, 0);   // per output variable: 0 = Position, else 1 + 4 * Location + Component
+    for (uint32_t o : out_vars) {
+        const uint32_t t = ptr_pointee[o];
+        if (t < bound && pos_member0[t] && out_var == kNone) { out_var = o; out_key[o] = 0; out_n[o] = 4; continue; }
+        if (!varyings || builtin_var[o] || location[o] >= 64 || component[o] > 3 || t >= bound || !ncomp[t]) return false;
+        out_key[o] = 1 + 4 * location[o] + component[o]; out_n[o] = ncomp[t];
+    }
+    if (out_var == kNone || outputs > 17 || (!varyings && outputs != 1)) return false;
     auto c = [&](uint32_t x) { return x < bound && is_const[x] ? cval[x] : kNone; };
     // gl_in: an input array of blocks whose member 0 is BuiltIn Position.
     auto gl_in = [&](uint32_t v) { uint32_t a = ptr_pointee[v], e = a < bound ? arr_elem[a] : kNone; return e < bound && pos_member0[e]; };
@@ -127,8 +146,13 @@ bool xbg_spirv_gs_passthru_gate(const uint32_t *w, size_t n, XbgGsPassGate *gate
         i += wc;
     }
     if (i >= n) return false;
-    std::vector<uint32_t> src(bound, kNone), out_chain(bound, kNone), in_chain(bound, kNone), fvar(bound, kNone);   // (v << 2) | k
-    uint32_t emits = 0, done = 0;
+    // Sources (key << 4) | (v << 2) | k, key as out_key; destinations (index into out_vars << 2) | k.
+    std::vector<uint32_t> src(bound, kNone), out_chain(bound, kNone), in_chain(bound, kNone), fvar(bound, kNone);
+    std::vector<uint32_t> out_index(bound, kNone);for (size_t q = 0; q < out_vars.size(); ++q) out_index[out_vars[q]] = uint32_t(q);
+    std::vector<uint8_t> done(out_vars.size(), 0);
+    auto in_varying = [&](uint32_t v) { uint32_t a = ptr_pointee[v], e = a < bound ? arr_elem[a] : kNone;
+        return varyings && sc[v] == ScInput && !builtin_var[v] && location[v] < 64 && component[v] <= 3 && e < bound && ncomp[e] ? ncomp[e] : 0u; };
+    uint32_t emits = 0;
     for (; i < n;) {
         const uint32_t wc = w[i] >> 16, op = w[i] & 0xffff;
         if (!wc || i + wc > n) return false;
@@ -137,8 +161,12 @@ bool xbg_spirv_gs_passthru_gate(const uint32_t *w, size_t n, XbgGsPassGate *gate
         case OpLine: case OpNoLine: break;
         case OpAccessChain: case OpInBoundsAccessChain: {
             if (wc < 5 || p[1] >= bound || p[2] >= bound) return false;
-            if (p[2] == out_var && wc == 6 && c(p[3]) == 0 && c(p[4]) < 4) out_chain[p[1]] = c(p[4]);
-            else if (sc[p[2]] == ScInput && wc == 7 && gl_in(p[2]) && c(p[3]) < 3 && c(p[4]) == 0 && c(p[5]) < 4) in_chain[p[1]] = c(p[3]) << 2 | c(p[5]);
+            const uint32_t b = p[2];
+            if (b == out_var && wc == 6 && c(p[3]) == 0 && c(p[4]) < 4) out_chain[p[1]] = out_index[b] << 2 | c(p[4]);
+            else if (b != out_var && out_index[b] != kNone && wc == 5 && c(p[3]) < out_n[b]) out_chain[p[1]] = out_index[b] << 2 | c(p[3]);
+            else if (sc[b] == ScInput && wc == 7 && gl_in(b) && c(p[3]) < 3 && c(p[4]) == 0 && c(p[5]) < 4) in_chain[p[1]] = c(p[3]) << 2 | c(p[5]);
+            else if (wc == 6 && in_varying(b) && c(p[3]) < 3 && c(p[4]) < in_varying(b))
+                in_chain[p[1]] = (1 + 4 * location[b] + component[b]) << 4 | c(p[3]) << 2 | c(p[4]);
             else return false;
             break; }
         case OpLoad:
@@ -150,16 +178,19 @@ bool xbg_spirv_gs_passthru_gate(const uint32_t *w, size_t n, XbgGsPassGate *gate
         case OpStore:
             if (wc < 3 || p[0] >= bound || p[1] >= bound || src[p[1]] == kNone) return false;
             if (out_chain[p[0]] != kNone) {
-                if (src[p[1]] >> 2 != emits || (src[p[1]] & 3) != out_chain[p[0]]) return false;
-                done |= 1u << out_chain[p[0]];
+                const uint32_t o = out_vars[out_chain[p[0]] >> 2], k = out_chain[p[0]] & 3, s = src[p[1]];
+                if ((s >> 4) != out_key[o] || ((s >> 2) & 3) != emits || (s & 3) != k) return false;
+                done[out_chain[p[0]] >> 2] |= uint8_t(1u << k);
             } else if (sc[p[0]] == ScFunction) fvar[p[0]] = src[p[1]];
             else return false;
             break;
-        case OpEmitVertex: if (done != 15) return false; ++emits; done = 0; break;
+        case OpEmitVertex:
+            for (size_t q = 0; q < out_vars.size(); ++q) { if (done[q] != (1u << out_n[out_vars[q]]) - 1) return false; done[q] = 0; }
+            ++emits; break;
         case OpEndPrimitive: if (emits != 3) return false; break;
         case OpReturn:
             if (emits != 3) return false;
-            if (gate) { gate->set = set[g_var]; gate->binding = binding[g_var]; gate->offset = off0[blk_type] + 4 * g_comp; gate->value = g_value; }
+            if (gate) { gate->set = set[g_var]; gate->binding = binding[g_var]; gate->offset = off0[blk_type] + 4 * g_comp; gate->value = g_value; gate->outputs = outputs; }
             return true;
         default: return false;
         }

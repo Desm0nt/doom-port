@@ -37,6 +37,7 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_spirv_temps.h"
 #include "xbg_spirv_raster.h"
 #include "xbg_spirv_gspass.h"
+#include "xbg_spirv_relaxed.h"
 #include "../../nvn/nvn_cover.h"
 extern "C" {
 #include "../../tex/nvn_deswizzle.h"
@@ -511,6 +512,7 @@ uint64_t snap_site_bytes[6]={},snap_site_req[6]={};unsigned snap_site=0;
 std::unordered_set<uint64_t> storage_pages;uint64_t storage_snap_count=0;
 namespace wtrack{extern uint64_t copied_bytes,dirty_pages,mismatches,fallbacks;}
 extern std::atomic<uint64_t> memo_epoch;extern uint64_t key_diff[14];extern uint64_t memo_bump[5];extern uint64_t xmemo_hits,xmemo_drops;struct PinRef{VkDescriptorSetLayout layout;uint32_t refs;};extern std::unordered_map<VkDescriptorSet,PinRef> memo_pinned[2];
+extern bool pipe_stats;   // [perf4] warm builds capture statistics too (DM_GFX_PIPE_STATS)
 extern uint64_t memo_front_hits;extern uint64_t desc_memo_hits,desc_memo_misses,desc_memo_why[6],desc_ns[6],noload_passes,img_cache_hits,img_cache_misses,noload_why[8],binds_skipped,set_binds,set_bind_offsets,set_binds_offsets_only,offset_changes[10],offset_changed_at[32];
 namespace warm{extern uint64_t hits,creates,create_ns,create_max_ns;extern std::atomic<uint64_t> built,failed,build_ns,async_built,async_skips,compiled;extern bool async_on;void flush();void register_module(VkShaderModule m,const std::string &key);
     extern bool keep_rewritten;bool take_rewritten(const std::string &key,std::vector<uint32_t> &out);}
@@ -571,7 +573,7 @@ struct Slot {
     std::unordered_map<std::vector<uint64_t>,VkDescriptorSet,SetKeyHash> set_cache; // identical descriptor contents -> one set per frame
     std::unordered_map<VkDescriptorSetLayout,std::vector<VkDescriptorSet>> spare_sets; // batch-allocated, reset with the pools
     struct PassRec {
-        uint32_t q0=0,q1=0,w=0,h=0,att=0,fmt=0,draws0=0,draws1=0,x=0,y=0,z=0;uint64_t verts0=0,verts1=0;
+        uint32_t q0=0,q1=0,w=0,h=0,att=0,fmt=0,draws0=0,draws1=0,x=0,y=0,z=0;uint64_t verts0=0,verts1=0;int end_line=0;   // end_line: end_open_pass call site (perf4)
         bool compute=false,complete=false,mixed=false,dz=false;std::string first,last;
     };
     bool prof=false;VkQueryPool prof_pool{};uint32_t prof_used=0,prof_slot=0,prof_skipped=0;uint64_t prof_frame=0;
@@ -689,7 +691,7 @@ bool pass_prof_enabled=false;uint64_t pass_prof_next=300,pass_prof_draws=0,pass_
 // Vertices (or indices) times instances drawn, for the per-pass verts= of NVN GPASS.
 uint64_t pass_prof_verts=0;
 uint32_t pass_prof_queries=0,pass_prof_slots=0,pass_prof_skipped_slots=0;
-void pass_prof_end(VkCommandBuffer cmd);
+void pass_prof_end(VkCommandBuffer cmd,int line=0);
 void pass_prof_depth_idle(VkCommandBuffer cmd);
 uint64_t depth_idle_passes=0;
 // Diagnostic (NVN PERF pass_ends): render-pass ends and full barriers per frame, by the guest op being executed
@@ -710,7 +712,7 @@ void begin_occlusion_query(VkCommandBuffer cmd,VkQueryPool pool,uint32_t index){
     need(!open_occlusion.cmd,"Nested occlusion query");
     vkCmdBeginQuery(cmd,pool,index,VK_QUERY_CONTROL_PRECISE_BIT);open_occlusion={cmd,pool,index};++occlusion_queries_started;
 }
-void end_open_pass(int line){if(open_pass.cmd){++pass_end_lines[line];end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];}}
+void end_open_pass(int line){if(open_pass.cmd){++pass_end_lines[line];end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd,line);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];}}
 void full_barrier(VkCommandBuffer cmd){storage_unbarriered=false;storage_dirty.clear();VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];}
 struct PerfCounts{size_t pipelines,layouts,samplers,passes,images,host_segments,host_bytes;};
 PerfCounts perf_counts();
@@ -795,7 +797,7 @@ void retire_slot(Slot &s){
             double us=double((t[r.q1].value-t[r.q0].value)&mask)*per;
             if(!complete)first=t[r.q0].value;last=t[r.q1].value;++complete;
             if(r.compute){compute_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=compute us=%.0f cs=%s groups=%u,%u,%u",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.first.c_str(),r.x,r.y,r.z);}
-            else{pass_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=pass us=%.0f %ux%u att=%u fmt=%u draws=%u verts=%llu first=%s last=%s mixed=%u dz=%u",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.w,r.h,r.att,r.fmt,r.draws1-r.draws0,(unsigned long long)(r.verts1-r.verts0),r.first.empty()?"builtin-clear/no-game-draw":r.first.c_str(),r.last.empty()?"builtin-clear/no-game-draw":r.last.c_str(),unsigned(r.mixed),unsigned(r.dz));}
+            else{pass_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=pass us=%.0f %ux%u att=%u fmt=%u draws=%u verts=%llu first=%s last=%s mixed=%u dz=%u end=L%d",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.w,r.h,r.att,r.fmt,r.draws1-r.draws0,(unsigned long long)(r.verts1-r.verts0),r.first.empty()?"builtin-clear/no-game-draw":r.first.c_str(),r.last.empty()?"builtin-clear/no-game-draw":r.last.c_str(),unsigned(r.mixed),unsigned(r.dz),r.end_line);}
         }
         if(complete)span_us=double((last-first)&mask)*per;
         xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u summary recorded=%zu complete=%zu skipped=%u queries=%u result=%d pass_us=%.0f compute_us=%.0f span_us=%.0f",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),s.prof_recs.size(),complete,s.prof_skipped,s.prof_used,int(status),pass_us,compute_us,span_us);
@@ -938,7 +940,7 @@ void save_pipeline_cache(){
     cache_saver=std::thread([unsaved]{setpriority(PRIO_PROCESS,0,10);write_pipeline_cache(unsaved);cache_save_busy=false;});
 }
 extern bool tex_dirty;extern uint64_t tex_dirty_tracked,tex_dirty_checks,tex_dirty_changed;extern uint64_t hash_site_bytes[4],hash_site_calls[4];extern std::map<int,uint64_t> pass_end_lines;extern uint64_t read_break_why[8],depth_feedback_reads;namespace zc{extern int enabled;extern uint64_t hits,sticky_misses,align_misses,pending_misses,mapped_bytes;}
-extern uint64_t guest_barriers_skipped,storage_chained,storage_merges,barriers_avoided,pro_copies,partial_blocks,partial_bytes,partial_uploads,gpu_indirect_draws,gpu_indirect_fallbacks,gpu_indirect_cpu;   // texture checks through the dirty tracker (get_image)
+extern uint64_t guest_barriers_skipped,storage_chained,storage_merges,barriers_avoided,pro_copies,partial_blocks,partial_bytes,partial_uploads,partial_prologue,gpu_indirect_draws,gpu_indirect_fallbacks,gpu_indirect_cpu;   // texture checks through the dirty tracker (get_image)
 // 3D 画面加亮的读数（定义在 dispatch 前的 namespace bright）
 // Readings of the 3D picture brightening (defined in namespace bright before dispatch)
 namespace bright{extern bool enabled;extern uint64_t applied;extern float last_k;}
@@ -970,7 +972,7 @@ void perf_frame(){
     xbg_logf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed));
     xbg_logf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);xbg_logf("NVN PERF textures bc_native=%llu bc_decoded=%llu live_images=%.1fMB bc_images=%.1fMB bc_payload=%.1fMB",(unsigned long long)native_bc_images,(unsigned long long)decoded_bc_images,image_bytes_live/1048576.0,bc_image_bytes_live/1048576.0,bc_data_bytes_live/1048576.0);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
     if(bright::enabled){xbg_logf("NVN PERF bright applied=%.2f k=%.2f",bright::applied/f,bright::last_k);bright::applied=0;}
-    if(tex_dirty){xbg_logf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}{char buf[512];int at=0;std::vector<std::pair<uint64_t,int>> v;for(auto &e:pass_end_lines)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<8;i++)at+=snprintf(buf+at,sizeof buf-at," L%d=%.1f",v[i].second,v[i].first/f);pass_end_lines.clear();xbg_logf("NVN PERF pass_end_lines%s read_break layout/written/attach=%.1f/%.1f/%.1f/%.1f depth_feedback_reads=%.1f",at?buf:"",read_break_why[1]/f,read_break_why[2]/f,read_break_why[4]/f,(read_break_why[3]+read_break_why[5]+read_break_why[6]+read_break_why[7])/f,depth_feedback_reads/f);memset(read_break_why,0,sizeof read_break_why);depth_feedback_reads=0;}xbg_logf("NVN PERF hash_sites MB/calls other=%.2f/%.0f texcheck=%.2f/%.0f texel=%.2f/%.0f upload=%.2f/%.0f",hash_site_bytes[0]/f/1048576,hash_site_calls[0]/f,hash_site_bytes[1]/f/1048576,hash_site_calls[1]/f,hash_site_bytes[2]/f/1048576,hash_site_calls[2]/f,hash_site_bytes[3]/f/1048576,hash_site_calls[3]/f);memset(hash_site_bytes,0,sizeof hash_site_bytes);memset(hash_site_calls,0,sizeof hash_site_calls);if(zc::enabled>0){xbg_logf("NVN PERF zerocopy hits=%.1f sticky_miss=%.1f align_miss=%.1f pending_miss=%.1f mapped=%.0fMB",zc::hits/f,zc::sticky_misses/f,zc::align_misses/f,zc::pending_misses/f,zc::mapped_bytes/1048576.0);zc::hits=zc::sticky_misses=zc::align_misses=zc::pending_misses=0;}if(storage_chained || guest_barriers_skipped){xbg_logf("NVN PERF storage-chain reused=%.1f gpu_merges=%.1f prologue_copies=%.1f guest_barriers_skipped=%.1f barriers_avoided=%.1f",storage_chained/f,storage_merges/f,pro_copies/f,guest_barriers_skipped/f,barriers_avoided/f);storage_chained=storage_merges=pro_copies=guest_barriers_skipped=barriers_avoided=0;}if(gpu_indirect_draws || gpu_indirect_fallbacks){xbg_logf("NVN PERF gpu-indirect draws=%.1f fallbacks=%.1f cpu=%.1f",gpu_indirect_draws/f,gpu_indirect_fallbacks/f,gpu_indirect_cpu/f);gpu_indirect_draws=gpu_indirect_fallbacks=gpu_indirect_cpu=0;}if(partial_uploads){xbg_logf("NVN PERF partial-tex uploads=%.1f blocks=%.1f KB=%.1f",partial_uploads/f,partial_blocks/f,partial_bytes/f/1024);partial_uploads=partial_blocks=partial_bytes=0;}
+    if(tex_dirty){xbg_logf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}{char buf[512];int at=0;std::vector<std::pair<uint64_t,int>> v;for(auto &e:pass_end_lines)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<8;i++)at+=snprintf(buf+at,sizeof buf-at," L%d=%.1f",v[i].second,v[i].first/f);pass_end_lines.clear();xbg_logf("NVN PERF pass_end_lines%s read_break layout/written/attach=%.1f/%.1f/%.1f/%.1f depth_feedback_reads=%.1f",at?buf:"",read_break_why[1]/f,read_break_why[2]/f,read_break_why[4]/f,(read_break_why[3]+read_break_why[5]+read_break_why[6]+read_break_why[7])/f,depth_feedback_reads/f);memset(read_break_why,0,sizeof read_break_why);depth_feedback_reads=0;}xbg_logf("NVN PERF hash_sites MB/calls other=%.2f/%.0f texcheck=%.2f/%.0f texel=%.2f/%.0f upload=%.2f/%.0f",hash_site_bytes[0]/f/1048576,hash_site_calls[0]/f,hash_site_bytes[1]/f/1048576,hash_site_calls[1]/f,hash_site_bytes[2]/f/1048576,hash_site_calls[2]/f,hash_site_bytes[3]/f/1048576,hash_site_calls[3]/f);memset(hash_site_bytes,0,sizeof hash_site_bytes);memset(hash_site_calls,0,sizeof hash_site_calls);if(zc::enabled>0){xbg_logf("NVN PERF zerocopy hits=%.1f sticky_miss=%.1f align_miss=%.1f pending_miss=%.1f mapped=%.0fMB",zc::hits/f,zc::sticky_misses/f,zc::align_misses/f,zc::pending_misses/f,zc::mapped_bytes/1048576.0);zc::hits=zc::sticky_misses=zc::align_misses=zc::pending_misses=0;}if(storage_chained || guest_barriers_skipped){xbg_logf("NVN PERF storage-chain reused=%.1f gpu_merges=%.1f prologue_copies=%.1f guest_barriers_skipped=%.1f barriers_avoided=%.1f",storage_chained/f,storage_merges/f,pro_copies/f,guest_barriers_skipped/f,barriers_avoided/f);storage_chained=storage_merges=pro_copies=guest_barriers_skipped=barriers_avoided=0;}if(gpu_indirect_draws || gpu_indirect_fallbacks){xbg_logf("NVN PERF gpu-indirect draws=%.1f fallbacks=%.1f cpu=%.1f",gpu_indirect_draws/f,gpu_indirect_fallbacks/f,gpu_indirect_cpu/f);gpu_indirect_draws=gpu_indirect_fallbacks=gpu_indirect_cpu=0;}if(partial_uploads){xbg_logf("NVN PERF partial-tex uploads=%.1f blocks=%.1f KB=%.1f prologue=%.1f",partial_uploads/f,partial_blocks/f,partial_bytes/f/1024,partial_prologue/f);partial_uploads=partial_blocks=partial_bytes=partial_prologue=0;}
     if(vcache::enabled){xbg_logf("NVN PERF vcache hits=%.1f (%.2fMB) fills=%.1f (%.2fMB) refills=%.2f volatile=%llu untracked=%llu flushes=%llu entries=%zu arena=%.1fMB pools=%d",vcache::hits/f,vcache::hit_bytes/1048576.0/f,vcache::fills/f,vcache::fill_bytes/1048576.0/f,vcache::refills/f,(unsigned long long)vcache::volatiles,(unsigned long long)vcache::untracked,(unsigned long long)vcache::flushes,vcache::live(),vcache::arena_bytes()/1048576.0,[]{int live=0,used=0;uint64_t adds=0;if(nvn_dirty_slot_stats)nvn_dirty_slot_stats(&live,&used,&adds);return used;}());vcache::hits=vcache::hit_bytes=vcache::fills=vcache::fill_bytes=vcache::refills=0;}
     {static uint64_t pm=0,pe=0;xbg_logf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f async_skips=%llu async_built=%llu",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6,(unsigned long long)warm::async_skips.exchange(0),(unsigned long long)warm::async_built.load());warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
     xbg_logf("NVN PERF setcache ab=%d hits=%.1f misses=%.1f template=%.1f plain=%.1f memo_hits=%.1f memo_misses=%.1f memo_front=%.1f why=texel%.1f/simg%.1f/dm%.1f/dynbuf%.1f/store%.1f",int(ab_frame_on),set_cache_hits/f,set_cache_misses/f,template_updates/f,plain_updates/f,desc_memo_hits/f,desc_memo_misses/f,memo_front_hits/f,desc_memo_why[0]/f,desc_memo_why[1]/f,desc_memo_why[2]/f,desc_memo_why[3]/f,desc_memo_why[4]/f);desc_memo_hits=desc_memo_misses=memo_front_hits=0;for(auto &w:desc_memo_why)w=0;xbg_logf("NVN PERF keydiff shader%.0f pool%.0f ubo%.0f uaddr%.0f size%.0f vp%.0f alpha%.0f drv%.0f tex%.0f samp%.0f saddr%.0f same%.0f new%.0f len%.0f",key_diff[0]/tf,key_diff[1]/tf,key_diff[2]/tf,key_diff[3]/tf,key_diff[4]/tf,key_diff[5]/tf,key_diff[6]/tf,key_diff[7]/tf,key_diff[8]/tf,key_diff[9]/tf,key_diff[10]/tf,key_diff[11]/tf,key_diff[12]/tf,key_diff[13]/tf);for(auto &k:key_diff)k=0;   // per timed frame
@@ -1369,8 +1371,10 @@ struct Commands {
     VkCommandBuffer command{};bool draw=false;
     // Non-draw operations keep the former submit-per-operation semantics: they
     // end any open pass and are fenced by full barriers before and after.
-    explicit Commands(bool is_draw=false):draw(is_draw){Slot &s=recording_slot();command=s.cmd;++perf.ops;++s.ops;
-        if(!draw){end_open_pass();full_barrier(command);}}
+    // line: the constructing call site, so NVN PERF pass_end_lines / GPASS end= tell partial uploads, VT readbacks and other
+    // non-draw ops apart (perf4; all of them used to show as this constructor's line).
+    explicit Commands(bool is_draw=false,int line=__builtin_LINE()):draw(is_draw){Slot &s=recording_slot();command=s.cmd;++perf.ops;++s.ops;
+        if(!draw){end_open_pass(line);full_barrier(command);}}
     void finish(){if(!draw){end_open_pass();full_barrier(command);}}
 };
 VkFormat format(int f) {
@@ -1965,6 +1969,8 @@ bool partial_eligible(const Image &im,const tex_t *t){
 }
 unsigned partial_why(const Image &im,const tex_t *t){return (t->L.size<(4u<<20))|0<<1|(t->d.target==2 && im.layers!=1)<<2|im.decoded<<3|(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT)<<4|((t->d.flags&0x10)!=0)<<5|(im.samples!=VK_SAMPLE_COUNT_1_BIT)<<6|(!(nvn_dirty_tracked && nvn_dirty_tracked(t->mem,t->L.size)))<<7;}
 void big_hash_note(const Image &im,const tex_t *t,const char *where){if(t->L.size<(4u<<20))return;static unsigned n=0;if(n++<24)xbg_logf("NVN big texture hash (%s) serial=%llu fmt=%#x %ux%ux%u layers=%u levels=%u target=%d flags=%#x size=%llu stable=%u stamp=%d partial_why=%#x",where,(unsigned long long)t->serial,t->d.format,im.width,im.height,im.depth,im.layers,im.levels,t->d.target,t->d.flags,(unsigned long long)t->L.size,im.stable_checks,int(im.dirty_stamp!=0),partial_why(im,t));}
+uint64_t partial_prologue=0;int partial_prologue_flag=-1;
+bool partial_prologue_on(){if(partial_prologue_flag<0){const char *e=getenv("DM_GFX_PARTIAL_PROLOGUE");partial_prologue_flag=e?atoi(e)!=0:1;xbg_logf("NVN DM_GFX_PARTIAL_PROLOGUE=%d",partial_prologue_flag);}return partial_prologue_flag!=0;}
 // Upload the blocks written since `since`; returns false when the layout is not handled (caller falls back to a full upload).
 bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
     std::vector<uint8_t> linear;std::vector<VkBufferImageCopy> copies;std::vector<std::pair<const uint8_t*,uint64_t>> diag_blocks;   // VT_DIAG: blocks read (torn/re-upload probes)
@@ -1998,7 +2004,13 @@ bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
         uint64_t &last=vtdiag::block_sub[uintptr_t(b.first)];if(last){const uint64_t age=stats.submissions+1-last;vtdiag::reup16+=age<16;vtdiag::reup128+=age<128;}last=stats.submissions+1;}   // +1: 0 = never
     if(!copies.empty()){
         Buffer staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &c:copies)c.bufferOffset+=staging.offset;
-        Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,uint32_t(copies.size()),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();
+        // [perf4] DM_GFX_PARTIAL_PROLOGUE (default 1): like gfx-upload-prologue for full uploads, when no command of this submission
+        // used the image yet its dirty blocks are copied in the slot's prologue command buffer, ahead of the whole submission
+        // (no earlier command read the old blocks). The in-pass path ended the open render pass and put two full barriers
+        // around the copy: ~5 partial uploads a frame in the VT-streaming scenes (pass_end_lines L1373, prof31).
+        if(upload_prologue && partial_prologue_on() && im.slot_use!=slot_serial && !ab_off("partpro")){Slot &s=recording_slot();
+            s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++partial_prologue;}
+        else{Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,uint32_t(copies.size()),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
         partial_bytes+=linear.size();++partial_uploads;
         if(vt_diag_on()){auto &e=vtdiag::partial[t->serial];++e.first;e.second+=copies.size();}
         {static unsigned n=0;if(n++<5 || (n&255)==0)xbg_logf("NVN partial texture upload serial=%llu fmt=%#x %ux%ux%u target=%d blocks=%zu bytes=%zu (total uploads %llu)",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.depth,t->d.target,copies.size(),linear.size(),(unsigned long long)partial_uploads);}
@@ -2324,6 +2336,14 @@ void invariant_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
 // the one that passes the pre-pass depth. Only shaders without discard / demote / terminate and without a FragDepth write get
 // it (their visible result cannot change; feedback then comes from visible fragments only). DM_GFX_EARLY_Z=0 turns it off.
 int early_z=-1;uint64_t early_z_shaders=0;
+// [perf4] DM_GFX_RELAXED=<mask> (default 0): RelaxedPrecision on fragment-shader float math outside the slice of texture
+// coordinates / integer conversions / memory stores (xbg_spirv_relaxed.cpp). 1 = arithmetic results, 3 = also registers.
+std::atomic<int> relaxed_mode{-1};std::atomic<uint64_t> relaxed_shaders{0},relaxed_decorations{0};
+void relaxed_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
+    if(relaxed_mode<0){const char *e=getenv("DM_GFX_RELAXED");relaxed_mode=e?int(strtol(e,nullptr,0)):0;xbg_logf("NVN DM_GFX_RELAXED=%d",relaxed_mode.load());}
+    if(!relaxed_mode || stage!=4)return;size_t excl=0;size_t n=xbg_spirv_relax(w,unsigned(relaxed_mode.load()),&excl);
+    if(n){++relaxed_shaders;relaxed_decorations+=n;}static std::atomic<unsigned> logged{0};if(logged++<400)xbg_logf("NVN relaxed shader=%s decorations=%zu kept_highp=%zu",key,n,excl);
+}
 void early_tests_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
     if(early_z<0){const char *e=getenv("DM_GFX_EARLY_Z");early_z=e?atoi(e)!=0:1;}
     if(!early_z || stage!=4 || w.size()<5)return;
@@ -2465,12 +2485,19 @@ Shader *load_shader(const void *control){
     // Time of each part of the load (file read, SPIR-V rewrites, analysis, module creation), for the loaded line below.
     const uint64_t load_t1=timing_clock();uint64_t load_t2=0,load_t3=0;
     auto p=std::make_unique<Shader>();p->key=key;p->stage=h.stage;p->bindings.resize(h.binding_count);memcpy(p->bindings.data(),bytes.data()+offset,h.binding_count*sizeof(xbg_shader_binding));offset+=h.binding_count*sizeof(xbg_shader_binding);p->inputs.resize(h.input_count);memcpy(p->inputs.data(),bytes.data()+offset,h.input_count*4);offset+=h.input_count*4;p->c1.assign(bytes.begin()+offset,bytes.begin()+offset+h.c1_bytes);offset+=h.c1_bytes;
-    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());validate_capabilities(words,h.stage);
+    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());relaxed_rewrite(words,h.stage,key.c_str());validate_capabilities(words,h.stage);
     // [perf3] DOOM's culling GS is a pure position pass-through while its switch word is off: remember where the switch lives
     // (on the bundle's own SPIR-V, before any rewrite) so draw() can drop the stage (DM_GFX_GS_PASSTHRU, perf_round3.md).
+    // [perf4] DM_GFX_GS_PASSTHRU_VARY (default 1): the shipped bundles of 5 of the 6 culling GS also forward 1-6 varyings
+    // (velocity / pre-pass attributes) as exact per-vertex copies of the same Location; the original gl_Position-only rule
+    // matched just 703f1fcc on the device, so ef97a273/ee0022fd/919c10a8/351c0bfc/78c87a04 kept running as real GS: ~4 ms
+    // GPU in heavy frames, and their Hi-Z texture (binding 9, never sampled on the pass-through branch) made prepare_read
+    // split the depth pre-pass / velocity passes once per draw (~25 one-draw passes a frame, read_break why=6).
     if(h.stage==3){std::vector<uint32_t> orig(h.spirv_bytes/4);memcpy(orig.data(),bytes.data()+offset,h.spirv_bytes);XbgGsPassGate g;
-        if(xbg_spirv_gs_passthru_gate(orig.data(),orig.size(),&g))for(auto &b:p->bindings)if(b.binding==g.binding && g.set==0 && b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM && b.count==1 && b.slot<16){
-            p->gs_gate_slot=int(b.slot);p->gs_gate_offset=g.offset;p->gs_gate_value=g.value;xbg_logf("NVN GS pass-through gate shader=%s ub slot=%u byte=%u off-unless=%u",key.c_str(),b.slot,g.offset,g.value);break;}}
+        static const bool vary=[]{const char *e=getenv("DM_GFX_GS_PASSTHRU_VARY");bool on=e?atoi(e)!=0:true;xbg_logf("NVN GS pass-through DM_GFX_GS_PASSTHRU_VARY=%d",int(on));return on;}();
+        if(xbg_spirv_gs_passthru_gate(orig.data(),orig.size(),&g,vary))for(auto &b:p->bindings)if(b.binding==g.binding && g.set==0 && b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM && b.count==1 && b.slot<16){
+            p->gs_gate_slot=int(b.slot);p->gs_gate_offset=g.offset;p->gs_gate_value=g.value;xbg_logf("NVN GS pass-through gate shader=%s ub slot=%u byte=%u off-unless=%u outputs=%u",key.c_str(),b.slot,g.offset,g.value,g.outputs);break;}
+        if(p->gs_gate_slot<0)xbg_logf("NVN GS pass-through gate shader=%s: no match (stays a geometry shader)",key.c_str());}
     // gfx-shader-reuse：预热线程已改写过这个着色器时直接取用；2 时照样改写，与取来的逐字比对。
     // gfx-shader-reuse: take the warm-up threads' rewrite of this shader when there is one; with 2, rewrite as well and compare word by word.
     std::vector<uint32_t> reused;const bool have_reused=shader_reuse && !ab_off("shreuse") && warm::take_rewritten(key,reused);
@@ -2596,7 +2623,7 @@ VkShaderModule load_module(const std::string &key){
     fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n<32 || n>16*1024*1024){fclose(f);return VK_NULL_HANDLE;}std::vector<uint8_t> b(static_cast<size_t>(n));bool ok=fread(b.data(),1,b.size(),f)==b.size();fclose(f);if(!ok)return VK_NULL_HANDLE;
     xbg_shader_header h;memcpy(&h,b.data(),sizeof(h));if(h.magic!=0x31534758 || h.version!=1 || h.spirv_bytes%4)return VK_NULL_HANDLE;
     size_t off=sizeof(h)+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes;if(off+h.spirv_bytes!=b.size())return VK_NULL_HANDLE;
-    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(key,w);gscull_rewrite(w,h.stage,key.c_str(),"warm");lone_rewrite(w,h.stage,key.c_str(),"warm");early_tests_rewrite(w,h.stage,key.c_str());invariant_rewrite(w,h.stage,key.c_str());quad_rewrite(w,h.stage,key.c_str(),"warm");warp_rewrite(w,h.stage,key.c_str(),"warm");tidy_rewrite(w);
+    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(key,w);gscull_rewrite(w,h.stage,key.c_str(),"warm");lone_rewrite(w,h.stage,key.c_str(),"warm");early_tests_rewrite(w,h.stage,key.c_str());invariant_rewrite(w,h.stage,key.c_str());relaxed_rewrite(w,h.stage,key.c_str());quad_rewrite(w,h.stage,key.c_str(),"warm");warp_rewrite(w,h.stage,key.c_str(),"warm");tidy_rewrite(w);
     if(keep_rewritten){std::lock_guard<std::mutex> l(mu);rewritten.emplace(key,w);}
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=w.size()*4;ci.pCode=w.data();VkShaderModule m;if(vkCreateShaderModule(cfg.device,&ci,nullptr,&m)!=VK_SUCCESS)return VK_NULL_HANDLE;
     std::lock_guard<std::mutex> l(mu);auto ins=modules.emplace(key,m);if(!ins.second){vkDestroyShaderModule(cfg.device,m,nullptr);return ins.first->second;}return m;
@@ -2649,6 +2676,7 @@ bool build(const Rec &rec){
     VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dy.flags=r.u();uint32_t nd=r.u();if(nd>64)return false;std::vector<VkDynamicState> ds(nd);for(auto &x:ds)x=VkDynamicState(r.u());dy.dynamicStateCount=nd;dy.pDynamicStates=ds.data();
     if(r.bad || r.i!=r.n)return false;
     ci.stageCount=ns;ci.pStages=st;ci.pVertexInputState=&v;ci.pInputAssemblyState=&a;ci.pTessellationState=ht?&t:nullptr;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&m;ci.pDepthStencilState=&d;ci.pColorBlendState=&b;ci.pDynamicState=&dy;ci.layout=layout;ci.renderPass=pass;
+    if(pipe_stats)ci.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     uint64_t c0=timing_clock();VkPipeline pl;if(vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pl)!=VK_SUCCESS)return false;
     if(timing_clock()-c0>=compile_ns)++compiled;
     std::string bytes(reinterpret_cast<const char*>(rec.words.data()),rec.words.size()*4);
@@ -2712,10 +2740,15 @@ bool take(const std::string &bytes,VkPipeline &out){std::lock_guard<std::mutex> 
 }
 // Diagnostic (marker gfx-pipe-stats, with the warm-up off): the driver's statistics of each pipeline as it is created, and
 // the draws per frame of each pipeline over frames 3000-3059.
-PFN_vkGetPipelineExecutablePropertiesKHR pstat_props=nullptr;PFN_vkGetPipelineExecutableStatisticsKHR pstat_stats=nullptr;bool pipe_stats=false,pstat_logged=false;
+// [perf4] DM_GFX_PIPE_STATS="from period" (env; "1" = "3000 1800"): the same statistics without the marker, with the warm-up on
+// (warm builds get the capture flag too), logged not at creation but for the pipelines used in each 60-frame window starting
+// at present `from` and every `period` presents after it: "NVN PSTAT use" (draws per frame, shaders, target size) for the
+// top 60 by draws, and each such pipeline's "NVN PSTAT" statistics once. Summarise with tools/pstat_report.py.
+PFN_vkGetPipelineExecutablePropertiesKHR pstat_props=nullptr;PFN_vkGetPipelineExecutableStatisticsKHR pstat_stats=nullptr;bool pipe_stats=false,pstat_logged=false,pstat_env=false;uint64_t pstat_from=3000,pstat_period=0;
+std::unordered_set<VkPipeline> pstat_done;
 struct PstatUse{uint64_t draws=0;std::string what;};std::unordered_map<VkPipeline,PstatUse> pstat_use;
 std::string pstat_what(){std::string s;for(unsigned st=0;st<6;st++)if(state.shader[st]){if(!s.empty())s+=';';s+=std::to_string(st)+":"+state.shader[st]->key;}return s;}
-void pstat_log(VkPipeline pl){
+void pstat_log(VkPipeline pl,const char *what_override=nullptr){
     VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};pi.pipeline=pl;uint32_t n=0;if(pstat_props(cfg.device,&pi,&n,nullptr)!=VK_SUCCESS)return;
     std::vector<VkPipelineExecutablePropertiesKHR> ex(n,VkPipelineExecutablePropertiesKHR{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});pstat_props(cfg.device,&pi,&n,ex.data());
     for(uint32_t i=0;i<n;i++){VkPipelineExecutableInfoKHR ei{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};ei.pipeline=pl;ei.executableIndex=i;uint32_t m=0;pstat_stats(cfg.device,&ei,&m,nullptr);
@@ -2724,7 +2757,7 @@ void pstat_log(VkPipeline pl){
                 case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:snprintf(v,sizeof v,"%llu",(unsigned long long)x.value.u64);break;default:snprintf(v,sizeof v,"%g",x.value.f64);}
             std::string name=x.name;for(auto &c:name)if(c==' ' || c=='=')c='_';line+=" "+name+"="+v;}
         std::string en=ex[i].name;for(auto &c:en)if(c==' ')c='_';
-        xbg_logf("NVN PSTAT pipeline=%p what=%s exec=%u stages=%#x name=%s subgroup=%u%s",(void*)pl,pstat_what().c_str(),i,unsigned(ex[i].stages),en.c_str(),ex[i].subgroupSize,line.c_str());}
+        xbg_logf("NVN PSTAT pipeline=%p what=%s exec=%u stages=%#x name=%s subgroup=%u%s",(void*)pl,what_override?what_override:pstat_what().c_str(),i,unsigned(ex[i].stages),en.c_str(),ex[i].subgroupSize,line.c_str());}
 }
 // 有的驱动在自己的着色器编译器里崩掉建管线的调用（Adreno 750：vkCreateComputePipelines 里 libllvm-qgl.so 段错误，
 // 只碰流体模拟的一个计算着色器），有的直接报错（Adreno 650：-13）。建计算管线前把着色器键写进 gfx-pipe-inflight，建完删掉；
@@ -2794,7 +2827,7 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
     if(graphics && cacheable && warm::take(bytes,out.pipeline)){++warm::hits;}
     // A draw that may be skipped gets no pipeline while its build is queued (warm::async_request); it is not cached.
     else if(graphics && cacheable && may_skip && warm::async_request(*graphics,key,bytes)){out.pipeline=VK_NULL_HANDLE;out.transient=true;++warm::async_skips;return;}
-    else if(graphics){uint64_t t0=timing_clock();VkGraphicsPipelineCreateInfo g=*graphics;if(pipe_stats)g.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;VK(vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&g,nullptr,&out.pipeline));if(pipe_stats)pstat_log(out.pipeline);uint64_t dt=timing_clock()-t0;if(dt>=compile_ns)++pipelines_unsaved;++warm::creates;warm::create_ns+=dt;++hud::pipelines;hud::pipeline_ns+=dt;warm::create_max_ns=std::max(warm::create_max_ns,dt);if(cacheable)warm::record(*graphics,key);}
+    else if(graphics){uint64_t t0=timing_clock();VkGraphicsPipelineCreateInfo g=*graphics;if(pipe_stats)g.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;VK(vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&g,nullptr,&out.pipeline));if(pipe_stats && !pstat_env)pstat_log(out.pipeline);uint64_t dt=timing_clock()-t0;if(dt>=compile_ns)++pipelines_unsaved;++warm::creates;warm::create_ns+=dt;++hud::pipelines;hud::pipeline_ns+=dt;warm::create_max_ns=std::max(warm::create_max_ns,dt);if(cacheable)warm::record(*graphics,key);}
     else{uint64_t t0=timing_clock();VkComputePipelineCreateInfo cc=*compute;if(pipe_stats)cc.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;const std::string &shader_key=state.shader[5]->key;pipeguard::begin(shader_key);const VkResult made=vkCreateComputePipelines(cfg.device,pipeline_cache,1,&cc,nullptr,&out.pipeline);pipeguard::end(shader_key,made==VK_SUCCESS);if(made!=VK_SUCCESS){char why[64];snprintf(why,sizeof why,"failed to build (result=%d)",int(made));pipeguard::record(shader_key,why);out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}++pipelines_unsaved;++hud::pipelines;hud::pipeline_ns+=timing_clock()-t0;if(pipe_stats)pstat_log(out.pipeline);}
     if(!cacheable){out.transient=true;return;}
     if(pipeline_objects.size()==pipeline_object_limit){
@@ -3545,7 +3578,7 @@ int pass_prof_reserve(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof 
 void pass_prof_complete(VkCommandBuffer cmd,int index){Slot &s=slots[slot_index];if(!s.prof || cmd!=s.cmd || index<0 || size_t(index)>=s.prof_recs.size())return;
     auto &r=s.prof_recs[index];r.draws1=uint32_t(pass_prof_draws);r.verts1=pass_prof_verts;vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,s.prof_pool,r.q1);r.complete=true;
 }
-void pass_prof_end(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof || cmd!=s.cmd)return;pass_prof_complete(cmd,s.prof_open);s.prof_open=-1;}
+void pass_prof_end(VkCommandBuffer cmd,int line){Slot &s=slots[slot_index];if(!s.prof || cmd!=s.cmd)return;if(s.prof_open>=0 && size_t(s.prof_open)<s.prof_recs.size())s.prof_recs[size_t(s.prof_open)].end_line=line;pass_prof_complete(cmd,s.prof_open);s.prof_open=-1;}
 void pass_prof_depth_idle(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof || cmd!=s.cmd || s.prof_open<0 || size_t(s.prof_open)>=s.prof_recs.size())return;s.prof_recs[size_t(s.prof_open)].dz=true;}
 void pass_prof_begin(const Pass &p,VkCommandBuffer cmd){Slot &s=slots[slot_index];s.prof_open=pass_prof_reserve(cmd);if(s.prof_open<0)return;
     auto &r=s.prof_recs[s.prof_open];r.w=p.width;r.h=p.height;r.att=uint32_t(p.images.size());r.fmt=p.images.empty()?0u:uint32_t(p.images[0]->fmt);
@@ -3883,9 +3916,12 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(memo && use_fast && pipeline.pipeline && !pipeline.transient){pipe_memo_key=pipe_memo_next;pipe_memo_pipeline=pipeline.pipeline;pipe_memo_valid=true;}}
     // gfx-async-pipelines: this draw is skipped while its pipeline builds in the background
     if(!pipeline.pipeline)return;
-    if(pipe_stats){uint64_t fr=stats.presents.load();if(fr>=3000 && fr<3060){auto &u=pstat_use[pipeline.pipeline];++u.draws;if(u.what.empty())u.what=pstat_what()+" "+std::to_string(p.width)+"x"+std::to_string(p.height);}
-        else if(fr>=3060 && !pstat_logged){pstat_logged=true;std::vector<std::pair<VkPipeline,PstatUse>> v(pstat_use.begin(),pstat_use.end());std::sort(v.begin(),v.end(),[](const auto &a,const auto &b){return a.second.draws>b.second.draws;});
-            for(size_t i=0;i<v.size() && i<80;i++)xbg_logf("NVN PSTAT use pipeline=%p draws_per_frame=%.1f what=%s",(void*)v[i].first,v[i].second.draws/60.0,v[i].second.what.c_str());}}
+    if(pipe_stats){uint64_t fr=stats.presents.load();uint64_t w0=pstat_from;if(pstat_period && fr>=pstat_from)w0=pstat_from+(fr-pstat_from)/pstat_period*pstat_period;
+        if(fr>=w0 && fr<w0+60){if(pstat_logged && pstat_period){pstat_logged=false;pstat_use.clear();}auto &u=pstat_use[pipeline.pipeline];++u.draws;if(u.what.empty())u.what=pstat_what()+" "+std::to_string(p.width)+"x"+std::to_string(p.height);}
+        else if(fr>=w0+60 && !pstat_logged){pstat_logged=true;std::vector<std::pair<VkPipeline,PstatUse>> v(pstat_use.begin(),pstat_use.end());std::sort(v.begin(),v.end(),[](const auto &a,const auto &b){return a.second.draws>b.second.draws;});
+            for(size_t i=0;i<v.size() && i<(pstat_env?60:80);i++){xbg_logf("NVN PSTAT use pipeline=%p draws_per_frame=%.1f window=%llu what=%s",(void*)v[i].first,v[i].second.draws/60.0,(unsigned long long)w0,v[i].second.what.c_str());
+                if(pstat_env && pstat_done.insert(v[i].first).second)pstat_log(v[i].first,v[i].second.what.c_str());}
+            pstat_use.clear();}}
     // Buffer copies precede the draw; original guest layout remains unchanged.
     static std::vector<std::pair<uint32_t,Buffer*>> vertex_buffers;vertex_buffers.clear();
     Buffer *ib=nullptr;VkIndexType index_type=VK_INDEX_TYPE_UINT16;
@@ -4742,7 +4778,11 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     {FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-descmemo").c_str(),"rb");if(w){desc_memo_enabled=false;fclose(w);}xbg_logf("NVN descmemo enabled=%d",int(desc_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-dynpartial").c_str(),"rb");if(w){dyn_partial_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-xmemo").c_str(),"rb");if(w){xmemo_enabled=false;fclose(w);}xbg_logf("NVN cross-frame memo enabled=%d",int(xmemo_enabled));}{auto marker=[&](const char *name){FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");int c=-1;if(w){c=fgetc(w);fclose(w);}return c;};persistent_fb_enabled=marker("/gfx-no-persistent-fb")<0;slot_pools_enabled=marker("/gfx-no-slot-pools")<0;readback_cached=marker("/gfx-readback-cached")=='1' || (marker("/gfx-readback-cached")<0 && getenv("DM_GFX_READBACK_CACHED") && *getenv("DM_GFX_READBACK_CACHED")=='1');texel_memo_enabled=marker("/gfx-no-texel-memo")<0;no_occlusion_queries=marker("/gfx-no-occlusion")=='1';samples_report_seen=false;open_occlusion=OpenOcclusion{};occlusion_queries_started=0;occlusion_batch_enabled=marker("/gfx-query-per-draw")!='1' && marker("/gfx-no-query-batch")<0;heavy_timestamps=marker("/gfx-heavy-timestamps")=='1';xbg_logf("NVN persistent framebuffers=%d slot command pools=%d cached readback=%d texel memo=%d (markers gfx-no-persistent-fb, gfx-no-slot-pools, gfx-readback-cached, gfx-no-texel-memo)",int(persistent_fb_enabled),int(slot_pools_enabled),int(readback_cached),int(texel_memo_enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wtrack").c_str(),"rb");wtrack::marker=-1;if(w){wtrack::marker=fgetc(w)=='1'?1:0;fclose(w);}wtrack::enabled=wtrack::marker==1;}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-wtrack").c_str(),"rb");if(w){wtrack::enabled=false;wtrack::marker=0;fclose(w);}xbg_logf("NVN wtrack enabled=%d (markers gfx-no-wtrack, gfx-wtrack=0)",int(wtrack::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-images").c_str(),"rb");no_mutable_images=true;if(w){no_mutable_images=fgetc(w)!='1';fclose(w);}xbg_logf("NVN mutable-format images=%d (marker gfx-mutable-images)",int(!no_mutable_images));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-mutable-test").c_str(),"rb");mutable_test=0;if(w){if(fscanf(w,"%u",&mutable_test)!=1)mutable_test=0;fclose(w);}if(mutable_test)xbg_logf("NVN mutable upgrade test every %u images (marker gfx-mutable-test)",mutable_test);}
      /* Android: no guest memory remapping probe. */
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");if(m){fclose(m);pstat_props=reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(vkGetDeviceProcAddr(cfg.device,"vkGetPipelineExecutablePropertiesKHR"));
-       pstat_stats=reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(vkGetDeviceProcAddr(cfg.device,"vkGetPipelineExecutableStatisticsKHR"));pipe_stats=pstat_props && pstat_stats;}xbg_logf("NVN pipeline statistics=%d (marker gfx-pipe-stats)",int(pipe_stats));}
+       pstat_stats=reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(vkGetDeviceProcAddr(cfg.device,"vkGetPipelineExecutableStatisticsKHR"));pipe_stats=pstat_props && pstat_stats;}
+      else if(const char *e=getenv("DM_GFX_PIPE_STATS"); e && *e && *e!='0'){unsigned long long a=0,b=0;int n=sscanf(e,"%llu %llu",&a,&b);if(n>=1 && a>1)pstat_from=a;pstat_period=n>=2?b:(a<=1?1800:0);
+        pstat_props=reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(vkGetDeviceProcAddr(cfg.device,"vkGetPipelineExecutablePropertiesKHR"));pstat_stats=reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(vkGetDeviceProcAddr(cfg.device,"vkGetPipelineExecutableStatisticsKHR"));
+        pipe_stats=pstat_env=pstat_props && pstat_stats;}
+      xbg_logf("NVN pipeline statistics=%d env=%d from=%llu period=%llu (marker gfx-pipe-stats / DM_GFX_PIPE_STATS)",int(pipe_stats),int(pstat_env),(unsigned long long)pstat_from,(unsigned long long)pstat_period);}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wb-skip").c_str(),"rb");wb_skip=false;if(m){wb_skip=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_WB_SKIP"))wb_skip=atoi(e)!=0;
       xbg_logf("NVN superseded storage writebacks skipped=%d pool_flags=%d (marker gfx-wb-skip)",int(wb_skip),int(nvn_pool_flags!=nullptr));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-memo").c_str(),"rb");pipe_memo=false;pipe_memo_valid=false;if(m){pipe_memo=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_PIPE_MEMO"))pipe_memo=atoi(e)!=0;
