@@ -213,7 +213,7 @@ def tool_version(exe):
 
 
 def chain_manifest(xlate, jobs_dir, opts):
-    xdir = os.path.dirname(os.path.abspath(xlate)); src = pathlib.Path(HERE).parents[2]   # .../src
+    xdir = os.path.dirname(os.path.abspath(xlate)); src = pathlib.Path(HERE).parents[2]   # the repository root (dm/ and tools/ in it)
     m = {'xlate_source': subprocess.run([xlate, '--source-sha'], capture_output=True, text=True).stdout.strip()}
     for dll in ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll', 'Spv.Generator.dll'):
         p = os.path.join(xdir, dll); m[dll] = sha16(open(p, 'rb').read()) if os.path.exists(p) else 'missing'
@@ -223,7 +223,7 @@ def chain_manifest(xlate, jobs_dir, opts):
     m['ryujinx_src'] = h.hexdigest()[:16]
     m['spirv-opt'], m['spirv-val'] = tool_version(OPT), tool_version(VAL)
     for f in ('dmsh_vk_doom.py', 'dmsh_vk.py', 'pack_game_shaders.py'): m[f] = sha16(open(os.path.join(HERE, f), 'rb').read())
-    jt = src.parent / 'tools' / 'doom_shader_jobs.py'
+    jt = src / 'tools' / 'doom_shader_jobs.py'
     m['doom_shader_jobs.py'] = sha16(jt.read_bytes()) if jt.exists() else 'missing'
     for f in ('jobs.tsv', 'shader_facts.tsv', 'glsl_bindings.json'): m[f] = sha16(open(os.path.join(jobs_dir, f), 'rb').read())
     m['options'] = opts
