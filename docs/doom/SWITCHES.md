@@ -79,6 +79,12 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_GFX_SHARPEN=<stops>` | не задан | FSR RCAS при выводе (`rcas.comp`); ⚙: 1.0 / 0.5 / 0.2 | вместе с `DM_DOOM_RES` |
 | `DM_GFX_PERF_SAMPLE` | 0 (APK) | строки `NVN PERF` (4 — каждый кадр окнами по 60) | всегда в замерах |
 | `DM_GFX_PASS_PROF="from period count"` | выкл | per-pass GPU timestamp профиль (`NVN GPASS`, с 29.10 поле `end=L<строка>` — кто закрыл проход), разбор `tools/gpass_report.py` (печатает и разбивку по `end=`) | `1` = `300 600 0` |
+| `DM_GFX_RELAXED=<маска>` | 0 | **СЛОМАНО, не включать** (A/B r2_b2: сцена почти чёрная, красные пятна). RelaxedPrecision (fp16) на float-математике FS вне слайса текстурных координат / целых / записей (`xbg_spirv_relaxed.cpp`) | отклонено 29.10: экономии у главного FS всё равно мало (фактически 18 % операций), статистика драйвера не показывает регистрового голода (21–25 регистров, без scratch) |
+| `DM_GFX_PIPE_STATS="from period"` | выкл | статистика драйвера (`VK_KHR_pipeline_executable_properties`) для топ-60 пайплайнов по draw в каждом 60-кадровом окне с present `from` через `period` (`1` = `3000 1800`), работает с warm-up. Строки `NVN PSTAT use` / `NVN PSTAT`; разбор `tools/pstat_report.py` | диагностика (perf4) |
+| `DM_GFX_DRAW_PROFILE="from frames [min_draws] [desc]"` | выкл | один раз за сессию включает живой CPU-профиль с детализацией draw (`NVN DRAW_TIMING`/`CPU_TIMING`) или descriptor (`desc` → `NVN DESC_TIMING`) на первом present ≥ from, где в кадре ≥ min_draws draw; напр. `3000 30 1100` | диагностика per-draw CPU (perf4) |
+| `DM_GFX_ARENA_UNCACHED=1` | 0 | арены per-draw (снимки UBO, потоки вершин/индексов, staging) на типе памяти HOST_VISIBLE\|COHERENT **без** HOST_CACHED, если буфер его допускает; сейчас берётся тип 6 = 0xf (кэшируемый → GPU читает с IO-coherent snoop). Лог `NVN DM_GFX_ARENA_UNCACHED=… buffer memory bits=…` и `NVN arena chunk … flags=` | A/B (perf5): GPU main/pre-pass ms; риск — медленные CPU-чтения арен |
+| `DM_GFX_ZC_CPU=1` | 0 | zero-copy пулы игры (вершины, UBO, SSBO — 1.3 ГБ) с `CPU_READ_RARELY` вместо `READ_OFTEN` → gralloc может дать некэшируемые (write-combined) страницы, которые GPU читает без snoop. Лог `NVN zero-copy memory: allowed=… picked=… flags=…` | A/B (perf5); риск — медленные CPU-чтения пулов игрой и нами (хэши, снимки) |
+| `DM_GFX_ANISO_MAX=<n>` | 0 (как у игры) | потолок анизотропии всех сэмплеров (`1` — выкл); первые 64 сэмплера логируются (`NVN sampler created … aniso=`) | A/B (perf5) |
 | `DM_GFX_ALIAS_LOG` | 0 | логи алиасинга storage/копий | отладка |
 | Наследие D2R (APK): `DM_GFX_WB_SKIP 1`, `DM_GFX_PIPE_MEMO 1`, `DM_GFX_NATIVE_BC 1`, `DM_GFX_WARP32 1`, `DM_GFX_LDC_FOLD 1`, `DM_GFX_FORWARD_TEMPS 1`, `DM_GFX_NAN_MINMAX 1`, `DM_GFX_DEFER_EVENTS 2`, `DM_GFX_READ_PREFLIGHT 0`, `DM_GFX_XVIEW_GUARD 1`, `DM_GFX_UPLOAD_PROLOGUE 1`, `DM_GFX_SHADER_REUSE 1`, `DM_GFX_VCACHE 1`, `DM_GFX_TEX_DIRTY 1`, `DM_GFX_ASYNC_POOL_RESET 1`, `DM_3D_SCALE 0.85` | | для DOOM отдельно не исследовались; `DM_GFX_NATIVE_BC=0` падал на лимите 256 МБ; `TEX_DIRTY=0`/`VCACHE=0` нужны только на LDPlayer (houdini). Влияние `DM_3D_SCALE` на DOOM не подтверждено (таргеты 1280×720 честные) | |
 
@@ -93,7 +99,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 
 | Переключатель | По умолч. | Смысл | Итог A/B |
 |---|---|---|---|
-| `DM_NVN_SYNC` | 1 (APK) | трансляция inline на потоке игры | `0` (отдельный поток) fps не менял |
+| `DM_NVN_SYNC` | **0** (APK, с 29.10) | `0` — трансляция на своём потоке (A/B 29.10: тяжёлые сцены 25 → 33 fps); `1` — inline на потоке игры | 28.10 `0` fps не менял (тогда всё упиралось в GPU) |
 | `DM_NVN_SYNC_LAG=1` | 0 | ждать fence кадра N-1 вместо N | средний fps как у chunk, но в 2-3 раза больше длинных кадров + мерцание — не включать |
 | `DM_NVN_POLL_US=N` | 0 | сон N мкс в неготовом poll | эксперимент (CPU/нагрев), не дефолт |
 | `DM_NVN_GW_STATS=1` | 0 | раз в 300 кадров `[nvn] GW per frame` — какой fence ждёт игра | диагностика |
@@ -110,6 +116,8 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_TIMERSLACK_NS` | 1000 | `prctl(PR_SET_TIMERSLACK)` гостевых потоков (Android по умолчанию 50 мкс) |
 | `DM_YIELD_BACKOFF=<cap us>[:<start us>]` | 250:2000 | сон на повторных yield; `0` — выкл |
 | `DM_HANDOFF=0` | 1 | без передачи на то же ядро при пробуждении |
+| `DM_HANDOFF_PINNED` | **1** (с 29.10) | handoff только если будящий сам привязан к одному ядру (как миграция Horizon: WorkerThread_00/01 с маской 0x7 больше не ждут главный поток); ~420 handoff/с по ~2 мс в старых дампах | A/B 29.10: тяжёлые сцены 33 → 35 fps, окна < 30 fps 39 % → 26 %; `0` — старое правило |
+| `DM_GFX_PIN_CPU=<hex>` | X4 (`80`) | маска ядер потока present (в sync-режиме = поток игры с трансляцией), как маркер `gfx-pin-cpu`; `0` — без привязки, `f0` — X4 + A720 | A/B (perf4) |
 | `DM_OPMODE` | 1 | режим работы Switch для игры (по коду Horizon: 1 = док/console, 0 = портатив/handheld); `0` fps не менял (замер ночи 27→28.10) |
 | `DM_ADPF=0` | вкл | выключить ADPF/perf hints (нужно под libhoudini) |
 | `DM_GYRO=0` | вкл | не отдавать игре гироскоп |
