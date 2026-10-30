@@ -1573,6 +1573,16 @@ static int pace_adapt_enabled(void) {
     if (g_pa < 0) { const char *e = getenv("DM_PACE_ADAPT"); g_pa = e && *e == '1'; }
     return g_pa;
 }
+// [DOOM] DM_PRESENT_MAX_HZ=<cap> (DmActivity's frame rate limit: 30 / 60 / 90 / 120, set with DM_DOOM_TICK_MAX = the same cap): the auto
+// mode presents at the largest integer fraction of the refresh rate not above the cap (nvn_pace_cap_hz) instead of the "at least 60"
+// tier, so a 90 / 144 / 165 Hz screen no longer presents 90 / 72 / 82.5 fps against a 60 Hz tick maximum (game time 1.5 / 1.2 / 1.375x
+// fast). 0 / unset = the old rule. DM_PRESENT_HZ still pins a fixed rate; the adaptive tiers (DM_PACE_ADAPT=1) keep their own 60 cap.
+// Above 60 is untested: the comment above on frame-counted UI logic (measured on D2R) is the risk to watch in DOOM's menus / HUD.
+static double present_cap_hz(void) {
+    static double v = -1;
+    if (v < 0) { const char *e = getenv("DM_PRESENT_MAX_HZ"); v = e && *e ? atof(e) : 0; if (!(v >= 10 && v <= 240)) v = 0; }
+    return v;
+}
 static double present_auto_hz(double screen_hz) {
 #ifdef __ANDROID__
     // Android has no Metal display-link pacer, so apply the power-saving target here.
@@ -1581,6 +1591,7 @@ static double present_auto_hz(double screen_hz) {
     // 自适应目标是最高60，而旧Apple策略是至少60；两者不共用取整方向。首帧/刷新率改变也受上限约束。
     // Adaptive pacing caps at 60; the legacy Apple policy has a floor of 60. Cap the first frame and refresh changes too.
     if (pace_adapt_enabled() && screen_hz > 0) return screen_hz / nvn_adaptive_divisor(screen_hz, g_pa_k, g_pa_screen_hz);
+    if (present_cap_hz() > 0) return nvn_pace_cap_hz(screen_hz, present_cap_hz());
     return dm_pace_hz(screen_hz, 60);
 }
 static int g_hz = -1, g_display_mode, g_hz_auto;   // g_hz_auto：有窗口、没用 DM_PRESENT_HZ 钉住——帧率跟着窗口所在屏的刷新率取整除档（每帧重读，换屏即换） | g_hz_auto: has a window and not pinned by DM_PRESENT_HZ; the frame rate takes the evenly dividing tier of the refresh rate of the screen the window is on (re-read every frame, changes with the screen)
@@ -1603,8 +1614,8 @@ static void present_cfg(const win_t *o) {
     // (the save indicator is exempted as a timing race), and the timing differences of key messages are within game mode's own noise band; proof after entering a run is still missing, pending action script coverage
     const char *m = getenv("DM_PRESENT_INTERVAL"); g_display_mode = m ? !strcmp(m, "display") : scr > 0;
     char name[128]; front_display_refresh(name, sizeof name);
-    if (g_hz_auto) LOG("[nvn] 出图节拍 %.2f Hz，间隔模式 %s（游戏设的出图间隔 %d；屏幕 %s，刷新率 %.2f Hz，取整除的一档）", present_auto_hz(mtl_display_refresh()), g_display_mode ? "display（每节拍一帧，剪口）" : "game（原版语义）", o->interval,
-        *name ? name : "主屏", mtl_display_refresh());
+    if (g_hz_auto) LOG("[nvn] 出图节拍 %.2f Hz，间隔模式 %s（游戏设的出图间隔 %d；屏幕 %s，刷新率 %.2f Hz，取整除的一档；上限 DM_PRESENT_MAX_HZ %.0f）", present_auto_hz(mtl_display_refresh()), g_display_mode ? "display（每节拍一帧，剪口）" : "game（原版语义）", o->interval,
+        *name ? name : "主屏", mtl_display_refresh(), present_cap_hz());
     else LOG("[nvn] 出图节拍 %d Hz，间隔模式 %s（游戏设的出图间隔 %d；%s）", g_hz, g_display_mode ? "display（每节拍一帧，剪口）" : "game（原版语义）", o->interval,
         e ? "DM_PRESENT_HZ 钉住" : "无窗口，固定 60 Hz");
 }

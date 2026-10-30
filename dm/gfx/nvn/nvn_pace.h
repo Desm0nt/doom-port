@@ -29,3 +29,13 @@ static inline double nvn_pace_hz(double screen_hz, double floor_hz) {
     if (screen_hz <= 0 || floor_hz <= 0) return floor_hz;
     double k = (double)(long)(screen_hz / floor_hz + 0.02); return k >= 1 ? screen_hz / k : screen_hz;
 }
+
+// [DOOM] Frame rate limit (DM_PRESENT_MAX_HZ, the gear's 30 / 60 / 90 / 120): the largest integer fraction of the screen refresh that is
+// not above the cap, so the game's adaptive tick (com_adaptiveTickMaxHz = the same cap) never runs game time faster than real time.
+// 120 Hz screen: cap 60 → 60, 90 → 60, 120 → 120, 30 → 30; 90 Hz: cap 60 → 45, 90 → 90; 144: 60 → 48, 120 → 72; 165: 60 → 55;
+// 60 Hz: any cap ≥ 60 → 60. Same 0.02 margin for NTSC rates (119.88 / cap 60 → 59.94). Refresh unknown (0): the cap.
+static inline double nvn_pace_cap_hz(double screen_hz, double cap_hz) {
+    if (screen_hz <= 0 || cap_hz <= 0) return cap_hz;
+    double r = screen_hz / cap_hz - 0.02; long k = (long)r; if (k < r) k++; if (k < 1) k = 1;
+    return screen_hz / (double)k;
+}
