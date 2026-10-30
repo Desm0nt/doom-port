@@ -79,23 +79,25 @@ Russian, Ukrainian, German, French, Spanish, Portuguese, Italian, Polish, Turkis
 
 ## Current state
 
-Target device: **Snapdragon 8 Gen 3 / Adreno 750** (Xiaomi 14 Ultra) — the only device tested so far. Other
-Snapdragon devices may work; other GPUs are untested.
+Tested on **Snapdragon 8 Gen 3 / Adreno 750** (Xiaomi 14 Ultra) and **Snapdragon 8 Gen 2 / Adreno 740** (Xiaomi 13 Pro).
+Other Snapdragon devices may work; other GPUs are untested.
 
 - The campaign is playable from the main menu through gameplay. Output is **1600×720 widescreen** by default on a
   20:9 screen (same height as the Switch's handheld 720p, with a wider Hor+ view: more on the sides, nothing
   stretched); the original **1280×720 (16:9)** with side bars is optional in the settings and ~25% lighter on the GPU.
-- Performance on Adreno 750 with the stock driver (1600×720): **45–60 fps** in most of the campaign; the heaviest
-  areas still drop to 20–35 fps, most of all on the first visit while textures stream in. GPU and CPU optimisation is
-  ongoing (the latest round removed about a third of the render passes per frame). The game's adaptive tick keeps game
-  speed equal to real time at any frame rate.
-- Memory: the game's VRAM pools get headroom over the console sizes (e.g. textures 1536 MB instead of 1162.5 MB); the
-  app uses about 2 GB of RAM.
+- Performance at 1600×720 with Turnip v27: **Snapdragon 8 Gen 3 (Adreno 750)** — 50–60 fps in most of the campaign
+  (capped at 60), the heaviest areas ~35–50 fps; **Snapdragon 8 Gen 2 (Adreno 740)** — ~40–50 fps, heavy areas ~33–40 fps
+  (measured on a warm, thermally throttled phone). Turning widescreen off (1280×720) or lowering the 3D resolution helps
+  on 8 Gen 2. Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
+- Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
+  on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level
+  loads become much slower.
 - Input: on-screen pad (left stick, mouse-like look on the right half, FIRE that also looks while held, R3),
   Bluetooth / USB controllers (the on-screen pad hides while one is connected), gyro aiming, aim assist with adjustable
   strength, rumble.
-- Settings (gear button): widescreen, 3D render resolution, the game's dynamic resolution, RCAS sharpening, Vulkan
-  driver (bundled Turnip, system or your own package), game language, aim assist strength, rumble, frame counter, look sensitivity. The in-game Video menu's *Chromatic Aberration* entry is
+- Settings (gear button): widescreen, frame rate limit, 3D render resolution, dynamic resolution (shared with the game's
+  Video menu), RCAS sharpening, Vulkan driver (by GPU, or your own package), game language, aim assist strength, rumble,
+  frame counter, look sensitivity. The in-game Video menu's *Chromatic Aberration* entry is
   repurposed as *Dynamic Resolution*.
 
 ### Known issues
@@ -229,6 +231,7 @@ DOOM Mobile stands on the work of others — thank you:
 - **[libadrenotools](https://github.com/bylaws/libadrenotools)** by Billy Laws (BSD-2-Clause).
 - **Ryujinx** shader translator (Ryujinx Team and Contributors, MIT), vendored by d2r-mobile in `dm/third_party/ryujinx`.
 - **[AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)** RCAS (MIT).
+- **[zlib-ng](https://github.com/zlib-ng/zlib-ng)** (zlib license) — optional fast inflate for the game's resource containers.
 - **[Mesa](https://mesa3d.org) Turnip** (MIT) — the default Vulkan driver, bundled in the APK as the adrenotools build
   by **[The412Banner](https://github.com/The412Banner/Banners-Turnip)** (Mesa main). Not stored in this repository:
   `tools/fetch_turnip.py` downloads it at build time with a pinned SHA-256.
@@ -257,7 +260,8 @@ NVN воспроизводится через Vulkan. Основа — прое�
 - Проверено на Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) и Adreno 740 (Snapdragon 8 Gen 2); другие GPU не проверялись.
   Драйвер выбирается по GPU: Adreno 6xx/7xx — встроенный Turnip (Mesa), другие Adreno — свой пакет Turnip, Mali/PowerVR/Xclipse —
   системный драйвер с обходами в движке; если драйвер не запустился, игра переходит на системный и сообщает об этом. Производительность (1600×720): 45–60 fps на большей части кампании, в самых
-  тяжёлых зонах пока 20–35 fps (сильнее всего при первом заходе, пока догружаются текстуры); оптимизация продолжается.
+  тяжёлых зонах ~35–50 fps на 8 Gen 3 и ~33–40 на 8 Gen 2 (замерено на прогретом, троттлящем телефоне); оптимизация
+  продолжается. На телефонах с 8–12 ГБ памяти перед игрой лучше закрыть фоновые приложения: своп сильно замедляет загрузки.
 - Вывод по умолчанию широкий **1600×720** (Hor+: шире обзор по бокам, без растяжения); классические **1280×720 (16:9)**
   с полосами — галочкой «Широкий экран» в настройках (со следующего запуска, на ~25 % легче для GPU).
 - Экранный геймпад с обзором «как мышью», геймпады, гироскоп, aim assist, вибрация, русский язык (язык игры берётся из
