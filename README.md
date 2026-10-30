@@ -88,7 +88,8 @@ Other Snapdragon devices may work; other GPUs are untested.
 - Performance at 1600×720 with Turnip v27: **Snapdragon 8 Gen 3 (Adreno 750)** — 50–60 fps in most of the campaign
   (capped at 60), the heaviest areas ~35–50 fps; **Snapdragon 8 Gen 2 (Adreno 740)** — ~40–50 fps, heavy areas ~33–40 fps
   (measured on a warm, thermally throttled phone). Turning widescreen off (1280×720) or lowering the 3D resolution helps
-  on 8 Gen 2. Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
+  on 8 Gen 2 in pixel-heavy scenes (the heaviest areas are geometry-bound instead). Level loads use a fast NEON zlib.
+  Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
 - Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
   on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level
   loads become much slower.
