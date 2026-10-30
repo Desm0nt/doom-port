@@ -162,12 +162,30 @@ The APK bundles **Mesa Turnip v27** (an adrenotools build of Mesa main for Adren
 falls back to the phone's own driver when Turnip does not load or finds no supported GPU. On Adreno 750 Turnip v27 is
 as fast as the Qualcomm driver or slightly faster.
 
-To try another driver, put an adrenotools package (a folder with `meta.json` and the driver `.so`, e.g. unpacked from a
-release of [Banners-Turnip](https://github.com/The412Banner/Banners-Turnip/releases)) into
-`Download/DOOM Mobile/drivers/<name>/`, then pick it in the gear dialog (*Драйвер Vulkan*) and restart the game. Builds
-exist for other Adreno generations (A710/A720, A8xx / Snapdragon 8 Elite, A740 on newer One UI firmware); pick the one
-for your GPU. *Системный* selects the phone's own driver. `TU_DEBUG` (Turnip's debug options, e.g. `sysmem`) can be set
-in `Download/DOOM Mobile/dm/env`.
+**Automatic downloads.** When the phone is online, the app reads [`drivers/manifest.json`](drivers/manifest.json) from
+this repository in the background and downloads the driver packages listed there that it does not have yet (Turnip
+builds for other Adreno generations: A710/A720/A722, A8xx / Snapdragon 8 Elite, A740 on newer One UI firmware). Every
+package is checked against the SHA-256 in the manifest. A package whose `auto` pattern matches the phone's GPU
+(`/sys/class/kgsl/kgsl-3d0/gpu_model`, e.g. `Adreno720v1`) becomes the default from the next launch, unless you picked a
+driver yourself. Offline nothing is downloaded and the bundled Turnip is used.
+
+**Your own driver.** Copy an adrenotools driver package into `Download/DOOM Mobile/drivers/` on the phone, in either
+form:
+
+```text
+Download/DOOM Mobile/drivers/
+  my-turnip.zip              <- the package zip as released (meta.json + the driver .so), unpacked on the next launch
+  my-turnip/                 <- or the unpacked folder
+    meta.json
+    libvulkan_freedreno.so
+```
+
+Restart the game, open the gear dialog, pick it under *Драйвер Vulkan* and restart again. *Системный* selects the
+phone's own driver. Compatible packages: adrenotools / Turnip releases such as
+[Banners-Turnip](https://github.com/The412Banner/Banners-Turnip/releases) (use the plain Android builds, not the
+`-Linux` / `-Wayland` ones). `TU_DEBUG` (Turnip's debug options, e.g. `sysmem`) can be set in
+`Download/DOOM Mobile/dm/env`. To offer a driver to everyone, add an entry (name, url, sha256, optional `auto` regex)
+to `drivers/manifest.json`.
 
 ## Repository layout
 

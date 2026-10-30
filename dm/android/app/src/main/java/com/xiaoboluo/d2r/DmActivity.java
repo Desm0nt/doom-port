@@ -267,6 +267,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             Os.setenv("DM_DRIVERS_DIR", drivers.getAbsolutePath(), true);
             extractBundledDrivers(drivers);   // the APK's default driver (Turnip, assets/drivers/<name>/)
             importDrivers(new File(Environment.getExternalStorageDirectory(), "Download/DOOM Mobile/drivers"), drivers);
+            updateDriversInBackground(drivers);   // other packages from the repository's drivers/manifest.json when online
             // Game language (DOOM takes it from the system like on the Switch: hle_oe.c GetDesiredLanguage reads DM_LANG; jni sets
             // DM_LANG from the phone locale only when it is unset). "" = follow the phone.
             // Aim assist strength (hle_hid.c DM_AA_STRENGTH: the game's single-player assist scaled; 0 = the game's weak MP-method assist)
@@ -285,7 +286,91 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // [DOOM] Default Vulkan driver: the bundled Turnip package when the APK has it (vk_driver.c falls back to the system driver
     // when it does not load or sees no Vulkan 1.1 GPU, e.g. on non-Adreno phones); "" = the system driver.
     static final String DEFAULT_DRIVER = "turnip27";
-    private String defaultDriver() { return new File(new File(getFilesDir(), "drivers"), DEFAULT_DRIVER).isDirectory() ? DEFAULT_DRIVER : ""; }
+    private String defaultDriver() {
+        File dir = new File(getFilesDir(), "drivers");
+        String auto = autoDriverForGpu(dir); if (auto != null) return auto;
+        return new File(dir, DEFAULT_DRIVER).isDirectory() ? DEFAULT_DRIVER : "";
+    }
+    // The GPU model as the kernel reports it, e.g. "Adreno750v2" (empty when unreadable or not an Adreno).
+    static String gpuModel() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/sys/class/kgsl/kgsl-3d0/gpu_model"))) {
+            String l = r.readLine(); return l == null ? "" : l.trim();
+        } catch (java.io.IOException e) { return ""; }
+    }
+    // A downloaded package whose manifest entry has an "auto" regex matching this GPU (drivers/manifest.json in the repository,
+    // cached as <dir>/manifest.json), e.g. the A710/A720 Turnip on an Adreno 720; null when none applies.
+    private static String autoDriverForGpu(File dir) {
+        String gpu = gpuModel(); if (gpu.isEmpty()) return null;
+        try {
+            org.json.JSONArray pk = new org.json.JSONObject(readSmall(new File(dir, "manifest.json"))).getJSONArray("packages");
+            for (int i = 0; i < pk.length(); i++) {
+                org.json.JSONObject o = pk.getJSONObject(i); String re = o.optString("auto", ""), name = o.getString("name");
+                if (!re.isEmpty() && java.util.regex.Pattern.compile(re).matcher(gpu).find() && hasDriverLib(new File(dir, name))) return name;
+            }
+        } catch (Exception e) { /* no manifest yet */ }
+        return null;
+    }
+    static boolean hasDriverLib(File d) { File[] fs = d.listFiles(); if (fs != null) for (File f : fs) if (f.getName().endsWith(".so")) return true; return false; }
+    static String readSmall(File f) throws java.io.IOException {
+        try (java.io.InputStream in = new java.io.FileInputStream(f)) { java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[8192]; int n; while ((n = in.read(buf)) > 0) b.write(buf, 0, n); return b.toString("UTF-8"); }
+    }
+    // [DOOM] Driver packages from the internet (when there is a connection): the repository's drivers/manifest.json lists
+    // adrenotools packages (name, url, sha256, optional "auto" GPU regex). Missing ones are downloaded in the background, checked
+    // against their SHA-256 and unpacked to <dir>/<name>/; they show up in the settings and, when "auto" matches this GPU, are
+    // used by default from the next launch. Offline nothing happens and the bundled Turnip / system driver are used.
+    static final String DRIVER_MANIFEST_URL = "https://raw.githubusercontent.com/Desm0nt/doom-port/main/drivers/manifest.json";
+    private void updateDriversInBackground(final File dir) {
+        new Thread(() -> {
+            try {
+                byte[] man = httpGet(DRIVER_MANIFEST_URL, 1 << 20);
+                org.json.JSONArray pk = new org.json.JSONObject(new String(man, "UTF-8")).getJSONArray("packages");
+                dir.mkdirs(); try (java.io.FileOutputStream os = new java.io.FileOutputStream(new File(dir, "manifest.json"))) { os.write(man); }
+                for (int i = 0; i < pk.length(); i++) {
+                    org.json.JSONObject o = pk.getJSONObject(i); String name = o.getString("name");
+                    if (!name.matches("[A-Za-z0-9._-]+") || hasDriverLib(new File(dir, name))) continue;
+                    byte[] zip = httpGet(o.getString("url"), 64 << 20);
+                    String got = sha256(zip);
+                    if (!got.equalsIgnoreCase(o.getString("sha256"))) { android.util.Log.e("dm", "driver " + name + ": SHA-256 mismatch " + got + ", skipped"); continue; }
+                    unzipDriver(new java.io.ByteArrayInputStream(zip), new File(dir, name));
+                    android.util.Log.i("dm", "driver " + name + ": downloaded (" + zip.length + " bytes)");
+                }
+            } catch (Exception e) { android.util.Log.i("dm", "driver update skipped: " + e); }
+        }, "dm-driver-update").start();
+    }
+    static byte[] httpGet(String url, int max) throws java.io.IOException {
+        for (int hop = 0; hop < 5; hop++) {   // GitHub release assets redirect to another host
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            c.setConnectTimeout(10000); c.setReadTimeout(30000); c.setInstanceFollowRedirects(false);
+            int code = c.getResponseCode();
+            if (code / 100 == 3) { url = c.getHeaderField("Location"); c.disconnect(); if (url == null) break; continue; }
+            if (code != 200) { c.disconnect(); throw new java.io.IOException("HTTP " + code + " " + url); }
+            try (java.io.InputStream in = c.getInputStream()) {
+                java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[1 << 16]; int n;
+                while ((n = in.read(buf)) > 0) { b.write(buf, 0, n); if (b.size() > max) throw new java.io.IOException("too large: " + url); }
+                return b.toByteArray();
+            } finally { c.disconnect(); }
+        }
+        throw new java.io.IOException("too many redirects");
+    }
+    static String sha256(byte[] d) {
+        try { byte[] h = java.security.MessageDigest.getInstance("SHA-256").digest(d); StringBuilder sb = new StringBuilder(); for (byte x : h) sb.append(String.format("%02x", x)); return sb.toString(); }
+        catch (java.security.NoSuchAlgorithmException e) { return ""; }
+    }
+    // Unpack an adrenotools package zip (meta.json + the driver library, at the zip root or in one folder) into out/.
+    static void unzipDriver(java.io.InputStream src, File out) throws java.io.IOException {
+        File tmp = new File(out.getPath() + ".tmp"); deleteDriverTree(tmp); tmp.mkdirs();
+        try (java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(src)) {
+            java.util.zip.ZipEntry e; byte[] buf = new byte[1 << 16];
+            while ((e = z.getNextEntry()) != null) {
+                if (e.isDirectory()) continue;
+                String n = new File(e.getName()).getName(); if (!(n.endsWith(".so") || n.equals("meta.json"))) continue;
+                try (java.io.OutputStream os = new java.io.FileOutputStream(new File(tmp, n))) { int k; while ((k = z.read(buf)) > 0) os.write(buf, 0, k); }
+            }
+        }
+        if (!hasDriverLib(tmp)) { deleteDriverTree(tmp); throw new java.io.IOException("no driver library in the package"); }
+        deleteDriverTree(out); if (!tmp.renameTo(out)) throw new java.io.IOException("rename failed: " + out);
+    }
+    static void deleteDriverTree(File f) { File[] fs = f.listFiles(); if (fs != null) for (File c : fs) deleteDriverTree(c); f.delete(); }
     // Copy assets/drivers/<name>/* to <dst>/<name>/ when missing or of another size.
     private void extractBundledDrivers(File dst) {
         try {
@@ -328,6 +413,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     private static void importDrivers(File src, File dst) {
         File[] dirs = src.listFiles(); if (dirs == null) return;
         for (File d : dirs) {
+            if (d.isFile() && d.getName().endsWith(".zip")) {   // a package zip dropped as is: unpack to <dst>/<zip name>/ once
+                String name = d.getName().substring(0, d.getName().length() - 4); File out = new File(dst, name);
+                if (!hasDriverLib(out)) try (java.io.InputStream in = new java.io.FileInputStream(d)) { unzipDriver(in, out); android.util.Log.i("dm", "driver package " + name + ": unpacked from zip"); }
+                catch (java.io.IOException e) { android.util.Log.e("dm", "driver package " + d.getName() + ": " + e); }
+                continue;
+            }
             File[] files = d.isDirectory() ? d.listFiles() : null; if (files == null) continue;
             File out = new File(dst, d.getName()); out.mkdirs();
             for (File f : files) {

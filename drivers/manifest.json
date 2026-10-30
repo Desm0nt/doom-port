@@ -1,0 +1,31 @@
+{
+  "comment": "Vulkan driver packages DOOM Mobile downloads when the phone is online (DmActivity.updateDriversInBackground). Each entry: name = folder under the app's drivers dir and the label in the settings, url = adrenotools package zip (meta.json + driver .so), sha256 = of that zip, auto = Java regex over /sys/class/kgsl/kgsl-3d0/gpu_model (e.g. Adreno750v2) selecting the package by default when the user has not picked a driver. The bundled default is turnip27 (Adreno 6xx/7xx).",
+  "packages": [
+    {
+      "name": "turnip27",
+      "title": "Mesa Turnip v27.0.0-20261029 (Adreno 6xx/7xx)",
+      "url": "https://github.com/The412Banner/Banners-Turnip/releases/download/v27.0.0-20261029/Turnip-v27.0.0-20261029.zip",
+      "sha256": "d413e41d53508cab28698548f77852f37846003727550b09814018e5b9a352b1"
+    },
+    {
+      "name": "turnip27-a710",
+      "title": "Mesa Turnip v27.0.0-20261029, Adreno 710/720/722 (experimental)",
+      "url": "https://github.com/The412Banner/Banners-Turnip/releases/download/v27.0.0-20261029/Turnip-v27.0.0-20261029-710-720-Test.zip",
+      "sha256": "4927023e818b81fe19e451549cf83290dc3545f28b537a9bf1f348b060747615",
+      "auto": "^Adreno7(10|20|22)"
+    },
+    {
+      "name": "turnip27-a8xx",
+      "title": "Mesa Turnip v27.0.0-20261029, Adreno 8xx / Snapdragon 8 Elite (experimental)",
+      "url": "https://github.com/The412Banner/Banners-Turnip/releases/download/v27.0.0-20261029/Turnip-v27.0.0-20261029-A8xx.zip",
+      "sha256": "b1126d1a320624101757c7728179b80590d19d17d38a2eb5d85eb5dfd50df82a",
+      "auto": "^Adreno8[0-9][0-9]"
+    },
+    {
+      "name": "turnip27-8g2",
+      "title": "Mesa Turnip v27.0.0-20261029, Adreno 740 on newer firmware (Samsung One UI); glitches elsewhere",
+      "url": "https://github.com/The412Banner/Banners-Turnip/releases/download/v27.0.0-20261029/Turnip-v27.0.0-20261029-8G2-OneUI.zip",
+      "sha256": "e7a9c8c12ccddd39b0316fae747350964096a6622630f1191bbab02208f356b3"
+    }
+  ]
+}
