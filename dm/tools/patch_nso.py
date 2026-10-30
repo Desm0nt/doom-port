@@ -1475,9 +1475,8 @@ ZLIB_GATES = {'2847991952b3d7abd228624fcd3b0779': [
     (0x20009f0, 0x93, 0xf81e0ff3, 'inflateEnd(strm): str x19, [sp, #-0x20]!'),
     (0x1ffeac0, 0x94, 0xaa0003e8, 'inflateReset(strm) (libpng): mov x8, x0'),
 ]}
-# [DOOM] The zlib gates stay out of the default patch until they have run on a phone; DM_ZLIB_GATES=1 adds them
-# (needed for DM_ZLIB_FAST / DM_ZLIB_STATS).
-if NAME == 'main' and os.environ.get('DM_ZLIB_GATES', '0') != '0':
+# [DOOM] zlib gates (DM_ZLIB_FAST / DM_ZLIB_STATS), in the default patch since the 30.10 phone test; DM_ZLIB_GATES=0 leaves them out.
+if NAME == 'main' and os.environ.get('DM_ZLIB_GATES', '1') != '0':
     for off, num, word, why in ZLIB_GATES.get(BUILD_ID, []):
         ins = dis(word, off)
         assert struct.unpack_from('<I', IMG, off)[0] == word, f'zlib gate original word mismatch {off:#x}'

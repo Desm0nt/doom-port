@@ -75,8 +75,10 @@ static void load_driver(void) {
         drv = path[0] ? path : NULL;
     }
     if (drv && *drv && hooks && *hooks) {
-        // TU_DEBUG is left to the user (dm/env): with Turnip v27 (Mesa main, 29.10) its own GMEM/sysmem choice matched forced
-        // sysmem on Adreno 750 (both ~ the Qualcomm driver); the old Turnip needed TU_DEBUG=sysmem (28.10: 25 vs 11 fps).
+        // Turnip draws our passes straight to memory unless TU_DEBUG is set (dm/env): on Adreno 740 (30.10, heavy TV-room scene)
+        // sysmem gave ~20% less GPU time per draw than GMEM with binning (the scene is geometry-bound, binning shades vertices
+        // twice); on Adreno 750 both modes were equal. TU_DEBUG= (empty) lets Turnip choose.
+        if (!getenv("TU_DEBUG")) setenv("TU_DEBUG", "sysmem", 0);
         LOG("[vk] TU_DEBUG=%s (Turnip reads it when the driver loads)", getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "(unset)");
         const char *slash = strrchr(drv, '/');
         char dir[1024], hookdir[1024];

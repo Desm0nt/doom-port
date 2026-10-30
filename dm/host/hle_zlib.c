@@ -16,7 +16,7 @@
 // msg texts are zlib-ng's; data_type's bit 256 (Z_TREES only) can differ. Return codes, flush values and decoding are zlib's.
 //
 // Switches (read once, at the first gate call; docs/SWITCHES.md section 5):
-//   DM_ZLIB_FAST=1     zlib-ng instead of the game's inflate (default 0: original code, the gates fall through)
+//   DM_ZLIB_FAST=1     zlib-ng instead of the game's inflate (default 1 since 30.10; 0 = original code, the gates fall through)
 //   DM_ZLIB_STATS=1    every 5 s (DM_ZLIB_STATS_SEC) a "[zlib]" line: calls, MB in / out, ms in inflate, busiest threads, by caller.
 //                      With DM_ZLIB_FAST=0 the host calls the original inflate through the gate's bypass and times it.
 //   DM_ZLIB_VERIFY=<n> (implies FAST) the first n streams (1 = 512) are also decoded by the game's own zlib on a shadow stream;
@@ -165,7 +165,7 @@ static void *stats_main(void *a) {
 
 static void cfg_init(void) {
     const char *e;
-    g_fast = (e = getenv("DM_ZLIB_FAST")) && atoi(e) > 0;
+    g_fast = (e = getenv("DM_ZLIB_FAST")) ? atoi(e) > 0 : 1;   // default on since the 30.10 phone test (4x faster, 0 mismatches)
     g_stats = (e = getenv("DM_ZLIB_STATS")) && atoi(e) > 0;
     if ((e = getenv("DM_ZLIB_STATS_SEC")) && atoi(e) > 0) g_stats_sec = (unsigned)atoi(e);
     if ((e = getenv("DM_ZLIB_VERIFY")) && atoi(e) > 0) { g_verify_left_init = atoi(e) == 1 ? 512 : atoi(e); g_fast = 1; }
