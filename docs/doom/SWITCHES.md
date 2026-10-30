@@ -11,11 +11,21 @@ Android-обёрткой (`jni_android.c`, `setenv(..., 0)` — не перек�
   сами и в конце удаляют. **Если хозяин играет сам — проверить, что старого `dm/env` не осталось.**
 - **Маркер-файлы** в `dm/` (`gfx-dump-now`, `gfx-capture-now`, `gfx-pipe-skip`, `gfx-lone-lane`, `gfx-noload`, `gfx-tex-dirty`
   и т. п.) — старый механизм d2r-mobile; маркер имеет приоритет над env того же смысла.
-- **Меню ⚙ в приложении** (`DmActivity.showDoomSettings`, SharedPreferences `doom_graphics` / `doom_controls`): графика
-  применяется со следующего запуска, управление — сразу. Пишет env: `DM_DOOM_DRS`, `DM_DOOM_RES`, `DM_GFX_SHARPEN`,
-  `DM_VK_DRIVER`, `DM_LANG`; плюс чувствительность обзора и компенсацию мёртвой зоны стика для `DoomPadView`.
-- **Игровое меню Settings → Video → «Dynamic Resolution»** — бывший пункт Chromatic Aberration, переназначенный патчем на
-  `rs_enable` (сохраняется в профиле игры). Рекомендуемый способ включать DRS (решение хозяина 28.10: настройка в меню игры).
+- **Меню ⚙ в приложении** (`DmActivity.showDoomSettings`, SharedPreferences `doom_graphics` / `doom_controls`; тексты —
+  `res/values*/doom_settings.xml`, 13 языков по локали системы, английский по умолчанию). У каждого пункта в подписи сказано,
+  когда он действует. **Со следующего запуска** (env до загрузки `libdm.so`): разрешение 3D `DM_DOOM_RES`, резкость
+  `DM_GFX_SHARPEN`, ограничение частоты кадров `DM_PRESENT_MAX_HZ` + `DM_DOOM_TICK_MAX` (30 / 60 / 90 / 120, по умолчанию 60;
+  90/120 — только если у дисплея есть такой режим), широкий экран `DM_DOOM_WIDE` (на лету только с `DM_DOOM_WIDE_LIVE=1`),
+  драйвер `DM_VK_DRIVER`, язык `DM_LANG`, аим-ассист `DM_AA_STRENGTH`, вибрация `DM_RUMBLE`. **Сразу**: чувствительность обзора,
+  компенсация мёртвой зоны, счётчик FPS (`DoomPadView.reloadSettings`) и динамическое разрешение (см. ниже). `dm/env`
+  перекрывает всё, что пишет ⚙.
+- **Динамическое разрешение — одно состояние** (BUGS_AND_FIXES §2.14): cvar игры `rs_enable`, сохраняется в профиле игры.
+  Менять можно в Video-меню игры («Dynamic Resolution», бывший Chromatic Aberration) **или** галочкой ⚙ — она читает текущее
+  значение и пишет его на лету (`hle_doom_drs.c`: `idCVar::SetInteger` между кадрами + запрос сохранения профиля). Дефолт cvar'а
+  пропатчен на 0 (CUTS `0x1c2feb4`), так что на свежей установке DRS выключен без `+set`. Последний выбор игрока хост дублирует в `files/save.drs` и восстанавливает после каждой загрузки профиля (diag45: сохранение профиля игрой не подтвердилось).
+- **Драйвер по умолчанию по GPU** (BUGS_AND_FIXES §2.16): Adreno 6xx/7xx → `turnip27`, 710/720/722 → `turnip27-a710` (если
+  скачан), 8xx → `turnip27-a8xx` (если скачан), ≤5xx и не-Adreno → системный. Фолбэк на системный показывается тостом;
+  crash-guard `files/driver-trying` переключает на системный после двух запусков подряд, умерших до первого кадра.
 - **cvar'ы игры** — через `DM_DOOM_ARGS="+set имя значение ..."` (через пробел, дописываются в конец командной строки
   после умолчаний ниже; итоговая строка видна в логе `命令行 | command line:`).
 
@@ -26,11 +36,11 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | Переключатель | По умолчанию | Что ставит | Когда менять |
 |---|---|---|---|
 | `DM_DOOM_RES=<0.25..1>` | не задан | `rs_forceFractionX/Y` = доля 3D от 1280×720 (UI остаётся 720p). Меню ⚙: 100/85/75/67 % | Ради fps на слабом GPU; 0.75 = 960×540 |
-| `DM_DOOM_DRS=1` | 0 | без него (и без `DM_DOOM_RES`) добавляется `+set rs_enable 0` | Включить собственный DRS DOOM. Хозяину DRS «шакально» — по умолчанию выкл. Лучше включать пунктом Video-меню |
+| `DM_DOOM_DRS=<n>` | не задан | только отладка: `+set rs_enable <n>` при каждом запуске (`0` — принудительно выкл). Без него `+set` не добавляется: дефолт `rs_enable` пропатчен на 0, решают Video-меню / ⚙ (одно состояние в профиле); для старого `main.patched.bin` без CUTS `0x1c2feb4` по-прежнему `+set rs_enable 0` (лог `[drs] rs_enable default`) | DRS включать в Video-меню или галочкой ⚙ |
 | `DM_DOOM_GEOMCULL=1` | 0 | без него `+set r_geometryCulling 0 +set r_smallTriangleCulling 0` | Только для отладки дыр GS-куллинга (см. BUGS) |
 | `DM_DOOM_LINEAR_STICKS=0` | 1 (линейно) | `joy_deadZone 0`, `joy_nxDefaultDeadzone 0`, `joy_nxProDeadzone 0`, `joy_powerScale 1`, `joy_gammaLook 0`, `joy_nxDefaultJoystickCurve 0`, `joy_dampenLook 0`, `joy_deltaPerMSLook 1000`, `joy_edgeAccelerationScalar 0`, `joy_mergedDeadZoneAngle 0`, `joy_smoothingEnabled 0` | `=0` вернёт кривые игры (0.35 мёртвая зона, степень, слью 0.003/мс, ускорение у края) — для физического геймпада, если линейность мешает |
 | `DM_DOOM_ADAPTIVE_TICK=0` | 1 | `com_fixedTic 1`, `com_adaptiveTick 1`, `com_adaptiveTickImmediateMode 1`, `com_adaptiveTickMinHz/MaxHz` | `=0` — исходный фиксированный тик 30 Гц (скорость игры = fps/30). Только для сравнения |
-| `DM_DOOM_TICK_MIN` / `DM_DOOM_TICK_MAX` | 30 / 60 | границы адаптивного тика | MIN=20 — попробовать тики ниже 30 Гц (не проверено) |
+| `DM_DOOM_TICK_MIN` / `DM_DOOM_TICK_MAX` | 30 / 60 | границы адаптивного тика; MAX (APK) = ограничение частоты кадров из ⚙ | MIN=20 — попробовать тики ниже 30 Гц (не проверено) |
 | `DM_AA_STRENGTH=<s>` | 1 | добавляет `+set aa_DESIGN_override 1`; в `hle_hid.c` выключает MP-методы aim assist и держит SP-значения оружия × s | `=0` — слабый MP-ассист игры; >1 — сильнее |
 | `DM_DOOM_WIDE` | **0 (выкл)** | `1` — широкий вывод Hor+: до разбора командной строки (`hle_args.c doom_wide`) таблица `r_mode` в .rodata (`main+0x39f1b10`, было {1280,720},{1920,1080}) → {W,720},{1.5W,1080}; W = 720 × соотношение экрана (`front_game_res(0)`, кратно 16, 1280..2160), только если экран шире 16:9; 2400×1080 → 1600×720. Пул RenderTarget растёт с шириной (см. `DM_DOOM_POOL_MARGIN`: 204 МБ при 1600; без запаса — минимум ⌈117·W/1280⌉+4 = 151). Лог `[wide] r_mode table ...` | `=<ширина>` (≥1280) — явно, напр. `1440`. Выкл по умолчанию после diag30 (белый экран = переполнен пул RenderTarget, BUGS §2.10); включать после проверки на телефоне. +25 % пикселей при 1600 — компенсировать `DM_DOOM_RES` |
 | `DM_DOOM_WIDE_LIVE` | **0 (выкл)** | `1` — галочка «Широкий экран» в шестерёнке переключается на лету (BUGS §2.12): игра всегда рисует W×720 (как `DM_DOOM_WIDE=1`, пул RenderTarget по широкому размеру), «выкл» = презентер показывает центральные 16:9 кадра (`vulkan_present.cpp crop169`; Hor+ → та же картинка, что у 16:9). Java `nativeWideLive` → `dm_doom_wide_live()` + `dm_present_crop169`; лог `[wide] live switch ...`, `dm-vulkan [wide] live: ...`. Без него — «со следующего запуска». Цена: в режиме «выкл» рисуется 1600×720 (+25 % пикселей); игры путь смены размера на лету не имеет (vid_restart — пустая заглушка) | — |
@@ -81,17 +91,20 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_GFX_PASS_PROF="from period count"` | выкл | per-pass GPU timestamp профиль (`NVN GPASS`, с 29.10 поле `end=L<строка>` — кто закрыл проход), разбор `tools/gpass_report.py` (печатает и разбивку по `end=`) | `1` = `300 600 0` |
 | `DM_GFX_RELAXED=<маска>` | 0 | **СЛОМАНО, не включать** (A/B r2_b2: сцена почти чёрная, красные пятна). RelaxedPrecision (fp16) на float-математике FS вне слайса текстурных координат / целых / записей (`xbg_spirv_relaxed.cpp`) | отклонено 29.10: экономии у главного FS всё равно мало (фактически 18 % операций), статистика драйвера не показывает регистрового голода (21–25 регистров, без scratch) |
 | `DM_GFX_PIPE_STATS="from period"` | выкл | статистика драйвера (`VK_KHR_pipeline_executable_properties`) для топ-60 пайплайнов по draw в каждом 60-кадровом окне с present `from` через `period` (`1` = `3000 1800`), работает с warm-up. Строки `NVN PSTAT use` / `NVN PSTAT`; разбор `tools/pstat_report.py` | диагностика (perf4) |
-| `DM_GFX_DRAW_PROFILE="from frames [min_draws] [desc]"` | выкл | один раз за сессию включает живой CPU-профиль с детализацией draw (`NVN DRAW_TIMING`/`CPU_TIMING`) или descriptor (`desc` → `NVN DESC_TIMING`) на первом present ≥ from, где в кадре ≥ min_draws draw; напр. `3000 30 1100` | диагностика per-draw CPU (perf4) |
+| `DM_GFX_DRAW_PROFILE="from frames [min_draws] [desc]"` | выкл | один раз за сессию включает живой CPU-профиль с детализацией draw (`NVN DRAW_TIMING`/`CPU_TIMING`; с perf6 и `section=` / `sub=` — разбивка `draw()` и descriptor-пути) или descriptor (`desc` → `NVN DESC_TIMING`) на первом present ≥ from, где в кадре ≥ min_draws draw; напр. `3000 30 1100` | диагностика per-draw CPU (perf4) |
 | `DM_GFX_ARENA_UNCACHED=1` | 0 | арены per-draw (снимки UBO, потоки вершин/индексов, staging) на типе памяти HOST_VISIBLE\|COHERENT **без** HOST_CACHED, если буфер его допускает; сейчас берётся тип 6 = 0xf (кэшируемый → GPU читает с IO-coherent snoop). Лог `NVN DM_GFX_ARENA_UNCACHED=… buffer memory bits=…` и `NVN arena chunk … flags=` | A/B (perf5): GPU main/pre-pass ms; риск — медленные CPU-чтения арен |
 | `DM_GFX_ZC_CPU=1` | 0 | zero-copy пулы игры (вершины, UBO, SSBO — 1.3 ГБ) с `CPU_READ_RARELY` вместо `READ_OFTEN` → gralloc может дать некэшируемые (write-combined) страницы, которые GPU читает без snoop. Лог `NVN zero-copy memory: allowed=… picked=… flags=…` | A/B (perf5); риск — медленные CPU-чтения пулов игрой и нами (хэши, снимки) |
 | `DM_GFX_ANISO_MAX=<n>` | 0 (как у игры) | потолок анизотропии всех сэмплеров (`1` — выкл); первые 64 сэмплера логируются (`NVN sampler created … aniso=`) | A/B (perf5) |
+| `DM_DIRTY_BLOCKS` | **1** (с 30.10; A/B: descriptor-путь 11.3 → 10.1 мкс/draw, артефактов нет) | трекер грязных страниц (`nvn_dirty.c`) ведёт сводку «новейшее поколение» на блок 64 страницы (256 КБ); `nvn_dirty_since` пропускает чистые блоки, а не читает поколение каждой страницы. Проверка идёт раз в guest-submit на каждую сэмплируемую текстуру (~7 submit/кадр), VT-кэши DOOM 33–89 МБ = 8–22 тыс. страниц | A/B (perf6): `DRAW_TIMING part=image` и `sub=desc_hit_get_image+prepare_read`; риск низкий (точная сводка, CAS-max) |
+| `DM_GFX_NAN_SAT` | **1** (с 30.10; A/B в динамике: main pass ~−24 %, артефактов нет) | при `DM_GFX_NAN_MINMAX=1` (APK) не менять `FClamp(x,0,1)` на `NClamp`: NIR делает из него `fsat` (NaN → 0, как .SAT Maxwell; на ir3 — бесплатный модификатор (sat)), а `NClamp` разворачивается в проверки NaN (fneu+bcsel) + max + min. 59 насыщений в `3ed1dd77`, 17 в `1101f5db`. Лог `NVN DM_GFX_NAN_SAT=1` | A/B (perf6): main pass ms; артефакты — чёрные/белые пиксели в местах NaN |
+| `DM_GFX_WARP_MODE=native\|lone` | **авто** (с 30.10): `lone`, если subgroup ≠ 32 | модули с subgroup-операциями в lone-lane форме (каждая инвокация — свой варп из одной дорожки), чтобы Maxwell-идиома warp-aggregated append (ballot → popcount → atomicAdd лидера → shuffle базы) не теряла дорожки 32+ на 64/128-дорожечных subgroup Adreno; compute оставляет subgroup при включённом `gfx-warp32`. Лог `NVN warp mode: …` и `NVN lone-lane shader=… (subgroup size is not 32)`. В DOOM это 7 модулей: 6 culling-GS (и так lone-lane через `DM_GFX_GSCULL_FIX`) и частицы `cec755c4e27678b5` (раньше lone-lane только из-за списка `gfx-lone-lane` после падения компилятора) | `native` — для A/B; на устройстве владельца изменений нет, защищает чистую установку |
 | `DM_GFX_ALIAS_LOG` | 0 | логи алиасинга storage/копий | отладка |
 | Наследие D2R (APK): `DM_GFX_WB_SKIP 1`, `DM_GFX_PIPE_MEMO 1`, `DM_GFX_NATIVE_BC 1`, `DM_GFX_WARP32 1`, `DM_GFX_LDC_FOLD 1`, `DM_GFX_FORWARD_TEMPS 1`, `DM_GFX_NAN_MINMAX 1`, `DM_GFX_DEFER_EVENTS 2`, `DM_GFX_READ_PREFLIGHT 0`, `DM_GFX_XVIEW_GUARD 1`, `DM_GFX_UPLOAD_PROLOGUE 1`, `DM_GFX_SHADER_REUSE 1`, `DM_GFX_VCACHE 1`, `DM_GFX_TEX_DIRTY 1`, `DM_GFX_ASYNC_POOL_RESET 1`, `DM_3D_SCALE 0.85` | | для DOOM отдельно не исследовались; `DM_GFX_NATIVE_BC=0` падал на лимите 256 МБ; `TEX_DIRTY=0`/`VCACHE=0` нужны только на LDPlayer (houdini). Влияние `DM_3D_SCALE` на DOOM не подтверждено (таргеты 1280×720 честные) | |
 
 ### Отладка Vulkan / драйвер
 | Переключатель | По умолч. | Смысл |
 |---|---|---|
-| `DM_VK_DRIVER=turnip` | системный | драйвер через adrenotools (`vk_driver.c`, трамплины `vk_tramp.S` из `tools/gen_vk_tramp.py`); ⚙ «Драйвер Turnip» |
+| `DM_VK_DRIVER=<пакет>` | по GPU (APK, `defaultDriver()`) | драйвер через adrenotools (`vk_driver.c`, трамплины `vk_tramp.S` из `tools/gen_vk_tramp.py`); ⚙ «Драйвер Vulkan». Итог загрузки — `dm_vk_driver_status()` / JNI `nativeDriverStatus` (`ok` / `no-library` / `load-failed` / `no-gpu`) |
 | `DM_VK_VALIDATION=1` | 0 | слой Khronos validation; нужен APK, собранный `build_apk.ps1 -Validation` |
 | `DM_VK_NULL=1` | — | CLI без окна: команды не рисуются, побочные эффекты применяются (только эмулятор/отладка) |
 
@@ -106,7 +119,8 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_NVN_ACQ_NOW=1` | 0 | старый acquire-fence (до фикса nx2android 1c6177d) | откат |
 | `DM_NVN_COUNT=1` | 0 | счётчики вызовов NVN | диагностика |
 | `DM_PRESENT_INTERVAL` | display | `game` — следовать интервалу игры (2 → 30 fps; точная скорость, но кап 30) | — |
-| `DM_PRESENT_HZ` | 60 (авто) | кап present | — |
+| `DM_PRESENT_HZ` | 60 (авто) | кап present (жёсткая частота; главнее `DM_PRESENT_MAX_HZ`) | — |
+| `DM_PRESENT_MAX_HZ=<L>` | 60 (APK, ⚙ «Ограничение частоты кадров») | авто-режим: наибольшая целая доля частоты экрана не выше L (`nvn_pace_cap_hz`; 120 Гц: 30/60/120, 90 Гц: 45/90). L > 60 — поверхность голосует L (`vulkan_present.cpp`), окно просит режим дисплея с частотой, кратной L. Без него — старое правило «не ниже 60» (на 90/144 Гц игра шла быстрее) | выше 60 не проверено: UI-логика, считающая кадры |
 | `DM_PRESENT_STRETCH` | 0 | `1` — растянуть картинку на весь экран (старое поведение); по умолчанию буфер в пропорциях окна, картинка с полосами там, где её соотношение уже экрана (с `DM_DOOM_WIDE=1` полос нет) | — |
 
 ## 4. HLE, потоки, ввод

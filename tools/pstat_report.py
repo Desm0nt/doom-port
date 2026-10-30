@@ -43,15 +43,17 @@ def main():
     keys = collections.Counter()
     for p in order[:a.top]:
         for name, _, _, kv in stats[p]:
-            if a.stage.lower() in name.lower():
+            if a.stage.lower() in name.lower() or (a.stage.lower().startswith('frag') and name == 'FS'):
                 keys.update(kv.keys())
-    pref = ['Instruction_count_all', 'ALU_instruction_count_32bit', 'ALU_instruction_count_16bit', 'Texture_read_instruction_count',
+    pref = ['Instruction_Count', 'NOPs_Count', 'Registers_used', 'Half-registers_used', 'Max_Waves_Per_Core', 'cat5_instructions',
+            'cat6_instructions', 'COV_Count', 'Const_file_size', 'Loops', 'Estimated_cycles_stalled_on_SY',   # Turnip (ir3)
+            'Instruction_count_all', 'ALU_instruction_count_32bit', 'ALU_instruction_count_16bit', 'Texture_read_instruction_count',
             'Overall_register_footprint_per_shader_instance', 'Half_precision_register_footprint_per_shader_instance', 'Scratch_memory_usage_per_shader_instance']
     cols = [k for k in pref if k in keys] + [k for k, _ in keys.most_common(30) if k not in pref and ('wave' in k.lower() or 'invoc' in k.lower() or 'spill' in k.lower())]
     if not cols: cols = [k for k, _ in keys.most_common(10)]
     print('draws/f  ' + '  '.join(f'{c[:14]:>14}' for c in cols) + '  shaders')
     for p in order[:a.top]:
-        ex = [e for e in stats[p] if a.stage.lower() in e[0].lower()] or stats[p][-1:]
+        ex = [e for e in stats[p] if a.stage.lower() in e[0].lower() or (a.stage.lower().startswith('frag') and e[0] == 'FS')] or stats[p][-1:]
         name, _, sg, kv = ex[0]
         print(f'{draws.get(p, 0):7.1f}  ' + '  '.join(f'{kv.get(c, "-")[:14]:>14}' for c in cols) + f'  sg={sg} {what.get(p, "")[:110]}')
     return 0
