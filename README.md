@@ -6,9 +6,10 @@ You bring the game: this repository contains no game content.
 
 Русский: [ниже](#по-русски).
 
-> **Tested so far only on Adreno 750** (Snapdragon 8 Gen 3, Xiaomi 14 Ultra). Other GPUs and devices are untested. The
-> APK uses the bundled Mesa **Turnip** Vulkan driver by default and falls back to the phone's own driver when Turnip
-> does not load; other driver packages can be picked in the settings (see *Vulkan drivers*).
+> **Tested so far on Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) and Adreno 740 (Snapdragon 8 Gen 2).** Other GPUs
+> are untested. Adreno 6xx/7xx use the bundled Mesa **Turnip** Vulkan driver by default; other Adreno generations get
+> their Turnip package, and non-Adreno GPUs (Mali, PowerVR, Xclipse) use the phone's own driver, with engine fallbacks
+> for features those GPUs lack (see *Vulkan drivers* and *Other GPUs*).
 
 ## Screenshots
 
@@ -37,8 +38,9 @@ The gear at the top of the screen opens the port's own settings, on top of the g
 
 | Setting | Default | What it does |
 |---|---|---|
-| DOOM dynamic resolution | off | lets the game lower the 3D resolution under load (also in the game's Video menu) |
-| Vulkan driver | Turnip v27 (bundled) | the bundled Turnip, the phone's system driver, or any driver package in `Download/DOOM Mobile/drivers` (next launch) |
+| Dynamic resolution | off | lets the game lower the 3D resolution under load; the same switch as **Video → Dynamic Resolution** in the game menu, applies at once and is saved in the game profile |
+| Vulkan driver | by GPU | Adreno 6xx/7xx: bundled Turnip; other Adreno: their Turnip package; others: system driver. Or any package in `Download/DOOM Mobile/drivers` (next launch); a driver that fails falls back to the system one with a message |
+| Frame rate limit | 60 | 30 / 60 / 90 / 120 (only rates your display supports; next launch; above 60 is experimental) |
 | Game language | system | text and voice: system language, Russian or English (next launch) |
 | Aim assist | 1 | strength of the game's aim assist; "Как на Switch" keeps the Switch behaviour (next launch) |
 | Widescreen | on | 1600×720 (screen aspect, wider view) instead of 1280×720 16:9 with side bars (next launch; turn it off on weaker devices) |
@@ -49,7 +51,8 @@ The gear at the top of the screen opens the port's own settings, on top of the g
 | Look sensitivity | 1.0 | swipe look and the look while FIRE is held |
 | Move stick dead-zone compensation | none | offsets the game's own move-stick dead zone |
 
-Graphics settings apply at the next launch, control settings at once. The dialog is in Russian for now.
+Each option says whether it applies at once or on the next launch. The dialog follows the system language: English,
+Russian, Ukrainian, German, French, Spanish, Portuguese, Italian, Polish, Turkish, Simplified Chinese, Japanese, Korean.
 
 ## What it is, and what it is not
 
@@ -180,12 +183,22 @@ Download/DOOM Mobile/drivers/
     libvulkan_freedreno.so
 ```
 
-Restart the game, open the gear dialog, pick it under *Драйвер Vulkan* and restart again. *Системный* selects the
-phone's own driver. Compatible packages: adrenotools / Turnip releases such as
+Restart the game, open the gear dialog, pick it under *Vulkan driver* and restart again. *System* selects the phone's
+own driver. Compatible packages: adrenotools / Turnip releases such as
 [Banners-Turnip](https://github.com/The412Banner/Banners-Turnip/releases) (use the plain Android builds, not the
 `-Linux` / `-Wayland` ones). `TU_DEBUG` (Turnip's debug options, e.g. `sysmem`) can be set in
 `Download/DOOM Mobile/dm/env`. To offer a driver to everyone, add an entry (name, url, sha256, optional `auto` regex)
 to `drivers/manifest.json`.
+
+## Other GPUs (Mali, PowerVR, Xclipse)
+
+Untested on real hardware yet. These phones use their own Vulkan driver; the engine checks the device's features and,
+instead of aborting, falls back where the game's Switch shaders need something the GPU lacks: no geometry shaders
+(the game's culling shaders are skipped), no D24 depth (D32 is used), no format-less storage image writes, no
+`shaderImageGatherExtended`, no GPU timestamps. BC textures are decoded on the CPU when the GPU cannot sample them.
+Experimental third-party drivers exist and can be added as packages (see above): Mesa PanVK for Mali on stock kernels
+(e.g. panvk-kbase-android) and RADV for Xclipse (radv-xclipse); there is none for PowerVR. Expect lower performance
+than on Snapdragon 8 Gen 2/3. Reports (device, GPU, driver, log) are very welcome.
 
 ## Repository layout
 
@@ -241,19 +254,22 @@ NVN воспроизводится через Vulkan. Основа — прое�
 
 - **Игры в репозитории нет.** Нужна своя копия DOOM для Switch (база + обновление v262144) и свои ключи консоли;
   подготовка файлов описана в [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md) (англ.).
-- Проверено пока только на Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra); другие GPU и устройства не проверялись,
-  по умолчанию используется встроенный драйвер Turnip (Mesa), запасной — системный. Производительность (1600×720): 45–60 fps на большей части кампании, в самых
+- Проверено на Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) и Adreno 740 (Snapdragon 8 Gen 2); другие GPU не проверялись.
+  Драйвер выбирается по GPU: Adreno 6xx/7xx — встроенный Turnip (Mesa), другие Adreno — свой пакет Turnip, Mali/PowerVR/Xclipse —
+  системный драйвер с обходами в движке; если драйвер не запустился, игра переходит на системный и сообщает об этом. Производительность (1600×720): 45–60 fps на большей части кампании, в самых
   тяжёлых зонах пока 20–35 fps (сильнее всего при первом заходе, пока догружаются текстуры); оптимизация продолжается.
 - Вывод по умолчанию широкий **1600×720** (Hor+: шире обзор по бокам, без растяжения); классические **1280×720 (16:9)**
   с полосами — галочкой «Широкий экран» в настройках (со следующего запуска, на ~25 % легче для GPU).
 - Экранный геймпад с обзором «как мышью», геймпады, гироскоп, aim assist, вибрация, русский язык (язык игры берётся из
   системы или задаётся в настройках), масштаб 3D-разрешения и резкость RCAS.
-- Шестерёнка вверху экрана открывает настройки порта: динамическое разрешение, драйвер Vulkan (встроенный Turnip, системный или свой пакет), язык игры, сила
+- Шестерёнка вверху экрана открывает настройки порта (на языке системы, 13 языков; у каждой опции указано, «сразу» или «со следующего
+  запуска»): динамическое разрешение (тот же переключатель, что «Видео → Динамическое разрешение» в игре), лимит FPS 30/60/90/120,
+  драйвер Vulkan, язык игры, сила
   помощи в прицеливании, вибрация (по умолчанию выключена), счётчик FPS, разрешение 3D, резкость RCAS,
   чувствительность обзора и компенсация мёртвой зоны стика (см. таблицу «Port settings» выше).
 - Известные ограничения: GPU-куллинг треугольников игры выключен (на нашем пути он терял видимые треугольники),
   динамическое разрешение выключено по умолчанию, поддерживается только обновление v262144, мультиплеер убран, сетевые
-  сервисы отвечают как у консоли без сети, окно настроек пока только на русском.
+  сервисы отвечают как у консоли без сети.
 - Подготовка файлов игры одной командой: `./setup.sh <база> <обновление> <prod.keys> [--push <serial>]`
   (на Windows — `setup.bat`), проверка без изменений — `./setup.sh check`. Нужны Python 3, **.NET 10 SDK** и ~70 ГБ
   свободного места на время распаковки NSZ. Готовый APK — в [Releases](https://github.com/Desm0nt/doom-port/releases).
