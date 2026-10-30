@@ -5,10 +5,12 @@
 //                          the UI stays at full resolution. 0.75 = 960x540 at 16:9.
 //   DM_DOOM_WIDE=1|0|<w>   widescreen Hor+ output W x 720 (default off; 1 = screen aspect; see doom_wide below).
 //   DM_DOOM_WIDE_LIVE=1    always render wide; the gear checkbox switches live (off = presenter 16:9 centre crop; BUGS 2.12).
-//   DM_DOOM_DRS=1          keep DOOM's dynamic resolution (rs_enable) on; default off (+set rs_enable 0).
+//   DM_DOOM_DRS=<n>        debugging: +set rs_enable <n> at every launch. Unset (normal): nothing -- rs_enable's default is patched
+//                          to "0" and the Video menu / gear checkbox (one shared state, saved in the game profile) decide.
 //   DM_DOOM_GEOMCULL=1     keep DOOM's triangle culling (default off: it drops visible triangles on our GPU path).
 //   DM_DOOM_ADAPTIVE_TICK=0  keep the fixed 30 Hz game tic (default: adaptive tick, game time follows real frame time).
-//   DM_DOOM_TICK_MIN / DM_DOOM_TICK_MAX  adaptive tick Hz range (default 30 / 60).
+//   DM_DOOM_TICK_MIN / DM_DOOM_TICK_MAX  adaptive tick Hz range (default 30 / 60; the gear's frame rate limit sets MAX = the limit,
+//                          together with DM_PRESENT_MAX_HZ, so game time keeps real time at the capped present rate).
 //   DM_DOOM_ARGS="..."     extra arguments, space separated, appended verbatim (e.g. "+set rs_showResolutionChanges 1").
 #include "hle.h"
 #include <stdlib.h>
@@ -134,9 +136,23 @@ int dm_doom_wide_live(void) {
     return ok;
 }
 
+void doom_drs_init(void);   // hle_doom_drs.c
+// 1 = the loaded main registers rs_enable with the default "0" (patch_nso.py CUTS 0x1c2feb4: add x2,x2,#0x154 instead of #0xb99).
+static int doom_drs_default_off(void) {
+    enum { REG_ADD = 0x1c2feb4 };
+    const uint8_t *mb = NULL; size_t msz = 0;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mb = g_mod[i].base; msz = g_mod[i].size; }
+    uint32_t w = 0; if (mb && msz > REG_ADD + 4) memcpy(&w, mb + REG_ADD, 4);
+    int off = w == 0x91055042u;
+    LOG("[drs] rs_enable default %s (main+%#x = %#x); %s", off ? "\"0\" (patched)" : w == 0x912e6442u ? "\"4\" (main without the default cut)" : "unknown",
+        REG_ADD, w, off ? "the profile / Video menu / gear decide" : "adding +set rs_enable 0 (remake main.patched.bin with the current patch_nso.py)");
+    return off;
+}
+
 static void build(void) {
     if (g_argc >= 0) return;
     g_argc = 0; add("doom");
+    doom_drs_init();     // live rs_enable bridge for the gear checkbox (hle_doom_drs.c)
     doom_wide();         // r_mode table (DM_DOOM_WIDE)
     doom_pools_args();   // +set nvn_VRAM*HeapSizeMB (DM_DOOM_POOL_MARGIN, and the wide RenderTarget minimum)
     const char *res = getenv("DM_DOOM_RES");
@@ -148,10 +164,16 @@ static void build(void) {
             add("+set"); add("rs_forceFractionY"); add(v);
         }
     }
-    // DOOM's own dynamic resolution (rs_enable) reacts to the GPU time it measures; with correct timestamps it now scales the 3D view
-    // down on this GPU. Off unless DM_DOOM_DRS=1 (a fixed DM_DOOM_RES fraction is the explicit way to trade sharpness for speed).
+    // DOOM's own dynamic resolution (rs_enable) reacts to the GPU time it measures; with correct timestamps it scales the 3D view down
+    // on this GPU. One control, one state: the Video menu item "Dynamic Resolution" (the repurposed Chromatic Aberration entry,
+    // patch_nso.py) saves rs_enable in the game profile, and the gear checkbox reads / writes the same cvar live (hle_doom_drs.c).
+    // The profile is loaded after the command line and sets the saved value with force (profile binder main+0x1107cc0), so a +set here
+    // would only matter until then; a fresh install has no saved value, so rs_enable's registered default decides -- patched from "4"
+    // to "0" (CUTS 0x1c2feb4). No +set is added when that cut is in the loaded main; an older main.patched.bin without it still gets
+    // +set rs_enable 0 so DRS never turns itself on. DM_DOOM_DRS=<n> (dm/env, debugging) forces +set rs_enable <n> at every launch.
     const char *drs = getenv("DM_DOOM_DRS");
-    if (!(drs && atoi(drs)) && !(res && *res)) { add("+set"); add("rs_enable"); add("0"); }
+    if (drs && *drs) { add("+set"); add("rs_enable"); add(atoi(drs) ? drs : "0"); LOG("[drs] DM_DOOM_DRS=%s: +set rs_enable %s at every launch", drs, atoi(drs) ? drs : "0"); }
+    else if (!doom_drs_default_off()) { add("+set"); add("rs_enable"); add("0"); }
     // Linear sticks for the on-screen controls (DM_DOOM_LINEAR_STICKS=0 keeps the game's response): DOOM defaults to a 0.35 dead
     // zone (joy_deadZone, joy_nxDefaultDeadzone), a power curve, a look slew limit (joy_dampenLook with joy_deltaPerMSLook 0.003 per ms,
     // ~330 ms to full tilt), edge acceleration (+40% past 0.9) and stick smoothing. With these off the right stick's tilt is the turn

@@ -80,6 +80,11 @@ CUTS = {
         (0x10e0fcc, '632844f9', '63d841f9', '... ldr x3,[x3,#0x850] -> [x3,#0x3b0]'),
         (0x35d6d52, '237374725f6d656e755f73797374656d5f6669656c645f6368726f6d617469635f61626572726174696f6e5f6c6162656c00', '44796e616d6963205265736f6c7574696f6e0000000000000000000000000000000000000000000000000000000000000000', 'Video menu label: Dynamic Resolution'),
         (0x39cd272, '237374725f6d656e755f73797374656d5f6669656c645f6368726f6d617469635f61626572726174696f6e5f68656c7000', '4c6f77657220746865203344207265736f6c7574696f6e207768656e207468652047505520697320627573790000000000', 'Video menu help'),
+        # rs_enable's registered default "4" -> "0" (dynamic resolution off unless the player's profile says otherwise): the static
+        # initializer at 0x1c2fea0 passes the default string as x2 = adrp #0x3980000 + 0xb99 ("4"); point it at 0x3980154, the "0\0"
+        # tail of "p0\0" in the same page. Nothing else writes rs_enable (only readers 0x1c26ec4 / 0x1c27898 test it), so a fresh
+        # install / a profile without the key runs with DRS off and no command-line +set is needed (hle_args.c checks this word).
+        (0x1c2feb4, '42642e91', '42500591', 'rs_enable default "4" -> "0": add x2,x2,#0xb99 -> #0x154 (tail "0" of "p0")'),
         (0x1080118, '08080034', '1f2003d5', 'idMenuManager_Shell::State_Transition_Initial_Screen: skip the TOS screen shown as the autosave notice (profile+0x38 is in-memory only) -> straight to the main menu'),
         (0x1080110, '28060034', '1f2003d5', 'idMenuManager_Shell::State_Transition_Initial_Screen: profile acceptedEULA (+0x470d) cbz -> nop: the legal screen counts as accepted (offline port, it was shown on every boot)'),
         (0x1ed4e6c, '400600b4', '1f2003d5', 'idCommonLocal::Frame event loop: GetLocalUserByInputDevice(ev.inputDevice) == NULL drops the event when a user is signed in on another device -> nop (single local player, every device is theirs)'),

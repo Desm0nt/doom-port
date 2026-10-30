@@ -534,6 +534,7 @@ static void doom_profile_state_obs(const uint64_t *r) {
     uint64_t lr = obs_guest_lr(r); module_t *m = module_of((void *)lr); const int32_t *p = (const int32_t *)r[0];
     LOG("[input] profile %p SetState %d -> %d (requested %d) from %s+%#llx", (void *)p, p[2], (int)r[1], p[3], m ? m->name : "?", m ? (unsigned long long)((const uint8_t *)lr - m->base) : 0ull);
 }
+void doom_drs_obs_chain(int id, void (*fn)(const uint64_t *));   // hle_doom_drs.c
 static void doom_input_obs_init(void) {
     static int done; if (done) return; done = 1;
     const char *v = getenv("DM_INPUT_OBS"); if (!v || !atoi(v)) return;
@@ -543,11 +544,11 @@ static void doom_input_obs_init(void) {
     if (gate_obs_present(OBS_DOOM_QUEUE_EVENT)) gate_obs_set(OBS_DOOM_QUEUE_EVENT, doom_queue_ev_obs);
     if (gate_obs_present(OBS_DOOM_WAIT_SWAPS)) gate_obs_set(OBS_DOOM_WAIT_SWAPS, doom_wait_swaps_obs);
     if (gate_obs_present(OBS_DOOM_READ_SYSEV)) gate_obs_set(OBS_DOOM_READ_SYSEV, doom_read_sysev_obs);
-    if (gate_obs_present(OBS_DOOM_FRAME)) gate_obs_set(OBS_DOOM_FRAME, doom_frame_obs);
+    doom_drs_obs_chain(OBS_DOOM_FRAME, doom_frame_obs);   // gates 30 / 34 belong to hle_doom_drs.c (DRS bridge), which calls these after its own
     if (gate_obs_present(OBS_DOOM_CLEAR_EVENTS)) gate_obs_set(OBS_DOOM_CLEAR_EVENTS, doom_clear_events_obs);
     if (gate_obs_present(OBS_DOOM_ADD_DIALOG)) gate_obs_set(OBS_DOOM_ADD_DIALOG, doom_add_dialog_obs);
     if (gate_obs_present(OBS_DOOM_ADD_DIALOG_IF)) gate_obs_set(OBS_DOOM_ADD_DIALOG_IF, doom_add_dialog_if_obs);
-    if (gate_obs_present(OBS_DOOM_PROFILE_STATE)) gate_obs_set(OBS_DOOM_PROFILE_STATE, doom_profile_state_obs);
+    doom_drs_obs_chain(OBS_DOOM_PROFILE_STATE, doom_profile_state_obs);
     if (gate_obs_present(OBS_DOOM_USER_BY_DEV)) gate_obs_set(OBS_DOOM_USER_BY_DEV, doom_user_by_dev_obs);
 }
 #endif

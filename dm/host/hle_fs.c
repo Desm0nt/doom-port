@@ -682,6 +682,11 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     fslog_init();
     if (g_fslog && fd < 4096) { pthread_mutex_lock(&g_fslog_lock); free(g_fdpath[fd]); g_fdpath[fd] = strdup(path); pthread_mutex_unlock(&g_fslog_lock); }
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
+#ifdef DM_GAME_DOOM
+    // [DOOM] every save-storage file opened for writing (e.g. savedir:/PROFILE/save.dat when the profile is saved, BUGS_AND_FIXES 2.14);
+    // the commit that follows logs "存档提交 #n"
+    else if (g_fsave[fd] && (mode & (MODE_WRITE | MODE_APPEND))) LOG("[save] open for writing %s (mode %d, size %lld)", path, mode, (long long)st.st_size);
+#endif
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) {
