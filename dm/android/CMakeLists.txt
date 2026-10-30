@@ -153,6 +153,22 @@ target_compile_options(dmcore PUBLIC $<$<COMPILE_LANGUAGE:C>:${DM_CFLAGS} -std=g
 set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
 set(BUILD_SHARED_LIBS OFF)
 add_subdirectory(${DM_PATH_ROOT}/third_party/libadrenotools ${CMAKE_CURRENT_BINARY_DIR}/adrenotools)
+if(DM_GAME_DOOM)
+  # [DOOM] zlib-ng 2.3.3 (zlib license, third_party/zlib-ng, docs/THIRD_PARTY.md): NEON inflate for the game's zlib 1.2.3
+  # (host/hle_zlib.c, DM_ZLIB_FAST). Native zng_* API (ZLIB_COMPAT OFF), so nothing clashes with the system libz; static,
+  # built with the toolchain's Release flags (-O3), not dmcore's -O1. Only the library target is built (EXCLUDE_FROM_ALL).
+  set(ZLIB_COMPAT OFF CACHE BOOL "" FORCE)
+  set(ZLIB_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+  set(ZLIBNG_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(WITH_GTEST OFF CACHE BOOL "" FORCE)
+  set(WITH_GZFILEOP OFF CACHE BOOL "" FORCE)
+  set(WITH_NATIVE_INSTRUCTIONS OFF CACHE BOOL "" FORCE)
+  set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+  add_subdirectory(${DM}/third_party/zlib-ng ${CMAKE_CURRENT_BINARY_DIR}/zlib-ng EXCLUDE_FROM_ALL)
+  set_target_properties(zlib-ng PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(dmcore PRIVATE zlib-ng)
+endif()
 set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
 target_compile_definitions(dmcore PRIVATE DM_ADRENOTOOLS=1)
 target_link_libraries(dmcore PUBLIC dm_vulkan_engine adrenotools aaudio android log m dl)

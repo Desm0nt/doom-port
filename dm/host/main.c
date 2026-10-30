@@ -175,6 +175,8 @@ static void host_preload(int argc, char **argv) {
 #ifndef DM_GAME_DOOM   // [DOOM] TACT/CASC (hle_tact.c) is D2R-only
     tact_chk_init();                // DM_TACTCHK 逐块记录（到选角停记） | DM_TACTCHK per-block log (logging stops at character select)
     tact_prefetch_start(argv[1]);   // 启动块后台预解码（缺省开：产物目录 bootlist.tsv；DM_TACT_PREFETCH=0 关） | Background pre-decode of boot blocks (on by default: bootlist.tsv in the build output directory; DM_TACT_PREFETCH=0 turns it off)
+#else
+    { void dm_zlib_init(void); dm_zlib_init(); }   // [DOOM] DM_ZLIB_FAST / _STATS / _VERIFY: the game's inflate gates (hle_zlib.c)
 #endif
     uint64_t tc = now_ns();
     stubs_report();

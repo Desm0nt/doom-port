@@ -33,8 +33,8 @@ void uimsg_subscribe(void (*fn)(const char *cat, const char *act, const char *ar
 int dm_loadscreen_up(void) { return 0; }
 void dm_hold_for_loadscreen(void) {}
 
-// ---- hle_tact.c: host calls 0x80+ (cuts); Doom's main/sdk *.cuts.tsv are empty ----
-uint64_t svc_host_call(int num, uint64_t *regs) { (void)num; (void)regs; return 0; }
+// ---- hle_tact.c: host calls 0x80+ (cuts). Doom has only the zlib entry gates 0x90..0x94 (hle_zlib.c, hle.h registry) ----
+uint64_t svc_host_call(int num, uint64_t *regs) { int dm_zlib_host_call(int, uint64_t *); return (uint64_t)dm_zlib_host_call(num, regs); }
 
 // ---- hle_private_aim.c / dm_padmode.c / dm_runeword.c / dm_textinput.c / dm_update.c pumps and filters ----
 void dm_aim_cone_pump(void) {}

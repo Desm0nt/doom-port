@@ -1457,6 +1457,48 @@ if RULE_RUN and PRIVATE_GATES:
     cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
                  'merc slots (client): hireling can-equip check, between "mov w1,#0x25" and the type test -> host swaps w1 to the item\'s own type for ring/amulet/boots/gloves/belt (rift best >= 10); x8 stays 0, original insn runs ->0x3beb5c; svc8e', '仅宿主'))
 
+# [DOOM] zlib 1.2.3 entry gates (host only; host/hle_zlib.c, hle.h SVC_HOST_ZLIB_*). The game's statically linked zlib 1.2.3
+# (raw deflate resource containers, BGL streaming, libpng) is reached only through direct bl / b to these five entries (no
+# relocation, adrp+add or blr takes their address; the other inflate* exports of zlib 1.2.3 are not in this build), so taking
+# over the entries covers every caller. Each entry branches to a block:
+#     stp x0, x8, [sp, #-16]! ; mov x8, xzr ; stp x29, x30, [sp, #-16]! ; <gate> ; ret_pt: ldp x29, x30, [sp], #16
+#     cbz x8, orig ; add sp, sp, #16 ; ret                          <- host did the call: x0 = its result (regs[8] = 1)
+#     orig: ldp x0, x8, [sp], #16 ; <original first word> ; b entry+4  <- original zlib (regs[8] = 0, x0 / x8 restored)
+# x8 is cleared before the gate, so a host that does not know the number (old libdm.so: unknown svc returns 0) runs the original
+# code. ret_pt + 20 (the original word + b entry+4) is the bypass the host calls to run the original function itself
+# (DM_ZLIB_STATS timing with DM_ZLIB_FAST=0, DM_ZLIB_VERIFY's reference decoder). The original first words are plain stack /
+# register moves (position independent, no x18). By default (no DM_ZLIB_* set) the host always answers x8 = 0.
+ZLIB_GATES = {'2847991952b3d7abd228624fcd3b0779': [
+    (0x1ffeb30, 0x90, 0xa9be4ff4, 'inflateInit2_(strm, windowBits, version, stream_size): stp x20, x19, [sp, #-0x20]!'),
+    (0x1ffecb0, 0x91, 0xa9be4ff4, 'inflateInit_(strm, version, stream_size) (libpng): stp x20, x19, [sp, #-0x20]!'),
+    (0x1ffede0, 0x92, 0xd102c3ff, 'inflate(strm, flush): sub sp, sp, #0xb0'),
+    (0x20009f0, 0x93, 0xf81e0ff3, 'inflateEnd(strm): str x19, [sp, #-0x20]!'),
+    (0x1ffeac0, 0x94, 0xaa0003e8, 'inflateReset(strm) (libpng): mov x8, x0'),
+]}
+# [DOOM] The zlib gates stay out of the default patch until they have run on a phone; DM_ZLIB_GATES=1 adds them
+# (needed for DM_ZLIB_FAST / DM_ZLIB_STATS).
+if NAME == 'main' and os.environ.get('DM_ZLIB_GATES', '0') != '0':
+    for off, num, word, why in ZLIB_GATES.get(BUILD_ID, []):
+        ins = dis(word, off)
+        assert struct.unpack_from('<I', IMG, off)[0] == word, f'zlib gate original word mismatch {off:#x}'
+        assert off in set(starts) and off < TEXT_END and off not in kinds and not any(seg[0].address <= off < seg[-1].address + 4 for seg in windows), f'zlib gate {off:#x}'
+        assert ins.mnemonic not in ('adr', 'adrp', 'b', 'bl', 'br', 'blr', 'ret', 'cbz', 'cbnz', 'tbz', 'tbnz') and not ins.mnemonic.startswith('b.') \
+            and not (ins.mnemonic.startswith('ldr') and '[' not in ins.op_str) and not has18(ins), f'zlib gate word not movable {off:#x}'
+        start = here()
+        emit(STP_PRE(0, 8, 31, -16))
+        emit(0xAA1F03E8)                                  # mov x8, xzr
+        emit(STP_PRE(29, 30, 31, -16))
+        emit_gate_call(); emit(BLR(30))
+        ret = here(); emit(LDP_POST(29, 30, 31, 16))
+        emit(0xB4000068)                                  # cbz x8, ret+16
+        emit(ADDI(31, 31, 16)); emit(0xD65F03C0)          # add sp, sp, #16 ; ret
+        emit(LDP_POST(0, 8, 31, 16)); emit(word); emit(B(here(), off + 4))   # ret+16; bypass = ret+20
+        assert struct.unpack_from('<I', patch, ret + 20 - PATCH_OFF)[0] == word
+        gates.append((ret, 'svc', num, off))
+        put_branch(off, start); stat('zlib_gate')
+        cuts.append((off, struct.pack('<I', word).hex(), struct.pack('<I', B(off, start)).hex(),
+                     f'zlib entry gate svc{num:#x} (hle_zlib.c): {why}; x8!=0 -> host result, else original ->{off + 4:#x}', '仅宿主'))
+
 # ---- 参数位（仅宿主）：{NSO 构建号: [(偏移 A, 原字 A, 偏移 B, 原字 B, 寄存器, 键, 理由)]}。
 # 原处两条造常数指令改成第一条跳补丁区参数跳板、第二条 nop；跳板间接取键页值后跳回第一条之后（A+4）：A、B 不相邻时中间的原指令照常执行
 # （曾跳回 B+4，运行模式通知处理 0xe10d5c/0xe10d60 越过 adrp x19.. 与另一跳板，切掌机即崩；structck ⑩ 核跳板出口）。
