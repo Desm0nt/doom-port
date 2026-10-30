@@ -3,6 +3,7 @@
 #include <vulkan/vulkan_android.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <errno.h>
 #include "../../nvn/nvn_copy_pitch.h"
@@ -52,6 +53,23 @@ __attribute__((weak)) void nvn_dirty_slot_stats(int *live,int *used_slots,uint64
 __attribute__((weak)) int nvn_texel_sync_on(void);
 __attribute__((weak)) void nvn_texel_lock(void);
 __attribute__((weak)) void nvn_texel_unlock(void);
+// [DOOM] DM_TEX_DISCARD (xbg_tex_discard.inc): released-page states of the tracker, and the second queue from vulkan_present.cpp.
+__attribute__((weak)) int nvn_dirty_gone_begin(const void *lo,size_t len,uint64_t stamp);
+__attribute__((weak)) void nvn_dirty_gone_abort(const void *lo,size_t len);
+__attribute__((weak)) void nvn_dirty_gone_commit(const void *lo,size_t len);
+__attribute__((weak)) size_t nvn_dirty_restore_begin(const void *lo,size_t len);
+__attribute__((weak)) void nvn_dirty_restore_commit(const void *lo,size_t len);
+__attribute__((weak)) int nvn_dirty_any_gone(const void *addr,size_t len);
+__attribute__((weak)) int nvn_dirty_page_state(const void *addr);
+__attribute__((weak)) void nvn_dirty_gone_ask(const void *addr);
+__attribute__((weak)) uintptr_t nvn_dirty_gone_take(void);
+__attribute__((weak)) uint32_t nvn_dirty_gone_req_seq(void);
+__attribute__((weak)) void nvn_dirty_gone_idle(uint32_t seen,int ms);
+__attribute__((weak)) void nvn_dirty_gone_kick(void);
+__attribute__((weak)) void nvn_dirty_gone_set_worker(void);
+__attribute__((weak)) void nvn_dirty_gone_stats(uint64_t *read_faults,uint64_t *write_faults,uint64_t *host_writes,uint64_t *slow_waits,int *gave_up);
+__attribute__((weak)) extern VkQueue dm_vk_aux_queue;
+__attribute__((weak)) extern uint32_t dm_vk_aux_family;
 // 3D 画面加亮的曝光 k（宿主 dm/host/dm_bright.c）；弱：不链宿主的图形单测不加亮
 // Exposure k of the 3D picture brightening (the host's dm/host/dm_bright.c); weak: graphics unit tests without the host do not brighten
 __attribute__((weak)) float dm_bright_k(void);
@@ -1303,6 +1321,10 @@ bool lookup(uint64_t address,size_t bytes,Buffer &out){
 // GPU writes still land through the pending-writeback path. Pages the replay writes on the CPU while earlier recorded draws may
 // still read them (UpdateUniformBuffer, CPU buffer copies and clears) become "sticky" and keep the snapshot path.
 // DOOM: on by default, DM_GFX_ZEROCOPY=0 turns it off; it needs dma-buf mappings coherent with the GPU (work/zc_test).
+// [DOOM] DM_TEX_DISCARD=1 keeps pools >= DM_TEX_DISCARD_ZC_MIN_MB (512: the TextureBuffer pool) on plain guest heap memory:
+// dma-buf pages are allocated up front, cannot be swapped and are not freed by MADV_DONTNEED, so discarding texture copies
+// there would release nothing (xbg_tex_discard.inc).
+namespace texdiscard{bool on();size_t zc_min_bytes();}
 namespace zc {
 constexpr size_t CHUNK=64u<<20;
 struct Chunk{uintptr_t lo=0;size_t n=0;VkBuffer buffer{};VkDeviceMemory memory{};AHardwareBuffer *ahb=nullptr;std::vector<uint8_t> sticky;};
@@ -1364,6 +1386,11 @@ bool map_chunk(uint8_t *lo,size_t n){
 // a whole guest pool, called synchronously from nvnMemoryPoolInitialize (before the game uses it as GPU memory)
 void map_pool(void *p,size_t n){
     if(!on() || !p || (uintptr_t(p)&4095) || n<(1u<<20) || (n&4095))return;
+    if(texdiscard::on() && n>=texdiscard::zc_min_bytes()){xbg_logf("NVN zero-copy: pool %p+%#zx (%.1f MB) left on guest heap memory for DM_TEX_DISCARD (>= DM_TEX_DISCARD_ZC_MIN_MB)",p,n,n/1048576.0);return;}
+    // [DOOM] DM_GFX_ZC_MAX_MB=<n> (default 0 = no limit): pools larger than n MB stay on guest heap memory (lazy, swappable) instead
+    // of dma-buf pages that are all resident and unswappable from the start; A/B of the memory effect without DM_TEX_DISCARD.
+    {static long max_mb=-1;if(max_mb<0){const char *e=getenv("DM_GFX_ZC_MAX_MB");max_mb=e?std::max(0L,atol(e)):0;if(max_mb)xbg_logf("NVN zero-copy DM_GFX_ZC_MAX_MB=%ld",max_mb);}
+     if(max_mb && n>size_t(max_mb)<<20){xbg_logf("NVN zero-copy: pool %p+%#zx (%.1f MB) left on guest heap memory (DM_GFX_ZC_MAX_MB)",p,n,n/1048576.0);return;}}
     std::lock_guard<std::mutex> l(mu);
     for(size_t at=0;at<n;at+=CHUNK)if(!map_chunk(static_cast<uint8_t*>(p)+at,std::min(CHUNK,n-at)))break;
     static unsigned told=0;if(told++<16)xbg_logf("NVN zero-copy pool %p+%#zx mapped (total %.1f MB in %d chunks)",p,n,mapped_bytes/1048576.0,count.load());
@@ -1489,6 +1516,7 @@ void capability_report(){
         if(++n%10==0){xbg_logf("NVN caps formats%s",line.c_str());line.clear();}}
     if(!line.empty())xbg_logf("NVN caps formats%s",line.c_str());
 }
+struct Image;namespace texdiscard{void undo(Image &im);}   // [DOOM] DM_TEX_DISCARD: give the guest copy back before the image changes
 struct Image {
     tex_t source{}; uint64_t provenance_epoch=0,provenance_writer=0;unsigned provenance_write_site=0; VkImage image{};VkDeviceMemory memory{};VkFormat fmt{};VkImageLayout layout=VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageAspectFlags aspects{};VkImageUsageFlags usage{};uint32_t width{},height{},depth=1,levels{},layers{},bpp{};VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;bool uploaded=false,gpu_written=false,decoded=false,mutable_format=false;VkImageCreateInfo create{}; // create: as created (no pNext), for upgrade_mutable
@@ -1500,9 +1528,13 @@ struct Image {
     // (gfx-upload-prologue decides by it whether an upload may go ahead of the submission).
     uint64_t slot_use=0;
     uint64_t dirty_stamp=0,dirty_seen=0;   // tex_dirty: the tracker stamp of the checked content (0: not tracked yet) and the tracker generation last checked
+    // [DOOM] DM_TEX_CLASS / DM_TEX_DISCARD (xbg_tex_discard.inc): CPU upload history (steady clock ns; full and partial uploads)
+    // and the discard record of the guest copy (0 = none) with the number of restores / undos (no more discards after 3).
+    uint64_t up_first_ns=0,up_last_ns=0;uint32_t up_full=0,up_partial=0;uint64_t discard_id=0;uint8_t discard_undos=0;
     std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // fb_keys: persistent framebuffers using these views
-    ~Image(){image_bytes_live-=mem_bytes;bc_image_bytes_live-=bc_bytes;bc_data_bytes_live-=bc_data;forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
+    ~Image(){if(discard_id)texdiscard::undo(*this);image_bytes_live-=mem_bytes;bc_image_bytes_live-=bc_bytes;bc_data_bytes_live-=bc_data;forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
     void transition(VkCommandBuffer cmd,VkImageLayout next){
+        if(discard_id && next!=VK_IMAGE_LAYOUT_GENERAL)texdiscard::undo(*this);   // the restore worker reads it in GENERAL on another queue
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.oldLayout=layout;b.newLayout=next;b.image=image;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
         b.subresourceRange={aspects,0,levels,0,layers};b.srcAccessMask=layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
         vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);layout=next;
@@ -1627,7 +1659,8 @@ void provenance_image(const char *event,const tex_t *t,const Image &im,const vie
     provenance_log("IMAGE event=%s requested=%llu source=%llu image=%p mem=%p pool=%p off=%lld bytes=%llu createEpoch=%llu currentEpoch=%llu writer=%llu writeSite=%u writerPhase=declared-or-complete-range-unspecified uploaded=%u gpu=%u fmt=%d target=%d extent=%dx%dx%d levels=%d samples=%d flags=%x stride=%d pkg=%d viewFmt=%d mip=%d/%d layer=%d/%d",
     event,(unsigned long long)t->serial,(unsigned long long)im.source.serial,(void*)im.image,t->mem,(void*)(t->mem && t->off>=0 && uint64_t(t->off)<=uint64_t(t->mem)?uint64_t(t->mem)-uint64_t(t->off):0),(long long)t->off,(unsigned long long)t->L.size,(unsigned long long)im.provenance_epoch,(unsigned long long)provenance.epoch((t->mem && t->off>=0 && uint64_t(t->off)<=uint64_t(t->mem)?uint64_t(t->mem)-uint64_t(t->off):0)),(unsigned long long)im.provenance_writer,im.provenance_write_site,im.uploaded,im.gpu_written,t->d.format,t->d.target,t->d.width,t->d.height,t->d.depth,t->d.levels,t->d.samples,t->d.flags,t->d.stride,t->d.pkg_block_h,v&&v->set_format?v->format:t->d.format,v&&v->set_levels?v->base_level:0,v&&v->set_levels?v->nlevels:int(im.levels),v&&v->set_layers?v->min_layer:0,v&&v->set_layers?v->nlayers:int(im.layers));
 }
-void provenance_write(Image &im,unsigned site){im.provenance_writer=++provenance.sequence;im.provenance_write_site=site;provenance_image("WRITE",&im.source,im);}
+void provenance_write(Image &im,unsigned site){if(im.discard_id)texdiscard::undo(im);   // [DOOM] DM_TEX_DISCARD: a GPU write (or new upload) is coming: guest copy back first
+    im.provenance_writer=++provenance.sequence;im.provenance_write_site=site;provenance_image("WRITE",&im.source,im);}
 
 // Invoked only after a completed game draw/clear fence. Read the real Vulkan
 // subresources and restore their original layout before guest execution resumes.
@@ -1994,6 +2027,7 @@ struct ImgFront{uint64_t serial=0,epoch=0;Image *im=nullptr;};ImgFront img_front
 // The Image currently registered for a serial, or null (the same front as get_image).
 Image *find_image(uint64_t serial){ImgFront &f=img_front[(serial*0x9E3779B97F4A7C15ull)>>54];if(f.epoch==images_epoch && f.serial==serial)return f.im;
     auto it=images.find(serial);if(it==images.end())return nullptr;f.serial=serial;f.epoch=images_epoch;f.im=it->second.get();return f.im;}
+#include "xbg_tex_discard.inc"   // [DOOM] DM_TEX_CLASS (live texture classes) / DM_TEX_DISCARD (release static guest copies)
 Image &get_image_slow(const tex_t *t,bool upload);
 Image &get_image_read(const tex_t *t,bool upload);
 // The common case, about 10k times a D2R camp frame: the image is in the front cache, and either nothing is uploaded or it was
@@ -2055,7 +2089,7 @@ bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
         if(upload_prologue && partial_prologue_on() && im.slot_use!=slot_serial && !ab_off("partpro")){Slot &s=recording_slot();
             s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++partial_prologue;}
         else{Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,uint32_t(copies.size()),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
-        partial_bytes+=linear.size();++partial_uploads;
+        partial_bytes+=linear.size();++partial_uploads;texdiscard::note_upload(im,true);
         if(vt_diag_on()){auto &e=vtdiag::partial[t->serial];++e.first;e.second+=copies.size();}
         {static unsigned n=0;if(n++<5 || (n&255)==0)xbg_logf("NVN partial texture upload serial=%llu fmt=%#x %ux%ux%u target=%d blocks=%zu bytes=%zu (total uploads %llu)",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.depth,t->d.target,copies.size(),linear.size(),(unsigned long long)partial_uploads);}
     }
@@ -2180,7 +2214,7 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
             s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++uploads_prologue;}
         else{++uploads_inpass;if(open_pass.cmd)++uploads_broke_pass;
             Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
-        im.uploaded=true;provenance_write(im,__LINE__);hash_site=3;im.cpu_hash=hash_memory(t->mem,t->L.size);hash_site=0;im.checked_submission=stats.submissions;
+        im.uploaded=true;provenance_write(im,__LINE__);texdiscard::note_upload(im,false);hash_site=3;im.cpu_hash=hash_memory(t->mem,t->L.size);hash_site=0;im.checked_submission=stats.submissions;
         if(partial_eligible(im,t) && !ab_off("texdirty")){nvn_dirty_protect(t->mem,t->L.size);im.dirty_stamp=im.dirty_seen=nvn_dirty_now();im.stable_checks=4;}
         if(reupload)++hud::reuploads;else ++hud::uploads;hud::upload_bytes+=linear.size();hud::upload_ns+=timing_clock()-up_t0;upl_full_ns+=timing_clock()-up_t0;upl_full_bytes+=linear.size();++upl_full_n;
     }
@@ -3141,6 +3175,7 @@ std::unordered_map<ImgKey,ImgEntry,ImgKeyHash> img_cache;bool img_cache_enabled=
 // compute shader. A later view format outside the list upgrades the image again with the longer list.
 VkFormat format_twin(VkFormat f){switch(f){case VK_FORMAT_R32_UINT:return VK_FORMAT_R32_SINT;case VK_FORMAT_R32_SINT:return VK_FORMAT_R32_UINT;case VK_FORMAT_R8G8B8A8_UNORM:return VK_FORMAT_R8G8B8A8_SRGB;case VK_FORMAT_R8G8B8A8_SRGB:return VK_FORMAT_R8G8B8A8_UNORM;case VK_FORMAT_B8G8R8A8_UNORM:return VK_FORMAT_B8G8R8A8_SRGB;case VK_FORMAT_B8G8R8A8_SRGB:return VK_FORMAT_B8G8R8A8_UNORM;default:return VK_FORMAT_UNDEFINED;}}
 void upgrade_mutable(Image &im,VkFormat want){
+    if(im.discard_id)texdiscard::undo(im);   // [DOOM] DM_TEX_DISCARD: the VkImage is about to be replaced
     VkImageCreateInfo ci=im.create;ci.flags|=VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;ci.pNext=nullptr;
     const bool listed=&dm_vk_format_list && dm_vk_format_list && want!=VK_FORMAT_UNDEFINED && !getenv("DM_GFX_NO_FORMAT_LIST");
     if(listed){auto add=[&](VkFormat f){if(f!=VK_FORMAT_UNDEFINED && std::find(im.view_formats.begin(),im.view_formats.end(),f)==im.view_formats.end())im.view_formats.push_back(f);};
@@ -5159,7 +5194,7 @@ extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_m
     ++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
 static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();cpu_visible_flush();debug_dump_frame(texture);{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     const VkImage shown=taafix::lower_left()?taafix::flip(c.command,im):im.image;   // DM_GFX_TAA_FIX 2: the lower-left window is stored bottom-up
-    c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,shown,im.fmt,im.width,im.height,window->crop,window->interval);}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;zcubo::frame();if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
+    c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,shown,im.fmt,im.width,im.height,window->crop,window->interval);}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;zcubo::frame();texdiscard::tick();if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
 extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t image){{static std::map<uint64_t,unsigned> rs;if(alias_log>0 && t && rs[t->serial]++<3)xbg_logf("NVN ReadTexels serial=%llu fmt=%#x",(unsigned long long)t->serial,t->d.format);}gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();need(t&&r&&dst,"Invalid ReadTexels arguments");auto found=images.find(t->serial);if(found==images.end() || !found->second->gpu_written){int bw,bh,bpp=nvn_fmt_bpb(t->d.format,&bw,&bh);need(bpp && r->xoffset==0 && r->yoffset==0 && r->zoffset==0 && r->depth==1 && uint32_t(r->width)==std::max(1u,t->d.width>>level) && uint32_t(r->height)==std::max(1u,t->d.height>>level),"CPU ReadTexels partial region unsupported");need(!(t->d.flags&0x10),"Linear CPU ReadTexels not implemented");need(nvn_deswizzle(&t->d,level,layer,t->mem,dst,row)==0,"ReadTexels deswizzle failed");}
     else{p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride,old_image=state.copy_image_stride;state.copy_stride=row;state.copy_image_stride=image;copy_texture_buffer(p,true);state.copy_stride=old;state.copy_image_stride=old_image;}}
 

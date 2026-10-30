@@ -14,6 +14,12 @@
 #include <unistd.h>
 #include <mach/mach_time.h>
 #include <sched.h>
+#include <time.h>
+#include <limits.h>
+#ifdef __linux__
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#endif
 
 // 页状态与 mprotect 的次序（改保护的一方先把状态改成 BUSY，mprotect 落地后才改成终态；别的线程见 BUSY 就等）：
 //   设只读：NONE → BUSY → mprotect(只读) → PROT；解保护：PROT → BUSY → mprotect(可写) → NONE。
@@ -31,6 +37,15 @@
 // in the page-fault handler, exceeding it returns "not our page" and lets the crash handler report the crash truthfully instead of spinning silently. The wait only reads atomics and takes no lock.
 enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2 };
 enum { BUSY_WAIT_MS = 2000 };
+// [DOOM] DM_TEX_DISCARD (default off; engine side xbg_tex_discard.inc): two more page states for static textures whose guest
+// copy was released. GONE = PROT_NONE, physical pages dropped (MADV_DONTNEED), the content lives only in the Vulkan image;
+// REST = the restore worker is rebuilding it. Transitions (all by the engine's restore worker):
+//   discard: PROT -> BUSY (all pages, generation <= the upload stamp) -> mprotect(NONE) + DONTNEED -> GONE
+//   restore: GONE -> REST -> content rebuilt off to the side, mremap'ed over the range read-only -> PROT (generation unchanged:
+//            the content equals the uploaded one, so the engine's dirty stamps stay valid; a write then faults as usual)
+// A guest fault (read or write) or a host pre-write on a GONE / REST page asks the worker for a restore and waits (futex);
+// pages never go from GONE to writable directly.
+enum { PG_GONE = 3, PG_REST = 4 };
 // 跟踪区间 = 各内存池（MemoryPoolInitialize 登记）。池销毁后复用 live=0 的槽，信号处理里无锁扫描。
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 #define MAX_RANGE 4096   // 原为 256：内存池多于它时超出的池不跟踪，里面的贴图每次取用都当成脏的重传（暗黑实测峰值见内存读数行的「内存池」；塞尔达约 300 个，踩过）。扫描只到已用的槽数，容量大不增加开销 | was 256: with more memory pools than that the excess pools are untracked and their textures are treated as dirty and re-uploaded on every use (for Diablo's measured peak see "memory pools" in the memory readout line; Zelda has about 300 and hit this). The scan only covers slots in use, so a larger capacity costs nothing
@@ -88,11 +103,63 @@ static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态
     { uint64_t g = atomic_fetch_add(&g_now, 1) + 1; atomic_store(&r->gen[p], g); bgen_note(r, p, g); }
     atomic_store(&r->state[p], PG_NONE);
 }
+// ---------- [DOOM] DM_TEX_DISCARD: restore requests (signal-safe: atomics, futex, nanosleep only) ----------
+enum { NREQ = 64, GONE_WAIT_MS = 60000 };
+static _Atomic uintptr_t g_req[NREQ];          // page addresses waiting for a restore (0 = free slot)
+static _Atomic uint32_t g_req_seq, g_gone_seq;  // futex words: new request (worker waits) / a restore landed (faulting threads wait)
+static _Atomic uint64_t g_gone_rf, g_gone_wf, g_gone_pw, g_gone_slow;
+static _Atomic int g_gone_worker_tid, g_gone_red;
+#ifdef __linux__
+static void fx_wait(_Atomic uint32_t *w, uint32_t v, int ms) {
+    struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+    syscall(__NR_futex, (uint32_t *)w, FUTEX_WAIT_PRIVATE, v, &ts, NULL, 0);
+}
+static void fx_wake(_Atomic uint32_t *w) { syscall(__NR_futex, (uint32_t *)w, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0); }
+static int my_tid(void) { return (int)syscall(__NR_gettid); }
+#else   // no futex (Apple hosts): short sleeps; DM_TEX_DISCARD is an Android engine feature, GONE pages never exist here
+static void fx_wait(_Atomic uint32_t *w, uint32_t v, int ms) { (void)w; (void)v; (void)ms; struct timespec ts = {0, 1000000L}; nanosleep(&ts, NULL); }
+static void fx_wake(_Atomic uint32_t *w) { (void)w; }
+static int my_tid(void) { return -1; }
+#endif
+static void gone_ask(uintptr_t a) {
+    a &= ~(g_pg - 1);
+    for (;;) {
+        int i;
+        for (i = 0; i < NREQ; i++) if (atomic_load(&g_req[i]) == a) break;   // already queued
+        if (i == NREQ) for (i = 0; i < NREQ; i++) { uintptr_t z = 0; if (atomic_compare_exchange_strong(&g_req[i], &z, a)) break; }
+        atomic_fetch_add(&g_req_seq, 1); fx_wake(&g_req_seq);
+        if (i < NREQ) return;
+        fx_wait(&g_gone_seq, atomic_load(&g_gone_seq), 2);   // all slots taken: let the worker drain some
+    }
+}
+// Wait until page p leaves GONE / REST (asking the worker for a restore while it is GONE). 1 = re-execute / go on; 0 = gave up
+// (worker thread itself, or no restore within GONE_WAIT_MS): the fault is reported as a crash instead of hanging silently.
+static int gone_wait(range_t *r, uintptr_t p) {
+    const uintptr_t a = r->base + (p << g_shift);
+    if (my_tid() == atomic_load(&g_gone_worker_tid)) return 0;   // the restore worker must never touch GONE pages (it would wait for itself)
+    uint64_t t0 = mach_absolute_time();
+    for (;;) {
+        uint32_t seq = atomic_load(&g_gone_seq);
+        uint8_t st = atomic_load(&r->state[p]);
+        if (st == PG_BUSY) { if (!busy_wait(r, p)) return 0; continue; }
+        if (st != PG_GONE && st != PG_REST) return 1;
+        if (st == PG_GONE) gone_ask(a);   // idempotent; re-asked every round so a dropped request cannot strand us
+        fx_wait(&g_gone_seq, seq, 50);
+        uint64_t ms = (mach_absolute_time() - t0) * g_tb.numer / g_tb.denom / 1000000ull;
+        if (ms > 1000) atomic_fetch_add(&g_gone_slow, 1);
+        if (ms > GONE_WAIT_MS) { atomic_store(&g_gone_red, 1); return 0; }
+    }
+}
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
-    range_t *r = is_write ? find((uintptr_t)addr) : NULL;
+    range_t *r = find((uintptr_t)addr);
     if (!r) return 0;
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
+    {   // [DOOM] DM_TEX_DISCARD: a released page (read or write); a read fault on a page being released (BUSY, already PROT_NONE)
+        uint8_t s = atomic_load(&r->state[p]);
+        if (s == PG_GONE || s == PG_REST) { atomic_fetch_add(is_write ? &g_gone_wf : &g_gone_rf, 1); return gone_wait(r, p); }
+        if (!is_write) return s == PG_BUSY ? busy_wait(r, p) : 0;
+    }
     uint8_t st = PG_PROT;
     if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_faults, 1); return 1; }
     if (st == PG_BUSY) return busy_wait(r, p);   // 别的线程正在改这页的保护：等它改完重执行（改成了只读就再缺页一次、走上面那一支） | Another thread is changing this page's protection: wait for it to finish and re-execute (if it became read-only, it faults once more and takes the branch above)
@@ -107,6 +174,7 @@ static void prep_write(void *addr, size_t len) {
         for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) {
             for (;;) { uint8_t st = PG_PROT;   // 见 BUSY 等完要重看：对方可能是在设只读，等完这页是 PROT，照样得解 | After waiting out BUSY, look again: the other side may have been setting read-only, in which case the page is PROT after the wait and still has to be unprotected
                 if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_preps, 1); break; }
+                if (st == PG_GONE || st == PG_REST) { atomic_fetch_add(&g_gone_pw, 1); if (!gone_wait(r, p)) break; continue; }   // [DOOM] DM_TEX_DISCARD: restore first, then unprotect as usual
                 if (st != PG_BUSY || !busy_wait(r, p)) break; }
         }
         a = stop;
@@ -207,6 +275,65 @@ void nvn_dirty_stats(uint64_t *faults, uint64_t *preps) { *faults = atomic_load(
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ticks) * tb.numer / tb.denom;
+}
+// ---------- [DOOM] DM_TEX_DISCARD: worker-side page transitions (see the PG_GONE notes at the top; nvn_dirty.h) ----------
+static range_t *pages_of(const void *lo, size_t len, uintptr_t *p, uintptr_t *q) {
+    if (!len || ((uintptr_t)lo & (g_pg - 1)) || (len & (g_pg - 1)) || !nvn_dirty_tracked(lo, len)) return NULL;
+    range_t *r = find((uintptr_t)lo);
+    *p = ((uintptr_t)lo - r->base) >> g_shift; *q = *p + (len >> g_shift);
+    return r;
+}
+int nvn_dirty_gone_begin(const void *lo, size_t len, uint64_t stamp) {
+    uintptr_t p, q; range_t *r = pages_of(lo, len, &p, &q);
+    if (!r) return 3;
+    uintptr_t i = p;
+    for (; i < q; i++) { uint8_t st = PG_PROT; if (!atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY)) break; }
+    int why = i < q ? 1 : 0;   // a page is not write-protected (written since, never protected, or busy)
+    if (!why) for (uintptr_t k = p; k < q; k++) if (atomic_load(&r->gen[k]) > stamp) { why = 2; break; }   // written after the upload stamp
+    if (why) for (uintptr_t k = p; k < i; k++) atomic_store(&r->state[k], PG_PROT);
+    return why;
+}
+void nvn_dirty_gone_abort(const void *lo, size_t len) {
+    uintptr_t p, q; range_t *r = pages_of(lo, len, &p, &q); if (!r) return;
+    for (uintptr_t k = p; k < q; k++) atomic_store(&r->state[k], PG_PROT);
+}
+void nvn_dirty_gone_commit(const void *lo, size_t len) {
+    uintptr_t p, q; range_t *r = pages_of(lo, len, &p, &q); if (!r) return;
+    mp((uintptr_t)lo, len, PROT_NONE);
+    madvise((void *)lo, len, MADV_DONTNEED);   // private anonymous memory: the pages are freed (a dma-buf / file mapping would keep them)
+    for (uintptr_t k = p; k < q; k++) atomic_store(&r->state[k], PG_GONE);
+    atomic_fetch_add(&g_gone_seq, 1); fx_wake(&g_gone_seq);
+}
+size_t nvn_dirty_restore_begin(const void *lo, size_t len) {
+    uintptr_t p, q; range_t *r = pages_of(lo, len, &p, &q); if (!r) return 0;
+    size_t n = 0;
+    for (uintptr_t k = p; k < q; k++) { uint8_t st = PG_GONE; n += atomic_compare_exchange_strong(&r->state[k], &st, PG_REST); }
+    return n;
+}
+void nvn_dirty_restore_commit(const void *lo, size_t len) {
+    uintptr_t p, q; range_t *r = pages_of(lo, len, &p, &q); if (!r) return;
+    for (uintptr_t k = p; k < q; k++) { uint8_t st = PG_REST; atomic_compare_exchange_strong(&r->state[k], &st, PG_PROT); }
+    atomic_fetch_add(&g_gone_seq, 1); fx_wake(&g_gone_seq);
+}
+int nvn_dirty_page_state(const void *addr) {
+    range_t *r = find((uintptr_t)addr); if (!r) return -1;
+    return atomic_load(&r->state[((uintptr_t)addr - r->base) >> g_shift]);
+}
+int nvn_dirty_any_gone(const void *addr, size_t len) {
+    if (!len) return 0;
+    uintptr_t a = (uintptr_t)addr & ~(g_pg - 1), e = (uintptr_t)addr + len;
+    for (; a < e; a += g_pg) { int s = nvn_dirty_page_state((const void *)a); if (s == PG_GONE || s == PG_REST) return 1; }
+    return 0;
+}
+void nvn_dirty_gone_ask(const void *addr) { gone_ask((uintptr_t)addr); }
+uintptr_t nvn_dirty_gone_take(void) { for (int i = 0; i < NREQ; i++) { uintptr_t a = atomic_exchange(&g_req[i], 0); if (a) return a; } return 0; }
+uint32_t nvn_dirty_gone_req_seq(void) { return atomic_load(&g_req_seq); }
+void nvn_dirty_gone_idle(uint32_t seen, int ms) { fx_wait(&g_req_seq, seen, ms); }
+void nvn_dirty_gone_kick(void) { atomic_fetch_add(&g_req_seq, 1); fx_wake(&g_req_seq); }
+void nvn_dirty_gone_set_worker(void) { atomic_store(&g_gone_worker_tid, my_tid()); }
+void nvn_dirty_gone_stats(uint64_t *read_faults, uint64_t *write_faults, uint64_t *host_writes, uint64_t *slow_waits, int *gave_up) {
+    *read_faults = atomic_load(&g_gone_rf); *write_faults = atomic_load(&g_gone_wf); *host_writes = atomic_load(&g_gone_pw);
+    *slow_waits = atomic_load(&g_gone_slow); *gave_up = atomic_load(&g_gone_red);
 }
 // [DOOM] Writer/reader exclusion for CPU texel writes vs. the renderer's partial re-upload (see nvn_dirty.h). Without it a
 // re-upload can race a WriteTexels on another thread: it protects and reads while the writer is mid-memcpy (torn page for

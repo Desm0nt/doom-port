@@ -89,15 +89,36 @@ unsigned dm_doom_wide_w(void) {
 // that fits the wider targets) and the app pool by that difference only.
 typedef struct { double tb, rt, unc, sh, dyn; int pool_add_mb; } doom_pools;
 static const doom_pools g_stock_pools = {1162.5, 117, 22.5, 5.5, 23, 0};
-static int margin_on(void) { const char *e = getenv("DM_DOOM_POOL_MARGIN"); return !(e && *e == '0' && !e[1]); }
+// [mem] Margin level: 2 = full (above), 1 = half (TextureBuffer 1350, small pools x1.25, 256 MB heap headroom), 0 = stock.
+// DM_DOOM_POOL_MARGIN=0/1/2 forces a level; unset = by RAM: MemTotal >= 14 GB (16 GB phones) -> 2, >= 10 GB (12 GB phones,
+// MemTotal ~11 GB) -> 1, below -> 0. The full margin (+956 MB app pool, ~+444 MB resident) pushed a 12 GB Xiaomi 13 Pro into
+// 4.9 GB of swap (MemFree 70-135 MB) and a 30 s level reload after death. Old values: "1" = full (now 2 also accepted).
+static long mem_total_mb(void) {
+    static long mb = -2; if (mb != -2) return mb; mb = -1;
+    FILE *f = fopen("/proc/meminfo", "r"); if (!f) return mb;
+    char line[128]; while (fgets(line, sizeof line, f)) { long kb; if (sscanf(line, "MemTotal: %ld kB", &kb) == 1) { mb = kb / 1024; break; } }
+    fclose(f); return mb;
+}
+static int margin_level(void) {
+    static int lv = -1; if (lv >= 0) return lv;
+    const char *e = getenv("DM_DOOM_POOL_MARGIN");
+    if (e && *e) lv = *e == '0' ? 0 : *e == '1' || *e == '2' ? 2 - (*e == '1' && e[1] == 'h') : 2;   // "0" stock, "1"/"2" full, "1h" half
+    else { long mb = mem_total_mb(); lv = mb < 0 ? 2 : mb >= 14 * 1024 ? 2 : mb >= 10 * 1024 ? 1 : 0; }
+    LOG("[pools] margin level %d (%s, MemTotal %ld MB)", lv, e && *e ? "DM_DOOM_POOL_MARGIN" : "by RAM", mem_total_mb());
+    return lv;
+}
+static int margin_on(void) { return margin_level() > 0; }
 static doom_pools doom_pool_plan(void) {
     doom_pools p = g_stock_pools; unsigned w = dm_doom_wide_w();
     double rt_min = w ? (117u * w + 1279) / 1280 + 4 : 117;   // minimum for the output width
-    if (margin_on()) {
+    const int lv = margin_level();
+    if (lv == 2) {
         p.tb = 1536; p.rt = ceil(rt_min * 1.35 / 4) * 4; p.unc = ceil(22.5 * 1.5); p.sh = ceil(5.5 * 1.5); p.dyn = ceil(23 * 1.5);
+    } else if (lv == 1) {
+        p.tb = 1350; p.rt = ceil(rt_min * 1.15 / 4) * 4; p.unc = ceil(22.5 * 1.25); p.sh = ceil(5.5 * 1.25); p.dyn = ceil(23 * 1.25);
     } else p.rt = rt_min;
     double extra = (p.tb - g_stock_pools.tb) + (p.rt - g_stock_pools.rt) + (p.unc - g_stock_pools.unc) + (p.sh - g_stock_pools.sh) + (p.dyn - g_stock_pools.dyn);
-    p.pool_add_mb = (int)ceil(extra) + (margin_on() ? 512 : 0);
+    p.pool_add_mb = (int)ceil(extra) + (lv == 2 ? 512 : lv == 1 ? 256 : 0);
     return p;
 }
 // hle_svc.c app_pool(): MB to add to the reported application pool (VRAM pool increase + heap headroom).

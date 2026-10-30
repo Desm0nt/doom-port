@@ -204,7 +204,10 @@ void wait_resize(){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wai
 // [DOOM] Optional sharpening of the game's frame at present: RCAS, the sharpening pass of AMD FSR 1 (shaders/rcas.comp, offline
 // compiled). DM_GFX_SHARPEN=<stops> turns it on (0 = strongest, 0.2 typical, 1 mild); used with DM_DOOM_RES (the game renders
 // 3D at a fraction and upscales it itself). Only for 8-bit UNORM RGBA/BGRA frames; anything else is presented unsharpened.
-extern "C" { int dm_vk_format_list=0; }   // VK_KHR_image_format_list enabled on the device (read by the Vulkan engine)
+extern "C" { int dm_vk_format_list=0; }
+// [DOOM] DM_TEX_DISCARD=1: a second queue of the same family for the engine's texture restore worker (xbg_tex_discard.inc), which
+// reads Vulkan images back while the translation thread owns the main queue (no engine lock on the fault path). Null = none.
+extern "C" { VkQueue dm_vk_aux_queue=VK_NULL_HANDLE; uint32_t dm_vk_aux_family=0; }   // VK_KHR_image_format_list enabled on the device (read by the Vulkan engine)
 namespace rcas {
 const uint32_t code[]={
 #include "shaders/rcas.spv.inc"
@@ -443,7 +446,10 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     auto pipe_stats_env=[]{const char *e=getenv("DM_GFX_PIPE_STATS");return e && *e && *e!='0';};
     bool pe=false;for(const auto &x:available)if(!strcmp(x.extensionName,VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))pe=true;
     if(FILE *ps=[&]{std::string dir=path;size_t cut=dir.find_last_of('/');FILE *f=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");if(!f && pe && pipe_stats_env())f=fopen("/proc/self/stat","rb");return f;}()){fclose(ps);dext.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);pef.pipelineExecutableInfo=VK_TRUE;pef.pNext=draw.pNext;draw.pNext=&pef;}
-    float priority=1;VkDeviceQueueCreateInfo qc{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qc.queueFamilyIndex=family;qc.queueCount=1;qc.pQueuePriorities=&priority;VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};dc.pNext=&draw;dc.pEnabledFeatures=&features.features;dc.queueCreateInfoCount=1;dc.pQueueCreateInfos=&qc;dc.enabledExtensionCount=uint32_t(dext.size());dc.ppEnabledExtensionNames=dext.data();if((r=vkCreateDevice(physical,&dc,nullptr,&device)))return fail("vkCreateDevice",r);vkGetDeviceQueue(device,family,0,&queue);
+    float priority[2]={1,0.5f};VkDeviceQueueCreateInfo qc{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qc.queueFamilyIndex=family;qc.queueCount=1;qc.pQueuePriorities=priority;
+    {const char *e=getenv("DM_TEX_DISCARD");const bool want=e && atoi(e)>0;if(want && q[family].queueCount>=2)qc.queueCount=2;   // [DOOM] restore worker queue (default off)
+     if(want)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","DM_TEX_DISCARD: family %u has %u queues -> aux queue %s",family,q[family].queueCount,qc.queueCount==2?"created":"unavailable (texture discard stays off)");}
+    VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};dc.pNext=&draw;dc.pEnabledFeatures=&features.features;dc.queueCreateInfoCount=1;dc.pQueueCreateInfos=&qc;dc.enabledExtensionCount=uint32_t(dext.size());dc.ppEnabledExtensionNames=dext.data();if((r=vkCreateDevice(physical,&dc,nullptr,&device)))return fail("vkCreateDevice",r);vkGetDeviceQueue(device,family,0,&queue);if(qc.queueCount==2){vkGetDeviceQueue(device,family,1,&dm_vk_aux_queue);dm_vk_aux_family=family;}
     for(;;){
         wait_window();
         if(!surface||window_changed()){
