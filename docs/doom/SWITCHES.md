@@ -44,7 +44,10 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | `DM_AA_STRENGTH=<s>` | 1 | добавляет `+set aa_DESIGN_override 1`; в `hle_hid.c` выключает MP-методы aim assist и держит SP-значения оружия × s | `=0` — слабый MP-ассист игры; >1 — сильнее |
 | `DM_DOOM_WIDE` | **0 (выкл)** | `1` — широкий вывод Hor+: до разбора командной строки (`hle_args.c doom_wide`) таблица `r_mode` в .rodata (`main+0x39f1b10`, было {1280,720},{1920,1080}) → {W,720},{1.5W,1080}; W = 720 × соотношение экрана (`front_game_res(0)`, кратно 16, 1280..2160), только если экран шире 16:9; 2400×1080 → 1600×720. Пул RenderTarget растёт с шириной (см. `DM_DOOM_POOL_MARGIN`: 204 МБ при 1600; без запаса — минимум ⌈117·W/1280⌉+4 = 151). Лог `[wide] r_mode table ...` | `=<ширина>` (≥1280) — явно, напр. `1440`. Выкл по умолчанию после diag30 (белый экран = переполнен пул RenderTarget, BUGS §2.10); включать после проверки на телефоне. +25 % пикселей при 1600 — компенсировать `DM_DOOM_RES` |
 | `DM_DOOM_WIDE_LIVE` | **0 (выкл)** | `1` — галочка «Широкий экран» в шестерёнке переключается на лету (BUGS §2.12): игра всегда рисует W×720 (как `DM_DOOM_WIDE=1`, пул RenderTarget по широкому размеру), «выкл» = презентер показывает центральные 16:9 кадра (`vulkan_present.cpp crop169`; Hor+ → та же картинка, что у 16:9). Java `nativeWideLive` → `dm_doom_wide_live()` + `dm_present_crop169`; лог `[wide] live switch ...`, `dm-vulkan [wide] live: ...`. Без него — «со следующего запуска». Цена: в режиме «выкл» рисуется 1600×720 (+25 % пикселей); игры путь смены размера на лету не имеет (vid_restart — пустая заглушка) | — |
-| `DM_DOOM_POOL_MARGIN` | 1 | пулы VRAM игры с запасом (`+set nvn_VRAM*HeapSizeMB`, `hle_args.c doom_pools_args`): TextureBuffer 1162.5→**1536**, RenderTarget 117→**160** (1.35×max(117, ⌈117·W/1280⌉+4), до кратного 4; 204 при W=1600), Uncached 22.5→**34**, Shader 5.5→**9**, Dynamic 23→**35** (+443.5 МБ; +487.5 при 1600). Пул приложения (`hle_svc.c app_pool`) +прирост пулов +512 МБ запаса кучи = **+956 МБ** (4241 МБ; 4285 при 1600), если `DM_APP_POOL_ADD_MB` не задан; резерв адресного пространства гостя растёт до пул+1.25 ГБ (5632 МБ). Лог `[pools] VRAM MB: ...` и `app pool: ... MB reported` | `0` — стоковые размеры (с `DM_DOOM_WIDE` только минимальный RenderTarget и пул +разница). Резидентно +~444 МБ сразу (пулы обнуляются и с zero-copy — это dma-buf), запас кучи 512 МБ — только по мере использования |
+| `DM_DOOM_POOL_MARGIN` | **по RAM** (с 30.10) | запас пулов VRAM игры. Уровни: полный (TextureBuffer 1536, RenderTarget 1.35×min, малые ×1.5, +512 МБ кучи), половинный (1350, 1.15×, ×1.25, +256), стоковый. Без env: MemTotal ≥ 14 ГБ → полный, ≥ 10 ГБ → половинный, иначе стоковый (лог `[pools] margin level`). `0` — стоковый, `1`/`2` — полный, `1h` — половинный | полный запас загнал 12-ГБ Xiaomi 13 Pro в 4.9 ГБ свопа |
+| `DM_TEX_DISCARD=1` | **0 (выкл)** | освобождать гостевую копию статичных текстур (BUGS §3.13): текстура залита ≥ `DM_TEX_DISCARD_AGE` с назад и с тех пор не переписывалась (VT-кэши, RT, storage, CPU-декодированные BC, depth, linear исключены), её целые страницы в пуле → `PROT_NONE` + `MADV_DONTNEED`; при касании (чтение/запись гостя, запись хоста, undo движка) поток `dm-texdiscard` читает Vulkan-образ на втором queue (`vkCmdCopyImageToBuffer` → swizzle → `mremap`) и возвращает страницы под защиту записи. Требует второй queue в семействе (Qualcomm — есть, Turnip — нет: тогда выкл с логом) и `DM_GFX_TEX_DIRTY=1` (APK). Включает: пул ≥ `DM_TEX_DISCARD_ZC_MIN_MB` **без zero-copy** (снапшоты для его вершин/UBO), лог `NVN TEXDISCARD …` каждые 10 с и `NVN TEXCLASS …` каждые 60 с | A/B на 8 Gen 2 (§3.13): своп, PSS, время перезагрузки уровня; fps (минус zero-copy пула TextureBuffer) |
+| `DM_TEX_DISCARD_AGE` / `_MIN_KB` / `_MAX_MB` / `_ZC_MIN_MB` / `_SCAN_MB` | 60 / 256 / 64 / 512 / 256 | возраст «статичности» (с); размер текстуры; пулы не-zero-copy при discard (512 = только TextureBuffer); сколько МБ ставить в очередь за один проход (раз в 10 с) | — |
+| `DM_TEX_CLASS=<с>` | **выкл** (60 при `DM_TEX_DISCARD=1`) | раз в N с лог классов живых текстур: `NVN TEXCLASS (class images/guest MB/vulkan MB …) rt … vt … hot … young … static … unused …`, строка «static discardable … \| not: zc/decoded/untracked/format/small/big/layout/dirty/undone» (= реальная экономия) и по пулам ≥ 64 МБ: `resident` (mincore), МБ текстур, zero-copy | замер перед включением discard |
 | `DM_DOOM_ARGS="..."` | пусто | любые `+set` | Изоляция проходов при диагностике (см. §7) |
 
 `g_argv` — 128 слотов (умолчания занимают ~60).
@@ -75,6 +78,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 |---|---|---|---|
 | `DM_GFX_SUBMIT_CHUNK_US` | **2000** | отправлять записываемый слот на GPU после N мкс трансляции (на границе guest-submit) | главный выигрыш 28.10 вечер: ~20 → ~47 fps медиана. `0` — один submit на present |
 | `DM_GFX_ZEROCOPY` | **1** для DOOM | пулы NVN на AHardwareBuffer по гостевым адресам (MAP_FIXED), без снапшотов | `0` — снапшоты (медленнее) |
+| `DM_GFX_ZC_MAX_MB=<n>` | 0 (без предела) | пулы больше n МБ остаются на обычной памяти кучи гостя (ленивые, свопятся) вместо dma-buf (весь пул резидентен с запуска и не свопится; `MADV_DONTNEED` его не освобождает). `600` = без zero-copy только TextureBuffer. Лог `NVN zero-copy: pool … left on guest heap memory` | A/B памяти отдельно от `DM_TEX_DISCARD` (тот делает то же для пулов ≥ 512 МБ) |
 | `DM_GFX_ZC_INDEX` | 0 | индексы indirect-draw прямо из AHB | `1` ронял драйвер Adreno |
 | `DM_GFX_ZC_UBO_MIN`, `DM_GFX_ZC_RACE` | 0 | эксперименты zero-copy UBO (гипотеза теней, отвергнута) | — |
 | `DM_GFX_PARTIAL_TEX` | 1 | частичная перезаливка изменённых GOB-блоков больших текстур (VT-кэши) | `0` — полная перезаливка (очень медленно) |
@@ -149,7 +153,7 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 ## 5. Патчи бинарника игры (CUTS, `dm/tools/patch_nso.py`, build-id `2847991952b3d7abd228624fcd3b0779`)
 
 Генерация: `DM_TARGET=android PYTHONUTF8=1 python dm/tools/patch_nso.py work/exefs-update/main work/patched main` →
-`work/patched/main.patched.bin` + `main.cuts.tsv`; на телефон в `DOOM Mobile/dm/out/`. Сейчас 18 записей:
+`work/patched/main.patched.bin` + `main.cuts.tsv`; на телефон в `DOOM Mobile/dm/out/`. Сейчас 19 записей CUTS (+ 5 zlib-гейтов, ниже):
 
 | Адрес | Что |
 |---|---|
@@ -166,6 +170,30 @@ id Tech 6 разбирает `+set <cvar> <value>`. Порт по умолчан
 | (`0x1f08e3c`, закомментирован) | пропуск заставки — ломал экран загрузки |
 
 OBS-гейты (наблюдение без изменения логики) для того же build-id — там же, таблица `OBS`.
+
+### zlib: входные гейты inflate (`ZLIB_GATES`, с 30.10; `main.cuts.tsv` теперь 24 строки, `main.gates.tsv` + svc 0x90..0x94)
+
+Игра несёт статически слинкованный **zlib 1.2.3** (raw deflate контейнеров, `ReadData`, фоновый загрузчик BGL, libpng).
+Все вызовы — прямые `bl`/`b` в пять входов, указатели на них нигде не берутся. На каждый вход — гейт: хост либо отвечает
+сам (`x8 = 1`, в `x0` результат), либо исполняется оригинал (`x8 = 0`; старый `libdm.so` без обработчика → всегда оригинал).
+Хост: `dm/host/hle_zlib.c`, библиотека `dm/third_party/zlib-ng` (2.3.3, NEON, лицензия zlib). Сгенерировать
+без гейтов: `DM_ZLIB_GATES=0` при запуске `patch_nso.py`.
+
+| Адрес | svc | Функция |
+|---|---|---|
+| `0x1ffeb30` | 0x90 | `inflateInit2_` (ReadData `-15`, BGL) |
+| `0x1ffecb0` | 0x91 | `inflateInit_` (libpng) |
+| `0x1ffede0` | 0x92 | `inflate` |
+| `0x20009f0` | 0x93 | `inflateEnd` |
+| `0x1ffeac0` | 0x94 | `inflateReset` (libpng) |
+
+| Переключатель | По умолч. | Смысл |
+|---|---|---|
+| `DM_ZLIB_FAST=1` | **0** (до проверки на телефоне) | inflate через zlib-ng вместо zlib 1.2.3 игры. Поток игры получает хостовый контекст в `strm->state`; поля `z_stream` 1.2.3 (LP64, 0x70 байт) копируются туда-обратно на каждом вызове. Коды возврата и раскодирование побайтно как у 1.2.3 (офлайн-сверка 1 514 записей / 959 МБ, 5 шаблонов вызовов — `third_party/zlib-ng/VERSION.md`); не совпадают только тексты `msg` и то, что память состояния берётся из кучи хоста, а не из аллокатора игры |
+| `DM_ZLIB_STATS=1` | 0 | раз в `DM_ZLIB_STATS_SEC` (5) с: `[zlib] 5.0s game zlib 1.2.3\|zlib-ng: N calls, in/out MB, inflate ms (% одного ядра), MB/s \| streams/live \| threads: tid name ms (%)…` и `[zlib] total … by caller: ReadData / BGL / BGL-last / png / main+0x…`. При `FAST=0` хост сам вызывает оригинальный inflate через обход гейта и меряет его |
+| `DM_ZLIB_VERIFY=<n>` | 0 | включает `FAST`; первые n потоков (`1` = 512) параллельно раскодируются zlib 1.2.3 игры на теневом потоке, каждый вызов сравнивается (код возврата, байты in/out, сами байты): `[zlib] VERIFY … mismatches`. Вызовы с выходным буфером > `DM_ZLIB_VERIFY_MAX_MB` (64) прекращают сверку потока (счётчик `stopped`) |
+
+Строка `[zlib] inflate gates MISSING` при старте = на телефоне старый `main.patched.bin` без гейтов (переключатели не действуют).
 
 ## 6. Инструменты (`tools/`)
 
