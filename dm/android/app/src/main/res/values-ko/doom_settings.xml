@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] Gear (settings) dialog of DmActivity.showDoomSettings: English is the default / fallback; values-xx follow the system locale. -->
+<resources>
+    <string name="gear_title">설정</string>
+    <string name="gear_save">저장</string>
+    <string name="gear_cancel">취소</string>
+    <string name="gear_label_fmt">%1$s (%2$s)</string>
+    <string name="gear_when_now">즉시 적용</string>
+    <string name="gear_when_next">다음 실행 시 적용</string>
+    <string name="gear_drs">동적 해상도: GPU 부하가 높을 때 3D 해상도를 낮춥니다. 게임 메뉴의 Video → Dynamic Resolution과 같은 스위치입니다</string>
+    <string name="gear_drs_unknown">동적 해상도: 게임이 시작된 후 사용할 수 있습니다(게임 메뉴 Video → Dynamic Resolution에서도 설정 가능)</string>
+    <string name="toast_drs_failed">여기서 동적 해상도를 변경할 수 없습니다. 게임 메뉴의 Video → Dynamic Resolution을 사용하세요</string>
+    <string name="gear_fps_limit">프레임 속도 제한</string>
+    <string name="gear_fps_note">60fps 초과는 실험적 기능입니다.</string>
+    <string name="gear_driver">Vulkan 드라이버</string>
+    <string name="gear_driver_system">시스템(제조사 드라이버, 다른 드라이버가 시작되지 않을 때의 대체 드라이버)</string>
+    <string name="gear_driver_system_short">시스템 드라이버</string>
+    <string name="gear_driver_active">현재 사용 중: %1$s</string>
+    <string name="gear_driver_active_fallback">현재 사용 중: 시스템 드라이버(%1$s 시작 실패)</string>
+    <string name="toast_driver_fallback">Vulkan 드라이버 %1$s이(가) 이 기기에서 시작되지 않았습니다(%2$s). 시스템 드라이버를 사용합니다.</string>
+    <string name="toast_driver_crashed">지난번 Vulkan 드라이버 %1$s(으)로 실행했을 때 충돌하거나 멈췄기 때문에 지금은 시스템 드라이버를 사용합니다. 설정에서 다시 선택할 수 있습니다.</string>
+    <string name="gear_lang">게임 언어(텍스트 및 음성)</string>
+    <string name="gear_lang_system">시스템 설정과 동일</string>
+    <string name="gear_aa">조준 보조</string>
+    <string name="gear_aa_switch">Switch와 동일</string>
+    <string name="gear_wide">와이드 화면: 양옆 여백 대신 더 넓은 시야</string>
+    <string name="gear_rumble">진동</string>
+    <string name="gear_fps_counter">FPS 및 프레임 시간 표시</string>
+    <string name="gear_res">3D 해상도(인터페이스는 720p 유지)</string>
+    <string name="gear_sharpen">선명도(FSR RCAS)</string>
+    <string name="gear_off">끄기</string>
+    <string name="gear_low">약하게</string>
+    <string name="gear_medium">보통</string>
+    <string name="gear_high">강하게</string>
+    <string name="gear_none">없음</string>
+    <string name="gear_small">작게</string>
+    <string name="gear_medium_dz">보통</string>
+    <string name="gear_large">크게</string>
+    <string name="gear_look">시점 감도(스와이프 및 발사 버튼)</string>
+    <string name="gear_deadzone">이동 스틱: 게임 데드존 보정</string>
+    <string name="toast_wide_now">와이드 화면: 적용됨</string>
+    <string name="toast_wide_next">와이드 화면: 다음 실행부터</string>
+</resources>

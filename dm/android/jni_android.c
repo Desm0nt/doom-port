@@ -175,6 +175,11 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     snprintf(romfs, sizeof romfs, "%s/romfs", g_src);
     snprintf(p, sizeof p, "%s/out/main.patched.bin", g_runtime);
     if (access(p, R_OK)) { snprintf(g_runtime, sizeof g_runtime, "%s/dm", g_src); LOG("boot: runtime %s", g_runtime); load_env_file(g_runtime); }
+    // [DOOM] DM_STDOUT_FILE=1: send this process's stdout (Android drops it) to <runtime>/stdout.txt, e.g. for the shader
+    // disassembly of Turnip/ir3 (IR3_SHADER_DEBUG=disasm) or other driver debug output that is not written to logcat.
+    { const char *e = getenv("DM_STDOUT_FILE");
+      if (e && *e == '1') { char sp[1200]; snprintf(sp, sizeof sp, "%s/stdout.txt", g_runtime);
+          if (freopen(sp, "w", stdout)) { setvbuf(stdout, NULL, _IOLBF, 0); LOG("boot: stdout -> %s", sp); } else LOG("boot: stdout -> %s failed", sp); } }
     int n = 1;
     if (access(romfs, R_OK | X_OK)) { LOG("【红】RomFS directory not accessible %s: errno %d", romfs, errno); n = -1; }
 #else
@@ -415,4 +420,17 @@ JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeWideLive(JNIE
     if (!dm_doom_wide_live()) return JNI_FALSE;
     dm_present_crop169(on ? 0 : 1);
     return JNI_TRUE;
+}
+// [DOOM] Gear checkbox <-> the game's rs_enable (hle_doom_drs.c): -1 = not known yet, 0 / 1 = off / on; set returns false when the
+// value cannot be written live (another main build / no Frame gate).
+int dm_doom_drs_get(void);
+int dm_doom_drs_set(int on);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeGetDrs(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_doom_drs_get(); }
+JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetDrs(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls; return dm_doom_drs_set(on ? 1 : 0) ? JNI_TRUE : JNI_FALSE;
+}
+// [DOOM] Vulkan driver status (vk_driver.c): "<requested>\t<active>\t<reason>", or "" before the driver is loaded.
+const char *dm_vk_driver_status(void);
+JNIEXPORT jstring JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeDriverStatus(JNIEnv *env, jclass cls) {
+    (void)cls; return (*env)->NewStringUTF(env, dm_vk_driver_status());
 }

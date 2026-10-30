@@ -27,6 +27,11 @@ static VkInstance g_instance;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static char g_driver_name[160] = "system";
 const char *dm_vk_driver_name(void) { return g_driver_name; }
+// For the app (jni_android.c nativeDriverStatus -> DmActivity toast / settings line): "<requested>\t<active>\t<reason>" once the driver
+// is loaded, "" before. requested = DM_VK_DRIVER ("" = system), active = "system" or the loaded library, reason = ok | no-library
+// (package folder without a .so) | load-failed (adrenotools could not open it) | no-gpu (it loaded but offers no Vulkan 1.1 GPU here).
+static char g_status[512];
+const char *dm_vk_driver_status(void) { return g_status; }
 
 #ifdef DM_ADRENOTOOLS
 // Does this driver offer a Vulkan 1.1+ GPU? (A Turnip build for another Adreno generation loads but finds no device.)
@@ -57,16 +62,16 @@ static int driver_has_gpu(PFN_vkGetInstanceProcAddr gipa) {
 #endif
 
 static void load_driver(void) {
-    void *lib = NULL;
+    void *lib = NULL; const char *reason = "ok", *req = getenv("DM_VK_DRIVER");
 #ifdef DM_ADRENOTOOLS
-    const char *drv = getenv("DM_VK_DRIVER"), *hooks = getenv("DM_NATIVE_LIB_DIR"), *pkgs = getenv("DM_DRIVERS_DIR");
+    const char *drv = req, *hooks = getenv("DM_NATIVE_LIB_DIR"), *pkgs = getenv("DM_DRIVERS_DIR");
     char path[1024];
     if (drv && *drv && !strchr(drv, '/') && pkgs) {   // a package name: DM_DRIVERS_DIR/<name>/<its .so> (DmActivity copies it there)
         char d[768]; snprintf(d, sizeof d, "%s/%s", pkgs, drv);
         DIR *dir = opendir(d); struct dirent *e; path[0] = 0;
         while (dir && (e = readdir(dir))) { size_t n = strlen(e->d_name); if (n > 3 && !strcmp(e->d_name + n - 3, ".so")) { snprintf(path, sizeof path, "%s/%s", d, e->d_name); break; } }
         if (dir) closedir(dir);
-        if (!path[0]) LOG("[vk] driver package %s: no library in %s", drv, d);
+        if (!path[0]) { LOG("[vk] driver package %s: no library in %s", drv, d); reason = "no-library"; }
         drv = path[0] ? path : NULL;
     }
     if (drv && *drv && hooks && *hooks) {
@@ -79,8 +84,9 @@ static void load_driver(void) {
         if (slash && (size_t)snprintf(dir, sizeof dir, "%.*s/", (int)(slash - drv), drv) < sizeof dir)
             lib = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, NULL, hookdir, dir, slash + 1, NULL, NULL);
         LOG("[vk] driver %s: %s", drv, lib ? "loaded through adrenotools" : "FAILED to load, using the system driver");
+        if (!lib) reason = "load-failed";
         PFN_vkGetInstanceProcAddr g = lib ? (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr") : NULL;
-        if (lib && (!g || !driver_has_gpu(g))) { LOG("[vk] driver %s: no Vulkan 1.1+ GPU here, using the system driver", drv); lib = NULL; }
+        if (lib && (!g || !driver_has_gpu(g))) { LOG("[vk] driver %s: no Vulkan 1.1+ GPU here, using the system driver", drv); lib = NULL; reason = "no-gpu"; }
         if (lib) snprintf(g_driver_name, sizeof g_driver_name, "%s", slash ? slash + 1 : drv);
     }
 #endif
@@ -90,6 +96,7 @@ static void load_driver(void) {
     if (!g_gipa) { LOG("[vk] the Vulkan driver has no vkGetInstanceProcAddr"); abort(); }
     g_create_instance = (PFN_vkCreateInstance)g_gipa(NULL, "vkCreateInstance");
     LOG("[vk] Vulkan driver: %s", g_driver_name);
+    snprintf(g_status, sizeof g_status, "%s\t%s\t%s", req ? req : "", g_driver_name, reason);
 }
 
 // vkCreateInstance goes through here so the instance-level functions can be resolved against the instance (one instance).

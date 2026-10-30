@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] Gear (settings) dialog of DmActivity.showDoomSettings: English is the default / fallback; values-xx follow the system locale. -->
+<resources>
+    <string name="gear_title">Ayarlar</string>
+    <string name="gear_save">Kaydet</string>
+    <string name="gear_cancel">İptal</string>
+    <string name="gear_label_fmt">%1$s (%2$s)</string>
+    <string name="gear_when_now">hemen</string>
+    <string name="gear_when_next">sonraki açılışta</string>
+    <string name="gear_drs">Dinamik çözünürlük: GPU yoğunken 3D çözünürlüğünü düşürür; oyun menüsündeki Video → Dynamic Resolution ile aynı ayar</string>
+    <string name="gear_drs_unknown">Dinamik çözünürlük: oyun başladıktan sonra kullanılabilir (veya oyun menüsünde: Video → Dynamic Resolution)</string>
+    <string name="toast_drs_failed">Dinamik çözünürlük burada değiştirilemedi; oyun menüsünü kullanın: Video → Dynamic Resolution</string>
+    <string name="gear_fps_limit">Kare hızı sınırı</string>
+    <string name="gear_fps_note">60 FPS üstü deneyseldir.</string>
+    <string name="gear_driver">Vulkan sürücüsü</string>
+    <string name="gear_driver_system">Sistem (üretici sürücüsü; başka bir sürücü başlamazsa yedek olarak da kullanılır)</string>
+    <string name="gear_driver_system_short">sistem sürücüsü</string>
+    <string name="gear_driver_active">Şu an kullanılan: %1$s</string>
+    <string name="gear_driver_active_fallback">Şu an kullanılan: sistem sürücüsü (%1$s başlamadı)</string>
+    <string name="toast_driver_fallback">Vulkan sürücüsü %1$s bu cihazda başlamadı (%2$s); sistem sürücüsü kullanılıyor.</string>
+    <string name="toast_driver_crashed">Vulkan sürücüsü %1$s ile son açılış çöktü veya dondu, bu yüzden şimdi sistem sürücüsü kullanılıyor. Ayarlar\'dan yeniden seçebilirsiniz.</string>
+    <string name="gear_lang">Oyun dili (metinler ve seslendirme)</string>
+    <string name="gear_lang_system">Sistemdeki gibi</string>
+    <string name="gear_aa">Nişan yardımı</string>
+    <string name="gear_aa_switch">Switch\'teki gibi</string>
+    <string name="gear_wide">Geniş ekran: yan şeritler yerine daha geniş görüş</string>
+    <string name="gear_rumble">Titreşim</string>
+    <string name="gear_fps_counter">FPS ve kare süresi sayacı</string>
+    <string name="gear_res">3D çözünürlük (arayüz 720p kalır)</string>
+    <string name="gear_sharpen">Keskinlik (FSR RCAS)</string>
+    <string name="gear_off">Kapalı</string>
+    <string name="gear_low">Düşük</string>
+    <string name="gear_medium">Orta</string>
+    <string name="gear_high">Yüksek</string>
+    <string name="gear_none">Yok</string>
+    <string name="gear_small">Küçük</string>
+    <string name="gear_medium_dz">Orta</string>
+    <string name="gear_large">Büyük</string>
+    <string name="gear_look">Bakış hassasiyeti (kaydırma ve ateş düğmesi)</string>
+    <string name="gear_deadzone">Hareket çubuğu: oyunun ölü bölge telafisi</string>
+    <string name="toast_wide_now">Geniş ekran: uygulandı</string>
+    <string name="toast_wide_next">Geniş ekran: sonraki açılıştan itibaren</string>
+</resources>

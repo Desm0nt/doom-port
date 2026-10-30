@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] Gear (settings) dialog of DmActivity.showDoomSettings: English is the default / fallback; values-xx follow the system locale. -->
+<resources>
+    <string name="gear_title">設定</string>
+    <string name="gear_save">保存</string>
+    <string name="gear_cancel">キャンセル</string>
+    <string name="gear_label_fmt">%1$s（%2$s）</string>
+    <string name="gear_when_now">すぐに反映</string>
+    <string name="gear_when_next">次回起動時に反映</string>
+    <string name="gear_drs">ダイナミック解像度：GPU の負荷が高いときに 3D 解像度を下げます。ゲームメニューの Video → Dynamic Resolution と同じスイッチです</string>
+    <string name="gear_drs_unknown">ダイナミック解像度：ゲーム起動後に使用できます（ゲームメニューの Video → Dynamic Resolution でも設定できます）</string>
+    <string name="toast_drs_failed">ここではダイナミック解像度を変更できませんでした。ゲームメニューの Video → Dynamic Resolution を使ってください</string>
+    <string name="gear_fps_limit">フレームレート上限</string>
+    <string name="gear_fps_note">60 fps を超える設定は実験的です。</string>
+    <string name="gear_driver">Vulkan ドライバー</string>
+    <string name="gear_driver_system">システム（メーカー製ドライバー。他のドライバーが起動しないときの予備にもなります）</string>
+    <string name="gear_driver_system_short">システムドライバー</string>
+    <string name="gear_driver_active">現在使用中：%1$s</string>
+    <string name="gear_driver_active_fallback">現在使用中：システムドライバー（%1$s は起動しませんでした）</string>
+    <string name="toast_driver_fallback">Vulkan ドライバー %1$s はこの端末で起動しませんでした（%2$s）。システムドライバーを使用します。</string>
+    <string name="toast_driver_crashed">前回 Vulkan ドライバー %1$s で起動した際にクラッシュまたはフリーズしたため、システムドライバーに切り替えました。設定で再度選択できます。</string>
+    <string name="gear_lang">ゲームの言語（テキストと音声）</string>
+    <string name="gear_lang_system">システムと同じ</string>
+    <string name="gear_aa">エイムアシスト</string>
+    <string name="gear_aa_switch">Switch と同じ</string>
+    <string name="gear_wide">ワイド画面：左右の帯の代わりに視野を広げる</string>
+    <string name="gear_rumble">振動</string>
+    <string name="gear_fps_counter">FPS とフレーム時間の表示</string>
+    <string name="gear_res">3D 解像度（UI は 720p のまま）</string>
+    <string name="gear_sharpen">シャープネス（FSR RCAS）</string>
+    <string name="gear_off">オフ</string>
+    <string name="gear_low">弱</string>
+    <string name="gear_medium">中</string>
+    <string name="gear_high">強</string>
+    <string name="gear_none">なし</string>
+    <string name="gear_small">小</string>
+    <string name="gear_medium_dz">中</string>
+    <string name="gear_large">大</string>
+    <string name="gear_look">視点感度（スワイプと射撃ボタン）</string>
+    <string name="gear_deadzone">移動スティック：ゲームのデッドゾーン補正</string>
+    <string name="toast_wide_now">ワイド画面：適用しました</string>
+    <string name="toast_wide_next">ワイド画面：次回起動時から</string>
+</resources>

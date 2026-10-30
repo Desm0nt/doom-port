@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] Gear (settings) dialog of DmActivity.showDoomSettings: English is the default / fallback; values-xx follow the system locale. -->
+<resources>
+    <string name="gear_title">Settings</string>
+    <string name="gear_save">Save</string>
+    <string name="gear_cancel">Cancel</string>
+    <string name="gear_label_fmt">%1$s (%2$s)</string>
+    <string name="gear_when_now">applies immediately</string>
+    <string name="gear_when_next">applies on next launch</string>
+    <string name="gear_drs">Dynamic resolution: lowers the 3D resolution when the GPU is busy; the same switch as Video → Dynamic Resolution in the game menu</string>
+    <string name="gear_drs_unknown">Dynamic resolution: available once the game has started (or in the game menu: Video → Dynamic Resolution)</string>
+    <string name="toast_drs_failed">Dynamic resolution could not be changed here; use the game menu: Video → Dynamic Resolution</string>
+    <string name="gear_fps_limit">Frame rate limit</string>
+    <string name="gear_fps_note">Above 60 fps is experimental.</string>
+    <string name="gear_driver">Vulkan driver</string>
+    <string name="gear_driver_system">System (vendor driver; also the fallback if another driver fails)</string>
+    <string name="gear_driver_system_short">system driver</string>
+    <string name="gear_driver_active">In use now: %1$s</string>
+    <string name="gear_driver_active_fallback">In use now: system driver (%1$s did not start)</string>
+    <string name="toast_driver_fallback">Vulkan driver %1$s did not start on this device (%2$s); the system driver is used.</string>
+    <string name="toast_driver_crashed">The last launch with Vulkan driver %1$s crashed or froze, so the system driver is used now. You can select it again in Settings.</string>
+    <string name="gear_lang">Game language (text and voice)</string>
+    <string name="gear_lang_system">As in the system</string>
+    <string name="gear_aa">Aim assist</string>
+    <string name="gear_aa_switch">As on Switch</string>
+    <string name="gear_wide">Widescreen: wider view instead of side bars</string>
+    <string name="gear_rumble">Vibration</string>
+    <string name="gear_fps_counter">FPS and frame time counter</string>
+    <string name="gear_res">3D resolution (the interface stays at 720p)</string>
+    <string name="gear_sharpen">Sharpening (FSR RCAS)</string>
+    <string name="gear_off">Off</string>
+    <string name="gear_low">Low</string>
+    <string name="gear_medium">Medium</string>
+    <string name="gear_high">High</string>
+    <string name="gear_none">None</string>
+    <string name="gear_small">Small</string>
+    <string name="gear_medium_dz">Medium</string>
+    <string name="gear_large">Large</string>
+    <string name="gear_look">Look sensitivity (swipe and fire button)</string>
+    <string name="gear_deadzone">Move stick: game dead zone compensation</string>
+    <string name="toast_wide_now">Widescreen: applied</string>
+    <string name="toast_wide_next">Widescreen: from the next launch</string>
+</resources>

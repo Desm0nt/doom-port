@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] Gear (settings) dialog of DmActivity.showDoomSettings: English is the default / fallback; values-xx follow the system locale. -->
+<resources>
+    <string name="gear_title">Налаштування</string>
+    <string name="gear_save">Зберегти</string>
+    <string name="gear_cancel">Скасувати</string>
+    <string name="gear_label_fmt">%1$s (%2$s)</string>
+    <string name="gear_when_now">одразу</string>
+    <string name="gear_when_next">з наступного запуску</string>
+    <string name="gear_drs">Динамічна роздільність: знижує роздільність 3D під навантаженням на GPU; той самий перемикач, що Video → Dynamic Resolution у меню гри</string>
+    <string name="gear_drs_unknown">Динамічна роздільність: доступна після запуску гри (або в меню гри: Video → Dynamic Resolution)</string>
+    <string name="toast_drs_failed">Не вдалося змінити динамічну роздільність тут; скористайтеся меню гри: Video → Dynamic Resolution</string>
+    <string name="gear_fps_limit">Обмеження частоти кадрів</string>
+    <string name="gear_fps_note">Понад 60 кадрів/с — експериментально.</string>
+    <string name="gear_driver">Драйвер Vulkan</string>
+    <string name="gear_driver_system">Системний (драйвер виробника; запасний, якщо інший драйвер не запустився)</string>
+    <string name="gear_driver_system_short">системний драйвер</string>
+    <string name="gear_driver_active">Зараз використовується: %1$s</string>
+    <string name="gear_driver_active_fallback">Зараз використовується: системний драйвер (%1$s не запустився)</string>
+    <string name="toast_driver_fallback">Драйвер Vulkan %1$s не запустився на цьому пристрої (%2$s); використовується системний.</string>
+    <string name="toast_driver_crashed">Попередній запуск із драйвером Vulkan %1$s завершився збоєм або зависанням, тому зараз використовується системний. Його можна знову вибрати в налаштуваннях.</string>
+    <string name="gear_lang">Мова гри (тексти й озвучення)</string>
+    <string name="gear_lang_system">Як у системі</string>
+    <string name="gear_aa">Допомога в прицілюванні</string>
+    <string name="gear_aa_switch">Як на Switch</string>
+    <string name="gear_wide">Широкий екран: ширший огляд замість смуг по боках</string>
+    <string name="gear_rumble">Вібрація</string>
+    <string name="gear_fps_counter">Лічильник FPS і часу кадру</string>
+    <string name="gear_res">Роздільність 3D (інтерфейс лишається 720p)</string>
+    <string name="gear_sharpen">Різкість (FSR RCAS)</string>
+    <string name="gear_off">Вимк</string>
+    <string name="gear_low">Слабка</string>
+    <string name="gear_medium">Середня</string>
+    <string name="gear_high">Сильна</string>
+    <string name="gear_none">Немає</string>
+    <string name="gear_small">Мала</string>
+    <string name="gear_medium_dz">Середня</string>
+    <string name="gear_large">Велика</string>
+    <string name="gear_look">Чутливість огляду (свайп і кнопка вогню)</string>
+    <string name="gear_deadzone">Стік руху: компенсація мертвої зони гри</string>
+    <string name="toast_wide_now">Широкий екран: застосовано</string>
+    <string name="toast_wide_next">Широкий екран: з наступного запуску</string>
+</resources>

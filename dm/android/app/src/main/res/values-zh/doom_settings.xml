@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] Gear (settings) dialog of DmActivity.showDoomSettings: English is the default / fallback; values-xx follow the system locale. -->
+<resources>
+    <string name="gear_title">设置</string>
+    <string name="gear_save">保存</string>
+    <string name="gear_cancel">取消</string>
+    <string name="gear_label_fmt">%1$s（%2$s）</string>
+    <string name="gear_when_now">立即生效</string>
+    <string name="gear_when_next">下次启动生效</string>
+    <string name="gear_drs">动态分辨率：GPU 繁忙时降低 3D 分辨率；与游戏菜单中 Video → Dynamic Resolution 是同一个开关</string>
+    <string name="gear_drs_unknown">动态分辨率：游戏启动后可用（也可在游戏菜单 Video → Dynamic Resolution 中设置）</string>
+    <string name="toast_drs_failed">无法在此更改动态分辨率；请使用游戏菜单：Video → Dynamic Resolution</string>
+    <string name="gear_fps_limit">帧率上限</string>
+    <string name="gear_fps_note">高于 60 帧为实验性功能。</string>
+    <string name="gear_driver">Vulkan 驱动</string>
+    <string name="gear_driver_system">系统（厂商驱动；其他驱动无法启动时也用它兜底）</string>
+    <string name="gear_driver_system_short">系统驱动</string>
+    <string name="gear_driver_active">当前使用：%1$s</string>
+    <string name="gear_driver_active_fallback">当前使用：系统驱动（%1$s 未能启动）</string>
+    <string name="toast_driver_fallback">Vulkan 驱动 %1$s 未能在此设备上启动（%2$s），已改用系统驱动。</string>
+    <string name="toast_driver_crashed">上次使用 Vulkan 驱动 %1$s 启动时崩溃或卡死，现已改用系统驱动。可在设置中重新选择。</string>
+    <string name="gear_lang">游戏语言（文本和语音）</string>
+    <string name="gear_lang_system">跟随系统</string>
+    <string name="gear_aa">瞄准辅助</string>
+    <string name="gear_aa_switch">与 Switch 相同</string>
+    <string name="gear_wide">宽屏：视野更宽，不留两侧黑边</string>
+    <string name="gear_rumble">振动</string>
+    <string name="gear_fps_counter">帧率和帧时间显示</string>
+    <string name="gear_res">3D 分辨率（界面保持 720p）</string>
+    <string name="gear_sharpen">锐化（FSR RCAS）</string>
+    <string name="gear_off">关</string>
+    <string name="gear_low">弱</string>
+    <string name="gear_medium">中</string>
+    <string name="gear_high">强</string>
+    <string name="gear_none">无</string>
+    <string name="gear_small">小</string>
+    <string name="gear_medium_dz">中</string>
+    <string name="gear_large">大</string>
+    <string name="gear_look">视角灵敏度（滑动和开火键）</string>
+    <string name="gear_deadzone">移动摇杆：补偿游戏死区</string>
+    <string name="toast_wide_now">宽屏：已应用</string>
+    <string name="toast_wide_next">宽屏：下次启动生效</string>
+</resources>

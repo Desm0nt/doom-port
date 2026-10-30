@@ -68,6 +68,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native void nativePadAxes(int device, float x, float y, float z, float rz, float lt, float rt, float hatX, float hatY);
     static native void nativePadRemoved(int device);
     static native boolean nativeWideLive(boolean on);   // [DOOM] live widescreen switch (DM_DOOM_WIDE_LIVE=1); false = applies at the next launch
+    static native int nativeGetDrs();                   // [DOOM] the game's rs_enable (hle_doom_drs.c): -1 not known yet, 0 off, 1 on
+    static native boolean nativeSetDrs(boolean on);     // [DOOM] queue a live rs_enable change + profile save; false = cannot be written here
+    static native String nativeDriverStatus();          // [DOOM] "<requested>\t<active>\t<reason>" (vk_driver.c), "" before the driver loads
 
     private static WeakReference<DmActivity> current = new WeakReference<>(null);
     private static volatile int bootFailure;
@@ -98,6 +101,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (inputs != null) inputs.registerInputDeviceListener(this, null);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        if (DOOM) applyDisplayMode();   // [DOOM] frame rate limit above 60: ask for a display mode at a multiple of it
         view = new SurfaceView(this);
         view.getHolder().addCallback(this);
         gameFrame = new FrameLayout(this);
@@ -232,29 +236,90 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     }
 
 
-    // [DOOM] Graphics options (gear button on the on-screen pad). Kept in SharedPreferences and handed to the native host as
-    // environment variables before the library loads (hle_args.c turns them into the game's +set arguments, vulkan_present.cpp
-    // reads the sharpening), so a change applies at the next start of the game.
+    // [DOOM] Gear (settings) dialog on the on-screen pad. Texts are string resources (res/values*/doom_settings.xml: English default,
+    // ru uk de fr es pt it pl tr zh ja ko by the system locale). Two kinds of options, each labelled with when it applies:
+    //   next launch: kept in SharedPreferences "doom_graphics" and handed to the native host as environment variables before the
+    //     library loads (hle_args.c turns them into the game's +set arguments; vulkan_present.cpp, vk_driver.c, haptics_android.c,
+    //     hle_hid.c, hle_nvn.c read them once at start) -- 3D resolution, sharpening, frame rate limit, widescreen (unless the live
+    //     switch DM_DOOM_WIDE_LIVE=1 is on), Vulkan driver, game language, aim assist, vibration;
+    //   immediately: the controls in "doom_controls" (DoomPadView.reloadSettings: look sensitivity, dead zone, FPS counter) and
+    //     dynamic resolution, which is the game's own rs_enable cvar shared with Video -> Dynamic Resolution in the game menu
+    //     (nativeGetDrs / nativeSetDrs, hle_doom_drs.c; saved in the game profile, not here).
     static final float[] RES_FRACTIONS = {1.0f, 0.85f, 0.75f, 0.67f};
     static final String[] RES_LABELS = {"100% (720p)", "85% (612p)", "75% (540p)", "67% (480p)"};
     static final String[] SHARPEN_STOPS = {"", "1.0", "0.5", "0.2"};
-    static final String[] SHARPEN_LABELS = {"Выкл", "Слабая", "Средняя", "Сильная"};
+    static final int[] SHARPEN_LABELS = {R.string.gear_off, R.string.gear_low, R.string.gear_medium, R.string.gear_high};
     static final float[] AA_STRENGTHS = {0f, 0.5f, 1.0f, 1.5f, 2.0f};
-    static final String[] AA_LABELS = {"Как на Switch", "0.5", "1", "1.5", "2"};
+    static final String[] AA_LABELS = {null /* gear_aa_switch */, "0.5", "1", "1.5", "2"};
     static final String[] LANG_CODES = {"", "ru", "en-US"};
-    static final String[] LANG_LABELS = {"Как в системе", "Русский", "English"};
+    static final String[] LANG_LABELS = {null /* gear_lang_system */, "Русский", "English"};   // game languages keep their own names
     static final float[] LOOK_GAINS = {0.6f, 0.8f, 1.0f, 1.3f, 1.7f};
     static final String[] LOOK_LABELS = {"0.6", "0.8", "1.0", "1.3", "1.7"};
     static final float[] DEADZONES = {0f, 0.08f, 0.15f, 0.25f};
-    static final String[] DEADZONE_LABELS = {"Нет", "Малая", "Средняя", "Большая"};
+    static final int[] DEADZONE_LABELS = {R.string.gear_none, R.string.gear_small, R.string.gear_medium_dz, R.string.gear_large};
+    // Frame rate limit (next launch): DM_PRESENT_MAX_HZ caps the present pacing (hle_nvn.c: the largest integer fraction of the refresh
+    // rate not above it) and DM_DOOM_TICK_MAX the game's adaptive tick (hle_args.c) to the same value, so game time stays real time.
+    // 90 / 120 are offered only when the display has a mode at a multiple of that rate; the window then asks for that mode
+    // (applyDisplayMode) and the surface votes for it (vulkan_present.cpp). Above 60 is untested (frame-counted UI logic risk).
+    static final int[] FPS_LIMITS = {30, 60, 90, 120};
+    static final int FPS_LIMIT_DEFAULT = 60;
     static int nearest(float[] v, float x) { int b = 0; for (int i = 1; i < v.length; i++) if (Math.abs(v[i] - x) < Math.abs(v[b] - x)) b = i; return b; }
 
     private SharedPreferences doomPrefs() { return getSharedPreferences("doom_graphics", MODE_PRIVATE); }
 
+    private android.view.Display display() {
+        android.view.Display d = null;
+        try { d = getDisplay(); } catch (RuntimeException e) { /* not attached yet */ }
+        if (d == null && displays != null) d = displays.getDisplay(android.view.Display.DEFAULT_DISPLAY);
+        return d;
+    }
+    // A display mode whose refresh rate is an integer multiple of hz (within 1 Hz), preferring the current resolution, then the
+    // lowest such rate; null = the display has none.
+    private android.view.Display.Mode modeFor(int hz) {
+        android.view.Display d = display(); if (d == null) return null;
+        android.view.Display.Mode cur = d.getMode(), best = null; boolean bestSame = false;
+        for (android.view.Display.Mode m : d.getSupportedModes()) {
+            float r = m.getRefreshRate(); int k = Math.round(r / hz);
+            if (k < 1 || Math.abs(r - k * hz) > 1.0f) continue;
+            boolean same = cur != null && m.getPhysicalWidth() == cur.getPhysicalWidth() && m.getPhysicalHeight() == cur.getPhysicalHeight();
+            if (best == null || (same && !bestSame) || (same == bestSame && r < best.getRefreshRate())) { best = m; bestSame = same; }
+        }
+        return best;
+    }
+    private boolean fpsLimitAvailable(int hz) { return hz <= 60 || modeFor(hz) != null; }
+    // The saved limit, lowered to the highest one this display supports (another screen / the system's refresh setting changed).
+    private int fpsLimit() {
+        int want = doomPrefs().getInt("fps_limit", FPS_LIMIT_DEFAULT);
+        if (want <= 60) return want == 30 ? 30 : 60;
+        int got = 60; for (int l : FPS_LIMITS) if (l > got && l <= want && fpsLimitAvailable(l)) got = l;
+        return got;
+    }
+    // Above 60 the window asks the system for a display mode at a multiple of the limit (e.g. 90 Hz for 90, 120 Hz for 120); at 30 / 60
+    // nothing is requested (the surface's own 120 Hz vote and the system decide, as before).
+    private void applyDisplayMode() {
+        int lim = fpsLimit(); if (lim <= 60) return;
+        android.view.Display.Mode m = modeFor(lim); if (m == null) return;
+        WindowManager.LayoutParams lp = getWindow().getAttributes(); lp.preferredDisplayModeId = m.getModeId(); getWindow().setAttributes(lp);
+        android.util.Log.i("dm", "frame rate limit " + lim + ": display mode " + m.getModeId() + " " + m.getPhysicalWidth() + "x" + m.getPhysicalHeight() + " @ " + m.getRefreshRate() + " Hz");
+    }
+
+    // [DOOM] Driver crash guard: before a non-system driver is loaded its name goes to files/driver-trying ("<name>\n<failed launches>");
+    // the file is removed once the game has presented a frame or the native side reports it fell back to the system driver
+    // (driverWatch). A file left over means the last launch died before its first frame with that driver: after DRIVER_GUARD_STRIKES
+    // such launches in a row the system driver is chosen (saved in the settings, so the player sees it and can pick the package again)
+    // and a message says why. Two strikes, not one: a launch killed by hand (or by a debug script) before its first frame is not a crash.
+    static final int DRIVER_GUARD_STRIKES = 2;
+    private String driverNotice;   // shown once the game view is up
+    private File driverGuard() { return new File(getFilesDir(), "driver-trying"); }
+
     private void applyDoomSettings() {
         SharedPreferences p = doomPrefs();
         try {
-            if (p.getBoolean("drs", false)) Os.setenv("DM_DOOM_DRS", "1", true); else Os.unsetenv("DM_DOOM_DRS");
+            // Dynamic resolution is the game's own setting now (hle_doom_drs.c); the old gear preference is dropped.
+            if (p.contains("drs")) p.edit().remove("drs").apply();
+            int lim = fpsLimit();
+            Os.setenv("DM_PRESENT_MAX_HZ", String.valueOf(lim), true);
+            Os.setenv("DM_DOOM_TICK_MAX", String.valueOf(lim), true);
             int res = p.getInt("res", 0);
             if (res > 0 && res < RES_FRACTIONS.length) Os.setenv("DM_DOOM_RES", String.valueOf(RES_FRACTIONS[res]), true); else Os.unsetenv("DM_DOOM_RES");
             int sh = p.getInt("sharpen", 0);
@@ -279,17 +344,61 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             String lang = p.getString("lang", "");
             if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
             String drv = p.getString("driver", defaultDriver());
+            File guard = driverGuard(); String left = readText(guard);
+            int strikes = 0;
+            if (left != null) {
+                String[] g = left.split("\n"); String name = g[0].trim();
+                try { strikes = g.length > 1 ? Integer.parseInt(g[1].trim()) : 1; } catch (NumberFormatException e) { strikes = 1; }
+                if (!name.equals(drv)) strikes = 0;   // about another driver: the player changed it since
+                android.util.Log.w("dm", "driver guard: last launch with " + name + " ended before its first frame (" + strikes + " in a row)");
+                if (strikes >= DRIVER_GUARD_STRIKES) {
+                    p.edit().putString("driver", "").apply(); drv = ""; strikes = 0;
+                    driverNotice = getString(R.string.toast_driver_crashed, driverLabel(name));
+                }
+                guard.delete();
+            }
+            if (!drv.isEmpty()) {
+                try (OutputStream os = new FileOutputStream(guard)) { os.write((drv + "\n" + (strikes + 1) + "\n").getBytes(StandardCharsets.UTF_8)); }
+                catch (IOException e) { android.util.Log.e("dm", "driver guard: " + e); }
+            }
             if (!drv.isEmpty()) Os.setenv("DM_VK_DRIVER", drv, true); else Os.unsetenv("DM_VK_DRIVER");
         } catch (ErrnoException e) { android.util.Log.e("dm", "doom settings: " + e); }
     }
 
-    // [DOOM] Default Vulkan driver: the bundled Turnip package when the APK has it (vk_driver.c falls back to the system driver
-    // when it does not load or sees no Vulkan 1.1 GPU, e.g. on non-Adreno phones); "" = the system driver.
-    static final String DEFAULT_DRIVER = "turnip27";
+    // [DOOM] Default Vulkan driver per GPU (docs/research/non_adreno_drivers.md 4.1); the player's choice (pref "driver") always wins.
+    // This is the hook for vendor rules: it returns a package name under files/drivers/ or "" = the system driver.
+    //   Adreno 6xx / 7xx            -> turnip27 (bundled)
+    //   Adreno 710 / 720 / 722      -> turnip27-a710 when downloaded, else system
+    //   Adreno 8xx                  -> turnip27-a8xx when downloaded, else system
+    //   Adreno 5xx and older        -> system (Turnip does not support a5xx)
+    //   Mali / PowerVR / Xclipse / Maleoon (no kgsl gpu_model) -> system; their optional packages (PanVK, RADV-Xclipse) stay
+    //                                  selectable in the dialog when the player supplies them
+    // A manifest entry with an "auto" regex that matches this Adreno (drivers/manifest.json) still comes first for Adreno >= 600.
+    // When gpu_model is unreadable on a Qualcomm SoC, turnip27 is tried (vk_driver.c falls back to the system driver without a GPU).
+    static final String DEFAULT_DRIVER = "turnip27", DRIVER_A710 = "turnip27-a710", DRIVER_A8XX = "turnip27-a8xx";
     private String defaultDriver() {
         File dir = new File(getFilesDir(), "drivers");
+        int m = adrenoModel(gpuModel());
+        if (m == 0) return qualcommSoc() ? pkgIfPresent(dir, DEFAULT_DRIVER) : "";
+        if (m < 600) return "";
         String auto = autoDriverForGpu(dir); if (auto != null) return auto;
-        return new File(dir, DEFAULT_DRIVER).isDirectory() ? DEFAULT_DRIVER : "";
+        if (m == 710 || m == 720 || m == 722) return pkgIfPresent(dir, DRIVER_A710);
+        if (m >= 800 && m < 900) return pkgIfPresent(dir, DRIVER_A8XX);
+        return pkgIfPresent(dir, DEFAULT_DRIVER);
+    }
+    private static String pkgIfPresent(File dir, String name) { return hasDriverLib(new File(dir, name)) ? name : ""; }
+    // "Adreno750v2" -> 750; 0 = no readable model; -1 = a model that is not an Adreno.
+    static int adrenoModel(String gpu) {
+        if (gpu == null || gpu.isEmpty()) return 0;
+        String g = gpu.toLowerCase(Locale.ROOT); int at = g.indexOf("adreno"); if (at < 0) return -1;
+        int i = at + 6, v = 0, n = 0;
+        while (i < g.length() && !Character.isDigit(g.charAt(i)) && n == 0 && i < at + 12) i++;
+        while (i < g.length() && Character.isDigit(g.charAt(i)) && n < 4) { v = v * 10 + (g.charAt(i++) - '0'); n++; }
+        return n > 0 ? v : -1;
+    }
+    static boolean qualcommSoc() {
+        String s = (android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.HARDWARE).toLowerCase(Locale.ROOT);
+        return s.contains("qti") || s.contains("qualcomm") || s.contains("qcom");
     }
     // The GPU model as the kernel reports it, e.g. "Adreno750v2" (empty when unreadable or not an Adreno).
     static String gpuModel() {
@@ -432,71 +541,130 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         }
     }
 
+    // "<label> (applies immediately)" / "<label> (applies on next launch)", in the locale's own punctuation (gear_label_fmt).
+    private String when(int label, boolean now) {
+        return getString(R.string.gear_label_fmt, getString(label), getString(now ? R.string.gear_when_now : R.string.gear_when_next));
+    }
+    private TextView heading(LinearLayout box, String text) {
+        TextView t = new TextView(this); t.setText(text); t.setPadding(0, 24, 0, 0); box.addView(t); return t;
+    }
+    private RadioGroup radios(LinearLayout box, String[] labels, int idBase, int checked, boolean horizontal) {
+        RadioGroup g = new RadioGroup(this); g.setOrientation(horizontal ? RadioGroup.HORIZONTAL : RadioGroup.VERTICAL);
+        for (int i = 0; i < labels.length; i++) { RadioButton r = new RadioButton(this); r.setText(labels[i]); r.setId(idBase + i); g.addView(r); }
+        g.check(idBase + checked); box.addView(g); return g;
+    }
+    private String[] texts(int[] ids) { String[] s = new String[ids.length]; for (int i = 0; i < ids.length; i++) s[i] = getString(ids[i]); return s; }
+    private static int picked(RadioGroup g, int idBase, int n) { return Math.min(Math.max(0, g.getCheckedRadioButtonId() - idBase), n - 1); }
+    // "<requested>\t<active>\t<reason>" from vk_driver.c, or null before the driver is loaded.
+    private String[] driverStatus() {
+        if (!libraryLoaded) return null;
+        String s; try { s = nativeDriverStatus(); } catch (Throwable t) { return null; }
+        String[] f = s == null ? new String[0] : s.split("\t", -1);
+        return f.length >= 3 ? f : null;
+    }
+
     void showDoomSettings() {
         runOnUiThread(() -> {
-            SharedPreferences p = doomPrefs();
+            SharedPreferences p = doomPrefs(), cp = getSharedPreferences("doom_controls", MODE_PRIVATE);
             LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(48, 24, 48, 0);
-            CheckBox drs = new CheckBox(this); drs.setText("Динамическое разрешение DOOM (снижает 3D при нагрузке)"); drs.setChecked(p.getBoolean("drs", false)); box.addView(drs);
-            // Vulkan driver: the system one, or any adrenotools package found under Download/DOOM Mobile/drivers/<name>/ (one folder
-            // per package, e.g. Turnip builds for different Adreno generations), labelled with the name from its meta.json.
-            TextView drvL = new TextView(this); drvL.setText("Драйвер Vulkan (со следующего запуска):"); drvL.setPadding(0, 24, 0, 0); box.addView(drvL);
-            RadioGroup drvG = new RadioGroup(this); drvG.setOrientation(RadioGroup.VERTICAL);
+            // Dynamic resolution: the game's rs_enable, read now and written live (the Video menu's "Dynamic Resolution" is the same state).
+            int drsNow = -1; try { if (libraryLoaded) drsNow = nativeGetDrs(); } catch (Throwable t) { android.util.Log.e("dm", "nativeGetDrs: " + t); }
+            final int drsWas = drsNow;
+            CheckBox drs = new CheckBox(this);
+            if (drsNow >= 0) { drs.setText(when(R.string.gear_drs, true)); drs.setChecked(drsNow == 1); }
+            else { drs.setText(R.string.gear_drs_unknown); drs.setEnabled(false); }
+            box.addView(drs);
+            heading(box, when(R.string.gear_res, false));
+            RadioGroup res = radios(box, RES_LABELS, 1000, Math.min(Math.max(0, p.getInt("res", 0)), RES_LABELS.length - 1), false);
+            heading(box, when(R.string.gear_sharpen, false));
+            RadioGroup sh = radios(box, texts(SHARPEN_LABELS), 2000, Math.min(Math.max(0, p.getInt("sharpen", 0)), SHARPEN_LABELS.length - 1), true);
+            // Frame rate limit: only the values this display can show evenly.
+            java.util.ArrayList<Integer> lims = new java.util.ArrayList<>();
+            for (int l : FPS_LIMITS) if (fpsLimitAvailable(l)) lims.add(l);
+            String[] limLabels = new String[lims.size()]; int limAt = 0, limCur = fpsLimit();
+            for (int i = 0; i < limLabels.length; i++) { limLabels[i] = String.valueOf(lims.get(i)); if (lims.get(i) == limCur) limAt = i; }
+            heading(box, when(R.string.gear_fps_limit, false));
+            RadioGroup fpsLim = radios(box, limLabels, 8000, limAt, true);
+            if (lims.get(lims.size() - 1) > 60) { TextView n = new TextView(this); n.setText(R.string.gear_fps_note); box.addView(n); }
+            CheckBox wide = new CheckBox(this); wide.setText(when(R.string.gear_wide, false)); wide.setChecked(p.getBoolean("wide", true)); box.addView(wide);
+            // Vulkan driver: the system one, or any adrenotools package under files/drivers/<name>/ (bundled, downloaded or imported from
+            // Download/DOOM Mobile/drivers), labelled with the name from its meta.json; below it, what the running game actually uses.
+            heading(box, when(R.string.gear_driver, false));
             final String[] drvNames = driverPackages();
-            { RadioButton r = new RadioButton(this); r.setText("Системный (драйвер производителя; запасной, если Turnip не запустился)"); r.setId(7000); drvG.addView(r); }
-            for (int i = 0; i < drvNames.length; i++) { RadioButton r = new RadioButton(this); r.setText(driverLabel(drvNames[i])); r.setId(7001 + i); drvG.addView(r); }
-            { String cur = p.getString("driver", defaultDriver()); int di = -1; for (int i = 0; i < drvNames.length; i++) if (drvNames[i].equals(cur)) di = i; drvG.check(7000 + di + 1); }
-            box.addView(drvG);
-            TextView langL = new TextView(this); langL.setText("Язык игры (тексты и озвучка, со следующего запуска):"); langL.setPadding(0, 24, 0, 0); box.addView(langL);
-            RadioGroup langG = new RadioGroup(this); langG.setOrientation(RadioGroup.HORIZONTAL);
-            for (int i = 0; i < LANG_CODES.length; i++) { RadioButton r = new RadioButton(this); r.setText(LANG_LABELS[i]); r.setId(5000 + i); langG.addView(r); }
-            { String cur = p.getString("lang", ""); int li = 0; for (int i = 0; i < LANG_CODES.length; i++) if (LANG_CODES[i].equals(cur)) li = i; langG.check(5000 + li); }
-            box.addView(langG);
-            TextView aaL = new TextView(this); aaL.setText("Помощь в прицеливании (со следующего запуска):"); aaL.setPadding(0, 24, 0, 0); box.addView(aaL);
-            RadioGroup aaG = new RadioGroup(this); aaG.setOrientation(RadioGroup.HORIZONTAL);
-            for (int i = 0; i < AA_STRENGTHS.length; i++) { RadioButton r = new RadioButton(this); r.setText(AA_LABELS[i]); r.setId(6000 + i); aaG.addView(r); }
-            aaG.check(6000 + nearest(AA_STRENGTHS, p.getFloat("aa", 1.0f))); box.addView(aaG);
-            CheckBox wide = new CheckBox(this); wide.setText("Широкий экран: обзор шире вместо полос (со следующего запуска)"); wide.setChecked(p.getBoolean("wide", true)); box.addView(wide);
-            CheckBox rumble = new CheckBox(this); rumble.setText("Вибрация (со следующего запуска)"); rumble.setChecked(p.getBoolean("rumble", false)); box.addView(rumble);
-            CheckBox fps = new CheckBox(this); fps.setText("Счётчик FPS и времени кадра");
-            fps.setChecked(getSharedPreferences("doom_controls", MODE_PRIVATE).getBoolean("fps", true)); box.addView(fps);
-            TextView rl = new TextView(this); rl.setText("Разрешение 3D (интерфейс остаётся 720p):"); rl.setPadding(0, 24, 0, 0); box.addView(rl);
-            RadioGroup res = new RadioGroup(this);
-            for (int i = 0; i < RES_LABELS.length; i++) { RadioButton r = new RadioButton(this); r.setText(RES_LABELS[i]); r.setId(1000 + i); res.addView(r); }
-            res.check(1000 + p.getInt("res", 0)); box.addView(res);
-            TextView sl = new TextView(this); sl.setText("Резкость (FSR RCAS):"); sl.setPadding(0, 24, 0, 0); box.addView(sl);
-            RadioGroup sh = new RadioGroup(this); sh.setOrientation(RadioGroup.HORIZONTAL);
-            for (int i = 0; i < SHARPEN_LABELS.length; i++) { RadioButton r = new RadioButton(this); r.setText(SHARPEN_LABELS[i]); r.setId(2000 + i); sh.addView(r); }
-            sh.check(2000 + p.getInt("sharpen", 0)); box.addView(sh);
-            TextView note = new TextView(this); note.setText("Графика применится при следующем запуске игры, управление — сразу."); note.setPadding(0, 24, 0, 0);
-            SharedPreferences cp = getSharedPreferences("doom_controls", MODE_PRIVATE);
-            TextView ll = new TextView(this); ll.setText("Чувствительность обзора (свайп и кнопка огня):"); ll.setPadding(0, 24, 0, 0); box.addView(ll);
-            RadioGroup look = new RadioGroup(this); look.setOrientation(RadioGroup.HORIZONTAL);
-            for (int i = 0; i < LOOK_GAINS.length; i++) { RadioButton r = new RadioButton(this); r.setText(LOOK_LABELS[i]); r.setId(3000 + i); look.addView(r); }
-            look.check(3000 + nearest(LOOK_GAINS, cp.getFloat("look", 1.0f))); box.addView(look);
-            TextView dl = new TextView(this); dl.setText("Стик движения: компенсация мёртвой зоны игры:"); dl.setPadding(0, 24, 0, 0); box.addView(dl);
-            RadioGroup dz = new RadioGroup(this); dz.setOrientation(RadioGroup.HORIZONTAL);
-            for (int i = 0; i < DEADZONES.length; i++) { RadioButton r = new RadioButton(this); r.setText(DEADZONE_LABELS[i]); r.setId(4000 + i); dz.addView(r); }
-            dz.check(4000 + nearest(DEADZONES, cp.getFloat("move_dz", 0f))); box.addView(dz);
-            box.addView(note);
+            String[] drvLabels = new String[drvNames.length + 1]; drvLabels[0] = getString(R.string.gear_driver_system);
+            for (int i = 0; i < drvNames.length; i++) drvLabels[i + 1] = driverLabel(drvNames[i]);
+            int drvAt = 0; { String cur = p.getString("driver", defaultDriver()); for (int i = 0; i < drvNames.length; i++) if (drvNames[i].equals(cur)) drvAt = i + 1; }
+            RadioGroup drvG = radios(box, drvLabels, 7000, drvAt, false);
+            String[] st = driverStatus();
+            if (st != null) {
+                boolean fell = !st[0].isEmpty() && "system".equals(st[1]);
+                TextView a = new TextView(this);
+                a.setText(fell ? getString(R.string.gear_driver_active_fallback, driverLabel(st[0]))
+                               : getString(R.string.gear_driver_active, st[0].isEmpty() || "system".equals(st[1]) ? getString(R.string.gear_driver_system_short) : driverLabel(st[0])));
+                box.addView(a);
+            }
+            heading(box, when(R.string.gear_lang, false));
+            String[] langLabels = LANG_LABELS.clone(); langLabels[0] = getString(R.string.gear_lang_system);
+            int langAt = 0; { String cur = p.getString("lang", ""); for (int i = 0; i < LANG_CODES.length; i++) if (LANG_CODES[i].equals(cur)) langAt = i; }
+            RadioGroup langG = radios(box, langLabels, 5000, langAt, true);
+            heading(box, when(R.string.gear_aa, false));
+            String[] aaLabels = AA_LABELS.clone(); aaLabels[0] = getString(R.string.gear_aa_switch);
+            RadioGroup aaG = radios(box, aaLabels, 6000, nearest(AA_STRENGTHS, p.getFloat("aa", 1.0f)), true);
+            CheckBox rumble = new CheckBox(this); rumble.setText(when(R.string.gear_rumble, false)); rumble.setChecked(p.getBoolean("rumble", false)); box.addView(rumble);
+            heading(box, when(R.string.gear_look, true));
+            RadioGroup look = radios(box, LOOK_LABELS, 3000, nearest(LOOK_GAINS, cp.getFloat("look", 1.0f)), true);
+            heading(box, when(R.string.gear_deadzone, true));
+            RadioGroup dz = radios(box, texts(DEADZONE_LABELS), 4000, nearest(DEADZONES, cp.getFloat("move_dz", 0f)), true);
+            CheckBox fps = new CheckBox(this); fps.setText(when(R.string.gear_fps_counter, true)); fps.setChecked(cp.getBoolean("fps", true)); box.addView(fps);
             android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
-            new AlertDialog.Builder(this).setTitle("Графика").setView(scroll)
-                .setPositiveButton("Сохранить", (d, w) -> {
+            new AlertDialog.Builder(this).setTitle(R.string.gear_title).setView(scroll)
+                .setPositiveButton(R.string.gear_save, (d, w) -> {
                     boolean wideChanged = wide.isChecked() != p.getBoolean("wide", true);
-                    p.edit().putBoolean("drs", drs.isChecked()).putString("driver", drvG.getCheckedRadioButtonId() > 7000 && drvG.getCheckedRadioButtonId() - 7001 < drvNames.length ? drvNames[drvG.getCheckedRadioButtonId() - 7001] : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked()).putFloat("aa", AA_STRENGTHS[Math.min(Math.max(0, aaG.getCheckedRadioButtonId() - 6000), AA_STRENGTHS.length - 1)]).putString("lang", LANG_CODES[Math.min(Math.max(0, langG.getCheckedRadioButtonId() - 5000), LANG_CODES.length - 1)])
-                        .putInt("res", Math.max(0, res.getCheckedRadioButtonId() - 1000)).putInt("sharpen", Math.max(0, sh.getCheckedRadioButtonId() - 2000)).apply();
-                    int li = Math.max(0, look.getCheckedRadioButtonId() - 3000), di = Math.max(0, dz.getCheckedRadioButtonId() - 4000);
-                    getSharedPreferences("doom_controls", MODE_PRIVATE).edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[Math.min(li, LOOK_GAINS.length - 1)])
-                        .putFloat("move_dz", DEADZONES[Math.min(di, DEADZONES.length - 1)]).apply();
+                    int drvPick = picked(drvG, 7000, drvNames.length + 1);
+                    p.edit().putString("driver", drvPick > 0 ? drvNames[drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked())
+                        .putFloat("aa", AA_STRENGTHS[picked(aaG, 6000, AA_STRENGTHS.length)]).putString("lang", LANG_CODES[picked(langG, 5000, LANG_CODES.length)])
+                        .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length))
+                        .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size()))).apply();
+                    cp.edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[picked(look, 3000, LOOK_GAINS.length)])
+                        .putFloat("move_dz", DEADZONES[picked(dz, 4000, DEADZONES.length)]).apply();
                     if (doomPad != null) doomPad.reloadSettings();
+                    if (drsWas >= 0 && drs.isChecked() != (drsWas == 1)) {
+                        boolean ok = false;
+                        try { ok = nativeSetDrs(drs.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetDrs: " + t); }
+                        if (!ok) android.widget.Toast.makeText(this, R.string.toast_drs_failed, android.widget.Toast.LENGTH_LONG).show();
+                    }
                     if (wideChanged) {   // [DOOM] BUGS_AND_FIXES 2.12: native answers whether it switched live (needs DM_DOOM_WIDE_LIVE=1)
                         boolean live = false;
                         try { live = libraryLoaded && nativeWideLive(wide.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeWideLive: " + t); }
-                        android.widget.Toast.makeText(this, live ? "Широкий экран: применено" : "Широкий экран: со следующего запуска", android.widget.Toast.LENGTH_SHORT).show();
+                        android.widget.Toast.makeText(this, live ? R.string.toast_wide_now : R.string.toast_wide_next, android.widget.Toast.LENGTH_SHORT).show();
                     }
                 })
-                .setNegativeButton("Отмена", null).show();
+                .setNegativeButton(R.string.gear_cancel, null).show();
         });
     }
+
+    // [DOOM] After the game starts: removes the driver crash guard once a frame was presented, and tells the player once when the
+    // chosen driver did not start and the native side fell back to the system driver (vk_driver.c status). Polls every second until
+    // both are settled.
+    private boolean driverGuardDone, driverStatusDone;
+    private final float[] guardStats = new float[4];
+    private final Runnable driverWatch = new Runnable() { @Override public void run() {
+        if (!started || isDestroyed()) return;
+        String[] st = driverStatus();
+        if (!driverStatusDone && st != null) {
+            driverStatusDone = true;
+            if (!st[0].isEmpty() && "system".equals(st[1])) {
+                android.util.Log.w("dm", "driver " + st[0] + " did not start (" + st[2] + "): system driver");
+                android.widget.Toast.makeText(DmActivity.this, getString(R.string.toast_driver_fallback, driverLabel(st[0]), st[2]), android.widget.Toast.LENGTH_LONG).show();
+                driverGuard().delete(); driverGuardDone = true;   // not a crash: the native side already chose the system driver
+            }
+        }
+        if (!driverGuardDone) {
+            try { nativeFrameStats(guardStats); } catch (Throwable t) { guardStats[0] = 0; }
+            if (guardStats[0] > 0) { driverGuard().delete(); driverGuardDone = true; android.util.Log.i("dm", "driver guard: first frames presented, guard cleared"); }
+        }
+        if (!(driverGuardDone && driverStatusDone)) view.postDelayed(this, 1000);
+    } };
 
     private void startHost() {
         if (bootFailure != 0) { showBootFailure(); return; }
@@ -561,6 +729,10 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         }
         started = true;
         if (touchOverlay != null) touchOverlay.setInputEnabled(true);
+        if (DOOM) {   // [DOOM] driver crash guard / fallback message (driverWatch), and the notice from the guard at this launch
+            if (driverNotice != null) { android.widget.Toast.makeText(this, driverNotice, android.widget.Toast.LENGTH_LONG).show(); driverNotice = null; }
+            view.postDelayed(driverWatch, 1000);
+        }
         nativeFocus(3);
     }
 

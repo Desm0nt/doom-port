@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] Gear (settings) dialog of DmActivity.showDoomSettings: English is the default / fallback; values-xx follow the system locale. -->
+<resources>
+    <string name="gear_title">Ustawienia</string>
+    <string name="gear_save">Zapisz</string>
+    <string name="gear_cancel">Anuluj</string>
+    <string name="gear_label_fmt">%1$s (%2$s)</string>
+    <string name="gear_when_now">od razu</string>
+    <string name="gear_when_next">od następnego uruchomienia</string>
+    <string name="gear_drs">Dynamiczna rozdzielczość: obniża rozdzielczość 3D, gdy GPU jest obciążone; ten sam przełącznik co Video → Dynamic Resolution w menu gry</string>
+    <string name="gear_drs_unknown">Dynamiczna rozdzielczość: dostępna po uruchomieniu gry (lub w menu gry: Video → Dynamic Resolution)</string>
+    <string name="toast_drs_failed">Nie udało się zmienić tutaj dynamicznej rozdzielczości; użyj menu gry: Video → Dynamic Resolution</string>
+    <string name="gear_fps_limit">Limit klatek na sekundę</string>
+    <string name="gear_fps_note">Powyżej 60 kl./s — eksperymentalnie.</string>
+    <string name="gear_driver">Sterownik Vulkan</string>
+    <string name="gear_driver_system">Systemowy (sterownik producenta; także zapasowy, gdy inny sterownik się nie uruchomi)</string>
+    <string name="gear_driver_system_short">sterownik systemowy</string>
+    <string name="gear_driver_active">Obecnie używany: %1$s</string>
+    <string name="gear_driver_active_fallback">Obecnie używany: sterownik systemowy (%1$s się nie uruchomił)</string>
+    <string name="toast_driver_fallback">Sterownik Vulkan %1$s nie uruchomił się na tym urządzeniu (%2$s); używany jest sterownik systemowy.</string>
+    <string name="toast_driver_crashed">Ostatnie uruchomienie ze sterownikiem Vulkan %1$s zakończyło się awarią lub zawieszeniem, więc teraz używany jest sterownik systemowy. Możesz wybrać go ponownie w ustawieniach.</string>
+    <string name="gear_lang">Język gry (teksty i głosy)</string>
+    <string name="gear_lang_system">Jak w systemie</string>
+    <string name="gear_aa">Wspomaganie celowania</string>
+    <string name="gear_aa_switch">Jak na Switchu</string>
+    <string name="gear_wide">Szeroki ekran: szerszy widok zamiast pasów po bokach</string>
+    <string name="gear_rumble">Wibracje</string>
+    <string name="gear_fps_counter">Licznik FPS i czasu klatki</string>
+    <string name="gear_res">Rozdzielczość 3D (interfejs zostaje w 720p)</string>
+    <string name="gear_sharpen">Wyostrzanie (FSR RCAS)</string>
+    <string name="gear_off">Wył.</string>
+    <string name="gear_low">Słabe</string>
+    <string name="gear_medium">Średnie</string>
+    <string name="gear_high">Mocne</string>
+    <string name="gear_none">Brak</string>
+    <string name="gear_small">Mała</string>
+    <string name="gear_medium_dz">Średnia</string>
+    <string name="gear_large">Duża</string>
+    <string name="gear_look">Czułość widoku (przesunięcie i przycisk strzału)</string>
+    <string name="gear_deadzone">Gałka ruchu: kompensacja martwej strefy gry</string>
+    <string name="toast_wide_now">Szeroki ekran: zastosowano</string>
+    <string name="toast_wide_next">Szeroki ekran: od następnego uruchomienia</string>
+</resources>
