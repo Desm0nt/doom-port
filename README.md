@@ -156,7 +156,7 @@ The script reads every tool path from the environment (`ANDROID_HOME`, `JAVA_HOM
 
    On Windows: `setup.bat` with the same arguments. Needs Python 3, the **.NET 10 SDK** (shader translator) and ~70 GB
    of free space while unpacking NSZ. Details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
-3. Install the APK (from [Releases](https://github.com/Desm0nt/doom-port/releases), or build it yourself, see
+3. Install the APK (from [Releases](https://github.com/Desm0nt/doom-port/releases/latest), or build it yourself, see
    *Building*) and copy `work/DOOM Mobile` to the phone's `Download` folder (or let `--push` / `./setup.sh push
    <serial>` do it over adb).
 4. Start *DOOM Mobile* and allow *All files access* when asked.
@@ -276,7 +276,7 @@ NVN воспроизводится через Vulkan. Основа — прое�
   сервисы отвечают как у консоли без сети.
 - Подготовка файлов игры одной командой: `./setup.sh <база> <обновление> <prod.keys> [--push <serial>]`
   (на Windows — `setup.bat`), проверка без изменений — `./setup.sh check`. Нужны Python 3, **.NET 10 SDK** и ~70 ГБ
-  свободного места на время распаковки NSZ. Готовый APK — в [Releases](https://github.com/Desm0nt/doom-port/releases).
+  свободного места на время распаковки NSZ. Готовый APK — в [Releases](https://github.com/Desm0nt/doom-port/releases/latest).
 - Сборка: `cmake -S dm/android -B work/build-android … -DDM_GAME=doom`, затем `build.bat` / `tools/build_apk.ps1` (см. «Building»).
 
 Подробности о состоянии порта, переключателях и истории исправлений — в [docs/doom/](docs/doom/) и [docs/research/](docs/research/).
