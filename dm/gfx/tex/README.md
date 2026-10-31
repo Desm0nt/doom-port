@@ -26,7 +26,7 @@ The offsets of each level and layer within the storage, and the block height and
 
 Some older Apple GPUs do not support BC compressed textures (determined by `supportsBCTextureCompression` of `MTLDevice`). On these devices:
 
-- the game's textures can be converted to ASTC format offline in advance with an optional supplementary pack (`dm/tools/astc_pack.py`; for dependencies see the "Optional" section of `docs/DEPENDENCIES.md`);
+- the game's textures can be converted to ASTC format offline in advance with an optional supplementary pack (`dm/tools/astc_pack.py`; it needs astcenc, <https://github.com/ARM-software/astc-encoder>);
 - the remaining BC textures are created by the replay layer in their decompressed format and decompressed at upload; decompression on the CPU goes through `nvn_bcdec.c` in this directory.
 
 The environment variable `DM_TEST_NO_BC=1` forces this path on any machine.

@@ -38,7 +38,7 @@ Original Switch shader package
   → xcrun metal / metallib  compiles into Metal shader libraries
 ```
 
-Without Apple's Metal compiler (Windows, Linux, a Mac without Xcode) the last step cannot be done. `tools/nometal_run.py` lets the same chain run its first two steps as usual and puts the translated MSL source into the library files as is; a package made this way compiles the shaders once on the phone, and the system caches the compiled result. This route is used by `dm/tools/d2rm_pack.py`; see `docs/NO_XCODE.md` in the repository root.
+Without Apple's Metal compiler (Windows, Linux, a Mac without Xcode) the last step cannot be done. `tools/nometal_run.py` lets the same chain run its first two steps as usual and puts the translated MSL source into the library files as is; a package made this way compiles the shaders once on the phone, and the system caches the compiled result. This route is used by `dm/tools/d2rm_pack.py`; see d2r-mobile's `docs/NO_XCODE.md`.
 
 The whole chain is driven by `tools/dmsh_build.py`, and `setup.sh` runs it for you. Key points:
 

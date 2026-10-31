@@ -5,7 +5,7 @@
 This is the ARM64 Android version. The APK links the shared host, the Vulkan
 replay engine, AAudio, a transparent touch overlay drawn the same way as iOS, and
 system text input. It has been played on real phones (camp, fights, panels, NPC
-dialogs); measurements are in `docs/android-notes/`. Players
+dialogs); measurements are in d2r-mobile's `docs/android-notes/`. Players
 install the release APK and import their own game content: see "Installing as a
 player" below.
 
@@ -143,7 +143,7 @@ lists during start-up, so a first visit to the places it covers does not
 stutter while pipelines build. `dm/android/tools/merge_warm_lists.py` merges
 several devices' `files/dm/vk-pipeline-list.bin` into one seed. A seed only
 works with the bundles it was recorded with, so it ships with them. The
-measurements are in `docs/android-notes/2026-10-22-first-play-stutter.md`.
+measurements are in d2r-mobile's `docs/android-notes/2026-10-22-first-play-stutter.md`.
 
 ## Validation and remaining work
 

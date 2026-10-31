@@ -8,7 +8,7 @@ Read these first; this document does not repeat them:
 
 - What you need and how to build from scratch: [../../README.md](../../README.md), [../../setup.sh](../../setup.sh)
 - Dependencies and versions: [../../docs/DEPENDENCIES.md](../../docs/DEPENDENCIES.md)
-- How to prepare the game files and where to put them: [../../docs/GAME_FILES.md](../../docs/GAME_FILES.md)
+- How to prepare the game files and where to put them: [../../docs/doom/GAME_FILES.md](../../docs/doom/GAME_FILES.md)
 - The rewriter, the host, the graphics layer, and "Generating assets from your game files": [../README.md](../README.md)
 
 In this document `$DM_ROOT` means the workspace root (default `~/dm-work`). Relative paths in commands are relative to `dm/ios` unless stated otherwise.

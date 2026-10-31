@@ -4,7 +4,7 @@ English: [README.md](README.md)
 
 游戏的 Switch 版用 NVN（Switch 的原生图形接口）画图。图形层在苹果的 Metal 上把这套接口重新实现一遍：游戏的每一次 NVN 调用落到这里，录成命令，提交时回放成 Metal 命令。游戏的着色器不在运行时翻译，而是在电脑上一次性离线翻译成 Metal 着色器库（电脑上没有苹果的 Metal 编译器时，最后的编译一步改在手机上做，见下文）。
 
-整个项目的构建步骤见仓库根目录的 `README.zh-CN.md` 与 `setup.sh`，依赖见 `docs/DEPENDENCIES.zh-CN.md`；这里只讲图形层自己的事。
+整个项目的构建步骤见仓库根目录的 `README.zh-CN.md` 与 `setup.sh`，依赖见 `docs/DEPENDENCIES.md`；这里只讲图形层自己的事。
 
 ## 怎么工作
 
@@ -38,7 +38,7 @@ Switch 原版着色器包
   → xcrun metal / metallib  编成 Metal 着色器库
 ```
 
-没有苹果的 Metal 编译器时（Windows、Linux、没装 Xcode 的 Mac），最后一步做不了。`tools/nometal_run.py` 让同一条链照常跑完前两步，把翻译出的 MSL 源码原样放进库文件；这样做出的包在手机上把着色器编译一次，系统会缓存编好的结果。这条路由 `dm/tools/d2rm_pack.py` 使用，见仓库根目录的 `docs/NO_XCODE.zh-CN.md`。
+没有苹果的 Metal 编译器时（Windows、Linux、没装 Xcode 的 Mac），最后一步做不了。`tools/nometal_run.py` 让同一条链照常跑完前两步，把翻译出的 MSL 源码原样放进库文件；这样做出的包在手机上把着色器编译一次，系统会缓存编好的结果。这条路由 `dm/tools/d2rm_pack.py` 使用，见 d2r-mobile 的 `docs/NO_XCODE.zh-CN.md`。
 
 整条链由 `tools/dmsh_build.py` 驱动，`setup.sh` 会替你跑。要点：
 

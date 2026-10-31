@@ -8,7 +8,7 @@ The steps for preparing the environment and building the app are not repeated he
 
 - Overview and the three build steps: [../README.md](../README.md)
 - Dependencies and versions: [../docs/DEPENDENCIES.md](../docs/DEPENDENCIES.md)
-- How to prepare the game files and where to put them: [../docs/GAME_FILES.md](../docs/GAME_FILES.md)
+- How to prepare the game files and where to put them: [../docs/doom/GAME_FILES.md](../docs/doom/GAME_FILES.md)
 - One command to prepare the workspace: `../setup.sh`
 
 Below, `$DM_ROOT` is the workspace root directory (default `~/dm-work`): the game files, rewrite build outputs, caches and run logs all live under it and are not committed to the repository.

@@ -21,7 +21,7 @@ English: [README.md](README.md)
 | `touch_mac.c`、`touch_mac.h` | Mac 宿主上的触摸前端：按触点脚本（`DM_TOUCH_SCRIPT`）逐拍送触点，[dm/verify](../verify/README.zh-CN.md) 的触摸功能用例靠它跑 |
 | `romfs_validate.h` | `romfs_validate.c` 的接口：核对资源档案在不在、大小对不对，并给出给玩家看的缺失清单 |
 | `stash_seed.h` | 第一次生成共享仓库时用的预置内容。公开仓库不带这个文件（它是游戏生成的一份存档的字节）：不在就不预置 |
-| `dm_derived_rt.h` | 只在不含游戏内容的「壳」里用：由游戏文件生成的几张表不编进代码，运行时从安装包里读，见 [docs/NO_XCODE.zh-CN.md](../../docs/NO_XCODE.zh-CN.md) |
+| `dm_derived_rt.h` | 只在不含游戏内容的「壳」里用：由游戏文件生成的几张表不编进代码，运行时从安装包里读，见 d2r-mobile 的 [docs/NO_XCODE.zh-CN.md](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/docs/NO_XCODE.zh-CN.md) |
 
 另外，`diag.c` 除了诊断，还是每个服务端拍的入口：`dm_vault.c`、`dm_pages.c` 等要在服务端拍里做的事由它调用。
 

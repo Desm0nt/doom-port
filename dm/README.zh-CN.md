@@ -7,8 +7,8 @@ English: [README.md](README.md)
 准备环境与出包的步骤不在这里重复：
 
 - 总体介绍与构建三步：[../README.zh-CN.md](../README.zh-CN.md)
-- 依赖与版本：[../docs/DEPENDENCIES.zh-CN.md](../docs/DEPENDENCIES.zh-CN.md)
-- 游戏文件怎么准备、放哪：[../docs/GAME_FILES.zh-CN.md](../docs/GAME_FILES.zh-CN.md)
+- 依赖与版本：[../docs/DEPENDENCIES.md](../docs/DEPENDENCIES.md)
+- 游戏文件怎么准备、放哪：[../docs/doom/GAME_FILES.md](../docs/doom/GAME_FILES.md)
 - 一条命令准备工作区：`../setup.sh`
 
 下文的 `$DM_ROOT` 指工作区根目录（缺省 `~/dm-work`）：游戏文件、改写产物、缓存和运行日志都在它下面，不进仓库。
@@ -87,7 +87,7 @@ App 把 `host/` 与 `gfx/` 的源码直接编进去，前端接口 `host/front.h
 | `verify/` | 验证：改写等价回归 `regress.sh`、整套验收 `accept.sh` 及其各项用到的脚本与格式说明 |
 | `data/` | 随仓库的小数据：资源覆盖层的借用路径登记表。启动预取清单公开仓库不带：缺了就不预取，启动时少一步提前解码 |
 | `i18n/` | 中英文案表 `ui_text.tsv`；`scan_literals.py` 检查玩家看得到的中文都进了这张表，例外登记在 `literal_whitelist.tsv` |
-| `third_party/` | 第三方代码，见 [../docs/DEPENDENCIES.zh-CN.md](../docs/DEPENDENCIES.zh-CN.md) |
+| `third_party/` | 第三方代码，见 [../docs/DEPENDENCIES.md](../docs/DEPENDENCIES.md) |
 
 ## 常用流程
 
@@ -206,7 +206,7 @@ DM_ROMFS=<Update/RomFS 目录> DM_SAVE=<存档目录> DM_TEMP=<临时目录> DM_
 - Mac 宿主：`make -C dm/host`。缺的三个生成文件（`dm_vault_tab.h`、`dm_hud_exp.h`、`dm_bright_levels.inc`）按 `DM_ROMFS_SRC` 自动生成。
 - iOS 单测：`make -C dm/ios/tests test`。缺的技能索引自动生成。
 
-缺游戏文件时会直接报一句说明要放哪个目录。这几条命令调用 `python3`，要在 `setup.sh` 建的 Python 环境里跑（Pillow、numpy 等装在里面，版本见 [../docs/DEPENDENCIES.zh-CN.md](../docs/DEPENDENCIES.zh-CN.md)）：先执行 `source ~/dm-work/build/cache/dm/venv/bin/activate`（设了 `DM_ROOT` 就把 `~/dm-work` 换成它）。
+缺游戏文件时会直接报一句说明要放哪个目录。这几条命令调用 `python3`，要在 `setup.sh` 建的 Python 环境里跑（Pillow、numpy 等装在里面，版本见 [../docs/DEPENDENCIES.md](../docs/DEPENDENCIES.md)）：先执行 `source ~/dm-work/build/cache/dm/venv/bin/activate`（设了 `DM_ROOT` 就把 `~/dm-work` 换成它）。
 
 **出了什么**
 

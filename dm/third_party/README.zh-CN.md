@@ -16,4 +16,4 @@ English: [README.md](README.md)
 
 - `flip/tool/` 里还带着 FLIP 命令行工具用到的三个单头文件库：`stb_image.h`（2.23）、`stb_image_write.h`（1.13）、`tinyexr.h`。它们的许可声明写在各自文件里。
 - `bcdec/README.md`、`libdeflate/VERSION.md`、`ryujinx/README.md`、`zlib-ng/VERSION.md` 记着各自的来源与用途。
-- 来源地址与许可证的汇总在 [docs/DEPENDENCIES.zh-CN.md](../../docs/DEPENDENCIES.zh-CN.md) 的「随仓库的第三方代码」一节。那一节还列了两处不在本目录的第三方代码：`dm/gfx/nvn/include/nvn.h`（MIT，作者见文件头）和 `dm/gfx/nvn/nvn_tex.c` 里移植自 deko3d 的排布尺寸算法（zlib 许可证）。
+- 来源地址与许可证的汇总在 [docs/DEPENDENCIES.md](../../docs/DEPENDENCIES.md) 的「随仓库的第三方代码」一节。那一节还列了两处不在本目录的第三方代码：`dm/gfx/nvn/include/nvn.h`（MIT，作者见文件头）和 `dm/gfx/nvn/nvn_tex.c` 里移植自 deko3d 的排布尺寸算法（zlib 许可证）。

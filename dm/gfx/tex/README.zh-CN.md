@@ -26,7 +26,7 @@ English: [README.md](README.md)
 
 一部分较老的苹果显卡不支持 BC 压缩贴图（由 `MTLDevice` 的 `supportsBCTextureCompression` 判断）。在这些设备上：
 
-- 游戏贴图可以用可选的补充包事先离线换成 ASTC 格式（`dm/tools/astc_pack.py`，依赖见 `docs/DEPENDENCIES.zh-CN.md` 的「可选」一节）；
+- 游戏贴图可以用可选的补充包事先离线换成 ASTC 格式（`dm/tools/astc_pack.py`，需要 astcenc，<https://github.com/ARM-software/astc-encoder>）；
 - 剩下的 BC 贴图由回放层建成解压后的格式，上传时解压，CPU 上的解压走本目录的 `nvn_bcdec.c`。
 
 环境变量 `DM_TEST_NO_BC=1` 可以在任何机器上强制走这条路径。

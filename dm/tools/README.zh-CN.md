@@ -10,7 +10,7 @@ English: [README.md](README.md)
 |---|---|
 | `patch_nso.py` | 程序改写器：把游戏程序里在苹果内核下不能原样执行的少数指令改写掉，其余逐字节保持原样。`setup.sh` 会调它 |
 | `extract_game.sh` | 从你自己的游戏包里取出本项目要的两部分（程序文件与资源），放进工作区 |
-| `d2rm_pack.py` | 不用 Xcode 出可玩的安装包：把你自己的游戏文件做进「壳」，见 [docs/NO_XCODE.zh-CN.md](../../docs/NO_XCODE.zh-CN.md) |
+| `d2rm_pack.py` | 不用 Xcode 出可玩的安装包：把你自己的游戏文件做进「壳」，见 d2r-mobile 的 [docs/NO_XCODE.zh-CN.md](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/docs/NO_XCODE.zh-CN.md) |
 | `guest_dylib.py` | 把改写后的游戏程序写成一个苹果格式的动态库（纯 Python，各系统产出逐字节相同）；`d2rm_pack.py` 调它 |
 | `winlf/` | Windows 上让做包工具链统一用 `\n` 换行，保证各系统做出的包一致 |
 | `product.sh` | 当前改写产物的代号只写在一处（`dm/PRODUCT`），各脚本经它取路径 |

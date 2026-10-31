@@ -1,5 +1,5 @@
-> 历史检查（2026-10-15）；最新集成和真机结果见 [安卓协作状态](../../../docs/ANDROID_COLLABORATION.zh-CN.md)。
-> Historical check (2026-10-15); see the [current Android status](../../../docs/ANDROID_COLLABORATION.md) for integration and device results.
+> 历史检查（2026-10-15）；最新集成和真机结果见 [安卓协作状态](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/docs/ANDROID_COLLABORATION.zh-CN.md)（d2r-mobile）。
+> Historical check (2026-10-15); see the [current Android status](https://github.com/jhaizhou-ops/d2r-mobile/blob/main/docs/ANDROID_COLLABORATION.md) (d2r-mobile) for integration and device results.
 
 # 安卓真实 Vulkan 后端候选（2026-10-15）
 

@@ -1,6 +1,7 @@
 # Third-party code in the DOOM port
 
-The tree in `src/` is a fork of d2r-mobile (MIT, Copyright (c) 2026 jhaizhou, `src/LICENSE`).
+The tree in `dm/` is a fork of d2r-mobile (MIT, Copyright (c) 2026 jhaizhou, kept in the root `LICENSE`); the third-party
+code it brought is listed in [DEPENDENCIES.md](DEPENDENCIES.md) and its contributors in [upstream/README-d2r-mobile.md](upstream/README-d2r-mobile.md).
 Code was also ported from two other MIT-licensed projects. Each ported file says so in a comment
 and keeps the original copyright line.
 

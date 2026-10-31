@@ -214,7 +214,7 @@ than on Snapdragon 8 Gen 2/3. Reports (device, GPU, driver, log) are very welcom
 | `third_party/libadrenotools` | git submodule (BSD-2-Clause) |
 | `docs/doom/` | Port documentation: state, recon, switches, game files, derived information |
 | `docs/research/` | Analysis notes behind individual fixes |
-| `docs/upstream/` | d2r-mobile's original README and contribution guide; the other files in `docs/` are upstream's D2R documentation |
+| `docs/THIRD_PARTY.md`, `docs/DEPENDENCIES.md`, `docs/DERIVED.md`, `docs/upstream/` | Attribution: code ported for DOOM, the third-party code and D2R-derived records inherited from d2r-mobile, and d2r-mobile's acknowledgements |
 
 ## Credits
 
@@ -222,6 +222,8 @@ DOOM Mobile stands on the work of others — thank you:
 
 - **[d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile)** by jhaizhou (MIT) — the base of this port: native
   NSO loader and rewriter, HLE host, NVN → Vulkan engine, shader translation chain and Android app.
+  Its Android app and Vulkan engine came from community contributors; see its
+  [acknowledgements](docs/upstream/README-d2r-mobile.md).
 - **[nxnative](https://github.com/seedds/nxnative)** by seedds (MIT) — threads and SVCs, SDK 6.x services, audio
   renderer, NVN entry points, timestamp units, patcher and translator pieces.
 - **[nx2android](https://github.com/shirai91/nx2android)** / nx2apk (MIT) — window acquire-sync fix (1c6177d),

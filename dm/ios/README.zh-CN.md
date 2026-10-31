@@ -7,8 +7,8 @@ D2R Mobile 的 iOS App：把宿主（`dm/host`）、图形层（`dm/gfx`）和�
 先读这几份，本文不重复它们：
 
 - 需要什么、怎么从零构建：[../../README.zh-CN.md](../../README.zh-CN.md)、[../../setup.sh](../../setup.sh)
-- 依赖与版本：[../../docs/DEPENDENCIES.zh-CN.md](../../docs/DEPENDENCIES.zh-CN.md)
-- 游戏文件怎么准备、放哪：[../../docs/GAME_FILES.zh-CN.md](../../docs/GAME_FILES.zh-CN.md)
+- 依赖与版本：[../../docs/DEPENDENCIES.md](../../docs/DEPENDENCIES.md)
+- 游戏文件怎么准备、放哪：[../../docs/doom/GAME_FILES.md](../../docs/doom/GAME_FILES.md)
 - 改写器、宿主、图形层，以及「从你的游戏文件生成资源」：[../README.zh-CN.md](../README.zh-CN.md)
 
 文中 `$DM_ROOT` 指工作区根目录（缺省 `~/dm-work`）。命令里的相对路径以 `dm/ios` 为准，除非另有说明。
