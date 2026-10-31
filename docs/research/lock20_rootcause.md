@@ -1,7 +1,7 @@
 # 20-fps lock (Mi 13 Pro / 8 Gen 2, TV room): root cause analysis
 
 Status: DONE (analysis only; no source/doc/build/adb/git changes). Scripts used (scratch audit folder): win.py, lk_timeline.py,
-lk_up.py, lk_corr.py, lk_phase.py, lk_pass.py, lk_tex.py, plt.py, relrefs.py. Log paths: G:\Games\PORT\doom-port\work\logs\play\<run>\logcat.txt.
+lk_up.py, lk_corr.py, lk_phase.py, lk_pass.py, lk_tex.py, plt.py, relrefs.py. Log paths: work/logs/play/<run>/logcat.txt (not in this repo).
 
 ## 0. Summary
 
