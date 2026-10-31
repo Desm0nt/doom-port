@@ -422,16 +422,32 @@ HLE_FORCE("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm", "renderer
           Result, h_ars_Update, uint8_t *sys, void *o, size_t on, void *p, size_t pn, const void *in, size_t inn) {
     static Result (*orig)(void *, void *, size_t, void *, size_t, const void *, size_t); if (!orig) orig = gsym("_ZN2nn5audio6server17AudioRenderSystem6UpdateEPvmS3_mPKvm");
     static uint64_t last_r = ~0ull;
+    // DM_AUDREN_CATCHUP=0: no catch-up frames, as on the Switch, where RequestUpdate only parses and never renders or blocks. DOOM has no
+    // effects to initialize ("effects 0 submixes 0"). Once the TV-room video starts (two updates without a render between them), every
+    // update became a catch-up that waited ~5 ms for queue space; the 20-fps phase of the 30.10 TV runs (24-41% of heavy time,
+    // 8 Gen 2 and 8 Gen 3) started at that moment. Off by default since 31.10: the owner's runs on both phones no longer drop (DM_AUDREN_CATCHUP=1 brings the catch-up frames back).
+    static int catchup = -1; if (catchup < 0) { const char *e = getenv("DM_AUDREN_CATCHUP"); catchup = e && *e == '1'; LOG("audren: catch-up frames %s (DM_AUDREN_CATCHUP)", catchup ? "on" : "off: updates never render or wait, as on the Switch"); }
+    // Every 10 s: updates, catch-ups, time updates spent waiting for queue space, and the thread that updated last
+    static uint64_t st_t, st_u, st_c, st_wn, st_wns, st_wmax; uint64_t t_now = now_ns(), w0 = 0;
+    if (!st_t) st_t = t_now;
+    else if (t_now - st_t >= 10000000000ull) {
+        uint64_t uu = atomic_load(&g_updates), cc = atomic_load(&g_catchups);
+        LOG("audren: last %.1f s: %llu updates, %llu catch-ups, %llu queue waits %.1f ms (max %.1f ms), updater tid %d", (t_now - st_t) / 1e9, (unsigned long long)(uu - st_u),
+            (unsigned long long)(cc - st_c), (unsigned long long)st_wn, st_wns / 1e6, st_wmax / 1e6, (int)gettid());
+        st_t = t_now; st_u = uu; st_c = cc; st_wn = st_wns = st_wmax = 0;
+    }
     uint64_t u = atomic_fetch_add(&g_updates, 1) + 1, r = atomic_load(&g_renders);
-    if (last_r != ~0ull && r == last_r) {
+    if (catchup && last_r != ~0ull && r == last_r) {
         uint64_t c = atomic_fetch_add(&g_catchups, 1) + 1;
         if (c <= 3) LOG("audren: no frame rendered before update %llu, rendering a catch-up frame first (%llu so far)", (unsigned long long)u, (unsigned long long)c);
         uint32_t t = atomic_load(&g_cq_tail);
         if (t - atomic_load(&g_cq_head) >= CQ) {   // queue full: wait for the render thread to play one (every 5 ms), so catch-up frames keep real time; at most 50 ms (an output that stopped)
             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 50000000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            w0 = now_ns();
             pthread_mutex_lock(&g_cq_mu);
             while (atomic_load(&g_open) && t - atomic_load(&g_cq_head) >= CQ && !pthread_cond_timedwait(&g_cq_cv, &g_cq_mu, &dl)) {}
             pthread_mutex_unlock(&g_cq_mu);
+            uint64_t wd = now_ns() - w0; st_wn++; st_wns += wd; if (wd > st_wmax) st_wmax = wd;
         }
         if (t - atomic_load(&g_cq_head) < CQ) { render_once(sys, g_cq[t % CQ], &g_cq_n[t % CQ]); atomic_store(&g_cq_tail, t + 1); }
         else render_once(sys, NULL, NULL);   // still full (the output stopped): render anyway, output discarded
