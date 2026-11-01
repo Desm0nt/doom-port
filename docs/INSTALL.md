@@ -215,8 +215,7 @@ On 8–12 GB phones close other apps before playing.
 1. Open the gear dialog → *Vulkan driver* → try *System* (or the other choice), restart the app.
 2. Check that the phone is supported (Snapdragon / Adreno recommended; see the README).
 3. Report it with the log: install [Android platform-tools](https://developer.android.com/tools/releases/platform-tools),
-   enable USB debugging, then run `adb logcat -d -s dm > doom-log.txt` right after the problem (or
-   `adb pull /sdcard/Android/data/org.doom.port/files/dm/boot.log`). Open an issue at
+   enable USB debugging, then run `adb logcat -d -s dm > doom-log.txt` right after the problem (the game must still be running or have just stopped). Open an issue at
    <https://github.com/Desm0nt/doom-port/issues> with the phone model, Android version and the log.
 
 **Can I delete things on the PC afterwards?**

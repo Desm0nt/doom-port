@@ -216,8 +216,7 @@ Lockpick_RCM: в ключах со старой прошивки нет новы
 1. Откройте шестерёнку → *Драйвер Vulkan* → попробуйте *System* (или другой вариант) и перезапустите приложение.
 2. Проверьте, что телефон подходит (рекомендуется Snapdragon / Adreno; см. README).
 3. Сообщите о проблеме с логом: поставьте [Android platform-tools](https://developer.android.com/tools/releases/platform-tools),
-   включите отладку по USB и сразу после проблемы выполните `adb logcat -d -s dm > doom-log.txt` (или
-   `adb pull /sdcard/Android/data/org.doom.port/files/dm/boot.log`). Создайте issue на
+   включите отладку по USB и сразу после проблемы выполните `adb logcat -d -s dm > doom-log.txt` (игра должна быть ещё запущена или только что закрыта). Создайте issue на
    <https://github.com/Desm0nt/doom-port/issues>, указав модель телефона, версию Android и приложив лог.
 
 **Можно потом удалить что-то на ПК?**

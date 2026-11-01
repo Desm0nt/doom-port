@@ -116,7 +116,7 @@ Other Snapdragon devices may work; other GPUs are untested.
 - Turnip is the default driver and matches or beats the stock Qualcomm driver on Adreno 750; on other Adreno
   generations you may need another Turnip build (see *Vulkan drivers*); non-Adreno GPUs use the system driver.
 - The heaviest scenes are still below 60 fps (see above).
-- The port's settings dialog is in Russian for now.
+- The port's settings dialog is translated into 13 languages (system locale, English by default).
 - Many renderer fixes are still behind switches for A/B testing; see [docs/doom/SWITCHES.md](docs/doom/SWITCHES.md).
 
 ## Building
