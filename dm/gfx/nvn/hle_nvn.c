@@ -1314,6 +1314,11 @@ static uint64_t g_frame;
 static uint64_t g_pa_wait;   // 本帧取图里节拍等待（自适应出图档用） | pacing wait inside acquire this frame (for the adaptive present tier)
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
+// [r2] Total pacing sleep inside AcquireTexture (wall ns, any thread): perf_android.c's DM_ADPF_WORK=wall takes it off the present interval
+static _Atomic uint64_t g_pace_sleep_ns;
+uint64_t dm_nvn_pace_sleep_ns(void) { return atomic_load_explicit(&g_pace_sleep_ns, memory_order_relaxed); }
+// [r2] Android (perf_android.c, strong): notes which guest thread presents (the game's main thread), for DM_GUEST_BIGCORE / ADPF
+__attribute__((weak)) void dm_aperf_guest_present(void) {}
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
@@ -1325,8 +1330,10 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(&g_rt_main, period); }
         rt_comp_tick(&g_rt_main, period);
+        uint64_t ps0 = now_ns();   // [r2] the pacing sleep actually taken (perf_android.c DM_ADPF_WORK=wall subtracts it)
         if (mtl_link_active()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
+        atomic_fetch_add_explicit(&g_pace_sleep_ns, now_ns() - ps0, memory_order_relaxed);
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
@@ -1677,6 +1684,7 @@ static uint64_t present_period(const win_t *o) {
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    dm_aperf_guest_present();   // [r2] Android: the presenting guest thread (one atomic compare)
 #ifdef DM_GAME_DOOM
     if (o->presents == 1 || o->presents % 300 == 0) LOG("[nvn] present #%llu (texture %d)", (unsigned long long)o->presents, idx);   // bring-up heartbeat
     // [DOOM] On-demand dump while the game runs (e.g. stuck behind a loading screen): creating DM_RUNTIME_DIR/dump makes the next

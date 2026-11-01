@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Hareket çubuğu: oyunun ölü bölge telafisi</string>
     <string name="toast_wide_now">Geniş ekran: uygulandı</string>
     <string name="toast_wide_next">Geniş ekran: sonraki açılıştan itibaren</string>
+    <string name="gear_button">Ayarlar düğmesi</string>
+    <string name="gear_button_normal">Normal</string>
+    <string name="gear_button_faded">Soluk</string>
+    <string name="gear_button_note">Soluk: zor görünür, eskisi gibi çalışır; ne kadar görüneceğini aşağıdaki kaydırıcı belirler.</string>
+    <string name="gear_button_alpha" formatted="true">Soluk düğmenin opaklığı: %%%1$d</string>
 </resources>

@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Move stick: game dead zone compensation</string>
     <string name="toast_wide_now">Widescreen: applied</string>
     <string name="toast_wide_next">Widescreen: from the next launch</string>
+    <string name="gear_button">Settings button</string>
+    <string name="gear_button_normal">Normal</string>
+    <string name="gear_button_faded">Faded</string>
+    <string name="gear_button_note">Faded: barely visible, works as before; set how visible with the slider below.</string>
+    <string name="gear_button_alpha" formatted="true">Faded button opacity: %1$d%%</string>
 </resources>

@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Stick de déplacement : compensation de la zone morte du jeu</string>
     <string name="toast_wide_now">Écran large : appliqué</string>
     <string name="toast_wide_next">Écran large : au prochain lancement</string>
+    <string name="gear_button">Bouton des paramètres</string>
+    <string name="gear_button_normal">Normal</string>
+    <string name="gear_button_faded">Estompé</string>
+    <string name="gear_button_note">Estompé : à peine visible, fonctionne comme avant ; réglez sa visibilité avec le curseur ci-dessous.</string>
+    <string name="gear_button_alpha" formatted="true">Opacité du bouton estompé : %1$d %%</string>
 </resources>

@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Stick de movimiento: compensación de la zona muerta del juego</string>
     <string name="toast_wide_now">Pantalla ancha: aplicada</string>
     <string name="toast_wide_next">Pantalla ancha: desde el próximo inicio</string>
+    <string name="gear_button">Botón de ajustes</string>
+    <string name="gear_button_normal">Normal</string>
+    <string name="gear_button_faded">Translúcido</string>
+    <string name="gear_button_note">Translúcido: apenas visible, funciona como antes; ajusta cuánto se ve con el control de abajo.</string>
+    <string name="gear_button_alpha" formatted="true">Opacidad del botón translúcido: %1$d %%</string>
 </resources>

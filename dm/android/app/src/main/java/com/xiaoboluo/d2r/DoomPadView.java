@@ -79,6 +79,12 @@ public class DoomPadView extends View {
     // Control options from the gear dialog (DmActivity): move dead-zone compensation and look sensitivity.
     // A real controller is connected (DmActivity.updatePadVisibility): only the settings button stays; everything held is released.
     private boolean controllerMode;
+    // Settings button look (gear dialog, doom_controls "gear_mode", players asked for it to be less in the way): normal, or faded (its
+    // alpha scaled to "gear_alpha" % of the usual, a slider in the dialog, full while pressed, same spot). Applies in controllerMode too.
+    // (A hidden mode, reopened from a notification or a three-finger tap, was dropped: MIUI / HyperOS take three fingers for their
+    // screenshot gesture, and an always-there notification was not wanted.) An old saved "hidden" (2) is shown as faded.
+    static final int GEAR_NORMAL = 0, GEAR_FADED = 1, GEAR_ALPHA_DEFAULT = 10;
+    private int gearMode = GEAR_NORMAL, gearAlpha = GEAR_ALPHA_DEFAULT;
     // Frame counter (gear dialog): fps, mean / max frame time and GPU time of the last 0.5 s, redrawn twice a second.
     private boolean showFps; private final float[] fstats = new float[4];
     private final Runnable fpsTick = new Runnable() { public void run() { if (!showFps) return; DmActivity.nativeFrameStats(fstats); invalidate(); postDelayed(this, 500); } };
@@ -94,16 +100,20 @@ public class DoomPadView extends View {
     void setControllerMode(boolean on) {
         if (on == controllerMode) return;
         controllerMode = on;
-        if (on) {
-            for (Btn b : btns) if (b.pointer >= 0) { DmActivity.nativePadKey(PAD_DEVICE, b.key, false); b.pointer = -1; }
-            left.pointer = -1; left.x = left.y = 0; look.pointer = fireLook.pointer = -1; pendX = pendY = lookX = lookY = 0;
-        }
+        if (on) releaseAll();
         invalidate();
     }
+    // Every held key up, stick centred, look stopped (the caller sends the zero axes when this pad drives the game).
+    private void releaseAll() {
+        for (Btn b : btns) if (b.pointer >= 0) { if (b.key != SETTINGS) DmActivity.nativePadKey(PAD_DEVICE, b.key, false); b.pointer = -1; }
+        left.pointer = -1; left.x = left.y = 0; look.pointer = fireLook.pointer = -1; pendX = pendY = lookX = lookY = 0;
+    }
+    private void openSettings() { if (getContext() instanceof DmActivity) ((DmActivity) getContext()).showDoomSettings(); }
 
     void reloadSettings() {
         SharedPreferences p = getContext().getSharedPreferences("doom_controls", Context.MODE_PRIVATE);
         deadzone = p.getFloat("move_dz", 0f); showFps = p.getBoolean("fps", true); if (showFps) postDelayed(fpsTick, 500); lookGain = p.getFloat("look", 1.0f);
+        gearMode = p.getInt("gear_mode", GEAR_NORMAL) == GEAR_NORMAL ? GEAR_NORMAL : GEAR_FADED; gearAlpha = Math.max(1, Math.min(100, p.getInt("gear_alpha", GEAR_ALPHA_DEFAULT))); invalidate();
     }
 
     private float bx(Btn b) { return b.fx * getWidth() + b.ox * dp; }
@@ -173,13 +183,16 @@ public class DoomPadView extends View {
         if (controllerMode) {   // a real controller drives the game: only the settings button, and no axes from this pad (they would
             // make the touch pad the active controller in front_android.c)
             if ((a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN)) { Btn b = hit(x, y);
-                if (b != null && b.key == SETTINGS && getContext() instanceof DmActivity) ((DmActivity) getContext()).showDoomSettings(); }
+                if (b != null && b.key == SETTINGS) { b.pointer = id; openSettings(); } }   // pointer: drawn pressed (faded mode)
+            else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP || a == MotionEvent.ACTION_CANCEL)
+                for (Btn b : btns) if (b.pointer >= 0 && (b.pointer == id || a != MotionEvent.ACTION_POINTER_UP)) b.pointer = -1;
+            invalidate();
             return true;
         }
         switch (a) {
         case MotionEvent.ACTION_DOWN: case MotionEvent.ACTION_POINTER_DOWN: {
             Btn b = hit(x, y);
-            if (b != null && b.key == SETTINGS) { if (getContext() instanceof DmActivity) ((DmActivity) getContext()).showDoomSettings(); }
+            if (b != null && b.key == SETTINGS) { b.pointer = id; openSettings(); }   // held only to be drawn pressed; no key
             else if (b != null) {
                 b.pointer = id; DmActivity.nativePadKey(PAD_DEVICE, b.key, true);
                 if (b.look && fireLook.pointer < 0) lookStart(fireLook, id, x, y);
@@ -199,7 +212,7 @@ public class DoomPadView extends View {
             break;
         case MotionEvent.ACTION_UP: case MotionEvent.ACTION_POINTER_UP: case MotionEvent.ACTION_CANCEL: {
             boolean all = a == MotionEvent.ACTION_CANCEL || a == MotionEvent.ACTION_UP;
-            for (Btn b : btns) if (b.pointer >= 0 && (b.pointer == id || all)) { DmActivity.nativePadKey(PAD_DEVICE, b.key, false); b.pointer = -1; }
+            for (Btn b : btns) if (b.pointer >= 0 && (b.pointer == id || all)) { if (b.key != SETTINGS) DmActivity.nativePadKey(PAD_DEVICE, b.key, false); b.pointer = -1; }
             if (left.pointer >= 0 && (id == left.pointer || all)) release(left);
             if (id == look.pointer || all) look.pointer = -1;
             if (id == fireLook.pointer || all) fireLook.pointer = -1;
@@ -226,9 +239,12 @@ public class DoomPadView extends View {
         for (Btn b : btns) drawBtn(c, b);
     }
     private void drawBtn(Canvas c, Btn b) {
+        boolean dim = b.key == SETTINGS && gearMode == GEAR_FADED && b.pointer < 0;   // faded gear: gearAlpha % of every alpha until pressed
         float x = bx(b), y = by(b), r = b.r * dp;
         fill.setColor(b.pointer >= 0 ? 0x80ffffff : (b.look ? 0x40ff6040 : 0x30ffffff));
+        if (dim) { fill.setAlpha(fill.getAlpha() * gearAlpha / 100); line.setAlpha(0x90 * gearAlpha / 100); text.setAlpha(0xd0 * gearAlpha / 100); }
         c.drawCircle(x, y, r, fill); c.drawCircle(x, y, r, line);
         c.drawText(b.label, x, y + text.getTextSize() * 0.35f, text);
+        if (dim) { line.setAlpha(0x90); text.setAlpha(0xd0); }
     }
 }

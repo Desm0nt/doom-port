@@ -33,6 +33,7 @@
 #include <dlfcn.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <unistd.h>   // gettid (bionic)
 #endif
 
 #define R_TIMEOUT     0xEA01u   // 内核模块 1，描述 117 | Kernel module 1, description 117
@@ -78,6 +79,7 @@ typedef struct thr {
     int native_wait;           // nesting depth of a blocking native HLE wait (G held)
     int host_owned;            // a guest thread the host created itself (dm_guest_thread_spawn): not one of the game's threads
     const uint32_t *whs; int whn;   // WaitSynchronization's handle array while waiting there: a signal wakes only waiters holding the object
+    int tid; char hname[16];   // [r2] Android: host thread id and the name given to it (pthread_setname_np), see thr_host_name
     uint64_t nyield, nbackoff, yrun_svc, yrun_t0, yrun_sig, yrun_sig2;   // yields, back-off sleeps, current run of yields (thr_yield)
     uint64_t nspin, srun_svc, srun_t0, spin_ret;   // spin-wait passes and the current spin wait (dm_spin_wait)
 } thr_t;
@@ -320,6 +322,7 @@ static void guest_timer_slack(void) {
     if (slack > 0) prctl(PR_SET_TIMERSLACK, (unsigned long)slack, 0, 0, 0);
 #endif
 }
+static void thr_host_name(thr_t *t);
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
@@ -330,7 +333,12 @@ static void *thread_main(void *p) {
     t->mport = pthread_mach_thread_np(pthread_self());
     crash_thread_init();
     guest_thread_init();
-    pthread_mutex_lock(&G); while (!t->started) pthread_cond_wait(&t->cv, &G); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G);
+#ifdef __ANDROID__
+    t->tid = (int)gettid();
+#endif
+    while (!t->started) pthread_cond_wait(&t->cv, &G);
+    thr_host_name(t); pthread_mutex_unlock(&G);
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
     die("客体线程入口返回");
 }
@@ -372,6 +380,9 @@ uint32_t svc_thread_main_init(void) {
     pthread_setspecific(g_keythr, t);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
     pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+#ifdef __ANDROID__
+    pthread_mutex_lock(&G); t->tid = (int)gettid(); thr_host_name(t); pthread_mutex_unlock(&G);
+#endif
     return t->handle;
 }
 
@@ -436,6 +447,35 @@ static const char *thr_name(thr_t *t, char *nb, size_t n) {   // SDK ThreadType+
     if (vm_read_overwrite(mach_task_self(), t->arg + THR_NAME_OFF, 8, (vm_address_t)&np, &got) || !np ||
         vm_read_overwrite(mach_task_self(), np, n - 1, (vm_address_t)nb, &got)) return "?";
     nb[got] = 0; return nb;
+}
+// [r2] Host names of guest threads (Android): the guest's own thread name when the SDK ThreadType has one (WorkerThread_00, ...),
+// else "g<core>-<id>"; the main thread is "guest-main". At most 15 bytes, non-ASCII bytes become '_'. Set when the thread starts
+// (holding G) and refreshed by thr_refresh_host_names (perf_android.c, every 10 s), since the game may name a thread after
+// starting it. Lets top / simpleperf / the "[perf] threads 10s:" line tell the guest threads apart.
+static void thr_host_name(thr_t *t) {   // holding G
+#ifdef __ANDROID__
+    if (!t->tid || t->exited) return;
+    char nb[64], want[16]; const char *nm = t->handle == 0x1001 ? "guest-main" : thr_name(t, nb, sizeof nb);
+    if (!nm[0] || !strcmp(nm, "?")) snprintf(want, sizeof want, "g%d-%llu", t->core, (unsigned long long)t->id);
+    else { size_t i = 0; for (; nm[i] && i < sizeof want - 1; i++) { unsigned char c = (unsigned char)nm[i]; want[i] = c > 32 && c < 127 ? (char)c : '_'; } want[i] = 0; }
+    if (!strcmp(want, t->hname)) return;
+    if (!pthread_setname_np(t->pt, want)) memcpy(t->hname, want, sizeof want);
+#else
+    (void)t;
+#endif
+}
+void thr_refresh_host_names(void) {
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) if (t->started && !t->exited) thr_host_name(t);
+    pthread_mutex_unlock(&G);
+}
+// [r2] Live guest threads' host thread ids (Android; 0 elsewhere): perf_android.c's thread monitor (DM_GUEST_BIGCORE, ADPF)
+int thr_guest_tids(int32_t *out, int max) {
+    int n = 0;
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t && n < max; t = t->all) if (t->started && !t->exited && t->tid) out[n++] = t->tid;
+    pthread_mutex_unlock(&G);
+    return n;
 }
 // 全部活着的客体线程（采样器 DM_SAMPLE=毫秒:* 用）：把 pthread 填进 out，返回个数
 // All live guest threads (used by the sampler DM_SAMPLE=ms:*): fill the pthreads into out, return the count

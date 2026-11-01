@@ -40,4 +40,9 @@
     <string name="gear_deadzone">移動スティック：ゲームのデッドゾーン補正</string>
     <string name="toast_wide_now">ワイド画面：適用しました</string>
     <string name="toast_wide_next">ワイド画面：次回起動時から</string>
+    <string name="gear_button">設定ボタン</string>
+    <string name="gear_button_normal">通常</string>
+    <string name="gear_button_faded">半透明</string>
+    <string name="gear_button_note">半透明：ほとんど見えませんが、これまで通り使えます。見え方は下のスライダーで調整できます。</string>
+    <string name="gear_button_alpha" formatted="true">半透明ボタンの不透明度：%1$d%%</string>
 </resources>

@@ -6,6 +6,7 @@
 #include "vulkan_present.h"
 #ifdef DM_GAME_DOOM
 extern "C" void dm_aperf_present(ANativeWindow*,float);
+extern "C" void dm_aperf_note_wait(int64_t);   // [r2] perf_android.c: the present thread's acquire wait (DM_ADPF_WORK=wall)
 #endif
 #include "../gfx/vulkan/nvn_vk.h"
 #include "../gfx/xtrace.h"
@@ -76,13 +77,29 @@ unsigned fastest_cores(){
         unsigned v=0;if(fscanf(f,"%u",&v)==1 && v){present|=1u<<c;if(v>best){best=v;mask=0;}if(v==best)mask|=1u<<c;}fclose(f);}
     return mask==present?0:mask;   // one core class: nothing to pick
 }
+// [r2] Where the present (translation) thread really runs: sched_getcpu() once per present, and every 30 s one line
+// "NVN pin cpus 30s: ..." with the share of presents seen on each CPU, the mask checks of that window and how many found the
+// mask reset (HyperOS rewrites it). Always on, pin or not (one getcpu per present).
+unsigned pin_hist[16],pin_hist_n=0,pin_checks_w=0,pin_drifts_w=0;int64_t pin_hist_t0=0;
+void pin_hist_tick(){
+    int c=sched_getcpu();if(c>=0&&c<16)++pin_hist[c];++pin_hist_n;
+    timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);int64_t now=int64_t(ts.tv_sec)*1000000000+ts.tv_nsec;
+    if(!pin_hist_t0){pin_hist_t0=now;return;}
+    if(now-pin_hist_t0<30000000000ll)return;
+    char line[256];int at=snprintf(line,sizeof line,"NVN pin cpus 30s: tid=%d mask=%x presents=%u",int(gettid()),pin_mask,pin_hist_n);
+    for(int i=0;i<16 && at<int(sizeof line)-16;i++)if(pin_hist[i])at+=snprintf(line+at,sizeof line-at," c%d=%.0f%%",i,100.0*pin_hist[i]/pin_hist_n);
+    if(at<int(sizeof line)-64)snprintf(line+at,sizeof line-at," mask_checks=%u found_reset=%u (total resets %u)",pin_checks_w,pin_drifts_w,pin_drifts);
+    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","%s",line);
+    memset(pin_hist,0,sizeof pin_hist);pin_hist_n=pin_checks_w=pin_drifts_w=0;pin_hist_t0=now;
+}
 void pin_update(){
+    pin_hist_tick();
     if(!pin_mask)return;bool want=true;
     if(pin_ab>0){timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);want=((ts.tv_sec/pin_ab)&1)==0;}
     bool changed=int(want)!=pin_state;if(!changed && ++pin_presents%120)return;
     if(!pin_have_original){CPU_ZERO(&pin_original);if(sched_getaffinity(0,sizeof pin_original,&pin_original))for(int c=0;c<32;c++)CPU_SET(c,&pin_original);pin_have_original=true;}
     cpu_set_t set;CPU_ZERO(&set);if(want){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_SET(c,&set);}else set=pin_original;
-    if(!changed){cpu_set_t cur;CPU_ZERO(&cur);if(!sched_getaffinity(0,sizeof cur,&cur) && CPU_EQUAL(&cur,&set))return;++pin_drifts;}
+    if(!changed){++pin_checks_w;cpu_set_t cur;CPU_ZERO(&cur);if(!sched_getaffinity(0,sizeof cur,&cur) && CPU_EQUAL(&cur,&set))return;++pin_drifts;++pin_drifts_w;}
     int r=sched_setaffinity(0,sizeof set,&set),err=r?errno:0;pin_state=want;if(r)++pin_failures;
     // Refused while the app's cpuset lacks the cores (Android moves the app between cpusets, at start for one): the kernel
     // keeps the request and applies it again when the cpuset allows, and the next check retries.
@@ -271,9 +288,11 @@ bool record(VkCommandBuffer cmd,unsigned f,VkImage source,VkFormat format,uint32
 // centre 16:9 (the Hor+ projection keeps the vertical FOV, so the centre crop is exactly the 16:9 view; the SWF HUD is centred at
 // scale 1). -1 = not decided yet: at the first frame, crop when DM_DOOM_WIDE_LIVE=1 and the gear option is off (DM_DOOM_WIDE=0).
 static std::atomic<int> crop169{-1};
+static std::atomic<int> mirror_next{0};   // [r3] DM_GFX_PRESENT_FLIP_FOLD: mirror the next present vertically (dm_present_mirror_next)
 int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t){
     std::lock_guard<std::mutex> render_lock(render_mutex);
     pin_update();
+    const bool mirror=mirror_next.exchange(0,std::memory_order_relaxed)!=0;
     VkFormatProperties sp;vkGetPhysicalDeviceFormatProperties(physical,source_format,&sp);if(!(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT))return VK_ERROR_FORMAT_NOT_SUPPORTED;
     int x=0,y=0,w=int(width),h=int(height);if(crop&&crop[2]>0&&crop[3]>0){x=std::clamp(crop[0],0,w);y=std::clamp(crop[1],0,h);w=std::min(crop[2],int(width)-x);h=std::min(crop[3],int(height)-y);}if(w<=0||h<=0)return VK_ERROR_INITIALIZATION_FAILED;
     {int c=crop169.load(std::memory_order_relaxed);
@@ -314,7 +333,14 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     if(in_flight[f]){XTRACE_BEGIN("dm-present-fence");r=vkWaitForFences(device,1,&done,VK_TRUE,10000000000ull);XTRACE_END();if(r)return r;if((r=vkResetFences(device,1,&done)))return r;in_flight[f]=false;
         if(present_stamped[f]){uint64_t t[2]{};if(vkGetQueryPoolResults(device,present_queries,f*2,2,sizeof t,t,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS && t[1]>=t[0]){present_gpu_ns+=double(t[1]-t[0])*present_tick_ns;
             if(++present_timed==300){__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN PERF present_gpu_us=%.0f extent=%ux%u (marker gfx-present-timing)",present_gpu_ns/present_timed/1e3,extent.width,extent.height);present_gpu_ns=0;present_timed=0;}}present_stamped[f]=false;}}
-    uint32_t index=0;XTRACE_BEGIN("dm-acquire");r=vkAcquireNextImageKHR(device,swapchain,50000000ull,acq,VK_NULL_HANDLE,&index);XTRACE_END();
+    uint32_t index=0;
+#ifdef DM_GAME_DOOM
+    timespec aq0;clock_gettime(CLOCK_MONOTONIC,&aq0);
+#endif
+    XTRACE_BEGIN("dm-acquire");r=vkAcquireNextImageKHR(device,swapchain,50000000ull,acq,VK_NULL_HANDLE,&index);XTRACE_END();
+#ifdef DM_GAME_DOOM
+    {timespec aq1;clock_gettime(CLOCK_MONOTONIC,&aq1);dm_aperf_note_wait((int64_t(aq1.tv_sec)-aq0.tv_sec)*1000000000+(aq1.tv_nsec-aq0.tv_nsec));}   // [r2] DM_ADPF_WORK=wall
+#endif
     if(r==VK_TIMEOUT||r==VK_NOT_READY)continue;
     if(r==VK_ERROR_OUT_OF_DATE_KHR){swap_dirty=true;wait_resize();continue;}
     if(r==VK_ERROR_SURFACE_LOST_KHR){if((r=vkQueueWaitIdle(queue)))return r;uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
@@ -335,6 +361,9 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
         VkClearColorValue black{};vkCmdClearColorImage(cmd,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&barrier.subresourceRange);
         barrier.oldLayout=barrier.newLayout;barrier.srcAccessMask=barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);}
     VkImageBlit blit{};blit.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};blit.dstSubresource=blit.srcSubresource;blit.srcOffsets[0]={x,y,0};blit.srcOffsets[1]={x+w,y+h,1};blit.dstOffsets[0]={dx,dy,0};blit.dstOffsets[1]={dx+dw,dy+dh,1};
+    // [r3] source stored bottom-up (DM_GFX_TAA_FIX lower-left): the crop rows [y, y+h) of the upright image are rows
+    // [height-y-h, height-y) here; srcOffsets[0].y > srcOffsets[1].y makes the blit mirror them
+    if(mirror){blit.srcOffsets[0].y=int(height)-y;blit.srcOffsets[1].y=int(height)-(y+h);}
     // 最近邻不要求额外线性过滤能力。鸿蒙：游戏出图比屏幕小、要放大，格式支持时用线性，不然像素发硬、斜边锯齿。
     // Nearest needs no extra linear-filter support. HarmonyOS: the game image is smaller than the screen and gets upscaled; use linear when the format supports it, otherwise pixels look blocky and diagonals jagged.
     VkFilter filter=VK_FILTER_NEAREST;
@@ -380,6 +409,10 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
 }
 // [DOOM] JNI nativeWideLive (jni_android.c): 1 = show the centre 16:9 of the wide frame, 0 = the whole wide frame. Takes effect at the next present.
 extern "C" void dm_present_crop169(int on){crop169.store(on?1:0,std::memory_order_relaxed);__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","[wide] live: %s",on?"centre 16:9 crop":"full wide frame");}
+// [r3] DM_GFX_PRESENT_FLIP_FOLD (xbg_game.cpp xbg_present_texture_now): the engine asks the next present to mirror the source
+// vertically in the swapchain blit instead of blitting it upside down into a flip image first (one full-screen blit and the
+// 3 flip images less). Declined (0) while RCAS sharpening is on: its pass reads the source as given.
+extern "C" int dm_present_mirror_next(int on){if(on && rcas::enabled())return 0;mirror_next.store(on?1:0,std::memory_order_relaxed);return 1;}
 extern "C" void dm_android_vk_set_window(ANativeWindow *window){if(window)ANativeWindow_acquire(window);{std::lock_guard<std::mutex> l(window_mutex);if(desired)ANativeWindow_release(desired);desired=window;++generation;}window_cv.notify_all();}
 extern "C" int dm_android_vk_has_window(){return has_window(nullptr);}
 extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t bytes){

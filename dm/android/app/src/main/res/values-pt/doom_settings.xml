@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Analógico de movimento: compensação da zona morta do jogo</string>
     <string name="toast_wide_now">Tela larga: aplicada</string>
     <string name="toast_wide_next">Tela larga: a partir da próxima inicialização</string>
+    <string name="gear_button">Botão de configurações</string>
+    <string name="gear_button_normal">Normal</string>
+    <string name="gear_button_faded">Esmaecido</string>
+    <string name="gear_button_note">Esmaecido: quase invisível, funciona como antes; ajuste o quanto aparece no controle abaixo.</string>
+    <string name="gear_button_alpha" formatted="true">Opacidade do botão esmaecido: %1$d%%</string>
 </resources>

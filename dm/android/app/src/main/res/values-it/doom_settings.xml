@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Stick di movimento: compensazione della zona morta del gioco</string>
     <string name="toast_wide_now">Schermo largo: applicato</string>
     <string name="toast_wide_next">Schermo largo: dal prossimo avvio</string>
+    <string name="gear_button">Pulsante impostazioni</string>
+    <string name="gear_button_normal">Normale</string>
+    <string name="gear_button_faded">Sbiadito</string>
+    <string name="gear_button_note">Sbiadito: appena visibile, funziona come prima; quanto si vede lo regola il cursore qui sotto.</string>
+    <string name="gear_button_alpha" formatted="true">Opacità del pulsante sbiadito: %1$d%%</string>
 </resources>

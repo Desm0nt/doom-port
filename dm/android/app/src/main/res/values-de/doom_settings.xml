@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Bewegungsstick: Ausgleich der Totzone des Spiels</string>
     <string name="toast_wide_now">Breitbild: übernommen</string>
     <string name="toast_wide_next">Breitbild: ab dem nächsten Start</string>
+    <string name="gear_button">Einstellungen-Schaltfläche</string>
+    <string name="gear_button_normal">Normal</string>
+    <string name="gear_button_faded">Durchscheinend</string>
+    <string name="gear_button_note">Durchscheinend: kaum sichtbar, funktioniert wie bisher; wie sichtbar, stellt der Regler unten ein.</string>
+    <string name="gear_button_alpha" formatted="true">Deckkraft der durchscheinenden Schaltfläche: %1$d %%</string>
 </resources>

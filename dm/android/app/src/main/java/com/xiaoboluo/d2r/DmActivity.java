@@ -242,7 +242,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     //     library loads (hle_args.c turns them into the game's +set arguments; vulkan_present.cpp, vk_driver.c, haptics_android.c,
     //     hle_hid.c, hle_nvn.c read them once at start) -- 3D resolution, sharpening, frame rate limit, widescreen (unless the live
     //     switch DM_DOOM_WIDE_LIVE=1 is on), Vulkan driver, game language, aim assist, vibration;
-    //   immediately: the controls in "doom_controls" (DoomPadView.reloadSettings: look sensitivity, dead zone, FPS counter) and
+    //   immediately: the controls in "doom_controls" (DoomPadView.reloadSettings: look sensitivity, dead zone, FPS counter, settings button look) and
     //     dynamic resolution, which is the game's own rs_enable cvar shared with Video -> Dynamic Resolution in the game menu
     //     (nativeGetDrs / nativeSetDrs, hle_doom_drs.c; saved in the game profile, not here).
     static final float[] RES_FRACTIONS = {1.0f, 0.85f, 0.75f, 0.67f};
@@ -257,6 +257,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static final String[] LOOK_LABELS = {"0.6", "0.8", "1.0", "1.3", "1.7"};
     static final float[] DEADZONES = {0f, 0.08f, 0.15f, 0.25f};
     static final int[] DEADZONE_LABELS = {R.string.gear_none, R.string.gear_small, R.string.gear_medium_dz, R.string.gear_large};
+    static final int[] GEAR_LABELS = {R.string.gear_button_normal, R.string.gear_button_faded};   // DoomPadView.GEAR_*
     // Frame rate limit (next launch): DM_PRESENT_MAX_HZ caps the present pacing (hle_nvn.c: the largest integer fraction of the refresh
     // rate not above it) and DM_DOOM_TICK_MAX the game's adaptive tick (hle_args.c) to the same value, so game time stays real time.
     // 90 / 120 are offered only when the display has a mode at a multiple of that rate; the window then asks for that mode
@@ -616,6 +617,23 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             heading(box, when(R.string.gear_deadzone, true));
             RadioGroup dz = radios(box, texts(DEADZONE_LABELS), 4000, nearest(DEADZONES, cp.getFloat("move_dz", 0f)), true);
             CheckBox fps = new CheckBox(this); fps.setText(when(R.string.gear_fps_counter, true)); fps.setChecked(cp.getBoolean("fps", true)); box.addView(fps);
+            // Settings button (DoomPadView.GEAR_*): normal / faded, with the faded opacity slider below.
+            heading(box, when(R.string.gear_button, true));
+            final int gearWas = Math.min(Math.max(0, cp.getInt("gear_mode", DoomPadView.GEAR_NORMAL)), GEAR_LABELS.length - 1);
+            RadioGroup gearG = radios(box, texts(GEAR_LABELS), 9000, gearWas, true);
+            TextView gearNote = new TextView(this); gearNote.setText(R.string.gear_button_note); box.addView(gearNote);
+            // Faded opacity, 1..100 % of the usual alpha; saved and shown on the pad while sliding (the pad is visible behind the dialog).
+            final int alphaWas = Math.max(1, Math.min(100, cp.getInt("gear_alpha", DoomPadView.GEAR_ALPHA_DEFAULT)));
+            final TextView alphaT = new TextView(this); alphaT.setText(getString(R.string.gear_button_alpha, alphaWas)); box.addView(alphaT);
+            android.widget.SeekBar alphaS = new android.widget.SeekBar(this); alphaS.setMax(99); alphaS.setProgress(alphaWas - 1); box.addView(alphaS);
+            alphaS.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+                public void onProgressChanged(android.widget.SeekBar sb, int v, boolean user) {
+                    alphaT.setText(getString(R.string.gear_button_alpha, v + 1)); cp.edit().putInt("gear_alpha", v + 1).apply();
+                    if (doomPad != null) doomPad.reloadSettings();
+                }
+                public void onStartTrackingTouch(android.widget.SeekBar sb) {}
+                public void onStopTrackingTouch(android.widget.SeekBar sb) {}
+            });
             android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
             new AlertDialog.Builder(this).setTitle(R.string.gear_title).setView(scroll)
                 .setPositiveButton(R.string.gear_save, (d, w) -> {
@@ -625,8 +643,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                         .putFloat("aa", AA_STRENGTHS[picked(aaG, 6000, AA_STRENGTHS.length)]).putString("lang", LANG_CODES[picked(langG, 5000, LANG_CODES.length)])
                         .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length))
                         .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size()))).apply();
+                    int gearPick = picked(gearG, 9000, GEAR_LABELS.length);
                     cp.edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[picked(look, 3000, LOOK_GAINS.length)])
-                        .putFloat("move_dz", DEADZONES[picked(dz, 4000, DEADZONES.length)]).apply();
+                        .putFloat("move_dz", DEADZONES[picked(dz, 4000, DEADZONES.length)]).putInt("gear_mode", gearPick).apply();
                     if (doomPad != null) doomPad.reloadSettings();
                     if (drsWas >= 0 && drs.isChecked() != (drsWas == 1)) {
                         boolean ok = false;
@@ -642,6 +661,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 .setNegativeButton(R.string.gear_cancel, null).show();
         });
     }
+
 
     // [DOOM] After the game starts: removes the driver crash guard once a frame was presented, and tells the player once when the
     // chosen driver did not start and the native side fell back to the system driver (vk_driver.c status). Polls every second until

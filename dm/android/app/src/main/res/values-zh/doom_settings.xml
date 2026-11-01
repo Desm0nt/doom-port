@@ -40,4 +40,9 @@
     <string name="gear_deadzone">移动摇杆：补偿游戏死区</string>
     <string name="toast_wide_now">宽屏：已应用</string>
     <string name="toast_wide_next">宽屏：下次启动生效</string>
+    <string name="gear_button">设置按钮</string>
+    <string name="gear_button_normal">正常</string>
+    <string name="gear_button_faded">半透明</string>
+    <string name="gear_button_note">半透明：几乎看不见，用法不变；可在下方滑块调整可见程度。</string>
+    <string name="gear_button_alpha" formatted="true">半透明按钮的不透明度：%1$d%%</string>
 </resources>

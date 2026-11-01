@@ -92,9 +92,10 @@ Other Snapdragon devices may work; other GPUs are untested.
   stretched); the original **1280×720 (16:9)** with side bars is optional in the settings and ~25% lighter on the GPU.
 - Performance at 1600×720 with Turnip v27: **Snapdragon 8 Gen 3 (Adreno 750)** — 50–60 fps in most of the campaign
   (capped at 60), the heaviest areas ~35–50 fps; **Snapdragon 8 Gen 2 (Adreno 740)** — ~40–50 fps, heavy areas ~33–40 fps
-  (measured on a warm, thermally throttled phone). Turning widescreen off (1280×720) or lowering the 3D resolution helps
-  on 8 Gen 2 in pixel-heavy scenes (the heaviest areas are geometry-bound instead). Level loads use a fast NEON zlib.
-  Since v0.4.1 scenes with in-game video screens no longer drop to ~20 fps (an audio renderer wait, fixed).
+  (measured on a warm, thermally throttled phone). Turning widescreen off (1280×720) helps on 8 Gen 2 in pixel-heavy
+  scenes. Level loads use a fast NEON zlib. Since v0.4.1 scenes with in-game video screens no longer drop to ~20 fps (an
+  audio renderer wait, fixed); v0.4.2 keeps the GPU busier between frames (a deeper submit queue), about +7–10% fps in
+  the heaviest scenes on 8 Gen 2.
   Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
 - Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
   on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level
@@ -104,7 +105,7 @@ Other Snapdragon devices may work; other GPUs are untested.
   strength, rumble.
 - Settings (gear button): widescreen, frame rate limit, 3D render resolution, dynamic resolution (shared with the game's
   Video menu), RCAS sharpening, Vulkan driver (by GPU, or your own package), game language, aim assist strength, rumble,
-  frame counter, look sensitivity. The in-game Video menu's *Chromatic Aberration* entry is
+  frame counter, look sensitivity, and the gear button itself (normal, or faded with an opacity slider). The in-game Video menu's *Chromatic Aberration* entry is
   repurposed as *Dynamic Resolution*.
 
 ### Known issues
@@ -116,6 +117,8 @@ Other Snapdragon devices may work; other GPUs are untested.
 - Turnip is the default driver and matches or beats the stock Qualcomm driver on Adreno 750; on other Adreno
   generations you may need another Turnip build (see *Vulkan drivers*); non-Adreno GPUs use the system driver.
 - The heaviest scenes are still below 60 fps (see above).
+- The gear dialog's *3D render resolution* currently has no effect (the game ignores the forced scale while dynamic
+  resolution is off); a fix is in progress.
 - The port's settings dialog is translated into 13 languages (system locale, English by default).
 - Many renderer fixes are still behind switches for A/B testing; see [docs/doom/SWITCHES.md](docs/doom/SWITCHES.md).
 

@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Стик движения: компенсация мёртвой зоны игры</string>
     <string name="toast_wide_now">Широкий экран: применено</string>
     <string name="toast_wide_next">Широкий экран: со следующего запуска</string>
+    <string name="gear_button">Кнопка настроек</string>
+    <string name="gear_button_normal">Обычная</string>
+    <string name="gear_button_faded">Полупрозрачная</string>
+    <string name="gear_button_note">Полупрозрачная: едва видна, работает как раньше; насколько видна — задаёт ползунок ниже.</string>
+    <string name="gear_button_alpha" formatted="true">Видимость полупрозрачной кнопки: %1$d%%</string>
 </resources>

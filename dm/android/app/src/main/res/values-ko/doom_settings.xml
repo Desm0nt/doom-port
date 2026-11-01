@@ -40,4 +40,9 @@
     <string name="gear_deadzone">이동 스틱: 게임 데드존 보정</string>
     <string name="toast_wide_now">와이드 화면: 적용됨</string>
     <string name="toast_wide_next">와이드 화면: 다음 실행부터</string>
+    <string name="gear_button">설정 버튼</string>
+    <string name="gear_button_normal">기본</string>
+    <string name="gear_button_faded">반투명</string>
+    <string name="gear_button_note">반투명: 거의 보이지 않지만 그대로 작동하며, 보이는 정도는 아래 슬라이더로 조절합니다.</string>
+    <string name="gear_button_alpha" formatted="true">반투명 버튼 불투명도: %1$d%%</string>
 </resources>

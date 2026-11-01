@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Стік руху: компенсація мертвої зони гри</string>
     <string name="toast_wide_now">Широкий екран: застосовано</string>
     <string name="toast_wide_next">Широкий екран: з наступного запуску</string>
+    <string name="gear_button">Кнопка налаштувань</string>
+    <string name="gear_button_normal">Звичайна</string>
+    <string name="gear_button_faded">Напівпрозора</string>
+    <string name="gear_button_note">Напівпрозора: ледь помітна, працює як раніше; наскільки її видно — задає повзунок нижче.</string>
+    <string name="gear_button_alpha" formatted="true">Видимість напівпрозорої кнопки: %1$d%%</string>
 </resources>

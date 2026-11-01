@@ -40,4 +40,9 @@
     <string name="gear_deadzone">Gałka ruchu: kompensacja martwej strefy gry</string>
     <string name="toast_wide_now">Szeroki ekran: zastosowano</string>
     <string name="toast_wide_next">Szeroki ekran: od następnego uruchomienia</string>
+    <string name="gear_button">Przycisk ustawień</string>
+    <string name="gear_button_normal">Normalny</string>
+    <string name="gear_button_faded">Przygaszony</string>
+    <string name="gear_button_note">Przygaszony: ledwo widoczny, działa jak dotąd; widoczność ustawia suwak poniżej.</string>
+    <string name="gear_button_alpha" formatted="true">Krycie przygaszonego przycisku: %1$d%%</string>
 </resources>
