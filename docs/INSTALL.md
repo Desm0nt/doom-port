@@ -48,9 +48,9 @@ The setup needs three files from **your own** Switch and **your own** copy of DO
 | the update | update **v262144**, title id `0100416004C00800` — only this exact version works | `DOOM ... [0100416004C00800][v262144].nsp` |
 | the keys | `prod.keys` of the same console | `prod.keys` |
 
-There are two ways to get them.
+You can dump them yourself as below, or get them some other way.
 
-**A. You do it yourself.** This needs a Switch that can run homebrew (how to get there is not covered here).
+**Dumping them yourself.** This needs a Switch that can run homebrew (how to get there is not covered here).
 1. Install the game and the latest update on the Switch.
 2. Dump the game and the update with [nxdumptool](https://github.com/DarkMatterCore/nxdumptool): installed or eShop
    copy → *NSP*; cartridge → *XCI* (the installed update is dumped separately as NSP). For NSP dumps turn on
@@ -58,15 +58,6 @@ There are two ways to get them.
 3. Dump the console keys with [Lockpick_RCM](https://github.com/shchmue/Lockpick_RCM). You get `prod.keys` on the SD card
    in `switch/`.
 4. Copy the three files to your PC.
-
-**B. Someone does it for you.** If you are not into homebrew, a friend who knows it, or a game/console repair shop that
-does Switch backups, can make the dump from **your** console and **your** cartridge. Tell them exactly this:
-
-> "Please dump DOOM (2016) for me: the base game **and** the update **v262144** (any of NSP / NSZ / XCI / XCZ is fine),
-> plus **prod.keys** from this console."
-
-Check what you got back: the update must be **v262144** (it is usually in the file name), and `prod.keys` must come from
-the console that the game was dumped on.
 
 The game and the update can be **NSP, NSZ, XCI or XCZ**, in any combination; an XCI that already contains the update
 counts as both; split dumps (parts `00`, `01`, … or `.xc0`, `.xc1`, …) work too. File names do not matter.
