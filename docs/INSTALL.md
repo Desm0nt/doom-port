@@ -38,17 +38,38 @@ File names do not matter: setup recognises the files by their content.
 - about **23 GB free** in internal storage;
 - a USB cable (or another way to copy a 22 GB folder to the phone).
 
-## Step 1. Dump your game and keys (on your Switch)
+## Step 1. Get the game files and keys from your Switch
 
-You need homebrew on your Switch for this. This guide does not cover how to get it.
+The setup needs three files from **your own** Switch and **your own** copy of DOOM:
 
-1. Dump the **base game** and the **update v262144** with
-   [nxdumptool](https://github.com/DarkMatterCore/nxdumptool):
-   - an installed game or eShop copy → *NSP*; a cartridge → *XCI* (dump the installed update separately as NSP);
-   - turn on **"remove console specific data"** for NSP dumps (otherwise the update cannot be read on a PC).
-2. Dump your console keys with [Lockpick_RCM](https://github.com/shchmue/Lockpick_RCM). You get `prod.keys`
-   (on the SD card in `switch/`).
-3. Copy the dumps and `prod.keys` to your PC.
+| File | What it is | Typical name |
+|---|---|---|
+| the game | DOOM (2016), title id `0100416004C00000` — dumped from your cartridge or your eShop copy | `DOOM ... [0100416004C00000].nsp` / `.xci` / `.nsz` / `.xcz` |
+| the update | update **v262144**, title id `0100416004C00800` — only this exact version works | `DOOM ... [0100416004C00800][v262144].nsp` |
+| the keys | `prod.keys` of the same console | `prod.keys` |
+
+There are two ways to get them.
+
+**A. You do it yourself.** This needs a Switch that can run homebrew (how to get there is not covered here).
+1. Install the game and the latest update on the Switch.
+2. Dump the game and the update with [nxdumptool](https://github.com/DarkMatterCore/nxdumptool): installed or eShop
+   copy → *NSP*; cartridge → *XCI* (the installed update is dumped separately as NSP). For NSP dumps turn on
+   **"remove console specific data"** — otherwise the update cannot be read on a PC.
+3. Dump the console keys with [Lockpick_RCM](https://github.com/shchmue/Lockpick_RCM). You get `prod.keys` on the SD card
+   in `switch/`.
+4. Copy the three files to your PC.
+
+**B. Someone does it for you.** If you are not into homebrew, a friend who knows it, or a game/console repair shop that
+does Switch backups, can make the dump from **your** console and **your** cartridge. Tell them exactly this:
+
+> "Please dump DOOM (2016) for me: the base game **and** the update **v262144** (any of NSP / NSZ / XCI / XCZ is fine),
+> plus **prod.keys** from this console."
+
+Check what you got back: the update must be **v262144** (it is usually in the file name), and `prod.keys` must come from
+the console that the game was dumped on.
+
+The game and the update can be **NSP, NSZ, XCI or XCZ**, in any combination; an XCI that already contains the update
+counts as both; split dumps (parts `00`, `01`, … or `.xc0`, `.xc1`, …) work too. File names do not matter.
 
 Do not download game files or keys from the internet, and do not share yours.
 
@@ -148,9 +169,6 @@ about 22 GB).
 Copying ~22 GB over USB takes 10–40 minutes. On macOS use [Android File Transfer](https://www.android.com/filetransfer/)
 or OpenMTP; on Linux the file manager usually shows the phone directly.
 
-**With adb (optional, for advanced users):** with USB debugging on, setup offers to copy the folder itself at the end
-when it sees the phone. Later you can run `setup.bat push` / `bash setup.sh push`; an interrupted copy resumes.
-
 ## Step 6. Install the app
 
 On the phone, open this link and install the APK:
@@ -214,9 +232,8 @@ On 8–12 GB phones close other apps before playing.
 **Black screen, yellow / white screen, or the app closes**
 1. Open the gear dialog → *Vulkan driver* → try *System* (or the other choice), restart the app.
 2. Check that the phone is supported (Snapdragon / Adreno recommended; see the README).
-3. Report it with the log: install [Android platform-tools](https://developer.android.com/tools/releases/platform-tools),
-   enable USB debugging, then run `adb logcat -d -s dm > doom-log.txt` right after the problem (the game must still be running or have just stopped). Open an issue at
-   <https://github.com/Desm0nt/doom-port/issues> with the phone model, Android version and the log.
+3. Open an issue at <https://github.com/Desm0nt/doom-port/issues>: phone model, Android version, what happened
+   and when (menu, loading, a certain level); a screenshot or a short video helps.
 
 **Can I delete things on the PC afterwards?**
 Yes. Once the folder is on the phone you may delete `work` (keep it if you want to copy again) and `tools/.runtime`

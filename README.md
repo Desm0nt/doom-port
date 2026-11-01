@@ -160,7 +160,7 @@ Full guide: **[docs/INSTALL.md](docs/INSTALL.md)** (English) / **[docs/INSTALL.r
    Setup provides Python, its packages and the .NET 10 SDK in `tools/.runtime` when they are missing (it asks first),
    checks the inputs and the free space (~50 GB while preparing), then extracts, patches and translates everything into
    `work/DOOM Mobile` (~22 GB). Technical details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
-3. Copy `work/DOOM Mobile` to the phone's `Download` folder (or let setup copy it over adb) and install the APK
+3. Copy `work/DOOM Mobile` to the phone's `Download` folder (USB cable, *File transfer* mode) and install the APK
    ([latest](https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk), or build it yourself,
    see *Building*).
 4. Start *DOOM Mobile* and allow *All files access* when asked.

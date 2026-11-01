@@ -703,7 +703,7 @@ def prepare(a, L):
         say(f'finished the requested steps; the folder is not complete yet: {L.phone}'); return 0
     if a.push:
         push(L, None if a.push == 'auto' else a.push); return 0
-    next_steps(L, True, a.yes)
+    next_steps(L, False, a.yes)
     return 0
 
 
