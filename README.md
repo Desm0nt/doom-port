@@ -95,7 +95,8 @@ Other Snapdragon devices may work; other GPUs are untested.
   (measured on a warm, thermally throttled phone). Turning widescreen off (1280×720) helps on 8 Gen 2 in pixel-heavy
   scenes. Level loads use a fast NEON zlib. Since v0.4.1 scenes with in-game video screens no longer drop to ~20 fps (an
   audio renderer wait, fixed); v0.4.2 keeps the GPU busier between frames (a deeper submit queue), about +7–10% fps in
-  the heaviest scenes on 8 Gen 2.
+  the heaviest scenes on 8 Gen 2; v0.4.3 trims GPU work without changing the image (shader and pass clean-ups, skipped
+  dead occlusion boxes), another ~1.4–1.9 ms per frame, about +9–11% fps on 8 Gen 2.
   Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
 - Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
   on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level

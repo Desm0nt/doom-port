@@ -534,8 +534,8 @@ std::vector<PendingWriteback> pending_writebacks;
 bool storage_unbarriered=false;std::vector<std::pair<uint64_t,uint64_t>> storage_dirty;   // [DOOM] ranges written since the last barrier (a read elsewhere needs none)
 int lazy_storage=-1;uint64_t lazy_storage_saved=0;
 void full_barrier(VkCommandBuffer cmd);void end_open_pass(int line=__builtin_LINE());std::map<int,uint64_t> pass_end_lines;   // [DOOM] which call site ends the open pass (NVN PERF pass_end_lines)
-// [r3] Round-3 switches of the audit (docs/research/pipeline_audit.md round 3; docs/SWITCHES.md, BUGS_AND_FIXES 3.17). All off
-// unless set, and then nothing below changes. Shader rewrites (DM_GFX_LDC_CANON / HALFFLAG_FOLD / F2I_NOTRUNC / TEXCOORD_NAN=0)
+// [r3] Round-3 switches of the audit (docs/research/pipeline_audit.md round 3; docs/SWITCHES.md, BUGS_AND_FIXES 3.17). The seven
+// exact ones are on by default since 01.11 (=0 turns one off); TEXCOORD_NAN=0 stays opt-in. With a switch off nothing below changes. Shader rewrites (DM_GFX_LDC_CANON / HALFFLAG_FOLD / F2I_NOTRUNC / TEXCOORD_NAN=0)
 // run in tidy_rewrite; DM_GFX_NO_PSIZE builds a second vertex module per shader that draw() takes for non-point pipelines. With
 // gfx-ab-toggle and gfx-ab-target naming one of those rewrites (ldccanon, halfflag, f2i, texnan) every shader it changes also
 // gets a module without it (Shader::module_ab, warm-up key <key>!ab) that the off phase uses (r3_ab_bit); target r3 toggles
@@ -5154,10 +5154,13 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      xbg_logf("NVN translator output clean-up: component fold=%d (marker gfx-ldc-fold) forwarded temporaries=%d (marker gfx-forward-temps)",int(ldc_fold),int(forward_temps));
      {FILE *q=fopen((base+"/gfx-shader-reuse").c_str(),"rb");shader_reuse=0;if(q){int c=fgetc(q);shader_reuse=c=='0'?0:c=='2'?2:1;fclose(q);}else if(const char *e=getenv("DM_GFX_SHADER_REUSE"))shader_reuse=atoi(e);
       warm::keep_rewritten=shader_reuse!=0;xbg_logf("NVN shader loads take the warm-up's rewritten SPIR-V=%d (marker gfx-shader-reuse; 2 also rewrites and compares)",shader_reuse);}
-     // [r3] round-3 switches (all off unless set); the A/B variant is decided here, before the warm-up threads rewrite shaders
-     ldc_canon=dm("/gfx-ldc-canon","DM_GFX_LDC_CANON");halfflag_fold=dm("/gfx-halfflag-fold","DM_GFX_HALFFLAG_FOLD");f2i_notrunc=dm("/gfx-f2i-notrunc","DM_GFX_F2I_NOTRUNC");no_psize=dm("/gfx-no-psize","DM_GFX_NO_PSIZE");
+     // [r3] round-3 switches; the A/B variant is decided here, before the warm-up threads rewrite shaders. The seven exact ones are on
+     // by default since 01.11 (Mi 13 Pro in-process A/B: GPU at 840 draws 18.45 -> 17.03 ms, 52 -> 57 fps standing, heaviest spot
+     // ~34 -> ~40 fps, no visual change); =0 or a marker holding '0' turns one off. DM_GFX_TEXCOORD_NAN=0 stays opt-in (inexact, no gain).
+     auto dm_on=[&](const char *marker,const char *env){FILE *q=fopen((base+marker).c_str(),"rb");bool on=true;if(q){on=fgetc(q)!='0';fclose(q);}else if(const char *e=getenv(env))on=atoi(e)!=0;return on;};
+     ldc_canon=dm_on("/gfx-ldc-canon","DM_GFX_LDC_CANON");halfflag_fold=dm_on("/gfx-halfflag-fold","DM_GFX_HALFFLAG_FOLD");f2i_notrunc=dm_on("/gfx-f2i-notrunc","DM_GFX_F2I_NOTRUNC");no_psize=dm_on("/gfx-no-psize","DM_GFX_NO_PSIZE");
      {const char *e=getenv("DM_GFX_TEXCOORD_NAN");texcoord_unguard=e && *e && atoi(e)==0;}
-     lazy_clear_on=dm("/gfx-lazy-clear","DM_GFX_LAZY_CLEAR");flip_fold_on=dm("/gfx-present-flip-fold","DM_GFX_PRESENT_FLIP_FOLD");dead_box_on=dm("/gfx-skip-dead-box","DM_GFX_SKIP_DEAD_BOX");
+     lazy_clear_on=dm_on("/gfx-lazy-clear","DM_GFX_LAZY_CLEAR");flip_fold_on=dm_on("/gfx-present-flip-fold","DM_GFX_PRESENT_FLIP_FOLD");dead_box_on=dm_on("/gfx-skip-dead-box","DM_GFX_SKIP_DEAD_BOX");
      {int period=0;char target[16]={0};if(FILE *m=fopen((base+"/gfx-ab-toggle").c_str(),"rb")){if(fscanf(m,"%d",&period)!=1)period=0;fclose(m);}
       if(FILE *t=fopen((base+"/gfx-ab-target").c_str(),"rb")){if(fscanf(t,"%15s",target)!=1)target[0]=0;fclose(t);}
       r3_ab_bit=0;if(period>0){if(ldc_canon && !strcmp(target,"ldccanon"))r3_ab_bit=R3_CANON;if(halfflag_fold && !strcmp(target,"halfflag"))r3_ab_bit=R3_HALF;if(f2i_notrunc && !strcmp(target,"f2i"))r3_ab_bit=R3_F2I;if(texcoord_unguard && !strcmp(target,"texnan"))r3_ab_bit=R3_TEXNAN;
