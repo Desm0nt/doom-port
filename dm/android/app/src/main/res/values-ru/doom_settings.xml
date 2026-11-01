@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Полупрозрачная</string>
     <string name="gear_button_note">Полупрозрачная: едва видна, работает как раньше; насколько видна — задаёт ползунок ниже.</string>
     <string name="gear_button_alpha" formatted="true">Видимость полупрозрачной кнопки: %1$d%%</string>
+    <string name="gear_drs_target">Цель динамического разрешения, fps (снижает разрешение 3D, чтобы держать эту частоту)</string>
+    <string name="gear_res_drs_note">Когда включено динамическое разрешение, оно само выбирает разрешение 3D; это значение действует, когда оно выключено.</string>
+    <string name="gear_light" formatted="false">Лёгкий режим: качество портативной Switch (без затенения окружения и проб отражений, проще тени и фильтрация, 3D не выше 80 % x 90 %) для слабых устройств</string>
+    <string name="toast_light_failed">Лёгкий режим недоступен с этой сборкой игры: обновите main.patched.bin</string>
 </resources>

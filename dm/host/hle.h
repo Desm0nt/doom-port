@@ -108,4 +108,8 @@ void dm_audio_source_close(void *h);
 //   0x90 inflateInit2_ main+0x1ffeb30   0x91 inflateInit_ main+0x1ffecb0   0x92 inflate main+0x1ffede0
 //   0x93 inflateEnd    main+0x20009f0   0x94 inflateReset main+0x1ffeac0   (zlib 1.2.3 -> zlib-ng, DM_ZLIB_FAST / _STATS / _VERIFY)
 enum { SVC_HOST_ZLIB_INIT2 = 0x90, SVC_HOST_ZLIB_INIT = 0x91, SVC_HOST_ZLIB_INFLATE = 0x92, SVC_HOST_ZLIB_END = 0x93, SVC_HOST_ZLIB_RESET = 0x94 };
+// [DOOM] r6 (BUGS_AND_FIXES 2.18): 0x95 = the DRS controller's GPU time, call site main+0x1c5b27c (bl 0x1c71310 -> svc #0x95): the host
+// (hle_doom_drs.c doom_drs_gpu_svc) calls the original 0x1c71310 and returns its microseconds in x0, or our Vulkan GPU busy time
+// per frame while rs_enable != 0.
+enum { SVC_HOST_DOOM_GPU_TIME = 0x95 };
 enum { SVC_HOST_TACT_ZLIB = 0x80, SVC_HOST_C2S_DELIVER = 0x81, SVC_HOST_C2S_SYS = 0x82, SVC_HOST_GRANNY_A = 0x83, SVC_HOST_GRANNY_B = 0x84, SVC_HOST_PRIVATE_SKILL_RENDER = 0x85, SVC_HOST_PRIVATE_SKILL_AIM = 0x86, SVC_HOST_GROUND_ASSET = 0x87, SVC_HOST_DROP_SOUND = 0x88, SVC_HOST_RIFT_EXIT = 0x89, SVC_HOST_JOIN_SPAWN = 0x8a, SVC_HOST_JOIN_CORPSE = 0x8b, SVC_HOST_SAVE_ACT = 0x8c, SVC_HOST_MERC_SLOT = 0x8d, SVC_HOST_MERC_SLOT_CL = 0x8e };   // 0x87：地上物品取模型路径（dm_dropfilter.c 掉落光）   // 0x83/0x84：Granny 逐块解码调用点（hle_granny.c） | 0x87: fetch the model path for ground items (dm_dropfilter.c drop light)   // 0x83/0x84: Granny per-block decode call sites (hle_granny.c)

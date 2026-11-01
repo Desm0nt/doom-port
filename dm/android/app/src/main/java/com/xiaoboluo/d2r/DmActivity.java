@@ -70,6 +70,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native boolean nativeWideLive(boolean on);   // [DOOM] live widescreen switch (DM_DOOM_WIDE_LIVE=1); false = applies at the next launch
     static native int nativeGetDrs();                   // [DOOM] the game's rs_enable (hle_doom_drs.c): -1 not known yet, 0 off, 1 on
     static native boolean nativeSetDrs(boolean on);     // [DOOM] queue a live rs_enable change + profile save; false = cannot be written here
+    static native boolean nativeSetLight(boolean on);   // [DOOM] r6 light mode (handheld quality preset) live; false = the game build lacks the patch
+    static native void nativeSetDrsFps(int fps);        // [DOOM] r6 dynamic resolution target fps (hle_doom_drs.c)
     static native String nativeDriverStatus();          // [DOOM] "<requested>\t<active>\t<reason>" (vk_driver.c), "" before the driver loads
 
     private static WeakReference<DmActivity> current = new WeakReference<>(null);
@@ -245,8 +247,13 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     //   immediately: the controls in "doom_controls" (DoomPadView.reloadSettings: look sensitivity, dead zone, FPS counter, settings button look) and
     //     dynamic resolution, which is the game's own rs_enable cvar shared with Video -> Dynamic Resolution in the game menu
     //     (nativeGetDrs / nativeSetDrs, hle_doom_drs.c; saved in the game profile, not here).
+    //   [r6] both (saved here, handed over as DM_DOOM_LIGHT / DM_DOOM_DRS_FPS at start and switched live through JNI): light mode =
+    //     the game's Switch handheld quality preset (nativeSetLight), dynamic resolution target fps (nativeSetDrsFps, shown while the
+    //     dynamic resolution box is ticked). BUGS_AND_FIXES 2.18.
     static final float[] RES_FRACTIONS = {1.0f, 0.85f, 0.75f, 0.67f};
     static final String[] RES_LABELS = {"100% (720p)", "85% (612p)", "75% (540p)", "67% (480p)"};
+    static final int[] DRS_FPS = {30, 45, 60};   // [r6] dynamic resolution target: rs_dropMilliseconds = 1000 / fps (hle_doom_drs.c)
+    static final int DRS_FPS_DEFAULT = 60;
     static final String[] SHARPEN_STOPS = {"", "1.0", "0.5", "0.2"};
     static final int[] SHARPEN_LABELS = {R.string.gear_off, R.string.gear_low, R.string.gear_medium, R.string.gear_high};
     static final float[] AA_STRENGTHS = {0f, 0.5f, 1.0f, 1.5f, 2.0f};
@@ -330,6 +337,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             Os.setenv("DM_DOOM_TICK_MAX", String.valueOf(lim), true);
             int res = p.getInt("res", 0);
             if (res > 0 && res < RES_FRACTIONS.length) Os.setenv("DM_DOOM_RES", String.valueOf(RES_FRACTIONS[res]), true); else Os.unsetenv("DM_DOOM_RES");
+            // [r6] light mode (off: unset = the game is not touched) and the dynamic resolution target (used only while DRS is on)
+            if (p.getBoolean("light", false)) Os.setenv("DM_DOOM_LIGHT", "1", true); else Os.unsetenv("DM_DOOM_LIGHT");
+            Os.setenv("DM_DOOM_DRS_FPS", String.valueOf(p.getInt("drs_fps", DRS_FPS_DEFAULT)), true);
             int sh = p.getInt("sharpen", 0);
             if (sh > 0 && sh < SHARPEN_STOPS.length) Os.setenv("DM_GFX_SHARPEN", SHARPEN_STOPS[sh], true); else Os.unsetenv("DM_GFX_SHARPEN");
             // Vulkan driver (vk_driver.c): adrenotools packages under <data>/drivers/<name>/ (meta.json + the library) are copied to
@@ -582,8 +592,18 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             if (drsNow >= 0) { drs.setText(when(R.string.gear_drs, true)); drs.setChecked(drsNow == 1); }
             else { drs.setText(R.string.gear_drs_unknown); drs.setEnabled(false); }
             box.addView(drs);
+            // [r6] DRS target fps, shown while the dynamic resolution box is ticked
+            TextView drsFpsH = heading(box, when(R.string.gear_drs_target, true));
+            String[] drsFpsLabels = new String[DRS_FPS.length]; int drsFpsAt = DRS_FPS.length - 1;
+            for (int i = 0; i < DRS_FPS.length; i++) { drsFpsLabels[i] = String.valueOf(DRS_FPS[i]); if (DRS_FPS[i] == p.getInt("drs_fps", DRS_FPS_DEFAULT)) drsFpsAt = i; }
+            RadioGroup drsFps = radios(box, drsFpsLabels, 9500, drsFpsAt, true);
+            Runnable drsFpsShow = () -> { int v = drs.isChecked() ? android.view.View.VISIBLE : android.view.View.GONE; drsFpsH.setVisibility(v); drsFps.setVisibility(v); };
+            drsFpsShow.run(); drs.setOnCheckedChangeListener((b, c) -> drsFpsShow.run());
             heading(box, when(R.string.gear_res, false));
             RadioGroup res = radios(box, RES_LABELS, 1000, Math.min(Math.max(0, p.getInt("res", 0)), RES_LABELS.length - 1), false);
+            TextView resNote = new TextView(this); resNote.setText(R.string.gear_res_drs_note); box.addView(resNote);
+            final boolean lightWas = p.getBoolean("light", false);
+            CheckBox light = new CheckBox(this); light.setText(when(R.string.gear_light, true)); light.setChecked(lightWas); box.addView(light);
             heading(box, when(R.string.gear_sharpen, false));
             RadioGroup sh = radios(box, texts(SHARPEN_LABELS), 2000, Math.min(Math.max(0, p.getInt("sharpen", 0)), SHARPEN_LABELS.length - 1), true);
             // Frame rate limit: only the values this display can show evenly.
@@ -649,7 +669,17 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                     p.edit().putString("driver", drvPick > 0 ? drvNames[drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked())
                         .putFloat("aa", AA_STRENGTHS[picked(aaG, 6000, AA_STRENGTHS.length)]).putString("lang", LANG_CODES[picked(langG, 5000, LANG_CODES.length)])
                         .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length))
-                        .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size()))).apply();
+                        .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size())))
+                        .putBoolean("light", light.isChecked()).putInt("drs_fps", DRS_FPS[picked(drsFps, 9500, DRS_FPS.length)]).apply();
+                    // [r6] live: light mode (the game's own dock / undock preset switch) and the DRS target; also set at the next start
+                    if (libraryLoaded) {
+                        try { nativeSetDrsFps(DRS_FPS[picked(drsFps, 9500, DRS_FPS.length)]); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetDrsFps: " + t); }
+                        if (light.isChecked() != lightWas) {
+                            boolean ok = false;
+                            try { ok = nativeSetLight(light.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetLight: " + t); }
+                            if (!ok) android.widget.Toast.makeText(this, R.string.toast_light_failed, android.widget.Toast.LENGTH_LONG).show();
+                        }
+                    }
                     int gearPick = picked(gearG, 9000, GEAR_LABELS.length);
                     cp.edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[picked(look, 3000, LOOK_GAINS.length)])
                         .putFloat("move_dz", DEADZONES[picked(dz, 4000, DEADZONES.length)]).putInt("gear_mode", gearPick).apply();

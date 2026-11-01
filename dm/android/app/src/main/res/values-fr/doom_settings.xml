@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Estompé</string>
     <string name="gear_button_note">Estompé : à peine visible, fonctionne comme avant ; réglez sa visibilité avec le curseur ci-dessous.</string>
     <string name="gear_button_alpha" formatted="true">Opacité du bouton estompé : %1$d %%</string>
+    <string name="gear_drs_target">Objectif de la résolution dynamique, fps (baisse la résolution 3D pour tenir cette fréquence)</string>
+    <string name="gear_res_drs_note">Quand la résolution dynamique est activée, elle choisit elle-même la résolution 3D ; cette valeur s\'applique quand elle est désactivée.</string>
+    <string name="gear_light" formatted="false">Mode léger : qualité Switch en mode portable (sans occlusion ambiante ni sondes de réflexion, ombres et filtrage simplifiés, 3D au plus 80 % x 90 %) pour les appareils modestes</string>
+    <string name="toast_light_failed">Le mode léger n\'est pas disponible avec cette version du jeu : mettez à jour main.patched.bin</string>
 </resources>

@@ -17,6 +17,14 @@
 enum { GOT_FIXEDTIC = 0x4885de8, GOT_ADAPTIVE = 0x4884948, GOT_IMMEDIATE = 0x48d95f0, GOT_MINHZ = 0x48d95d8, GOT_MAXHZ = 0x48d95d0,
        GOT_TIMESCALE = 0x48d7478, GOT_TICKOBJ = 0x487fc40, STATIC_S = 0x66bd7c0, STR_FIXEDTIC = 0x36139c3 };
 static uint8_t *g_mb; static size_t g_msz;
+static int g_main_state;   // 0 = not looked up yet, 1 = the expected update main, -1 = another build (nothing here reads it)
+static int main_ok(void) {
+    if (g_main_state) return g_main_state > 0;
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { g_mb = g_mod[i].base; g_msz = g_mod[i].size; }
+    if (!g_mb) return 0;   // modules not loaded yet: look again next time
+    if (g_msz < STATIC_S + 0x100 || memcmp(g_mb + STR_FIXEDTIC, "com_fixedTic", 13)) { g_mb = NULL; g_main_state = -1; return 0; }
+    g_main_state = 1; return 1;
+}
 static int ok_ptr(uint64_t p, size_t n) { return p && p >= (uint64_t)g_mb && p + n <= (uint64_t)g_mb + g_msz; }
 // idCVar: GOT slot -> object in main .bss; integer value at +0x30, float at +0x34 (how the frame loop reads them)
 static int cv_i(uint64_t got) { uint64_t o = *(uint64_t *)(g_mb + got); return ok_ptr(o, 0x38) ? *(int32_t *)(o + 0x30) : -999; }
@@ -25,11 +33,7 @@ static float cv_f(uint64_t got) { uint64_t o = *(uint64_t *)(g_mb + got); return
 void dm_doom_tick_diag(void) {
     static int on = -1; if (on < 0) { const char *e = getenv("DM_DOOM_TICKLOG"); on = e && *e == '1'; }
     if (!on) return;
-    if (!g_mb) {
-        for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { g_mb = g_mod[i].base; g_msz = g_mod[i].size; }
-        if (!g_mb || g_msz < STATIC_S + 0x100 || memcmp(g_mb + STR_FIXEDTIC, "com_fixedTic", 13)) {
-            LOG("[tick] DM_DOOM_TICKLOG: main is not the expected update build, diagnostic off"); on = 0; g_mb = NULL; return; }
-    }
+    if (!main_ok()) { LOG("[tick] DM_DOOM_TICKLOG: main is not the expected update build, diagnostic off"); on = 0; return; }
     uint8_t *S = g_mb + STATIC_S;
     uint64_t now = now_ns(), ts = *(volatile uint64_t *)(S + 0x90), carry = *(volatile uint64_t *)(S + 0xa0);
     static uint64_t t0, prev_ts, prev_carry, n_pres, n_adapt, last_hz; static double game_us;
@@ -55,6 +59,23 @@ void dm_doom_tick_diag(void) {
         game_us / 1e6 / wall, cv_i(GOT_FIXEDTIC), cv_i(GOT_ADAPTIVE), cv_i(GOT_IMMEDIATE), mn, mx, cv_f(GOT_TIMESCALE), thz, tms, allow,
         *(int32_t *)(S + 0x14));
     t0 = now; n_pres = n_adapt = 0; game_us = 0;
+}
+
+// [r6b] Gameplay signal for the present pacer (hle_nvn.c present_play_tick, DM_PRESENT_MENU_HZ). Called once per present (any
+// thread; two cvar reads and one 8-byte read of the game's static S). Returns 1 when the game ran an adaptive game frame since the
+// previous call, 0 when it did not, -1 when the signal is not available. The adaptive branch of the frame loop (0x1ecf940, which
+// stores Sys_Microseconds at S+0x90 on every call) is taken only when com_adaptiveTick is on, the game state is 6 (in game) and the
+// tick object's allowHzChange (+0x24) is set by the map -- i.e. exactly in gameplay, and exactly where game time follows the real
+// frame time (com_adaptiveTickMaxHz = the frame rate limit). Menus run the fixed 30 Hz tic (no call); the level-load pacifier
+// (loading screen) renders without game frames (no call). -1: another main build, or com_adaptiveTick 0 (DM_DOOM_ADAPTIVE_TICK=0),
+// where the call never happens -- the pacer then keeps the old behaviour instead of capping gameplay as if it were a menu.
+int dm_doom_play_signal(void) {
+    if (!main_ok()) return -1;
+    if (cv_i(GOT_ADAPTIVE) <= 0 || cv_i(GOT_IMMEDIATE) <= 0) return -1;
+    static uint64_t prev;
+    uint64_t ts = *(volatile uint64_t *)(g_mb + STATIC_S + 0x90);
+    int ran = ts && prev && ts != prev; prev = ts;
+    return ran;
 }
 #else
 void dm_doom_tick_diag(void) {}

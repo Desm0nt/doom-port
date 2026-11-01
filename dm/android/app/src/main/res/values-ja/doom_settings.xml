@@ -45,4 +45,8 @@
     <string name="gear_button_faded">半透明</string>
     <string name="gear_button_note">半透明：ほとんど見えませんが、これまで通り使えます。見え方は下のスライダーで調整できます。</string>
     <string name="gear_button_alpha" formatted="true">半透明ボタンの不透明度：%1$d%%</string>
+    <string name="gear_drs_target">ダイナミック解像度の目標フレームレート（このフレームレートを保つよう 3D 解像度を下げます）</string>
+    <string name="gear_res_drs_note">ダイナミック解像度がオンのときは 3D 解像度を自動で選びます。この値はオフのときに使われます。</string>
+    <string name="gear_light" formatted="false">軽量モード：Switch 携帯モードの画質（環境遮蔽と反射プローブなし、影とフィルタリングを簡略化、3D は最大 80% x 90%）。性能の低い端末向け</string>
+    <string name="toast_light_failed">このゲームビルドでは軽量モードを使えません：main.patched.bin を更新してください</string>
 </resources>

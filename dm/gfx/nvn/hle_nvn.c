@@ -1590,6 +1590,18 @@ static double present_cap_hz(void) {
     if (v < 0) { const char *e = getenv("DM_PRESENT_MAX_HZ"); v = e && *e ? atof(e) : 0; if (!(v >= 10 && v <= 240)) v = 0; }
     return v;
 }
+// [r6b] DM_PRESENT_MENU_HZ=<hz> (default 60; 0 = the limit applies everywhere, the v0.4.4 behaviour): with a frame rate limit above
+// it, presents are capped at <hz> outside gameplay (menus, the level-load pacifier). Measured on the Mi 13 Pro (02.11): limit 60 ->
+// loading screen 60 fps, level load 48 s; limit 120 -> loading screen 90 fps, load 86 s -- every pacifier frame takes CPU / GPU time
+// from the loader. g_menu_cap is set by present_play_tick (once per present) from the game's own gameplay signal; game speed is not
+// affected (menus run the fixed 30 Hz tic, gameplay keeps the full limit and com_adaptiveTickMaxHz = the limit).
+static double present_menu_hz(void) {
+    static double v = -1;
+    if (v < 0) { const char *e = getenv("DM_PRESENT_MENU_HZ"); v = e && *e ? atof(e) : 60; if (!(v >= 10 && v <= 240)) v = 0; }
+    return v;
+}
+static _Atomic int g_menu_cap;   // 1 = outside gameplay: present_auto_hz uses present_menu_hz instead of the limit
+int dm_nvn_present_menu_capped(void) { return atomic_load_explicit(&g_menu_cap, memory_order_relaxed); }   // perf_android.c: keep the window's frame-rate vote
 static double present_auto_hz(double screen_hz) {
 #ifdef __ANDROID__
     // Android has no Metal display-link pacer, so apply the power-saving target here.
@@ -1598,7 +1610,7 @@ static double present_auto_hz(double screen_hz) {
     // 自适应目标是最高60，而旧Apple策略是至少60；两者不共用取整方向。首帧/刷新率改变也受上限约束。
     // Adaptive pacing caps at 60; the legacy Apple policy has a floor of 60. Cap the first frame and refresh changes too.
     if (pace_adapt_enabled() && screen_hz > 0) return screen_hz / nvn_adaptive_divisor(screen_hz, g_pa_k, g_pa_screen_hz);
-    if (present_cap_hz() > 0) return nvn_pace_cap_hz(screen_hz, present_cap_hz());
+    if (present_cap_hz() > 0) return nvn_pace_cap_hz(screen_hz, atomic_load_explicit(&g_menu_cap, memory_order_relaxed) ? present_menu_hz() : present_cap_hz());
     return dm_pace_hz(screen_hz, 60);
 }
 static int g_hz = -1, g_display_mode, g_hz_auto;   // g_hz_auto：有窗口、没用 DM_PRESENT_HZ 钉住——帧率跟着窗口所在屏的刷新率取整除档（每帧重读，换屏即换） | g_hz_auto: has a window and not pinned by DM_PRESENT_HZ; the frame rate takes the evenly dividing tier of the refresh rate of the screen the window is on (re-read every frame, changes with the screen)
@@ -1682,6 +1694,30 @@ static uint64_t present_period(const win_t *o) {
     return hz > 0 ? (uint64_t)(itv * 1e9 / hz) : 0;
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
+// [r6b] Gameplay vs menu / loading for DM_PRESENT_MENU_HZ, once per present. dm_doom_play_signal (host hle_doom_tick.c): 1 = the game
+// ran an adaptive game frame since the last present (game state 6 + allowHzChange = gameplay), 0 = not, -1 = unknown (another build,
+// adaptive tick off; graphics unit tests: this weak definition) -> no menu cap. Hysteresis: gameplay after 8 adaptive frames in a row
+// (each within 250 ms of the previous one), menu / loading after 500 ms without one, so a long gameplay hitch does not flap it much.
+// A loading screen reported by the host (g_nvn_loadscreen_up, D2R only) also counts as loading.
+__attribute__((weak)) int dm_doom_play_signal(void) { return -1; }
+static void present_play_tick(void) {
+    double cap = present_cap_hz(), menu = present_menu_hz();
+    int cur = atomic_load_explicit(&g_menu_cap, memory_order_relaxed), want = 0;
+    if (g_hz_auto && cap > 0 && menu > 0 && cap > menu) {
+        static uint64_t last_play; static unsigned run; static int said_unknown;
+        int s = dm_doom_play_signal(); uint64_t now = now_ns();
+        if (s < 0) { if (!said_unknown) { said_unknown = 1; LOG("[nvn] present cap: no gameplay signal (another main build or adaptive tick off), menus keep the %.0f Hz limit", cap); } }
+        else {
+            if (s > 0) { run = last_play && now - last_play < 250000000ull ? run + 1 : 1; last_play = now; }
+            want = cur ? run < 8 || now - last_play > 250000000ull : !last_play || now - last_play > 500000000ull;
+        }
+        if (g_nvn_loadscreen_up && g_nvn_loadscreen_up()) want = 1;
+    }
+    if (want != cur) {
+        atomic_store_explicit(&g_menu_cap, want, memory_order_relaxed);
+        LOG("[nvn] present cap %.2f Hz (%s; limit DM_PRESENT_MAX_HZ %.0f, DM_PRESENT_MENU_HZ %.0f)", present_auto_hz(mtl_display_refresh()), want ? "menu/loading" : "gameplay", cap, menu);
+    }
+}
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     dm_aperf_guest_present();   // [r2] Android: the presenting guest thread (one atomic compare)
@@ -1700,6 +1736,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     { static int gate;
       if (!gate && g_nvn_loadscreen_up && g_nvn_loadscreen_up()) { gate = 1; int ms = mtl_warm_wait(15000); if (ms) LOG("[nvn] 进局读取画面等管线预热 %d ms", ms); } }
     present_cfg(o);
+    present_play_tick();   // [r6b] gameplay / menu present cap (DM_PRESENT_MENU_HZ), before this present's period is taken
     gfx_enter();
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // 只入队，立即返回；ticket 存翻译队列的任务号 | Enqueue only and return at once; ticket holds the translation queue's job number

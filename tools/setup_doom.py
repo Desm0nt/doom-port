@@ -117,7 +117,16 @@ class Layout:
         return build_id(self.exefs / 'main') == BUILD_ID and (self.exefs / 'sdk').is_file()
 
     def out_ok(self):
-        return all((self.out / f).is_file() for f in MODULE_FILES)
+        # Complete AND made by the patcher in this checkout: build_src.sha256 (written by patch_nso.py) lists the hashes of the
+        # patcher sources, so a newer release with new patches regenerates dm/out on the next setup run.
+        if not all((self.out / f).is_file() for f in MODULE_FILES): return False
+        try: rec = dict(reversed(l.split()) for l in (self.out / 'build_src.sha256').read_text().splitlines() if l.strip())
+        except (OSError, ValueError): return False
+        import hashlib
+        for name in ('patch_nso.py', 'nso_code.py'):
+            src = ROOT / 'dm' / 'tools' / name
+            if src.is_file() and rec.get(name) != hashlib.sha256(src.read_bytes()).hexdigest(): return False
+        return True
 
     def romfs_ok(self):
         return self.romfs_manifest.is_file() and self.romfs.is_dir()

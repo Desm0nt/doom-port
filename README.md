@@ -100,6 +100,10 @@ Other Snapdragon devices may work; other GPUs are untested.
   v0.4.4 shortens the hitches when a level starts and when you enter a new area (faster texture uploads, shaders read
   from internal storage instead of the shared Download folder): about −35% in total time spent in frames over 100 ms.
   The frame rate limit above 60 now really reaches the game (90 / 120 Hz screens).
+  v0.4.5 adds a **Light mode** (the Switch handheld quality preset, for weaker phones), a working **3D resolution**
+  option, and **dynamic resolution that targets 30 / 45 / 60 fps** using the port's own GPU timing; menus and loading
+  screens now run at 60 so loads are fast with a higher limit. After updating to v0.4.5 run the setup again once: it
+  regenerates the patched game files these options need (with the old ones the new options stay off).
   Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
 - Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
   on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level
@@ -107,8 +111,8 @@ Other Snapdragon devices may work; other GPUs are untested.
 - Input: on-screen pad (left stick, mouse-like look on the right half, FIRE that also looks while held, R3),
   Bluetooth / USB controllers (the on-screen pad hides while one is connected), gyro aiming, aim assist with adjustable
   strength, rumble.
-- Settings (gear button): widescreen, frame rate limit, 3D render resolution, dynamic resolution (shared with the game's
-  Video menu), RCAS sharpening, Vulkan driver (by GPU, or your own package), game language, aim assist strength, rumble,
+- Settings (gear button): widescreen, frame rate limit, light mode (Switch handheld preset), 3D render resolution, dynamic resolution with a target fps
+  (shared with the game's Video menu), RCAS sharpening, Vulkan driver (by GPU, or your own package), game language, aim assist strength, rumble,
   frame counter, look sensitivity, and the gear button itself (normal, or faded with an opacity slider). The in-game Video menu's *Chromatic Aberration* entry is
   repurposed as *Dynamic Resolution*.
 
@@ -116,7 +120,7 @@ Other Snapdragon devices may work; other GPUs are untested.
 
 - The game's GPU triangle culling (`r_geometryCulling`, `r_smallTriangleCulling`) is **off by default**: on our GPU
   path it dropped visible triangles. Turning it on (`DM_DOOM_GEOMCULL=1`) is for debugging only.
-- Dynamic resolution is off by default (it looked worse than a fixed lower resolution); enable it in the Video menu.
+- Dynamic resolution is off by default; enable it in the gear settings or the Video menu and pick its target fps.
 - Only update **v262144** is supported; the patches and addresses are tied to its build id.
 - Turnip is the default driver and matches or beats the stock Qualcomm driver on Adreno 750; on other Adreno
   generations you may need another Turnip build (see *Vulkan drivers*); non-Adreno GPUs use the system driver.

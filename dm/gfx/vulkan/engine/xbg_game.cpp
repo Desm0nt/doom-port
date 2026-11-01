@@ -382,6 +382,8 @@ void timing_boundary(){
 // 最近一个统计窗的每帧 GPU / 翻译 CPU 毫秒（宿主 hle_oe.c 的 GPU 时间 3D 比例控制器、hle_nvn.c 的自适应出图档读）| per-frame GPU / translation CPU ms of the last
 std::atomic<double> perf_gpu_ms{-1},perf_cpu_ms{-1};
 extern "C" double xbg_recent_gpu_ms(void){return perf_gpu_ms.load();}
+extern std::atomic<uint64_t> drs_busy_total_ns;   // [r6] defined before retire_slot
+extern "C" uint64_t xbg_gpu_busy_total_ns(void){return drs_busy_total_ns.load(std::memory_order_relaxed);}
 extern "C" double xbg_recent_cpu_ms(void){return perf_cpu_ms.load();}
 bool sync_mode=false; // diagnostic: marker files/gfx-sync-mode resolves all GPU results at each submit end
 std::atomic<uint64_t> completed{0};uint64_t submitted=0; // guest fence values: submitted xbg_submit calls / GPU-complete ones (see Slot::covers)
@@ -930,6 +932,15 @@ void apply_ready_events(){
     size_t k=0;for(;k<pending_events.size();++k){const PendingEvent &e=pending_events[k];if(static_cast<const Slot*>(e.slot)->pending)break;apply_event(e.addr,e.mode,e.v);}
     pending_events.erase(pending_events.begin(),pending_events.begin()+k);
 }
+// [r6] Monotonic GPU busy time (ns) for the game's dynamic resolution: hle_doom_drs.c reads it once a game frame through
+// xbg_gpu_busy_total_ns and hands the per-frame difference to the game's DRS controller (BUGS_AND_FIXES 2.18). With chunk diagnostics
+// on (the default) it is the union of slot spans (chunk::gpu_span, queued submissions not counted twice), else the sum of slot spans.
+std::atomic<uint64_t> drs_busy_total_ns{0};
+inline void drs_busy_add(uint64_t serial,uint64_t t0,uint64_t t1,uint64_t ns){
+    if(!chunk::diag){drs_busy_total_ns.fetch_add(ns,std::memory_order_relaxed);return;}
+    const uint64_t b0=chunk::busy_ticks;chunk::gpu_span(serial,t0,t1);
+    if(chunk::busy_ticks>b0)drs_busy_total_ns.fetch_add(uint64_t(double(chunk::busy_ticks-b0)*properties.limits.timestampPeriod),std::memory_order_relaxed);
+}
 void retire_slot(Slot &s){
     if(!s.pending)return;
     poolreset::finish(s);
@@ -956,8 +967,8 @@ void retire_slot(Slot &s){
         if(complete)span_us=double((last-first)&mask)*per;
         xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u summary recorded=%zu complete=%zu skipped=%u queries=%u result=%d pass_us=%.0f compute_us=%.0f span_us=%.0f",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),s.prof_recs.size(),complete,s.prof_skipped,s.prof_used,int(status),pass_us,compute_us,span_us);
     }
-    if(s.timestamps){uint64_t t[2]{};if(vkGetQueryPoolResults(cfg.device,s.timestamps,0,2,sizeof(t),t,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS && t[1]>=t[0]){uint64_t mask=timestamp_bits<64?(uint64_t(1)<<timestamp_bits)-1:~0ull;const uint64_t ns=uint64_t(double((t[1]-t[0])&mask)*properties.limits.timestampPeriod);perf.gpu_ns+=ns;++perf.gpu_samples;hud::gpu_add(s.hud_frame,ns);if(chunk::diag)chunk::gpu_span(s.serial,t[0],t[1]);}else if(chunk::diag)chunk::gpu_span(s.serial,0,0);}
-    else if(chunk::diag)chunk::gpu_span(s.serial,0,0);   // an empty span keeps the submission order moving
+    if(s.timestamps){uint64_t t[2]{};if(vkGetQueryPoolResults(cfg.device,s.timestamps,0,2,sizeof(t),t,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS && t[1]>=t[0]){uint64_t mask=timestamp_bits<64?(uint64_t(1)<<timestamp_bits)-1:~0ull;const uint64_t ns=uint64_t(double((t[1]-t[0])&mask)*properties.limits.timestampPeriod);perf.gpu_ns+=ns;++perf.gpu_samples;hud::gpu_add(s.hud_frame,ns);drs_busy_add(s.serial,t[0],t[1],ns);}else drs_busy_add(s.serial,0,0,0);}
+    else drs_busy_add(s.serial,0,0,0);   // an empty span keeps the submission order moving
     CPU_SCOPE(Cleanup);uint64_t c0=timing_clock();
     // One readback per occlusion pool (the fence has signalled, so every used query is available).
     {static std::vector<uint64_t> results;size_t used=s.occlusion_used;results.assign(used,0);

@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Esmaecido</string>
     <string name="gear_button_note">Esmaecido: quase invisível, funciona como antes; ajuste o quanto aparece no controle abaixo.</string>
     <string name="gear_button_alpha" formatted="true">Opacidade do botão esmaecido: %1$d%%</string>
+    <string name="gear_drs_target">Meta da resolução dinâmica, fps (reduz a resolução 3D para manter esta taxa)</string>
+    <string name="gear_res_drs_note">Com a resolução dinâmica ligada, ela escolhe a resolução 3D; este valor vale quando ela está desligada.</string>
+    <string name="gear_light" formatted="false">Modo leve: qualidade do Switch no modo portátil (sem oclusão de ambiente nem sondas de reflexo, sombras e filtragem mais simples, 3D no máximo 80 % x 90 %) para aparelhos fracos</string>
+    <string name="toast_light_failed">O modo leve não está disponível nesta versão do jogo: atualize o main.patched.bin</string>
 </resources>

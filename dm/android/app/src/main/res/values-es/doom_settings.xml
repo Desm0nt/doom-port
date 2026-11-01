@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Translúcido</string>
     <string name="gear_button_note">Translúcido: apenas visible, funciona como antes; ajusta cuánto se ve con el control de abajo.</string>
     <string name="gear_button_alpha" formatted="true">Opacidad del botón translúcido: %1$d %%</string>
+    <string name="gear_drs_target">Objetivo de la resolución dinámica, fps (baja la resolución 3D para mantener esta tasa)</string>
+    <string name="gear_res_drs_note">Con la resolución dinámica activada, ella elige la resolución 3D; este valor se usa cuando está desactivada.</string>
+    <string name="gear_light" formatted="false">Modo ligero: calidad de Switch en modo portátil (sin oclusión ambiental ni sondas de reflejos, sombras y filtrado más simples, 3D como máximo 80 % x 90 %) para dispositivos modestos</string>
+    <string name="toast_light_failed">El modo ligero no está disponible con esta versión del juego: actualiza main.patched.bin</string>
 </resources>

@@ -99,6 +99,37 @@ CUTS = {
         # offline. One round per wake: the drain inside a round already empties the socket (up to 127 packets), the 1 ms wake
         # period, the shutdown check at 0xcfaf8 and the port itself are unchanged.
         (0xcfaac, '6c020054', '13000014', 'idDTLSWorkerThread::Run: b.gt #0xcfaf8 -> b #0xcfaf8 (one recv/yield round per 1 ms wake instead of 9)'),
+        # [r6] Round 6 user options (BUGS_AND_FIXES 2.18). All three keep the original result while the option is off.
+        # 6a light mode: idRenderSystemLocal::ProgramPerformanceModeConfiguration (0x1c064c0, from SwapBuffers) picks the handheld
+        # quality preset (15 cvars + the handheld DRS caps flag 0x593e074) as w20 = (perfMode cache 0x4839c20 == 0) && r_nxUndockedPerf.
+        # New: w20 = (perfMode == 0 && r_nxUndockedPerf != 0) || r_nxUndockedPerf == 2. r_nxUndockedPerf (bool cvar, default 1, idCVar
+        # 0x573d118, read only here) is written to 2 by the host (hle_doom_drs.c, DM_DOOM_LIGHT / gear) with the dirty flag 0x4839c28,
+        # so the preset is re-applied like a dock change while GetPerformanceMode / GetOperationMode (gamma boost, Npad, touch, BDM) stay.
+        (0x1c06568, 'e8179f1a', '2409407a', 'light mode: cset w8,eq -> ccmp w9,#0,#4,eq (perfMode == 0 ? flags of undocked != 0 : Z)'),
+        (0x1c0656c, '3f010071', 'e8079f1a', '... cmp w9,#0 -> cset w8,ne (= perfMode == 0 && undocked != 0)'),
+        (0x1c06570, 'e9079f1a', '3f090071', '... cset w9,ne -> cmp w9,#2'),
+        (0x1c06574, '1401090a', '14159f1a', '... and w20,w8,w9 -> csinc w20,w8,wzr,ne (r_nxUndockedPerf == 2 forces the handheld preset)'),
+        # 6b fixed 3D scale with DRS off: the resolution-scale update 0x1c26e80 returned scale = max (1.0) and controller 1.0 when
+        # rs_enable == 0 before it read rs_forceFractionX/Y (cbz w13 at 0x1c26ec8), so DM_DOOM_RES did nothing. Reordered: the "scaling
+        # allowed" flag 0x4839c2a is tested first (0 -> the old 1.0 exit, as before), then rs_enable == 0 jumps to a 3-word block in the
+        # padding after the function (store 1.0 to +0x14 exactly like the old exit) and on into the forceFraction + clamp tail 0x1c26eec.
+        # forceFraction 0 (default) gives max clamped to [min, max] = max, the same values as before; rs_enable != 0 is unchanged.
+        (0x1c26ec4, 'ad3140b9', 'ae3140b9', '3D scale: ldr w13,[x13,#0x30] -> ldr w14 (rs_enable kept in w14)'),
+        (0x1c26ec8, '6d060034', 'ed6201d0', '... cbz w13,#0x1c26f94 -> adrp x13,#0x4884000 (scaling-allowed flag first)'),
+        (0x1c26ecc, 'ed6201d0', 'adb144f9', '... -> ldr x13,[x13,#0x960]'),
+        (0x1c26ed0, 'adb144f9', 'ad014039', '... -> ldrb w13,[x13]'),
+        (0x1c26ed4, 'ad014039', '0d060034', '... -> cbz w13,#0x1c26f94 (flag 0: old exit)'),
+        (0x1c26ed8, 'ed050034', '6101271e', '... -> fmov s1,w11'),
+        (0x1c26edc, '6101271e', '8001271e', '... -> fmov s0,w12'),
+        (0x1c26ee0, '8001271e', '2e240034', '... -> cbz w14,#0x1c27364 (rs_enable 0: forced-fraction path)'),
+        (0x1c27364, '00000000', '0df0a752', '... padding udf -> mov w13,#0x3f800000'),
+        (0x1c27368, '00000000', '0d1400b9', '... padding udf -> str w13,[x0,#0x14] (controller value 1.0 as the old exit)'),
+        (0x1c2736c, '00000000', 'e0feff17', '... padding udf -> b #0x1c26eec (forceFraction X/Y if > 0, clamp to [min, max])'),
+        # 6c DRS on our GPU time: the frame's GPU microseconds handed to the DRS controller 0x1c27370 come from 0x1c71310 (sum of the
+        # game's ReportValue timestamp pairs; our ReportValue writes no timestamp, so it never measured anything). The call at the DRS
+        # site becomes host call 0x95 (hle.h SVC_HOST_DOOM_GPU_TIME, hle_doom_drs.c): the host calls the original 0x1c71310 and returns
+        # its value unless DRS is on, then it returns our Vulkan GPU busy time per frame. The two other callers (stats) are untouched.
+        (0x1c5b27c, '25580094', 'a11200d4', 'DRS GPU time: bl 0x1c71310 -> svc #0x95 (host returns the original value, or our GPU time while DRS is on)', '仅宿主'),
     ],
     'db0507f36b84200ac05f75d76ed5026f': [
     # （放进所有产物共用的基础改写）：游戏显存分配器预算 260 MB → 512 MB

@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Przygaszony</string>
     <string name="gear_button_note">Przygaszony: ledwo widoczny, działa jak dotąd; widoczność ustawia suwak poniżej.</string>
     <string name="gear_button_alpha" formatted="true">Krycie przygaszonego przycisku: %1$d%%</string>
+    <string name="gear_drs_target">Cel dynamicznej rozdzielczości, fps (obniża rozdzielczość 3D, by utrzymać tę liczbę klatek)</string>
+    <string name="gear_res_drs_note">Gdy dynamiczna rozdzielczość jest włączona, sama wybiera rozdzielczość 3D; ta wartość działa, gdy jest wyłączona.</string>
+    <string name="gear_light" formatted="false">Tryb lekki: jakość Switcha w trybie przenośnym (bez okluzji otoczenia i sond odbić, prostsze cienie i filtrowanie, 3D najwyżej 80 % x 90 %) dla słabszych urządzeń</string>
+    <string name="toast_light_failed">Tryb lekki jest niedostępny w tej wersji gry: zaktualizuj main.patched.bin</string>
 </resources>

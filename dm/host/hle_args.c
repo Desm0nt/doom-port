@@ -2,7 +2,11 @@
 // startup, which is how options reach the renderer without patching code:
 //   DM_DOOM_RES=<0.5..1>   3D render fraction (rs_forceFractionX / Y): the game renders the 3D view at that fraction of
 //                          the output size (1280x720, or W x 720 with DM_DOOM_WIDE) and upscales it itself (with its TAA);
-//                          the UI stays at full resolution. 0.75 = 960x540 at 16:9.
+//                          the UI stays at full resolution. 0.75 = 960x540 at 16:9. [r6] Works with dynamic resolution off only with
+//                          the CUT at main+0x1c26ec4 (before it the rs_enable 0 exit skipped the fraction); 1.0 adds nothing (a forced
+//                          1.0 overrode DRS); while DRS is on hle_doom_drs.c sets the fraction to 0 so DRS decides (BUGS_AND_FIXES 2.18).
+//   DM_DOOM_LIGHT=1, DM_DOOM_DRS_FPS=30|45|60, DM_DOOM_DRS_GPU=0  light mode / DRS target / DRS on the game's own GPU timer
+//                          (hle_doom_drs.c, read by doom_drs_init below).
 //   DM_DOOM_WIDE=1|0|<w>   widescreen Hor+ output W x 720 (default off; 1 = screen aspect; see doom_wide below).
 //   DM_DOOM_WIDE_LIVE=1    always render wide; the gear checkbox switches live (off = presenter 16:9 centre crop; BUGS 2.12).
 //   DM_DOOM_DRS=<n>        debugging: +set rs_enable <n> at every launch. Unset (normal): nothing -- rs_enable's default is patched
@@ -179,7 +183,7 @@ static void build(void) {
     const char *res = getenv("DM_DOOM_RES");
     if (res && *res) {
         double f = atof(res);
-        if (f >= 0.25 && f <= 1.0) {
+        if (f >= 0.25 && f < 0.999) {   // [r6] 100 % = no +set: a forced 1.0 would also pin dynamic resolution at full size
             char v[32]; snprintf(v, sizeof v, "%.3f", f);
             add("+set"); add("rs_forceFractionX"); add(v);
             add("+set"); add("rs_forceFractionY"); add(v);

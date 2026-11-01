@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Soluk</string>
     <string name="gear_button_note">Soluk: zor görünür, eskisi gibi çalışır; ne kadar görüneceğini aşağıdaki kaydırıcı belirler.</string>
     <string name="gear_button_alpha" formatted="true">Soluk düğmenin opaklığı: %%%1$d</string>
+    <string name="gear_drs_target">Dinamik çözünürlük hedefi, fps (bu kare hızını korumak için 3D çözünürlüğü düşürür)</string>
+    <string name="gear_res_drs_note">Dinamik çözünürlük açıkken 3D çözünürlüğü kendisi seçer; bu değer kapalıyken kullanılır.</string>
+    <string name="gear_light" formatted="false">Hafif mod: Switch el modu kalitesi (ortam kapatma ve yansıma sondaları yok, daha basit gölgeler ve filtreleme, 3D en fazla %80 x %90) zayıf cihazlar için</string>
+    <string name="toast_light_failed">Hafif mod bu oyun derlemesinde yok: main.patched.bin dosyasını güncelleyin</string>
 </resources>

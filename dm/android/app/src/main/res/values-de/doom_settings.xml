@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Durchscheinend</string>
     <string name="gear_button_note">Durchscheinend: kaum sichtbar, funktioniert wie bisher; wie sichtbar, stellt der Regler unten ein.</string>
     <string name="gear_button_alpha" formatted="true">Deckkraft der durchscheinenden Schaltfläche: %1$d %%</string>
+    <string name="gear_drs_target">Ziel der dynamischen Auflösung, fps (senkt die 3D-Auflösung, um diese Bildrate zu halten)</string>
+    <string name="gear_res_drs_note">Bei eingeschalteter dynamischer Auflösung wählt sie die 3D-Auflösung selbst; dieser Wert gilt, wenn sie aus ist.</string>
+    <string name="gear_light" formatted="false">Leichter Modus: Handheld-Qualität der Switch (ohne Umgebungsverdeckung und Reflexionsproben, einfachere Schatten und Filterung, 3D höchstens 80 % x 90 %) für schwache Geräte</string>
+    <string name="toast_light_failed">Der leichte Modus ist mit diesem Spiel-Build nicht verfügbar: main.patched.bin aktualisieren</string>
 </resources>

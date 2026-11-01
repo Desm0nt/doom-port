@@ -430,6 +430,16 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeGetDrs(JNIEnv *en
 JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetDrs(JNIEnv *env, jclass cls, jboolean on) {
     (void)env; (void)cls; return dm_doom_drs_set(on ? 1 : 0) ? JNI_TRUE : JNI_FALSE;
 }
+// [DOOM] r6 (BUGS_AND_FIXES 2.18, hle_doom_drs.c): light mode (the game's handheld quality preset) live; false = the loaded main lacks
+// the light-mode patch. DRS target fps (30 / 45 / 60) for rs_drop/raiseMilliseconds while dynamic resolution is on.
+int dm_doom_light_set(int on);
+void dm_doom_drs_fps_set(int fps);
+JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetLight(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls; return dm_doom_light_set(on ? 1 : 0) ? JNI_TRUE : JNI_FALSE;
+}
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetDrsFps(JNIEnv *env, jclass cls, jint fps) {
+    (void)env; (void)cls; dm_doom_drs_fps_set(fps);
+}
 // [DOOM] Vulkan driver status (vk_driver.c): "<requested>\t<active>\t<reason>", or "" before the driver is loaded.
 const char *dm_vk_driver_status(void);
 JNIEXPORT jstring JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeDriverStatus(JNIEnv *env, jclass cls) {

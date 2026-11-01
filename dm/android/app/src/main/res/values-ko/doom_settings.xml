@@ -45,4 +45,8 @@
     <string name="gear_button_faded">반투명</string>
     <string name="gear_button_note">반투명: 거의 보이지 않지만 그대로 작동하며, 보이는 정도는 아래 슬라이더로 조절합니다.</string>
     <string name="gear_button_alpha" formatted="true">반투명 버튼 불투명도: %1$d%%</string>
+    <string name="gear_drs_target">동적 해상도 목표 프레임 레이트(이 프레임 레이트를 유지하도록 3D 해상도를 낮춥니다)</string>
+    <string name="gear_res_drs_note">동적 해상도가 켜져 있으면 3D 해상도를 스스로 고릅니다. 이 값은 꺼져 있을 때 적용됩니다.</string>
+    <string name="gear_light" formatted="false">가벼운 모드: Switch 휴대 모드 화질(앰비언트 오클루전과 반사 프로브 없음, 더 단순한 그림자와 필터링, 3D 최대 80% x 90%), 성능이 낮은 기기용</string>
+    <string name="toast_light_failed">이 게임 빌드에서는 가벼운 모드를 사용할 수 없습니다: main.patched.bin을 업데이트하세요</string>
 </resources>

@@ -45,4 +45,8 @@
     <string name="gear_button_faded">半透明</string>
     <string name="gear_button_note">半透明：几乎看不见，用法不变；可在下方滑块调整可见程度。</string>
     <string name="gear_button_alpha" formatted="true">半透明按钮的不透明度：%1$d%%</string>
+    <string name="gear_drs_target">动态分辨率目标帧率（为保持该帧率而降低 3D 分辨率）</string>
+    <string name="gear_res_drs_note">开启动态分辨率时由它自行选择 3D 分辨率；关闭时使用此处的值。</string>
+    <string name="gear_light" formatted="false">轻量模式：Switch 掌机画质（无环境光遮蔽和反射探针，阴影与过滤更简单，3D 最高 80% x 90%），适合性能较弱的设备</string>
+    <string name="toast_light_failed">当前游戏补丁不支持轻量模式：请更新 main.patched.bin</string>
 </resources>

@@ -45,4 +45,8 @@
     <string name="gear_button_faded">Sbiadito</string>
     <string name="gear_button_note">Sbiadito: appena visibile, funziona come prima; quanto si vede lo regola il cursore qui sotto.</string>
     <string name="gear_button_alpha" formatted="true">Opacità del pulsante sbiadito: %1$d%%</string>
+    <string name="gear_drs_target">Obiettivo della risoluzione dinamica, fps (abbassa la risoluzione 3D per mantenere questo frame rate)</string>
+    <string name="gear_res_drs_note">Con la risoluzione dinamica attiva, è lei a scegliere la risoluzione 3D; questo valore vale quando è disattivata.</string>
+    <string name="gear_light" formatted="false">Modalità leggera: qualità di Switch in modalità portatile (senza occlusione ambientale né sonde di riflessione, ombre e filtri più semplici, 3D al massimo 80 % x 90 %) per dispositivi poco potenti</string>
+    <string name="toast_light_failed">La modalità leggera non è disponibile con questa build del gioco: aggiorna main.patched.bin</string>
 </resources>

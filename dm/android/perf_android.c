@@ -48,6 +48,7 @@
 double dm_present_period(void);   // gfx/vulkan/nvn_vk.c: this present's pacing period (s)
 __attribute__((weak)) double xbg_recent_gpu_ms(void);
 __attribute__((weak)) uint64_t dm_nvn_pace_sleep_ns(void);         // gfx/nvn/hle_nvn.c: total pacing sleep inside AcquireTexture
+__attribute__((weak)) int dm_nvn_present_menu_capped(void);         // gfx/nvn/hle_nvn.c [r6b]: 1 = presents capped at DM_PRESENT_MENU_HZ (menu / loading)
 __attribute__((weak)) int thr_guest_tids(int32_t *out, int max);    // host/hle_thread.c: live guest threads' host tids
 __attribute__((weak)) void thr_refresh_host_names(void);           // host/hle_thread.c: re-read the guest names into the host names
 
@@ -491,5 +492,9 @@ void dm_aperf_present(ANativeWindow *w, float marker_vote) {
     prev_t = t;
     static ANativeWindow *voted_w; static float voted;
     float want = vote_for(marker_vote, period);
+    // [r6b] The menu / loading present cap (DM_PRESENT_MENU_HZ) does not change the window's vote: with the thermal vote it would drop
+    // the panel to 60 Hz in a menu, and the gameplay tier (the largest fraction of the *current* refresh under the limit) would then
+    // stay at 60 until the phone cooled down. Display mode switches on every menu / gameplay change are avoided too.
+    if (voted > 0 && w == voted_w && dm_nvn_present_menu_capped && dm_nvn_present_menu_capped()) want = voted;
     if (w && want > 0 && (w != voted_w || fabsf(want - voted) > 0.5f)) { vote(w, want); voted_w = w; voted = want; }
 }

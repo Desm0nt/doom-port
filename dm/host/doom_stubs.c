@@ -33,8 +33,12 @@ void uimsg_subscribe(void (*fn)(const char *cat, const char *act, const char *ar
 int dm_loadscreen_up(void) { return 0; }
 void dm_hold_for_loadscreen(void) {}
 
-// ---- hle_tact.c: host calls 0x80+ (cuts). Doom has only the zlib entry gates 0x90..0x94 (hle_zlib.c, hle.h registry) ----
-uint64_t svc_host_call(int num, uint64_t *regs) { int dm_zlib_host_call(int, uint64_t *); return (uint64_t)dm_zlib_host_call(num, regs); }
+// ---- hle_tact.c: host calls 0x80+ (cuts). Doom has the zlib entry gates 0x90..0x94 (hle_zlib.c, hle.h registry) and the DRS
+// GPU time 0x95 (hle_doom_drs.c, r6) ----
+uint64_t svc_host_call(int num, uint64_t *regs) {
+    if (num == SVC_HOST_DOOM_GPU_TIME) { void doom_drs_gpu_svc(uint64_t *); doom_drs_gpu_svc(regs); return 1; }
+    int dm_zlib_host_call(int, uint64_t *); return (uint64_t)dm_zlib_host_call(num, regs);
+}
 
 // ---- hle_private_aim.c / dm_padmode.c / dm_runeword.c / dm_textinput.c / dm_update.c pumps and filters ----
 void dm_aim_cone_pump(void) {}
