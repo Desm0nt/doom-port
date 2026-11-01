@@ -289,10 +289,17 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     }
     private boolean fpsLimitAvailable(int hz) { return hz <= 60 || modeFor(hz) != null; }
     // The saved limit, lowered to the highest one this display supports (another screen / the system's refresh setting changed).
+    // No display yet (or no mode list): keep the saved limit; the native pacer clamps it to an integer fraction of the real refresh
+    // rate anyway (hle_nvn.c nvn_pace_cap_hz). The choice is logged ("fps limit ...") because a silent drop to 60 went unnoticed.
     private int fpsLimit() {
         int want = doomPrefs().getInt("fps_limit", FPS_LIMIT_DEFAULT);
         if (want <= 60) return want == 30 ? 30 : 60;
+        android.view.Display d = display();
+        if (d == null) { android.util.Log.i("dm", "fps limit " + want + ": no display yet, kept"); return want; }
         int got = 60; for (int l : FPS_LIMITS) if (l > got && l <= want && fpsLimitAvailable(l)) got = l;
+        StringBuilder modes = new StringBuilder();
+        for (android.view.Display.Mode m : d.getSupportedModes()) modes.append(' ').append(m.getModeId()).append('@').append(m.getRefreshRate());
+        android.util.Log.i("dm", "fps limit " + want + " -> " + got + " (modes" + modes + ", current " + d.getMode().getModeId() + ")");
         return got;
     }
     // Above 60 the window asks the system for a display mode at a multiple of the limit (e.g. 90 Hz for 90, 120 Hz for 120); at 30 / 60

@@ -37,3 +37,15 @@ void nvn_dirty_gone_stats(uint64_t *read_faults, uint64_t *write_faults, uint64_
 int nvn_texel_sync_on(void);
 void nvn_texel_lock(void);
 void nvn_texel_unlock(void);
+// [r4] DM_DIRTY_PROTECT_BGEN=1|2|3 (engine round 4b, docs/SWITCHES.md): re-protect a texture visiting only the 64-page windows
+// whose newest generation passed the caller's floor (cookie, one per texture), with test-and-test-and-set and one range lookup.
+// mode bit 0 = windows (needs the env set: unprotects are counted in flight, see nvn_dirty.c), bit 1 = verify with a full walk
+// afterwards (st->missed = pages it still had to protect that the windows should have covered). A zero cookie walks every page.
+typedef struct { uint64_t floor, reg; uintptr_t addr; size_t len; } nvn_dirty_cookie;
+typedef struct { uint64_t calls, full, windows, pages, kept, missed; } nvn_dirty_pstat;   // cumulative; the caller resets
+int nvn_dirty_pbgen_mode(void);                                    // DM_DIRTY_PROTECT_BGEN as read by the tracker (0 = off)
+unsigned nvn_dirty_page_shift(void);
+void nvn_dirty_protect_gen(const void *addr, size_t len, nvn_dirty_cookie *ck, int mode, nvn_dirty_pstat *st);
+// Pages of [addr, addr+len) written after stamp as a bitmap (bit i = i-th page from the page holding addr); returns the page
+// count, 0 when untracked or nwords is too small. *windows += block summaries above stamp that were read page by page.
+size_t nvn_dirty_since_bits(const void *addr, size_t len, uint64_t stamp, uint64_t *bits, size_t nwords, uint64_t *windows);

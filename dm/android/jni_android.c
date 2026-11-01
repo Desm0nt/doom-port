@@ -187,6 +187,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     LOG("boot: 资源链接 %d 个文件", n);
 #endif
     setenv("DM_RUNTIME_DIR", g_runtime, 1);   // [DOOM] hle_nvn.c polls <it>/dump for an on-demand thread dump
+    setenv("DM_FILES_DIR", g_files, 0);       // [r5] internal storage (not FUSE): DM_GFX_SHADER_RAWCACHE=2|3 mirrors the shader bundles there
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);
 #ifdef DM_ANDROID_DEBUG_ENV
     debug_environment();

@@ -18,6 +18,14 @@ t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_di
 #   make t_dirty_gone && ./t_dirty_gone
 t_dirty_gone: t_dirty_gone.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
 	gcc -O1 -g -Wall -Wno-unused-function -I../../android/compat/include -include dm_android_compat.h -o $@ t_dirty_gone.c -lpthread
+# [r4] DM_DIRTY_PROTECT_BGEN window re-protect, verify walk and since bitmap; Linux only like t_dirty_gone:
+#   make t_dirty_pbgen && ./t_dirty_pbgen
+t_dirty_pbgen: t_dirty_pbgen.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
+	gcc -O1 -g -Wall -Wno-unused-function -I../../android/compat/include -include dm_android_compat.h -o $@ t_dirty_pbgen.c -lpthread
+# [r5] DM_GFX_DESWZ_DIRECT: GOB-wise deswizzle == nvn_deswizzle byte for byte (formats, targets, sizes, mips, block heights);
+#   make t_deswz_direct && ./t_deswz_direct
+t_deswz_direct: t_deswz_direct.c ../tex/nvn_deswizzle.c ../tex/nvn_deswizzle.h ../nvn/nvn_tex.c ../nvn/nvn_tex.h
+	gcc -O1 -g -Wall -Wno-unused-function -o $@ t_deswz_direct.c ../tex/nvn_deswizzle.c ../nvn/nvn_tex.c
 t_builtin: t_builtin.m ../nvn/nvn_builtin.h
 	clang -O1 -g -Wall -fobjc-arc -o $@ t_builtin.m -framework Metal -framework Foundation
 t_deswz_gpu: t_deswz_gpu.m ../tex/nvn_deswizzle.c ../tex/nvn_deswizzle_gpu.m ../tex/nvn_deswizzle.h ../tex/nvn_deswizzle_gpu.h ../nvn/nvn_tex.c ../nvn/nvn_tex.h

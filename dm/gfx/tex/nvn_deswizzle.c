@@ -69,3 +69,46 @@ int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const vo
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
     return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0);
 }
+
+// [r5] GOB-wise deswizzle (DM_GFX_DESWZ_DIRECT). nvn_bl_offset(x, y, z) splits into a per-row part and a per-GOB-column part:
+//   row(y, z) = (z >> td) * slab + (y >> (3 + th)) * brow + (((z & (bd - 1)) << th) + ((y >> 3) & (bh - 1))) * 512
+//               + ((y & 7) >> 1) * 64 + (y & 1) * 16
+//   col(x)    = (x >> 6) * block + seg[(x & 63) >> 4],  seg = {0, 32, 256, 288}   (x is a multiple of 16)
+// which is the same sum term by term (x % 64 / 32 * 256 + x % 32 / 16 * 32 = seg[x % 64 / 16]; z / bd, y / (8 bh) and the
+// modulos are shifts and masks since bh = 2^th, bd = 2^td). The copies are the same 16-byte segments (the last one n < 16).
+static const uint32_t gob_seg[4] = {0, 32, 256, 288};
+int nvn_deswizzle_gob(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t pitch) {
+    uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
+    if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
+    if (pitch < row_bytes) return -1;
+    const uint8_t *bl = (const uint8_t *)src + base; uint8_t *lin = (uint8_t *)dst;
+    const uint32_t bh = 1u << th, bd = 1u << td;
+    const uint64_t gobs_x = (row_bytes + 63) / 64, blocks_y = (rows + 8 * bh - 1) / (8 * bh);
+    const uint64_t block = 512ull << (th + td), brow = gobs_x * block, slab = gobs_x * blocks_y * block;
+    const uint32_t full = row_bytes / 64, tail = row_bytes % 64;
+    for (uint32_t z = 0; z < slices; z++) {
+        const uint64_t zo = (uint64_t)(z >> td) * slab;
+        const uint32_t zg = (z & (bd - 1)) << th;
+        for (uint32_t y = 0; y < rows; y++) {
+            const uint8_t *p = bl + zo + (uint64_t)(y >> (3 + th)) * brow + (uint64_t)(zg + ((y >> 3) & (bh - 1))) * 512u
+                             + ((y & 7) >> 1) * 64u + (y & 1) * 16u;
+            uint8_t *row = lin + ((size_t)z * rows + y) * pitch;
+            for (uint32_t g = 0; g < full; g++, p += block, row += 64) {
+                memcpy(row, p, 16); memcpy(row + 16, p + 32, 16); memcpy(row + 32, p + 256, 16); memcpy(row + 48, p + 288, 16);
+            }
+            for (uint32_t x = 0; x < tail; x += 16) memcpy(row + x, p + gob_seg[x >> 4], tail - x < 16 ? tail - x : 16);
+        }
+    }
+    return 0;
+}
+
+void nvn_deswizzle_gob_block(const uint8_t *blk, unsigned th, uint32_t xb, uint32_t ny, uint32_t nz, uint8_t *dst) {
+    const uint32_t bh = 1u << th;
+    for (uint32_t z = 0; z < nz; z++)
+        for (uint32_t y = 0; y < ny; y++) {
+            const uint8_t *p = blk + (size_t)((z << th) + ((y >> 3) & (bh - 1))) * 512u + ((y & 7) >> 1) * 64u + (y & 1) * 16u;
+            uint8_t *row = dst + ((size_t)z * ny + y) * xb;
+            if (xb == 64) { memcpy(row, p, 16); memcpy(row + 16, p + 32, 16); memcpy(row + 32, p + 256, 16); memcpy(row + 48, p + 288, 16); }
+            else for (uint32_t x = 0; x < xb; x += 16) memcpy(row + x, p + gob_seg[x >> 4], xb - x < 16 ? xb - x : 16);
+        }
+}

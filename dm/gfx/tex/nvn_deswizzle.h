@@ -24,3 +24,11 @@ uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, u
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices,
                        uint64_t *base, unsigned *tileH, unsigned *tileD, uint32_t *bpb);
+// [r5] DM_GFX_DESWZ_DIRECT: the same result as nvn_deswizzle, byte for byte, walked GOB by GOB: the block-linear offset of a row
+// is computed once per row with shifts (block height / depth are powers of two), then each 64-byte GOB row is four 16-byte copies
+// at fixed offsets {0, 32, 256, 288}; no division or modulo in the inner loop. Unit test: tests/t_deswz_direct.c.
+int nvn_deswizzle_gob(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src_storage, void *dst_linear, size_t dst_pitch);
+// [r5] One block of partial_upload: block points at the block's first byte (x, y and z of the block start are GOB / block aligned),
+// tileH is the level's block height (log2 GOBs); xb (<= 64) bytes of ny rows and nz slices go packed to dst, row (z * ny + y) at
+// dst + (z * ny + y) * xb. Equals nvn_bl_offset per 16-byte segment, as partial_upload did.
+void nvn_deswizzle_gob_block(const uint8_t *block, unsigned tileH, uint32_t xb, uint32_t ny, uint32_t nz, uint8_t *dst);

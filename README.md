@@ -97,6 +97,9 @@ Other Snapdragon devices may work; other GPUs are untested.
   audio renderer wait, fixed); v0.4.2 keeps the GPU busier between frames (a deeper submit queue), about +7–10% fps in
   the heaviest scenes on 8 Gen 2; v0.4.3 trims GPU work without changing the image (shader and pass clean-ups, skipped
   dead occlusion boxes), another ~1.4–1.9 ms per frame, about +9–11% fps on 8 Gen 2.
+  v0.4.4 shortens the hitches when a level starts and when you enter a new area (faster texture uploads, shaders read
+  from internal storage instead of the shared Download folder): about −35% in total time spent in frames over 100 ms.
+  The frame rate limit above 60 now really reaches the game (90 / 120 Hz screens).
   Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
 - Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
   on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level

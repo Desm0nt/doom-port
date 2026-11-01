@@ -50,6 +50,14 @@ __attribute__((weak)) void nvn_dirty_protect(const void *addr,size_t len);
 __attribute__((weak)) uint64_t nvn_dirty_now(void);
 __attribute__((weak)) int nvn_dirty_since(const void *addr,size_t len,uint64_t stamp);
 __attribute__((weak)) void nvn_dirty_slot_stats(int *live,int *used_slots,uint64_t *adds_total);
+// [r4] DM_DIRTY_PROTECT_BGEN (nvn_dirty.h; these two structs must match it): window re-protect with a per-texture cookie, and
+// the pages written since a stamp as a bitmap (one range lookup instead of two per GOB block).
+typedef struct { uint64_t floor, reg; uintptr_t addr; size_t len; } nvn_dirty_cookie;
+typedef struct { uint64_t calls, full, windows, pages, kept, missed; } nvn_dirty_pstat;
+__attribute__((weak)) int nvn_dirty_pbgen_mode(void);
+__attribute__((weak)) unsigned nvn_dirty_page_shift(void);
+__attribute__((weak)) void nvn_dirty_protect_gen(const void *addr,size_t len,nvn_dirty_cookie *ck,int mode,nvn_dirty_pstat *st);
+__attribute__((weak)) size_t nvn_dirty_since_bits(const void *addr,size_t len,uint64_t stamp,uint64_t *bits,size_t nwords,uint64_t *windows);
 // DM_GFX_VT_ATOMIC: WriteTexels vs. partial re-upload exclusion (nvn_dirty.h); weak like the rest of the tracker.
 __attribute__((weak)) int nvn_texel_sync_on(void);
 __attribute__((weak)) void nvn_texel_lock(void);
@@ -100,6 +108,7 @@ __attribute__((weak)) float dm_bright_k(void);
 #include <memory>
 #include <mutex>
 #include <sys/stat.h>
+#include <dirent.h>   // [r5] DM_GFX_SHADER_RAWCACHE: shader mirror / spv-override listing
 #include <string>
 #include <vector>
 #include <chrono>
@@ -483,6 +492,10 @@ struct Arena {
     // reset() keeps all memory mapped (a synchronous reader may still copy out
     // of it); trim() releases oversized/extra chunks before the next recording.
     size_t keep_chunks=3;
+    // [r5] DM_GFX_ARENA_KEEP=decay (arena_decay_trim): the most standard chunks one submission of this arena used in the current
+    // window (hw_win, since win_t0) and in the previous one (hw_prev). note_use runs at retire, before reset, only with the switch.
+    uint32_t hw_win=0,hw_prev=0;uint64_t win_t0=0;
+    void note_use(){uint32_t n=0;for(auto &c:chunks)if(c.used && c.size==arena_chunk_bytes)++n;if(n>hw_win)hw_win=n;}
     void reset(){for(auto &c:chunks)c.used=0;current=0;used_total=0;}
     void trim(){
         size_t kept=0;std::vector<ArenaChunk> keep;
@@ -527,6 +540,7 @@ struct PendingWriteback {uint64_t addr,bytes;Buffer buffer;const void *slot;bool
 int storage_chain=-1;uint64_t storage_chained=0,storage_merges=0,barriers_avoided=0;int guest_barrier=-1;uint64_t guest_barriers_skipped=0;bool storage_image_draw=false;   // a draw bound a storage image since the last honoured guest barrier
 struct Image;std::vector<Image*> storage_images_bound;void mark_storage_images();
 std::vector<PendingWriteback> pending_writebacks;
+uint64_t pend_gen=1;   // [r4] moves whenever pending_writebacks gains, loses or reorders entries (DM_GFX_UBO_VIEWCACHE validity)
 // [DOOM] Lazy storage barrier: a draw that writes storage buffers no longer ends the render pass and barriers right away (DOOM's
 // depth pre-pass culling geometry shaders write disjoint ranges from ~180 draws a frame, so that split the pass ~180 times).
 // The barrier is placed before the first GPU read of a pending range (pending_view) and before the command buffer ends.
@@ -605,6 +619,43 @@ bool ab_frame_on=true;
 char ab_target[16]={0};
 inline bool ab_off(const char *name){return ab_period>0 && !ab_frame_on && !strcmp(ab_target,name);}
 bool ab_enabled(){if(ab_period<=0)return true;ab_on=((std::chrono::steady_clock::now().time_since_epoch().count()/1000000000ll/ab_period)&1)==0;return ab_on;}
+// [r4] Round-4 switches of the audit (translator CPU; docs/research/pipeline_audit.md round 4, 3.6, 3.7, section 5; docs/SWITCHES.md,
+// BUGS_AND_FIXES 3.18). All off by default; with a switch unset nothing it guards runs. A/B targets (gfx-ab-toggle + gfx-ab-target):
+// tailclamp (DM_GFX_INDEX_TAIL_CLAMP), pbgen (DM_DIRTY_PROTECT_BGEN), uboview (DM_GFX_UBO_VIEWCACHE), stategen (DM_GFX_STATEGEN),
+// perfquiet (DM_GFX_PERF_VERBOSE=0), rbcached (DM_GFX_READBACK_CACHED=1); r4 = every one of them that is on. Counters: NVN PERF r4.
+int tail_clamp=0,pbgen_mode=0,ubo_vc=0,stategen=0;bool perf_quiet=false,perf_force_verbose=false,rb_ab=false,r4_log=false;
+inline bool r4_off(const char *name){return ab_off(name) || ab_off("r4");}
+uint64_t r4_tail_draws=0,r4_tail_clamped=0,r4_tail_bytes=0,r4_tail_saved=0,r4_tail_checked=0,r4_tail_bad=0,r4_tail_bad_total=0;
+nvn_dirty_pstat r4_pst{};uint64_t r4_pb_bits=0,r4_pb_bitwin=0,r4_pb_bitmis=0,r4_pb_bitmis_total=0,r4_pb_missed_total=0;
+uint64_t r4_uvc_hits=0,r4_uvc_misses=0,r4_uvc_mism=0,r4_uvc_mism_total=0,r4_uvc_sorted=0;
+uint64_t r4_sg_desc=0,r4_sg_pipe=0,r4_sg_desc_mism=0,r4_sg_pipe_mism=0,r4_sg_mism_total=0;
+uint64_t r4_quiet_lines=0,r4_rb_swaps=0;
+// [r5] Round-5 switches of the audit (hitches and memory; docs/research/pipeline_audit.md round 5, 3.13-3.15, section 5;
+// docs/SWITCHES.md, BUGS_AND_FIXES 3.19). All off by default: with a switch unset nothing it guards runs and no line is added.
+// DM_GFX_SHADER_RAWCACHE (r5raw, load_shader, warm::load_module), DM_GFX_DESWZ_DIRECT (get_image_slow, partial_upload),
+// DM_GFX_ARENA_KEEP=decay (arena_decay_trim), DM_GFX_PROTECT_CHURN (get_image_slow). The NVN r5 line every 10 s (r5_report) carries
+// the counters and the arena sizes per slot; DM_GFX_R5_LOG=1 prints it with every switch off as well (the A/B baseline).
+int r5_rawcache=0,r5_deswz=0,r5_churn=0;bool r5_decay=false,r5_log=false;uint64_t r5_decay_ns=8000000000ull,r5_log_t=0;
+std::atomic<uint64_t> r5_ld_mem{0},r5_ld_mirror{0},r5_ld_fuse{0},r5_ld_mem_ns{0},r5_ld_mirror_ns{0},r5_ld_fuse_ns{0},r5_warm_mem{0},r5_mirror_reads{0},
+    r5_raw_stored{0},r5_raw_dropped{0},r5_spv_skips{0};
+uint64_t r5_dz_full=0,r5_dz_bytes=0,r5_dz_ns=0,r5_dz_old=0,r5_dz_old_ns=0,r5_dz_blocks=0,r5_dz_cmp=0,r5_dz_mism=0,r5_dz_hash_skips=0,r5_dz_unknown_reup=0;
+uint64_t r5_ar_released=0,r5_ar_released_bytes=0,r5_ar_memo_drops=0;
+uint64_t r5_ch_same=0,r5_ch_untracked=0,r5_ch_retracked=0;
+// [r4] DM_GFX_STATEGEN state generations. execute() moves desc_gen / pso_gen for every command except the ones listed as not
+// touching what the descriptor key / the pipeline is built from (quiet_desc / quiet_pso, filled at init), so a missed case can
+// only cost a rebuild. The fast paths also compare the per-draw inputs that change without a command (shader pointers: GS
+// pass-through; pool memory; render pass and layouts; primitive). desc_call / desc_calls: the key is reused only by the call
+// right after the one that built it (a compute or other descriptors() call in between rebuilds it).
+namespace sg {
+uint64_t desc_gen=1,desc_gen_at=0,desc_calls=0,desc_call=0,key_ver=0,front_ver=~0ull;bool desc_valid=false;const void *desc_sh[5]{};const void *desc_tp=nullptr,*desc_sp=nullptr;
+uint64_t pso_gen=1,pso_gen_at=0;bool pipe_valid=false;bool quiet_desc[256]{},quiet_pso[256]{};
+// The draw that last set the pipeline memo (pipe_memo_key / pipe_memo_pipeline): its per-draw inputs and vertex bindings.
+struct Pipe{const void *sh[5];VkShaderModule mod[5];const void *layout,*pass_def;VkRenderPass pass;VkPipelineLayout pl;int prim;uint32_t samples,colors,rt_n,depth_format,restart;const void *depth;bool ll;
+    std::vector<VkVertexInputBindingDescription> bindings;int zero_binding;};Pipe pipe{};
+inline bool same_bindings(const std::vector<VkVertexInputBindingDescription> &a,const std::vector<VkVertexInputBindingDescription> &b){
+    if(a.size()!=b.size())return false;for(size_t i=0;i<a.size();i++)if(a[i].binding!=b[i].binding || a[i].stride!=b[i].stride || a[i].inputRate!=b[i].inputRate)return false;return true;}
+void invalidate(){desc_valid=false;pipe_valid=false;++desc_gen;++pso_gen;}
+}
 struct Slot {
     bool reset_queued=false,reset_busy=false;VkResult reset_result=VK_SUCCESS;   // poolreset: a reset job was queued for this submission / still runs (under poolreset::mu)
     // xview: this submission read a pending result of the other slot through pending_view (from its readback arena).
@@ -616,7 +667,7 @@ struct Slot {
     VkCommandBuffer cmd{};VkCommandPool pool{};VkFence fence{};VkQueryPool timestamps{};bool recording=false,pending=false;uint64_t ops=0,covers=0; // covers: guest fence value complete once this slot retires
     uint64_t serial=0;   // slot_serial of the pending submission (NVN PERF chunk: GPU spans in submission order)
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
-    Retire retire;Arena stream,readback;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
+    Retire retire;Arena stream,readback;Arena readback_alt;std::vector<VkDescriptorPool> pools;size_t pool_next=0;   // readback_alt: [r4] the parked readback arena of the rbcached A/B
     // gfx-xview-guard (recording_slot, readback_buffer): ranges of this slot's readback buffers the other slot read through
     // pending views (viewed), the ranges guarded during this recording, and the copies and fills that write guarded
     // buffers from the GPU in a prologue command buffer submitted ahead of cmd.
@@ -925,12 +976,39 @@ void retire_slot(Slot &s){
     for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();
     uint64_t c3=timing_clock();s.retire.run();release_descriptors(s);uint64_t c4=timing_clock();
     perf.arena_peak=std::max<uint64_t>(perf.arena_peak,s.stream.peak+s.readback.peak);s.stream.peak=s.readback.peak=0;
+    if(r5_decay){s.stream.note_use();s.readback.note_use();}   // [r5] DM_GFX_ARENA_KEEP=decay: chunks this submission used
     s.stream.reset();s.readback.reset();
     // Every set is fully rewritten before use, so sets are recycled instead of resetting pools (vkAllocateDescriptorSets cost ~15 us/set on Maleoon).
     for(auto &u:s.used_sets){auto &sp=s.spare_sets[u.first];sp.insert(sp.end(),u.second.begin(),u.second.end());u.second.clear();}s.set_cache.clear();
     cleanup_ns[0]+=c1-c0;cleanup_ns[1]+=c2-c1;cleanup_ns[2]+=c3-c2;cleanup_ns[3]+=c4-c3;cleanup_ns[4]+=timing_clock()-c4;
     s.pending=false;s.xview=false;
     if(!resolving_pending)apply_ready_events();   // after this slot's writebacks; inside resolve_pending its own copy runs first
+}
+// [r5] DM_GFX_ARENA_KEEP=decay (pipeline_audit.md 3.15): Arena::trim keeps up to 6 standard 32 MB chunks per arena (its keep_chunks
+// 3 / 1 never applied: max(keep_chunks, 6)), so a level start (arena peak 177 MB) or the TV room (~100 MB) left them mapped for the
+// rest of the session in every ring slot. Here an arena keeps max(hw_prev, hw_win) + 1 standard chunks (at least 1, at most 6):
+// the most chunks one submission used in the previous and in the current window of r5_decay_ns, plus one spare, so a peak is let go
+// one to two windows after it ends. Oversized chunks go as in trim(). The released chunks are destroyed when this slot retires next
+// (s.retire, run in retire_slot): every submission recorded before then has completed by then, so no GPU read (an in-flight slot
+// through a pending view, xview) can still reach them. Memo: a persistent descriptor set compares only VkBuffer handles (and
+// offsets) of its dynamic UBOs, support / driver blocks and read-only storage snapshots, and a later make() may get a recycled handle
+// of a destroyed chunk, so every release bumps memo_epoch (every slot drops its memo before its next lookup, memo_check_epoch; the
+// memo front and the state-gen front go with memo_mod_gen). Nothing else keeps arena Buffers across a slot's recordings: driver blocks
+// are per slot_serial, snapshots / uniform snapshots / set_cache / bind cache / img_cache are reset per submission or slot start,
+// pro_ops / pro_images per recording, uboview holds zero-copy views (guest memory, not arenas), and vcache / texel / static arenas are
+// separate. The readback arena is not shrunk while the guard (ranges the other slots read) is non-empty: trim() as before.
+void arena_decay_trim(Slot &s,Arena &a,bool may_shrink){
+    if(!may_shrink){a.trim();return;}
+    const uint64_t now=timing_clock();if(!a.win_t0)a.win_t0=now;
+    if(now-a.win_t0>=r5_decay_ns){a.hw_prev=a.hw_win;a.hw_win=0;a.win_t0=now;}
+    const size_t want=std::min<size_t>(6,size_t(std::max(a.hw_prev,a.hw_win))+1);
+    size_t kept=0,released=0;std::vector<ArenaChunk> keep;
+    for(auto &c:a.chunks){
+        if(c.size!=arena_chunk_bytes){Arena::destroy(c);continue;}   // oversized (one staging allocation): as trim()
+        if(kept<want){keep.push_back(c);++kept;continue;}
+        ArenaChunk old=c;s.retire.handles.push_back([old]()mutable{Arena::destroy(old);});++released;r5_ar_released_bytes+=old.size;}
+    a.chunks.swap(keep);a.current=0;
+    if(released){r5_ar_released+=released;++memo_epoch;++r5_ar_memo_drops;}
 }
 // [perf7] wall time of starting a slot (retire the previous use of this ring slot = wait for its fence, pool reset wait,
 // trims): counted so per-draw CPU profiles can tell GPU waits from CPU work (NVN PERF slotbegin, DRAW_TIMING slot_begin).
@@ -948,11 +1026,17 @@ Slot &recording_slot(){
          s.guard.clear();if(busy && xview_guard && !ab_off("xguard"))s.guard.swap(s.viewed);s.viewed.clear();s.pro_ops.clear();s.pro_images.clear();}
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
-        s.stream.trim();s.readback.keep_chunks=s.guard.empty()?1:s.readback.chunks.size();s.readback.trim();
+        // [r4] A/B target rbcached (DM_GFX_READBACK_CACHED=1): the memory type is fixed per arena chunk, so each phase has its own
+        // readback arena. The one of the other phase is parked untouched (the slots in flight may still read it through pending
+        // views) and reset when it comes back a phase later, long after every slot that could read it has retired.
+        if(rb_ab){const bool want=!r4_off("rbcached");if(s.readback.cached!=want){std::swap(s.readback,s.readback_alt);s.readback.reset();s.readback.cached=want;++r4_rb_swaps;}}
+        if(r5_decay){s.readback.keep_chunks=s.guard.empty()?1:s.readback.chunks.size();arena_decay_trim(s,s.stream,true);arena_decay_trim(s,s.readback,s.guard.empty());}   // [r5]
+        else{
+        s.stream.trim();s.readback.keep_chunks=s.guard.empty()?1:s.readback.chunks.size();s.readback.trim();}
         if(texel_memo_enabled && (slot_serial&15)<slot_count)texel_evict(slot_index,false);   // this slot's copies: its previous submission retired (each ring slot once per 16 serials)
         if(!s.cmd){if(slot_pools_enabled){VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;VK(vkCreateCommandPool(cfg.device,&cp,nullptr,&s.pool));}
             VkCommandBufferAllocateInfo a{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};a.commandPool=s.pool?s.pool:command_pool;a.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;a.commandBufferCount=1;VK(vkAllocateCommandBuffers(cfg.device,&a,&s.cmd));}
-        s.readback.cached=readback_cached;
+        s.readback.cached=rb_ab?!r4_off("rbcached"):readback_cached;
         if(!s.fence){VkFenceCreateInfo f{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(cfg.device,&f,nullptr,&s.fence));}
         if(!s.timestamps && timestamp_bits){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=2;VK(vkCreateQueryPool(cfg.device,&q,nullptr,&s.timestamps));}
         bind_cache_reset();if(s.pool){if(s.reset_queued){poolreset::finish(s);s.reset_queued=false;if(s.reset_result==VK_TIMEOUT)xbg_fatalf("The GPU did not finish this slot's work within %llu ms (fence wait timed out), so the device is hung",(unsigned long long)(std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull)/1000000ull));else VK(s.reset_result);}else VK(vkResetCommandPool(cfg.device,s.pool,0));}else{VK(vkResetCommandBuffer(s.cmd,0));if(s.pro)VK(vkResetCommandBuffer(s.pro,0));}VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;VK(vkBeginCommandBuffer(s.cmd,&b));
@@ -1054,17 +1138,48 @@ extern uint64_t guest_barriers_skipped,storage_chained,storage_merges,barriers_a
 // 3D 画面加亮的读数（定义在 dispatch 前的 namespace bright）
 // Readings of the 3D picture brightening (defined in namespace bright before dispatch)
 namespace bright{extern bool enabled;extern uint64_t applied;extern float last_k;}
+// [r4] DM_GFX_PERF_VERBOSE=0 (marker gfx-perf-verbose holding '0'): the once-a-second block (~34 lines, ~2 ms in one frame) keeps
+// only v=1, parts, r3, r4, slotbegin, chunk and uploads window; every other line goes through perf_vlogf and is dropped (counted
+// in r4 suppressed=). Its counters are still reset as before. DM_GFX_PASS_PROF / DM_GFX_DRAW_PROFILE keep the whole block.
+// A/B target perfquiet (off phase: every line again). Unset / =1: every line, as before.
+bool perf_quiet_now=false;
+void perf_vlogf(const char *fmt,...){if(perf_quiet_now){++r4_quiet_lines;return;}char text[1024];va_list a;va_start(a,fmt);vsnprintf(text,sizeof(text),fmt,a);va_end(a);xbg_logf("%s",text);}
+void r4_window_reset(){r4_tail_draws=r4_tail_clamped=r4_tail_bytes=r4_tail_saved=r4_tail_checked=r4_tail_bad=0;r4_pst=nvn_dirty_pstat{};r4_pb_bits=r4_pb_bitwin=r4_pb_bitmis=0;
+    r4_uvc_hits=r4_uvc_misses=r4_uvc_mism=r4_uvc_sorted=0;r4_sg_desc=r4_sg_pipe=r4_sg_desc_mism=r4_sg_pipe_mism=0;r4_quiet_lines=0;}
+// [r5] NVN r5 every 10 s (r5_log): totals since start unless noted. Shader loads by where the bytes came from (memory = the warm-up's
+// raw bytes, mirror = internal storage, fuse = the shader directory) with their average read ms; full uploads through the direct
+// path vs the old one (count, MB, ms); compare-mode results; arena sizes now per ring slot (stream / readback MB).
+void r5raw_stats(size_t &mem,size_t &peak,size_t &ready);
+void r5_report(){
+    const uint64_t now=timing_clock();if(!r5_log_t){r5_log_t=now;return;}if(now-r5_log_t<10000000000ull)return;r5_log_t=now;
+    size_t mem=0,peak=0,ready=0;r5raw_stats(mem,peak,ready);
+    auto avg=[](uint64_t ns,uint64_t n){return n?ns/1e6/double(n):0.0;};
+    char ar[256];int at=0;ar[0]=0;double total=0;
+    for(unsigned i=0;i<slot_count && at<int(sizeof ar)-40;i++){double sm=0,rm=0;for(auto &c:slots[i].stream.chunks)sm+=c.size;for(auto &c:slots[i].readback.chunks)rm+=c.size;for(auto &c:slots[i].readback_alt.chunks)rm+=c.size;
+        sm/=1048576.0;rm/=1048576.0;total+=sm+rm;at+=snprintf(ar+at,sizeof ar-at,"%s%.0f/%.0f",i?" ":"",sm,rm);}
+    const uint64_t lm=r5_ld_mem.load(),lr=r5_ld_mirror.load(),lf=r5_ld_fuse.load();
+    xbg_logf("NVN r5 shaders rawcache=%d loads mem=%llu (%.2f ms) mirror=%llu (%.2f ms) fuse=%llu (%.2f ms) warm_mem=%llu mirror_reads=%llu raw_mb=%.1f peak=%.1f stored=%llu dropped=%llu mirror_ready=%zu spv_skips=%llu",
+        r5_rawcache,(unsigned long long)lm,avg(r5_ld_mem_ns.load(),lm),(unsigned long long)lr,avg(r5_ld_mirror_ns.load(),lr),(unsigned long long)lf,avg(r5_ld_fuse_ns.load(),lf),
+        (unsigned long long)r5_warm_mem.load(),(unsigned long long)r5_mirror_reads.load(),mem/1048576.0,peak/1048576.0,(unsigned long long)r5_raw_stored.load(),(unsigned long long)r5_raw_dropped.load(),ready,(unsigned long long)r5_spv_skips.load());
+    xbg_logf("NVN r5 textures deswz=%d direct=%llu (%.1f MB %.2f ms) old=%llu (%.2f ms) part_blocks=%llu cmp=%llu mism=%llu hash_skips=%llu unknown_reup=%llu churn=%d same=%llu untracked=%llu retracked=%llu",
+        r5_deswz,(unsigned long long)r5_dz_full,r5_dz_bytes/1048576.0,avg(r5_dz_ns,r5_dz_full),(unsigned long long)r5_dz_old,avg(r5_dz_old_ns,r5_dz_old),(unsigned long long)r5_dz_blocks,(unsigned long long)r5_dz_cmp,(unsigned long long)r5_dz_mism,
+        (unsigned long long)r5_dz_hash_skips,(unsigned long long)r5_dz_unknown_reup,r5_churn,(unsigned long long)r5_ch_same,(unsigned long long)r5_ch_untracked,(unsigned long long)r5_ch_retracked);
+    xbg_logf("NVN r5 arena keep=%s released=%llu (%.0f MB) memo_drops=%llu mb_per_slot(stream/readback)=[%s] total_mb=%.0f",
+        r5_decay?"decay":"peak",(unsigned long long)r5_ar_released,r5_ar_released_bytes/1048576.0,(unsigned long long)r5_ar_memo_drops,ar,total);
+}
 void perf_frame(){
+    if(r5_log)r5_report();   // [r5]
     {texel_distinct+=texel_frame_keys.size();for(auto k:texel_frame_keys)if(texel_prev_keys.count(k))++texel_reused;texel_prev_keys.swap(texel_frame_keys);texel_frame_keys.clear();}
     if(completion_wait_enabled)fold_completion_wait_stats();
     if(perf_frame_timed)++perf_timed_frames;perf_frame_timed=perf_sample && stats.presents.load()%perf_sample==0;   // the next frame
-    {bool was=ab_frame_on;ab_frame_on=ab_enabled();tls_gate=!ab_off("tlsgate");img_fast=!ab_off("imgfast");if(was!=ab_frame_on && ab_period>0){if(r3_memo_flip)pipe_memo_valid=false;perf=Perf{};perf.window_start=timing_clock();set_cache_hits=set_cache_misses=0;chunk::end_cuts=chunk::mid_cuts=chunk::not_ready=chunk::checks=chunk::busy_ticks=0;return;}}
+    {bool was=ab_frame_on;ab_frame_on=ab_enabled();tls_gate=!ab_off("tlsgate");img_fast=!ab_off("imgfast");if(was!=ab_frame_on && ab_period>0){if(r3_memo_flip)pipe_memo_valid=false;if(stategen)sg::invalidate();r4_window_reset();perf=Perf{};perf.window_start=timing_clock();set_cache_hits=set_cache_misses=0;chunk::end_cuts=chunk::mid_cuts=chunk::not_ready=chunk::checks=chunk::busy_ticks=0;return;}}
     pipelines_unsaved+=size_t(warm::compiled.exchange(0));
     if(pipelines_unsaved && stats.presents.load()>=pipeline_save_frame+300){pipeline_save_frame=stats.presents.load();save_pipeline_cache();}
     uint64_t now=timing_clock();if(!perf.window_start){perf.window_start=now;perf.frames=0;return;}
     if(++perf.frames<60)return;
     double wall=double(now-perf.window_start)/1e6,f=double(perf.frames);
-    if(poolreset::enabled){xbg_logf("NVN PERF poolreset queued=%.2f waits=%.2f wait_ms=%.3f",poolreset::queued/f,poolreset::waits/f,poolreset::wait_ns/1e6/f);poolreset::queued=poolreset::waits=poolreset::wait_ns=0;}
+    perf_quiet_now=perf_quiet && !perf_force_verbose && !pass_prof_enabled && !r4_off("perfquiet");   // [r4] DM_GFX_PERF_VERBOSE=0
+    if(poolreset::enabled){perf_vlogf("NVN PERF poolreset queued=%.2f waits=%.2f wait_ms=%.3f",poolreset::queued/f,poolreset::waits/f,poolreset::wait_ns/1e6/f);poolreset::queued=poolreset::waits=poolreset::wait_ns=0;}
     const double tf=perf_timed_frames?double(perf_timed_frames):1.0;   // parts and descriptor timers come from the timed frames only
     xbg_logf("NVN PERF v=1 sync=%d frames=%llu wall_ms=%.1f fps=%.2f submit_cpu_ms=%.2f present_cpu_ms=%.2f gpu_ms=%.2f gpu_samples=%llu submits=%.2f waits=%.2f sync_wb=%llu sync_rb=%llu sync_q=%llu ops=%.1f folded=%.1f passes=%.1f draws=%.1f dispatches=%.1f why=w%llu/p%llu/a%llu(%llu,%llu,%llu,%llu,%llu,%llu|%llu,%llu,%llu,%llu)/c%llu/f%llu/s%llu views=%llu snap_hit=%llu snap_miss=%llu snap_mb=%.1f arena_peak_mb=%.1f pipelines=%zu layouts=%zu samplers=%zu passes=%zu images=%zu host_segments=%zu host_mb=%.1f",
         int(sync_mode),(unsigned long long)perf.frames,wall,f*1000.0/wall,double(perf.submit_cpu_ns)/1e6/f,double(perf.present_cpu_ns)/1e6/f,perf.gpu_samples?double(perf.gpu_ns)/1e6/f:-1.0,(unsigned long long)perf.gpu_samples,
@@ -1076,43 +1191,51 @@ void perf_frame(){
         for(unsigned i=0;i<XbgCpuTiming::Count && at<int(sizeof(line))-48;i++){const auto &c=timing.counters[i];if(c.calls<perf_timing_before[i].calls)perf_timing_before[i]=XbgCpuTiming::Counter{};uint64_t ns=c.exclusive_ns-perf_timing_before[i].exclusive_ns,calls=c.calls-perf_timing_before[i].calls;at+=snprintf(line+at,sizeof(line)-at," %s=%.2f/%.1f",names[i],double(ns)/1e6/tf,double(calls)/tf);perf_timing_before[i]=c;}
         xbg_logf("%s",line);
     }
-    xbg_logf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
-    xbg_logf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
-    xbg_logf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
-    xbg_logf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed));
+    perf_vlogf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
+    perf_vlogf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
+    perf_vlogf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
+    perf_vlogf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed));
     if(r3_log){xbg_logf("NVN PERF r3 ab=%d ldc_canon=%llu canon_merges=%llu halfflag=%llu f2i_notrunc=%llu texcoord_unguarded=%llu psize_modules=%llu lazy_clear folded=%.2f flushed=%.2f appended=%.2f flipfold=%.2f deadbox=%.1f deadbox_total=%llu ab_variant=%#x",
         int(ab_frame_on),(unsigned long long)r3_canon.load(),(unsigned long long)r3_canon_merges.load(),(unsigned long long)r3_half.load(),(unsigned long long)r3_f2i.load(),(unsigned long long)r3_texnan.load(),(unsigned long long)r3_psize.load(),r3_lazy_folded/f,r3_lazy_flushed/f,r3_lazy_appended/f,r3_flipfold/f,r3_deadbox/f,(unsigned long long)r3_deadbox_total,r3_ab_bit);
         r3_lazy_folded=r3_lazy_flushed=r3_lazy_appended=r3_flipfold=r3_deadbox=0;}
-    xbg_logf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);xbg_logf("NVN PERF textures bc_native=%llu bc_decoded=%llu live_images=%.1fMB bc_images=%.1fMB bc_payload=%.1fMB",(unsigned long long)native_bc_images,(unsigned long long)decoded_bc_images,image_bytes_live/1048576.0,bc_image_bytes_live/1048576.0,bc_data_bytes_live/1048576.0);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
-    if(bright::enabled){xbg_logf("NVN PERF bright applied=%.2f k=%.2f",bright::applied/f,bright::last_k);bright::applied=0;}
-    if(tex_dirty){xbg_logf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}{char buf[512];int at=0;std::vector<std::pair<uint64_t,int>> v;for(auto &e:pass_end_lines)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<8;i++)at+=snprintf(buf+at,sizeof buf-at," L%d=%.1f",v[i].second,v[i].first/f);pass_end_lines.clear();xbg_logf("NVN PERF pass_end_lines%s read_break layout/written/attach=%.1f/%.1f/%.1f/%.1f depth_feedback_reads=%.1f",at?buf:"",read_break_why[1]/f,read_break_why[2]/f,read_break_why[4]/f,(read_break_why[3]+read_break_why[5]+read_break_why[6]+read_break_why[7])/f,depth_feedback_reads/f);memset(read_break_why,0,sizeof read_break_why);depth_feedback_reads=0;}xbg_logf("NVN PERF hash_sites MB/calls other=%.2f/%.0f texcheck=%.2f/%.0f texel=%.2f/%.0f upload=%.2f/%.0f",hash_site_bytes[0]/f/1048576,hash_site_calls[0]/f,hash_site_bytes[1]/f/1048576,hash_site_calls[1]/f,hash_site_bytes[2]/f/1048576,hash_site_calls[2]/f,hash_site_bytes[3]/f/1048576,hash_site_calls[3]/f);memset(hash_site_bytes,0,sizeof hash_site_bytes);memset(hash_site_calls,0,sizeof hash_site_calls);if(zc::enabled>0){xbg_logf("NVN PERF zerocopy hits=%.1f sticky_miss=%.1f align_miss=%.1f pending_miss=%.1f mapped=%.0fMB",zc::hits/f,zc::sticky_misses/f,zc::align_misses/f,zc::pending_misses/f,zc::mapped_bytes/1048576.0);zc::hits=zc::sticky_misses=zc::align_misses=zc::pending_misses=0;}if(storage_chained || guest_barriers_skipped){xbg_logf("NVN PERF storage-chain reused=%.1f gpu_merges=%.1f prologue_copies=%.1f guest_barriers_skipped=%.1f barriers_avoided=%.1f",storage_chained/f,storage_merges/f,pro_copies/f,guest_barriers_skipped/f,barriers_avoided/f);storage_chained=storage_merges=pro_copies=guest_barriers_skipped=barriers_avoided=0;}if(gpu_indirect_draws || gpu_indirect_fallbacks){xbg_logf("NVN PERF gpu-indirect draws=%.1f fallbacks=%.1f cpu=%.1f",gpu_indirect_draws/f,gpu_indirect_fallbacks/f,gpu_indirect_cpu/f);gpu_indirect_draws=gpu_indirect_fallbacks=gpu_indirect_cpu=0;}if(partial_uploads){xbg_logf("NVN PERF partial-tex uploads=%.1f blocks=%.1f KB=%.1f prologue=%.1f",partial_uploads/f,partial_blocks/f,partial_bytes/f/1024,partial_prologue/f);partial_uploads=partial_blocks=partial_bytes=partial_prologue=0;}
-    if(vcache::enabled){xbg_logf("NVN PERF vcache hits=%.1f (%.2fMB) fills=%.1f (%.2fMB) refills=%.2f volatile=%llu untracked=%llu flushes=%llu entries=%zu arena=%.1fMB pools=%d",vcache::hits/f,vcache::hit_bytes/1048576.0/f,vcache::fills/f,vcache::fill_bytes/1048576.0/f,vcache::refills/f,(unsigned long long)vcache::volatiles,(unsigned long long)vcache::untracked,(unsigned long long)vcache::flushes,vcache::live(),vcache::arena_bytes()/1048576.0,[]{int live=0,used=0;uint64_t adds=0;if(nvn_dirty_slot_stats)nvn_dirty_slot_stats(&live,&used,&adds);return used;}());vcache::hits=vcache::hit_bytes=vcache::fills=vcache::fill_bytes=vcache::refills=0;}
-    {static uint64_t pm=0,pe=0;xbg_logf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f async_skips=%llu async_built=%llu",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6,(unsigned long long)warm::async_skips.exchange(0),(unsigned long long)warm::async_built.load());warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
-    xbg_logf("NVN PERF setcache ab=%d hits=%.1f misses=%.1f template=%.1f plain=%.1f memo_hits=%.1f memo_misses=%.1f memo_front=%.1f why=texel%.1f/simg%.1f/dm%.1f/dynbuf%.1f/store%.1f",int(ab_frame_on),set_cache_hits/f,set_cache_misses/f,template_updates/f,plain_updates/f,desc_memo_hits/f,desc_memo_misses/f,memo_front_hits/f,desc_memo_why[0]/f,desc_memo_why[1]/f,desc_memo_why[2]/f,desc_memo_why[3]/f,desc_memo_why[4]/f);desc_memo_hits=desc_memo_misses=memo_front_hits=0;for(auto &w:desc_memo_why)w=0;xbg_logf("NVN PERF keydiff shader%.0f pool%.0f ubo%.0f uaddr%.0f size%.0f vp%.0f alpha%.0f drv%.0f tex%.0f samp%.0f saddr%.0f same%.0f new%.0f len%.0f",key_diff[0]/tf,key_diff[1]/tf,key_diff[2]/tf,key_diff[3]/tf,key_diff[4]/tf,key_diff[5]/tf,key_diff[6]/tf,key_diff[7]/tf,key_diff[8]/tf,key_diff[9]/tf,key_diff[10]/tf,key_diff[11]/tf,key_diff[12]/tf,key_diff[13]/tf);for(auto &k:key_diff)k=0;   // per timed frame
-    xbg_logf("NVN PERF binds_skipped_per_frame=%.1f xmemo_hits=%.1f drops=%llu bumps=%llu/%llu/%llu/%llu/%llu pinned=%zu/%zu",binds_skipped/f,xmemo_hits/f,(unsigned long long)xmemo_drops,(unsigned long long)memo_bump[0],(unsigned long long)memo_bump[1],(unsigned long long)memo_bump[2],(unsigned long long)memo_bump[3],(unsigned long long)memo_bump[4],memo_pinned[0].size(),memo_pinned[1].size());binds_skipped=0;{char top[160]="";int at=0;bool used[32]={};
+    if(r4_log){r4_pb_missed_total+=r4_pst.missed;   // [r4] per frame unless named total / a count of the window
+     xbg_logf("NVN PERF r4 ab=%d tailclamp=%d draws=%.2f clamped=%.2f copied_mb=%.2f saved_mb=%.2f checked=%llu bad=%llu bad_total=%llu pbgen=%d calls=%.2f full=%.2f windows=%.1f pages=%.0f kept=%.2f missed=%llu missed_total=%llu bitmaps=%.2f bitwin=%.1f bitmis=%llu bitmis_total=%llu"
+        " uboview=%d hits=%.1f misses=%.1f mism=%llu mism_total=%llu sorted=%.1f stategen=%d desc_skips=%.1f pipe_skips=%.1f desc_mism=%llu pipe_mism=%llu mism_total=%llu perfquiet=%d suppressed=%llu rbcached=%d swaps=%llu",
+        int(ab_frame_on),tail_clamp,r4_tail_draws/f,r4_tail_clamped/f,r4_tail_bytes/1048576.0/f,r4_tail_saved/1048576.0/f,(unsigned long long)r4_tail_checked,(unsigned long long)r4_tail_bad,(unsigned long long)r4_tail_bad_total,
+        pbgen_mode,r4_pst.calls/f,r4_pst.full/f,r4_pst.windows/f,r4_pst.pages/f,r4_pst.kept/f,(unsigned long long)r4_pst.missed,(unsigned long long)r4_pb_missed_total,r4_pb_bits/f,r4_pb_bitwin/f,(unsigned long long)r4_pb_bitmis,(unsigned long long)r4_pb_bitmis_total,
+        ubo_vc,r4_uvc_hits/f,r4_uvc_misses/f,(unsigned long long)r4_uvc_mism,(unsigned long long)r4_uvc_mism_total,r4_uvc_sorted/f,stategen,r4_sg_desc/f,r4_sg_pipe/f,(unsigned long long)r4_sg_desc_mism,(unsigned long long)r4_sg_pipe_mism,(unsigned long long)r4_sg_mism_total,
+        int(perf_quiet),(unsigned long long)r4_quiet_lines,int(rb_ab),(unsigned long long)r4_rb_swaps);
+     r4_window_reset();}
+    perf_vlogf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);perf_vlogf("NVN PERF textures bc_native=%llu bc_decoded=%llu live_images=%.1fMB bc_images=%.1fMB bc_payload=%.1fMB",(unsigned long long)native_bc_images,(unsigned long long)decoded_bc_images,image_bytes_live/1048576.0,bc_image_bytes_live/1048576.0,bc_data_bytes_live/1048576.0);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
+    if(bright::enabled){perf_vlogf("NVN PERF bright applied=%.2f k=%.2f",bright::applied/f,bright::last_k);bright::applied=0;}
+    if(tex_dirty){perf_vlogf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}{char buf[512];int at=0;std::vector<std::pair<uint64_t,int>> v;for(auto &e:pass_end_lines)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<8;i++)at+=snprintf(buf+at,sizeof buf-at," L%d=%.1f",v[i].second,v[i].first/f);pass_end_lines.clear();perf_vlogf("NVN PERF pass_end_lines%s read_break layout/written/attach=%.1f/%.1f/%.1f/%.1f depth_feedback_reads=%.1f",at?buf:"",read_break_why[1]/f,read_break_why[2]/f,read_break_why[4]/f,(read_break_why[3]+read_break_why[5]+read_break_why[6]+read_break_why[7])/f,depth_feedback_reads/f);memset(read_break_why,0,sizeof read_break_why);depth_feedback_reads=0;}perf_vlogf("NVN PERF hash_sites MB/calls other=%.2f/%.0f texcheck=%.2f/%.0f texel=%.2f/%.0f upload=%.2f/%.0f",hash_site_bytes[0]/f/1048576,hash_site_calls[0]/f,hash_site_bytes[1]/f/1048576,hash_site_calls[1]/f,hash_site_bytes[2]/f/1048576,hash_site_calls[2]/f,hash_site_bytes[3]/f/1048576,hash_site_calls[3]/f);memset(hash_site_bytes,0,sizeof hash_site_bytes);memset(hash_site_calls,0,sizeof hash_site_calls);if(zc::enabled>0){perf_vlogf("NVN PERF zerocopy hits=%.1f sticky_miss=%.1f align_miss=%.1f pending_miss=%.1f mapped=%.0fMB",zc::hits/f,zc::sticky_misses/f,zc::align_misses/f,zc::pending_misses/f,zc::mapped_bytes/1048576.0);zc::hits=zc::sticky_misses=zc::align_misses=zc::pending_misses=0;}if(storage_chained || guest_barriers_skipped){perf_vlogf("NVN PERF storage-chain reused=%.1f gpu_merges=%.1f prologue_copies=%.1f guest_barriers_skipped=%.1f barriers_avoided=%.1f",storage_chained/f,storage_merges/f,pro_copies/f,guest_barriers_skipped/f,barriers_avoided/f);storage_chained=storage_merges=pro_copies=guest_barriers_skipped=barriers_avoided=0;}if(gpu_indirect_draws || gpu_indirect_fallbacks){perf_vlogf("NVN PERF gpu-indirect draws=%.1f fallbacks=%.1f cpu=%.1f",gpu_indirect_draws/f,gpu_indirect_fallbacks/f,gpu_indirect_cpu/f);gpu_indirect_draws=gpu_indirect_fallbacks=gpu_indirect_cpu=0;}if(partial_uploads){perf_vlogf("NVN PERF partial-tex uploads=%.1f blocks=%.1f KB=%.1f prologue=%.1f",partial_uploads/f,partial_blocks/f,partial_bytes/f/1024,partial_prologue/f);partial_uploads=partial_blocks=partial_bytes=partial_prologue=0;}
+    if(vcache::enabled){perf_vlogf("NVN PERF vcache hits=%.1f (%.2fMB) fills=%.1f (%.2fMB) refills=%.2f volatile=%llu untracked=%llu flushes=%llu entries=%zu arena=%.1fMB pools=%d",vcache::hits/f,vcache::hit_bytes/1048576.0/f,vcache::fills/f,vcache::fill_bytes/1048576.0/f,vcache::refills/f,(unsigned long long)vcache::volatiles,(unsigned long long)vcache::untracked,(unsigned long long)vcache::flushes,vcache::live(),vcache::arena_bytes()/1048576.0,[]{int live=0,used=0;uint64_t adds=0;if(nvn_dirty_slot_stats)nvn_dirty_slot_stats(&live,&used,&adds);return used;}());vcache::hits=vcache::hit_bytes=vcache::fills=vcache::fill_bytes=vcache::refills=0;}
+    {static uint64_t pm=0,pe=0;perf_vlogf("NVN PERF pipelines_new=%llu evicted=%llu warm_hits=%llu created=%llu create_ms=%.1f create_max_ms=%.1f warm_built=%llu warm_failed=%llu warm_ms=%.0f async_skips=%llu async_built=%llu",(unsigned long long)(pipeline_counts.misses-pm),(unsigned long long)(pipeline_counts.evictions-pe),(unsigned long long)warm::hits,(unsigned long long)warm::creates,warm::create_ns/1e6,warm::create_max_ns/1e6,(unsigned long long)warm::built.load(),(unsigned long long)warm::failed.load(),warm::build_ns.load()/1e6,(unsigned long long)warm::async_skips.exchange(0),(unsigned long long)warm::async_built.load());warm::hits=warm::creates=warm::create_ns=warm::create_max_ns=0;pm=pipeline_counts.misses;pe=pipeline_counts.evictions;}
+    perf_vlogf("NVN PERF setcache ab=%d hits=%.1f misses=%.1f template=%.1f plain=%.1f memo_hits=%.1f memo_misses=%.1f memo_front=%.1f why=texel%.1f/simg%.1f/dm%.1f/dynbuf%.1f/store%.1f",int(ab_frame_on),set_cache_hits/f,set_cache_misses/f,template_updates/f,plain_updates/f,desc_memo_hits/f,desc_memo_misses/f,memo_front_hits/f,desc_memo_why[0]/f,desc_memo_why[1]/f,desc_memo_why[2]/f,desc_memo_why[3]/f,desc_memo_why[4]/f);desc_memo_hits=desc_memo_misses=memo_front_hits=0;for(auto &w:desc_memo_why)w=0;perf_vlogf("NVN PERF keydiff shader%.0f pool%.0f ubo%.0f uaddr%.0f size%.0f vp%.0f alpha%.0f drv%.0f tex%.0f samp%.0f saddr%.0f same%.0f new%.0f len%.0f",key_diff[0]/tf,key_diff[1]/tf,key_diff[2]/tf,key_diff[3]/tf,key_diff[4]/tf,key_diff[5]/tf,key_diff[6]/tf,key_diff[7]/tf,key_diff[8]/tf,key_diff[9]/tf,key_diff[10]/tf,key_diff[11]/tf,key_diff[12]/tf,key_diff[13]/tf);for(auto &k:key_diff)k=0;   // per timed frame
+    perf_vlogf("NVN PERF binds_skipped_per_frame=%.1f xmemo_hits=%.1f drops=%llu bumps=%llu/%llu/%llu/%llu/%llu pinned=%zu/%zu",binds_skipped/f,xmemo_hits/f,(unsigned long long)xmemo_drops,(unsigned long long)memo_bump[0],(unsigned long long)memo_bump[1],(unsigned long long)memo_bump[2],(unsigned long long)memo_bump[3],(unsigned long long)memo_bump[4],memo_pinned[0].size(),memo_pinned[1].size());binds_skipped=0;{char top[160]="";int at=0;bool used[32]={};
      for(int r=0;r<4;r++){int best=-1;for(int k=0;k<32;k++)if(!used[k] && offset_changed_at[k] && (best<0 || offset_changed_at[k]>offset_changed_at[best]))best=k;if(best<0)break;used[best]=true;at+=snprintf(top+at,sizeof(top)-size_t(at),"%s%d:%.1f",r?",":"",best,offset_changed_at[best]/f);}
-     xbg_logf("NVN PERF binds set_binds=%.1f offsets_per_bind=%.1f offsets_only=%.1f changed n1=%.1f n2=%.1f n3=%.1f n4+=%.1f at=%s",set_binds/f,set_binds?double(set_bind_offsets)/double(set_binds):0.0,set_binds_offsets_only/f,offset_changes[1]/f,offset_changes[2]/f,offset_changes[3]/f,(offset_changes[4]+offset_changes[5]+offset_changes[6]+offset_changes[7]+offset_changes[8]+offset_changes[9])/f,top);}
-    set_binds=set_bind_offsets=set_binds_offsets_only=0;for(auto &x:offset_changes)x=0;for(auto &x:offset_changed_at)x=0;xmemo_hits=0;xbg_logf("NVN PERF noload_passes_per_frame=%.2f img_cache_hits=%.1f misses=%.1f why=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f",noload_passes/f,img_cache_hits/f,img_cache_misses/f,noload_why[0]/f,noload_why[1]/f,noload_why[2]/f,noload_why[3]/f,noload_why[4]/f,noload_why[5]/f,noload_why[6]/f,noload_why[7]/f);for(auto &w:noload_why)w=0;noload_passes=0;img_cache_hits=img_cache_misses=0;xbg_logf("NVN PERF desc_ns_per_frame memo_key=%.2f tmpl_update=%.2f alloc=%.2f setkey=%.2f build=%.2f hit_total=%.2f",desc_ns[0]/1e6/tf,desc_ns[1]/1e6/tf,desc_ns[2]/1e6/tf,desc_ns[3]/1e6/tf,desc_ns[4]/1e6/tf,desc_ns[5]/1e6/tf);for(auto &x:desc_ns)x=0;template_updates=plain_updates=0;set_cache_hits=set_cache_misses=0;
-    xbg_logf("NVN PERF async=%d drains=%.2f drain_ms=%.2f pace_ms=%.2f waits=%.2f",int(gfx_async),gfx_drain_calls.exchange(0)/f,gfx_drain_ns.exchange(0)/1e6/f,gfx_pace_ns.exchange(0)/1e6/f,gfx_wait_calls.exchange(0)/f);xbg_logf("NVN PERF events defer=%d deferred=%.2f cpu_reads_pending=%llu epochs=%zu reports=%zu",int(defer_events),events_deferred/f,(unsigned long long)event_reads,epochs.size(),pending_reports.size());if(evguard::enabled){Dl_info di{};uintptr_t pc=evguard::last_pc.load();const char *mod=pc && dladdr(reinterpret_cast<void*>(pc),&di) && di.dli_fname?di.dli_fname:"?";xbg_logf("NVN PERF evguard guards=%llu exact=%llu other=%llu writes=%llu last_addr=%#llx last_pc=%#llx in %s",(unsigned long long)evguard::guards.load(),(unsigned long long)evguard::exact.load(),(unsigned long long)evguard::other.load(),(unsigned long long)evguard::writes.load(),(unsigned long long)evguard::last_addr.load(),(unsigned long long)pc,mod);
-     xbg_logf("NVN PERF evguard engine_opens=%llu recloses=%llu",(unsigned long long)evguard::engine_opens.load(),(unsigned long long)evguard::recloses.load());
-     xbg_logf("NVN PERF evguard last word=%#llx x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx",(unsigned long long)evguard::last_word.load(),(unsigned long long)evguard::last_x[0].load(),(unsigned long long)evguard::last_x[1].load(),(unsigned long long)evguard::last_x[2].load(),(unsigned long long)evguard::last_x[3].load(),(unsigned long long)evguard::last_x[4].load(),(unsigned long long)evguard::last_x[5].load());
+     perf_vlogf("NVN PERF binds set_binds=%.1f offsets_per_bind=%.1f offsets_only=%.1f changed n1=%.1f n2=%.1f n3=%.1f n4+=%.1f at=%s",set_binds/f,set_binds?double(set_bind_offsets)/double(set_binds):0.0,set_binds_offsets_only/f,offset_changes[1]/f,offset_changes[2]/f,offset_changes[3]/f,(offset_changes[4]+offset_changes[5]+offset_changes[6]+offset_changes[7]+offset_changes[8]+offset_changes[9])/f,top);}
+    set_binds=set_bind_offsets=set_binds_offsets_only=0;for(auto &x:offset_changes)x=0;for(auto &x:offset_changed_at)x=0;xmemo_hits=0;perf_vlogf("NVN PERF noload_passes_per_frame=%.2f img_cache_hits=%.1f misses=%.1f why=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f",noload_passes/f,img_cache_hits/f,img_cache_misses/f,noload_why[0]/f,noload_why[1]/f,noload_why[2]/f,noload_why[3]/f,noload_why[4]/f,noload_why[5]/f,noload_why[6]/f,noload_why[7]/f);for(auto &w:noload_why)w=0;noload_passes=0;img_cache_hits=img_cache_misses=0;perf_vlogf("NVN PERF desc_ns_per_frame memo_key=%.2f tmpl_update=%.2f alloc=%.2f setkey=%.2f build=%.2f hit_total=%.2f",desc_ns[0]/1e6/tf,desc_ns[1]/1e6/tf,desc_ns[2]/1e6/tf,desc_ns[3]/1e6/tf,desc_ns[4]/1e6/tf,desc_ns[5]/1e6/tf);for(auto &x:desc_ns)x=0;template_updates=plain_updates=0;set_cache_hits=set_cache_misses=0;
+    perf_vlogf("NVN PERF async=%d drains=%.2f drain_ms=%.2f pace_ms=%.2f waits=%.2f",int(gfx_async),gfx_drain_calls.exchange(0)/f,gfx_drain_ns.exchange(0)/1e6/f,gfx_pace_ns.exchange(0)/1e6/f,gfx_wait_calls.exchange(0)/f);perf_vlogf("NVN PERF events defer=%d deferred=%.2f cpu_reads_pending=%llu epochs=%zu reports=%zu",int(defer_events),events_deferred/f,(unsigned long long)event_reads,epochs.size(),pending_reports.size());if(evguard::enabled){Dl_info di{};uintptr_t pc=evguard::last_pc.load();const char *mod=pc && dladdr(reinterpret_cast<void*>(pc),&di) && di.dli_fname?di.dli_fname:"?";perf_vlogf("NVN PERF evguard guards=%llu exact=%llu other=%llu writes=%llu last_addr=%#llx last_pc=%#llx in %s",(unsigned long long)evguard::guards.load(),(unsigned long long)evguard::exact.load(),(unsigned long long)evguard::other.load(),(unsigned long long)evguard::writes.load(),(unsigned long long)evguard::last_addr.load(),(unsigned long long)pc,mod);
+     perf_vlogf("NVN PERF evguard engine_opens=%llu recloses=%llu",(unsigned long long)evguard::engine_opens.load(),(unsigned long long)evguard::recloses.load());
+     perf_vlogf("NVN PERF evguard last word=%#llx x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx",(unsigned long long)evguard::last_word.load(),(unsigned long long)evguard::last_x[0].load(),(unsigned long long)evguard::last_x[1].load(),(unsigned long long)evguard::last_x[2].load(),(unsigned long long)evguard::last_x[3].load(),(unsigned long long)evguard::last_x[4].load(),(unsigned long long)evguard::last_x[5].load());
      for(int i=0;i<8;i++){uintptr_t lr=evguard::callers[i].load();if(!lr)break;Dl_info li{};const char *lm="?",*ls="?";uintptr_t base=0,sym=0;
          if(dladdr(reinterpret_cast<void*>(lr),&li)){if(li.dli_fname)lm=li.dli_fname;if(li.dli_sname)ls=li.dli_sname;base=uintptr_t(li.dli_fbase);sym=uintptr_t(li.dli_saddr);}
-         xbg_logf("NVN PERF evguard caller lr=%#llx %s+%#llx (%s+%#llx) hits=%llu",(unsigned long long)lr,lm,(unsigned long long)(lr-base),ls,(unsigned long long)(sym?lr-sym:0),(unsigned long long)evguard::caller_hits[i].load());}}events_deferred=0;
+         perf_vlogf("NVN PERF evguard caller lr=%#llx %s+%#llx (%s+%#llx) hits=%llu",(unsigned long long)lr,lm,(unsigned long long)(lr-base),ls,(unsigned long long)(sym?lr-sym:0),(unsigned long long)evguard::caller_hits[i].load());}}events_deferred=0;
     {static const char *site_names[SITE_COUNT]={"other","ring","present","event","arena","gpu_sync","complete","poll","legacy_wait","chunk_mid"};
      char line[768];int at=snprintf(line,sizeof(line),"NVN PERF block_ms");
      for(int i=0;i<SITE_COUNT && at<int(sizeof(line))-40;i++)if(block_calls[i])at+=snprintf(line+at,sizeof(line)-at," %s=%.2f/%.2f",site_names[i],block_ns[i]/1e6/f,block_calls[i]/f);
      at+=snprintf(line+at,sizeof(line)-at," legacy_wait_total=%.2f submit_by",legacy_wait_ns/1e6/f);
      for(int i=0;i<SITE_COUNT && at<int(sizeof(line))-40;i++)if(submit_by[i])at+=snprintf(line+at,sizeof(line)-at," %s=%.2f",site_names[i],submit_by[i]/f);
-     xbg_logf("%s",line);for(int i=0;i<SITE_COUNT;i++)block_ns[i]=block_calls[i]=submit_by[i]=0;legacy_wait_ns=0;}
+     perf_vlogf("%s",line);for(int i=0;i<SITE_COUNT;i++)block_ns[i]=block_calls[i]=submit_by[i]=0;legacy_wait_ns=0;}
     {char line[1024];int at=snprintf(line,sizeof(line),"NVN PERF pass_ends");
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(pass_end_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,pass_end_by[i]/f);
      at+=snprintf(line+at,sizeof(line)-at," fb_hits=%.1f fb_creates=%.2f fb_live=%zu texel_binds=%.1f distinct=%.1f reused=%.1f resident=%zu/%zu hits=%.1f refresh=%.1f fallback=%.2f evict=%.2f occlusion=%.1f reports=%.1f samples=%.0f ops=%.1f/%.1f/%.1f pending=%zu pipe_fast=%.1f pass_fast=%.1f barriers",fb_hits/f,fb_creates/f,persistent_framebuffers.size(),texel_binds/f,texel_distinct/f,texel_reused/f,texel_resident[0].size(),texel_resident[1].size(),texel_hits/f,texel_refreshes/f,texel_fallbacks/f,texel_evictions/f,occlusion_queries_started/f,samples_reports/f,samples_reported/f,counter_ops[0]/f,counter_ops[1]/f,counter_ops[2]/f,pending_reports.size(),pipeline_fast_hits/f,pass_fast_hits/f);pipeline_fast_hits=0;pass_fast_hits=0;fb_hits=fb_creates=0;occlusion_queries_started=samples_reports=samples_reported=0;for(auto &c:counter_ops)c=0;texel_binds=texel_distinct=texel_reused=0;texel_hits=texel_refreshes=texel_fallbacks=texel_evictions=0;
      for(int i=0;i<64 && at<int(sizeof(line))-24;i++)if(barrier_by[i])at+=snprintf(line+at,sizeof(line)-at," op%d=%.1f",i,barrier_by[i]/f);
      if(at<int(sizeof(line))-24)at+=snprintf(line+at,sizeof(line)-at," depth_idle=%.1f",depth_idle_passes/f);
-     xbg_logf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;}
-    xbg_logf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
-    xbg_logf("NVN PERF xview views=%.2f races=%.2f guarded=%.2f guarded_kb=%.1f",xviews/f,xview_races/f,xview_guarded/f,xview_guarded_bytes/1024.0/f);xviews=xview_races=xview_guarded=xview_guarded_bytes=0;
+     perf_vlogf("%s",line);for(int i=0;i<64;i++)pass_end_by[i]=barrier_by[i]=0;depth_idle_passes=0;}
+    perf_vlogf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f);for(auto &c:cleanup_ns)c=0;writeback_bytes=0;
+    perf_vlogf("NVN PERF xview views=%.2f races=%.2f guarded=%.2f guarded_kb=%.1f",xviews/f,xview_races/f,xview_guarded/f,xview_guarded_bytes/1024.0/f);xviews=xview_races=xview_guarded=xview_guarded_bytes=0;
     if(slot_begin_n){xbg_logf("NVN PERF slotbegin per_frame=%.2f ms=%.3f retire_ms=%.3f (slot starts: fence/pool-reset waits + trims; inside the first draw/op of each Vulkan submission)",slot_begin_n/f,slot_begin_ns/f/1e6,slot_retire_ns/f/1e6);slot_begin_n=slot_begin_ns=slot_retire_ns=0;}
     // [DOOM] round 1: chunk cuts a frame at the end of a guest submit / inside one, checks that found the next slot still busy,
     // and the GPU busy time without the overlap of queued submissions (idle = wall - it). [r2] Printed whenever chunks are on
@@ -1120,13 +1243,13 @@ void perf_frame(){
     if(chunk::diag){const double busy=double(chunk::busy_ticks)*properties.limits.timestampPeriod/1e6/f;
      xbg_logf("NVN PERF chunk slots=%u mid=%u chunk_us=%lld cuts end=%.2f mid=%.2f not_ready=%.2f mid_checks=%.1f gpu_busy_ms=%.2f gpu_idle_ms=%.2f rebases=%llu bad=%llu (per frame; busy = union of slot spans)",slot_count,chunk::mid,chunk::us,chunk::end_cuts/f,chunk::mid_cuts/f,chunk::not_ready/f,chunk::checks/f,busy,wall/f-busy,(unsigned long long)chunk::rebases,(unsigned long long)chunk::bad_spans);
      chunk::end_cuts=chunk::mid_cuts=chunk::not_ready=chunk::checks=chunk::busy_ticks=chunk::rebases=chunk::bad_spans=0;}
-    {if(regwait_calls.load()){xbg_logf("NVN PERF regwait calls=%.1f blocked=%.1f wait_ms=%.3f (per frame; game-thread registrations waiting for the translation thread)",regwait_calls.load()/f,regwait_blocked.load()/f,regwait_ns.load()/f/1e6);regwait_calls=0;regwait_blocked=0;regwait_ns=0;}}
+    {if(regwait_calls.load()){perf_vlogf("NVN PERF regwait calls=%.1f blocked=%.1f wait_ms=%.3f (per frame; game-thread registrations waiting for the translation thread)",regwait_calls.load()/f,regwait_blocked.load()/f,regwait_ns.load()/f/1e6);regwait_calls=0;regwait_blocked=0;regwait_ns=0;}}
     if(uploads_prologue || uploads_inpass || upl_check_n){xbg_logf("NVN PERF uploads window prologue=%llu inpass=%llu broke_pass=%llu full=%llu full_MB=%.2f cpu_ms_per_frame full=%.2f partial=%.2f checks=%.2f (%.1f/frame)",(unsigned long long)uploads_prologue,(unsigned long long)uploads_inpass,(unsigned long long)uploads_broke_pass,(unsigned long long)upl_full_n,upl_full_bytes/1048576.0,upl_full_ns/f/1e6,upl_part_ns/f/1e6,upl_check_ns/f/1e6,upl_check_n/f);uploads_prologue=uploads_inpass=uploads_broke_pass=0;upl_full_ns=upl_full_bytes=upl_full_n=upl_part_ns=upl_check_ns=upl_check_n=0;}
-    if(shaders_reused || shader_reuse_mismatches){xbg_logf("NVN PERF shader_reuse window reused=%llu mismatches=%llu",(unsigned long long)shaders_reused,(unsigned long long)shader_reuse_mismatches);shaders_reused=shader_reuse_mismatches=0;}
-    if(wb_skip){xbg_logf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
-    if(pipe_memo){xbg_logf("NVN PERF pipememo ab=%d hits=%.1f misses=%.1f",int(ab_frame_on),pipe_memo_hits/f,pipe_memo_misses/f);pipe_memo_hits=pipe_memo_misses=0;}
+    if(shaders_reused || shader_reuse_mismatches){perf_vlogf("NVN PERF shader_reuse window reused=%llu mismatches=%llu",(unsigned long long)shaders_reused,(unsigned long long)shader_reuse_mismatches);shaders_reused=shader_reuse_mismatches=0;}
+    if(wb_skip){perf_vlogf("NVN PERF wbskip ab=%d skipped=%.1f (%.2fMB)",int(ab_frame_on),wb_skipped/f,wb_skipped_bytes/1048576.0/f);wb_skipped=wb_skipped_bytes=0;}
+    if(pipe_memo){perf_vlogf("NVN PERF pipememo ab=%d hits=%.1f misses=%.1f",int(ab_frame_on),pipe_memo_hits/f,pipe_memo_misses/f);pipe_memo_hits=pipe_memo_misses=0;}
     {extern int gs_passthru_on;extern uint64_t gs_passthru_skipped,gs_passthru_kept,memo_simg_hits;extern int memo_simg_on;   // [perf3] per frame
-     if(gs_passthru_on>0 || memo_simg_on>0)xbg_logf("NVN PERF perf3 gs_passthru skipped=%.1f kept=%.1f memo_simg hits=%.1f",gs_passthru_skipped/f,gs_passthru_kept/f,memo_simg_hits/f);gs_passthru_skipped=gs_passthru_kept=memo_simg_hits=0;}
+     if(gs_passthru_on>0 || memo_simg_on>0)perf_vlogf("NVN PERF perf3 gs_passthru skipped=%.1f kept=%.1f memo_simg hits=%.1f",gs_passthru_skipped/f,gs_passthru_kept/f,memo_simg_hits/f);gs_passthru_skipped=gs_passthru_kept=memo_simg_hits=0;}
     {double gm=perf.gpu_samples?double(perf.gpu_ns)/1e6/f:-1.0,cm=double(perf.submit_cpu_ns)/1e6/f;perf_gpu_ms.store(gm);perf_cpu_ms.store(cm);}
     perf=Perf{};perf.window_start=now;perf_timed_frames=0;
 }
@@ -1397,7 +1520,7 @@ namespace zc {
 constexpr size_t CHUNK=64u<<20;
 struct Chunk{uintptr_t lo=0;size_t n=0;VkBuffer buffer{};VkDeviceMemory memory{};AHardwareBuffer *ahb=nullptr;std::vector<uint8_t> sticky;};
 Chunk table[512];std::atomic<int> count{0};std::mutex mu;int enabled=-1;
-uint64_t hits=0,sticky_misses=0,align_misses=0,pending_misses=0,mapped_bytes=0;
+uint64_t hits=0,sticky_misses=0,align_misses=0,pending_misses=0,mapped_bytes=0;uint64_t sticky_gen=0;   // sticky_gen: [r4] moves when a page turns sticky (DM_GFX_UBO_VIEWCACHE validity)
 PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_props=nullptr;
 bool on(){
     if(enabled<0){const char *e=getenv("DM_GFX_ZEROCOPY");
@@ -1472,7 +1595,7 @@ Chunk *find(uint64_t address,uint64_t bytes){
 void mark(uint64_t address,uint64_t bytes){
     if(enabled<=0 || !bytes)return;
     int n=count.load(std::memory_order_acquire);
-    for(int i=0;i<n;i++){Chunk &c=table[i];if(address+bytes>c.lo && address<c.lo+c.n){uint64_t a=std::max<uint64_t>(address,c.lo)-c.lo,b=std::min<uint64_t>(address+bytes,c.lo+c.n)-c.lo;for(uint64_t pg=a>>12;pg<=(b-1)>>12;pg++)c.sticky[pg]=1;}}
+    for(int i=0;i<n;i++){Chunk &c=table[i];if(address+bytes>c.lo && address<c.lo+c.n){uint64_t a=std::max<uint64_t>(address,c.lo)-c.lo,b=std::min<uint64_t>(address+bytes,c.lo+c.n)-c.lo;for(uint64_t pg=a>>12;pg<=(b-1)>>12;pg++)if(!c.sticky[pg]){c.sticky[pg]=1;++sticky_gen;}}}
 }
 uint64_t tail(uint64_t address){int n=count.load(std::memory_order_acquire);for(int i=0;i<n;i++){Chunk &c=table[i];if(address>=c.lo && address-c.lo<c.n)return c.lo+c.n-address;}return 0;}   // bytes to the end of the chunk holding address
 bool view(uint64_t address,uint64_t bytes,VkDeviceSize align,Buffer &out){
@@ -1596,6 +1719,11 @@ struct Image {
     // (gfx-upload-prologue decides by it whether an upload may go ahead of the submission).
     uint64_t slot_use=0;
     uint64_t dirty_stamp=0,dirty_seen=0;   // tex_dirty: the tracker stamp of the checked content (0: not tracked yet) and the tracker generation last checked
+    // [r5] DM_GFX_DESWZ_DIRECT: cpu_hash was not taken at the last full upload (the texture was write-protected at once); a check that
+    // would compare it treats the texture as changed. DM_GFX_PROTECT_CHURN: consecutive tracked checks that found the pages written
+    // but the bytes unchanged, untracked (hashed every submission instead of re-protected) and unchanged hashes since then.
+    bool hash_unknown=false,churn_off=false;uint8_t churn_same=0;uint32_t churn_quiet=0;
+    nvn_dirty_cookie pck{};   // [r4] DM_DIRTY_PROTECT_BGEN: floor of the window re-protect of this texture's pages (zero = walk every page)
     // [DOOM] DM_TEX_CLASS / DM_TEX_DISCARD (xbg_tex_discard.inc): CPU upload history (steady clock ns; full and partial uploads)
     // and the discard record of the guest copy (0 = none) with the number of restores / undos (no more discards after 3).
     uint64_t up_first_ns=0,up_last_ns=0;uint32_t up_full=0,up_partial=0;uint64_t discard_id=0;uint8_t discard_undos=0;
@@ -1891,7 +2019,7 @@ void apply_image_writebacks(const void *slot){
         if(vt_diag_on() && im.bpp==4)vtdiag::writeback(t,im,p,src);   // before the guest memory is overwritten
         if(t.d.flags&0x10){size_t stride=t.d.stride?t.d.stride:((size_t(p.pitch)+31)&~size_t(31));for(uint32_t y=0;y<p.h && y*stride+p.pitch<=t.L.size;y++)memcpy(t.mem+y*stride,src+size_t(y)*p.pitch,p.pitch);}
         else if(nvn_swizzle(&t.d,0,0,src,p.pitch,t.mem)){static bool told=false;if(!told){told=true;xbg_logf("NVN cpu-visible write-back: layout unsupported serial=%llu",(unsigned long long)t.serial);}continue;}
-        im.cpu_hash=hash_memory(t.mem,t.L.size);++cpu_visible_writebacks;
+        im.cpu_hash=hash_memory(t.mem,t.L.size);im.hash_unknown=false;++cpu_visible_writebacks;
         {static unsigned n=0;if(n++<3)xbg_logf("NVN cpu-visible write-back serial=%llu fmt=%#x %ux%u flags=%#x (virtual-texture feedback, async)",(unsigned long long)t.serial,t.d.format,p.w,p.h,t.d.flags);}
     }
     pending_image_writebacks.swap(keep);
@@ -1992,7 +2120,7 @@ void resolve_slot_writebacks(const void *slot){
     for(size_t i=0;i<pending_writebacks.size();i++){auto &w=pending_writebacks[i];if(w.slot!=slot){keep.push_back(w);continue;}
         if(writeback_superseded(i)){++wb_skipped;wb_skipped_bytes+=w.bytes;continue;}
         writeback_bytes+=w.bytes;w.buffer.invalidate();invalidate_cpu_range(w.addr,w.bytes);memcpy(reinterpret_cast<void*>(w.addr),w.buffer.mapped,w.bytes);}
-    pending_writebacks.swap(keep);resolving_pending=false;
+    pending_writebacks.swap(keep);++pend_gen;resolving_pending=false;
 }
 void write_report(const PendingReport &r){
     uint64_t samples=0;auto e=epochs.find(r.epoch);if(e!=epochs.end()){e->second.advance_known();samples=e->second.prefix(r.count);}
@@ -2018,7 +2146,7 @@ void resolve_pending(){
     if(resolving_pending || (pending_writebacks.empty() && pending_reports.empty()))return;
     resolving_pending=true;
     gpu_sync(pending_writebacks.empty()?perf.sync_query:perf.sync_writeback);
-    apply_image_writebacks(nullptr);auto writebacks=std::move(pending_writebacks);pending_writebacks.clear();
+    apply_image_writebacks(nullptr);auto writebacks=std::move(pending_writebacks);pending_writebacks.clear();++pend_gen;
     for(auto &w:writebacks){w.buffer.invalidate();invalidate_cpu_range(w.addr,w.bytes);memcpy(reinterpret_cast<void*>(w.addr),w.buffer.mapped,w.bytes);}
     for(auto &r:pending_reports)write_report(r);
     pending_reports.clear();
@@ -2117,12 +2245,33 @@ unsigned partial_why(const Image &im,const tex_t *t){return (t->L.size<(4u<<20))
 void big_hash_note(const Image &im,const tex_t *t,const char *where){if(t->L.size<(4u<<20))return;static unsigned n=0;if(n++<24)xbg_logf("NVN big texture hash (%s) serial=%llu fmt=%#x %ux%ux%u layers=%u levels=%u target=%d flags=%#x size=%llu stable=%u stamp=%d partial_why=%#x",where,(unsigned long long)t->serial,t->d.format,im.width,im.height,im.depth,im.layers,im.levels,t->d.target,t->d.flags,(unsigned long long)t->L.size,im.stable_checks,int(im.dirty_stamp!=0),partial_why(im,t));}
 uint64_t partial_prologue=0;int partial_prologue_flag=-1;
 bool partial_prologue_on(){if(partial_prologue_flag<0){const char *e=getenv("DM_GFX_PARTIAL_PROLOGUE");partial_prologue_flag=e?atoi(e)!=0:1;xbg_logf("NVN DM_GFX_PARTIAL_PROLOGUE=%d",partial_prologue_flag);}return partial_prologue_flag!=0;}
+// [r4] DM_DIRTY_PROTECT_BGEN (pipeline_audit.md 3.7; nvn_dirty.c nvn_dirty_protect_gen for why it is complete): the dirty check
+// re-protected every page of a texture (22.5 MB = 5760 CAS for serial 94, 3-4 times a frame) although only pages written since the
+// last protect can be writable. With the switch the tracked texture keeps a cookie (Image::pck) and the re-protect visits only the
+// 64-page windows whose newest generation passed its floor; first protects (cookie reset) walk every page. The tracker's mode
+// (it counts unprotects in flight only when the env is set at its first pool) decides: 1 windows, 2 the safe part only (full walk
+// with test-and-test-and-set and one range lookup), 3 windows + a verifying full walk (NVN PERF r4 pbgen missed=). The GOB-block
+// walk of partial_upload reads the pages written since the stamp into a bitmap once (one range lookup, clean windows skipped)
+// instead of two range lookups per block; with 3 it also asks nvn_dirty_since per block and counts differences. A/B pbgen.
+inline void dirty_protect_im(Image &im,const tex_t *t,bool first){
+    if(pbgen_mode && nvn_dirty_protect_gen && !r4_off("pbgen")){if(first)im.pck=nvn_dirty_cookie{};nvn_dirty_protect_gen(t->mem,t->L.size,&im.pck,pbgen_mode==2?0:pbgen_mode==3?3:1,&r4_pst);}
+    else nvn_dirty_protect(t->mem,t->L.size);
+}
 // Upload the blocks written since `since`; returns false when the layout is not handled (caller falls back to a full upload).
 bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
     std::vector<uint8_t> linear;std::vector<VkBufferImageCopy> copies;std::vector<std::pair<const uint8_t*,uint64_t>> diag_blocks;   // VT_DIAG: blocks read (torn/re-upload probes)
+    static std::vector<uint64_t> pbits;size_t pnp=0;unsigned psh=0;uintptr_t pbase=0;   // [r4] pages written since `since` (pbgen)
+    if(pbgen_mode && nvn_dirty_since_bits && nvn_dirty_page_shift && !r4_off("pbgen")){psh=nvn_dirty_page_shift();const size_t words=((size_t(t->L.size)>>psh)+2+63)/64;if(pbits.size()<words)pbits.resize(words);
+        pnp=nvn_dirty_since_bits(t->mem,size_t(t->L.size),since,pbits.data(),pbits.size(),&r4_pb_bitwin);pbase=uintptr_t(t->mem)&~((uintptr_t(1)<<psh)-1);++r4_pb_bits;}
+    auto dirty=[&](const uint8_t *a,size_t len)->bool{
+        if(!pnp)return nvn_dirty_since(a,len,since)!=0;
+        const uintptr_t lo=(uintptr_t(a)-pbase)>>psh,hi=(uintptr_t(a)+len-1-pbase)>>psh;if(hi>=pnp)return nvn_dirty_since(a,len,since)!=0;
+        bool any=false;for(uintptr_t i=lo;i<=hi && !any;i++)any=(pbits[i>>6]>>(i&63))&1;
+        if(pbgen_mode==3 && any!=(nvn_dirty_since(a,len,since)!=0)){++r4_pb_bitmis;++r4_pb_bitmis_total;}   // bitmap 0 / tracker 1: a write since the bitmap (caught at the next check); 1 / 0 cannot happen
+        return any;};
     int bw=1,bh=1;nvn_fmt_bpb(t->d.format,&bw,&bh);
     for(uint32_t layer=0;layer<im.layers;layer++)for(uint32_t level=0;level<im.levels;level++){
-        if(level==0 && im.layers>1 && t->L.layer_size && uint64_t(layer+1)*t->L.layer_size<=t->L.size && !nvn_dirty_since(t->mem+uint64_t(layer)*t->L.layer_size,size_t(t->L.layer_size),since)){level=im.levels;continue;}   // untouched layer
+        if(level==0 && im.layers>1 && t->L.layer_size && uint64_t(layer+1)*t->L.layer_size<=t->L.size && !dirty(t->mem+uint64_t(layer)*t->L.layer_size,size_t(t->L.layer_size))){level=im.levels;continue;}   // untouched layer
         uint32_t row_bytes,rows,slices,bpb;uint64_t base;unsigned th,td;
         if(nvn_deswizzle_geom(&t->d,level,layer,&row_bytes,&rows,&slices,&base,&th,&td,&bpb) || !slices || !bpb || 64%bpb)return false;
         const uint32_t W=std::max(1u,im.width>>level),H=std::max(1u,im.height>>level),D=t->d.target==2?std::max(1u,im.depth>>level):1;
@@ -2132,11 +2281,15 @@ bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
             const uint32_t x0=bx*64,y0=by*brows,z0=bz*bdepth;
             const uint8_t *bl=t->mem+base+(nvn_bl_offset(x0,y0,z0,row_bytes,rows,th,td)&~(block-1));
             if(bl+block>t->mem+t->L.size)continue;
-            if(!nvn_dirty_since(bl,size_t(block),since))continue;
+            if(!dirty(bl,size_t(block)))continue;
             const uint32_t xb=std::min<uint32_t>(64,row_bytes-x0),ny=std::min<uint32_t>(brows,rows-y0),nz=std::min<uint32_t>(bdepth,slices-z0);
             size_t at=(linear.size()+15)&~size_t(15);linear.resize(at+size_t(xb)*ny*nz);
+            if(r5_deswz==1){nvn_deswizzle_gob_block(bl,th,xb,ny,nz,linear.data()+at);++r5_dz_blocks;}   // [r5] DM_GFX_DESWZ_DIRECT: GOB-wise, same bytes
+            else{
             for(uint32_t z=0;z<nz;z++)for(uint32_t y=0;y<ny;y++)for(uint32_t x=0;x<xb;x+=16){uint32_t n=std::min<uint32_t>(16,xb-x);
                 memcpy(linear.data()+at+(size_t(z)*ny+y)*xb+x,t->mem+base+nvn_bl_offset(x0+x,y0+y,z0+z,row_bytes,rows,th,td),n);}
+            if(r5_deswz==2){static std::vector<uint8_t> cmp;cmp.resize(size_t(xb)*ny*nz);nvn_deswizzle_gob_block(bl,th,xb,ny,nz,cmp.data());++r5_dz_cmp;   // [r5] compare: the old bytes are used
+                if(memcmp(cmp.data(),linear.data()+at,cmp.size())){++r5_dz_mism;if(r5_dz_mism<=16)xbg_logf("NVN r5 deswz MISMATCH partial serial=%llu fmt=%#x level=%u layer=%u block=%u,%u,%u th=%u td=%u",(unsigned long long)t->serial,t->d.format,level,layer,bx,by,bz,th,td);}}}
             VkBufferImageCopy c{};c.bufferOffset=at;c.bufferRowLength=(xb/bpb)*bw;c.bufferImageHeight=ny*bh;
             c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,level,layer,1};
             c.imageOffset={int32_t((x0/bpb)*bw),int32_t(y0*bh),int32_t(z0)};
@@ -2225,30 +2378,61 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 // DM_GFX_VT_ATOMIC=1: hold the texel-write lock over protect + stamp + read, so no WriteTexels is half done
                 // while we snapshot (torn VT page) and no page is skipped by protect as BUSY and then written unseen.
                 struct TexelGuard{bool on;TexelGuard():on(nvn_texel_sync_on && nvn_texel_lock && nvn_texel_unlock && nvn_texel_sync_on()){if(on)nvn_texel_lock();}~TexelGuard(){if(on)nvn_texel_unlock();}} texel_guard;
-                const uint64_t ck0=timing_clock();nvn_dirty_protect(t->mem,t->L.size);uint64_t stamp=nvn_dirty_now();++tex_dirty_checks;   // protect and stamp before reading
+                const uint64_t ck0=timing_clock();dirty_protect_im(im,t,false);uint64_t stamp=nvn_dirty_now();++tex_dirty_checks;   // protect and stamp before reading
                 struct UplCheck{uint64_t t0;~UplCheck(){upl_check_ns+=timing_clock()-t0;++upl_check_n;}} upl_check{ck0};
                 bool part_ok=false;if(partial_eligible(im,t)){const uint64_t pt0=timing_clock();part_ok=partial_upload(im,t,im.dirty_stamp,stamp);const uint64_t dt=timing_clock()-pt0;upl_part_ns+=dt;upl_check.t0+=dt;}
                 if(part_ok){im.dirty_stamp=stamp;}
-                else if((big_hash_note(im,t,"tracked"),hash_site=1,hash_memory(t->mem,t->L.size))!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;++tex_dirty_changed;}else im.dirty_stamp=stamp;
+                else if(im.hash_unknown){im.uploaded=false;im.stable_checks=0;++tex_dirty_changed;++r5_dz_unknown_reup;}   // [r5] no hash at the upload: treated as changed
+                else if((big_hash_note(im,t,"tracked"),hash_site=1,hash_memory(t->mem,t->L.size))!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;++tex_dirty_changed;im.churn_same=0;}
+                else{im.dirty_stamp=stamp;
+                    // [r5] DM_GFX_PROTECT_CHURN (pipeline_audit.md section 5): the third tracked check in a row that finds the pages written
+                    // but the bytes the same (a texture rewritten with identical contents, ~9.6k write faults a second in menus / loads)
+                    // stops protecting it: untracked, its hash is compared on every submission that uses it (below), which catches a real
+                    // change in the same submission as the tracker would. The pages protected just now fault once more, then stay open.
+                    // After 1024 unchanged hashes it is tracked again (stable_checks 3: the next check protects and stamps). Never for a
+                    // partial-upload texture (>= 4 MB VT caches): hashing it whole every submission would cost far more than the faults.
+                    if(r5_churn && !partial_eligible(im,t)){++r5_ch_same;if(++im.churn_same>=3){im.dirty_stamp=0;im.churn_off=true;im.churn_quiet=0;im.stable_checks=4;++r5_ch_untracked;}}}
                 now=stamp;}
             im.dirty_seen=now;}
         // Textures unchanged for 4 checks are re-verified every 16th submission (staggered). With tex_dirty the 4th unchanged
         // check write-protects a tracked texture instead (protect and stamp before the hash), and the tracker answers from then
         // on: protecting at upload faulted ~40k times per level load on the Redmi, as the loader went on writing those pages.
-        else if(im.stable_checks<4 || ((stats.submissions+t->serial)&15)==0){
-            const bool track=tex_dirty && im.stable_checks==3 && !ab_off("texdirty") && nvn_dirty_tracked && nvn_dirty_protect && nvn_dirty_now && nvn_dirty_since && nvn_dirty_tracked(t->mem,t->L.size);
-            uint64_t stamp=0;if(track){nvn_dirty_protect(t->mem,t->L.size);stamp=nvn_dirty_now();}
-            big_hash_note(im,t,"untracked");hash_site=1;uint64_t hash=hash_memory(t->mem,t->L.size);hash_site=0;if(hash!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;}else{++im.stable_checks;if(track){im.dirty_stamp=im.dirty_seen=stamp;++tex_dirty_tracked;}}}
+        else if(im.stable_checks<4 || im.churn_off || ((stats.submissions+t->serial)&15)==0){   // [r5] churn_off: every submission
+            const bool track=tex_dirty && im.stable_checks==3 && !im.churn_off && !ab_off("texdirty") && nvn_dirty_tracked && nvn_dirty_protect && nvn_dirty_now && nvn_dirty_since && nvn_dirty_tracked(t->mem,t->L.size);
+            uint64_t stamp=0;if(track){dirty_protect_im(im,t,true);stamp=nvn_dirty_now();}
+            big_hash_note(im,t,"untracked");hash_site=1;uint64_t hash=hash_memory(t->mem,t->L.size);hash_site=0;if(im.hash_unknown || hash!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;if(im.hash_unknown)++r5_dz_unknown_reup;}else{++im.stable_checks;if(track){im.dirty_stamp=im.dirty_seen=stamp;++tex_dirty_tracked;}
+                if(im.churn_off && ++im.churn_quiet>=1024){im.churn_off=false;im.churn_same=0;im.stable_checks=3;++r5_ch_retracked;}}}
         im.checked_submission=stats.submissions;}
     // Diagnostic: CPU writes into textures whose contents the GPU produced (copies) are invisible to us.
-    if(upload && im.gpu_written && im.decoded && t->mem && ((stats.submissions+t->serial)&63)==0 && im.checked_submission!=stats.submissions){im.checked_submission=stats.submissions;uint64_t hash=hash_memory(t->mem,t->L.size);if(im.cpu_hash && hash!=im.cpu_hash){static unsigned n=0;if(n++<40)xbg_logf("NVN CPUGPU texture changed by CPU after GPU write serial=%llu fmt=%#x %ux%u layers=%u levels=%u target=%d",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.layers,im.levels,t->d.target);}im.cpu_hash=hash;}
+    if(upload && im.gpu_written && im.decoded && t->mem && ((stats.submissions+t->serial)&63)==0 && im.checked_submission!=stats.submissions){im.checked_submission=stats.submissions;uint64_t hash=hash_memory(t->mem,t->L.size);im.hash_unknown=false;if(im.cpu_hash && hash!=im.cpu_hash){static unsigned n=0;if(n++<40)xbg_logf("NVN CPUGPU texture changed by CPU after GPU write serial=%llu fmt=%#x %ux%u layers=%u levels=%u target=%d",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.layers,im.levels,t->d.target);}im.cpu_hash=hash;}
     if(upload && !im.uploaded && !im.gpu_written){
-        const uint64_t up_t0=timing_clock();const bool reupload=im.cpu_hash!=0;
+        const uint64_t up_t0=timing_clock();const bool reupload=im.cpu_hash!=0 || im.hash_unknown;
         im.dirty_stamp=0;   // a new upload starts on the hash checks again
         need(im.samples==VK_SAMPLE_COUNT_1_BIT,"Cannot upload uninitialized multisample image from CPU storage");
         need(t->mem && t->pool && t->off>=0 && uint64_t(t->off)<=t->pool->size && t->L.size<=t->pool->size-uint64_t(t->off),"Texture storage outside memory pool");
         if(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT)xbg_logf("NVN depth initial upload serial=%llu format=%#x vkFormat=%u target=%d extent=%ux%ux%u levels=%u layers=%u source=%p bytes=%llu",(unsigned long long)t->serial,t->d.format,unsigned(im.fmt),t->d.target,im.width,im.height,im.depth,im.levels,im.layers,t->mem,(unsigned long long)t->L.size);
-        std::vector<uint8_t> linear;std::vector<VkBufferImageCopy> copies;
+        std::vector<uint8_t> linear;std::vector<VkBufferImageCopy> copies;Buffer staging;size_t up_bytes=0;
+        // [r5] DM_GFX_DESWZ_DIRECT=1 (pipeline_audit.md 3.14): a colour block-linear texture that is not CPU-decoded (plain or native
+        // ASTC / BC blocks) is deswizzled GOB-wise (nvn_deswizzle_gob, byte for byte nvn_deswizzle: tests/t_deswz_direct.c) straight
+        // into the mapped stream buffer: no std::vector (zero-filled by resize), no second memcpy. Same subresource offsets (16-byte
+        // aligned) and pitches as below, so the same copies; only the alignment gaps between subresources, which no copy reads, are not
+        // zeroed. Depth (plane split), CPU-decoded BC and linear textures keep the vector path. =2: the old path, plus a GOB-wise
+        // deswizzle of each subresource compared with it (NVN r5 textures cmp= mism=, first mismatches logged); the old bytes are used.
+        const bool dz_direct=r5_deswz==1 && im.aspects==VK_IMAGE_ASPECT_COLOR_BIT && !im.decoded && !(t->d.flags&0x10);
+        if(dz_direct){
+            struct Sub{uint32_t level,layer;size_t pitch;};std::vector<Sub> subs;size_t total=0;
+            int cbw=1,cbh=1;nvn_fmt_bpb(t->d.format,&cbw,&cbh);if(cbw<1)cbw=1;if(cbh<1)cbh=1;
+            for(uint32_t layer=0;layer<im.layers;layer++)for(uint32_t level=0;level<im.levels;level++){
+                uint32_t w=std::max(1u,im.width>>level),h=std::max(1u,im.height>>level),depth=std::max(1u,im.depth>>level);
+                const uint32_t bx=(w+cbw-1)/cbw,by=(h+cbh-1)/cbh;const size_t begin=(total+15)&~size_t(15),pitch=size_t(bx)*im.bpp;total=begin+pitch*by*depth;
+                VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);subs.push_back({level,layer,pitch});}
+            staging=stream_buffer(total,nullptr,0,false);uint8_t *dst=static_cast<uint8_t*>(staging.mapped);
+            for(size_t i=0;i<subs.size();i++)need(nvn_deswizzle_gob(&t->d,subs[i].level,subs[i].layer,t->mem,dst+copies[i].bufferOffset,subs[i].pitch)==0,"Texture deswizzle failed");
+            staging.flush();for(auto &copy:copies)copy.bufferOffset+=staging.offset;up_bytes=total;
+        }else{
+        auto dz_cmp=[&](uint32_t level,uint32_t layer,const uint8_t *old,size_t n,size_t pitch){   // [r5] DM_GFX_DESWZ_DIRECT=2
+            static std::vector<uint8_t> cmp;cmp.resize(n);need(nvn_deswizzle_gob(&t->d,level,layer,t->mem,cmp.data(),pitch)==0,"Texture deswizzle (compare) failed");++r5_dz_cmp;
+            if(memcmp(cmp.data(),old,n)){++r5_dz_mism;if(r5_dz_mism<=16)xbg_logf("NVN r5 deswz MISMATCH full serial=%llu fmt=%#x %ux%ux%u target=%d level=%u layer=%u bytes=%zu",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.depth,t->d.target,level,layer,n);}};
         for(uint32_t layer=0;layer<im.layers;layer++)for(uint32_t level=0;level<im.levels;level++){
             uint32_t w=std::max(1u,im.width>>level),h=std::max(1u,im.height>>level),depth=std::max(1u,im.depth>>level);
             if(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT){
@@ -2263,6 +2447,7 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
             if(native_blocks){ // ASTC etc.: copy whole blocks, rows of blocks
                 uint32_t bx=(w+cbw-1)/cbw,by=(h+cbh-1)/cbh;linear.resize(begin+size_t(bx)*by*depth*im.bpp);
                 need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(bx)*im.bpp)==0,"Compressed texture deswizzle failed");
+                if(r5_deswz==2)dz_cmp(level,layer,linear.data()+begin,size_t(bx)*by*depth*im.bpp,size_t(bx)*im.bpp);
                 VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);continue;}
             linear.resize(begin+size_t(w)*h*depth*im.bpp);
             if(im.decoded){
@@ -2271,10 +2456,11 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 need(nvn_deswizzle(&t->d,level,layer,t->mem,blocks.data(),size_t(blocks_x)*block_bytes)==0,"BC image deswizzle failed");
                 need(xbg_decode_bc_linear(t->d.format,w,h,depth,blocks.data(),blocks.size(),0,0,linear.data()+begin,size_t(w)*h*depth*im.bpp)==0,"BC image decode failed");
             }else if(t->d.flags&0x10){need(!layer && !level && depth==1,"Linear mip/layer/volume texture not implemented");size_t pitch=t->d.stride?t->d.stride:(w*im.bpp+31)&~size_t(31);for(uint32_t y=0;y<h;y++)memcpy(linear.data()+begin+y*w*im.bpp,t->mem+y*pitch,w*im.bpp);}
-            else need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(w)*im.bpp)==0,"Texture deswizzle failed");
+            else{need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(w)*im.bpp)==0,"Texture deswizzle failed");
+                if(r5_deswz==2)dz_cmp(level,layer,linear.data()+begin,size_t(w)*h*depth*im.bpp,size_t(w)*im.bpp);}
             VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);
         }
-        Buffer staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;
+        staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;up_bytes=linear.size();}
         // gfx-upload-prologue：这次提交里还没有命令用过这张图，它的新内容可以排在整个提交之前，前面没有读到旧内容的命令。
         // gfx-upload-prologue: no command of this submission used this image yet, so its new contents can go ahead of the whole
         // submission; no earlier command read the old contents.
@@ -2282,9 +2468,19 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
             s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++uploads_prologue;}
         else{++uploads_inpass;if(open_pass.cmd)++uploads_broke_pass;
             Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
-        im.uploaded=true;provenance_write(im,__LINE__);texdiscard::note_upload(im,false);hash_site=3;im.cpu_hash=hash_memory(t->mem,t->L.size);hash_site=0;im.checked_submission=stats.submissions;
-        if(partial_eligible(im,t) && !ab_off("texdirty")){nvn_dirty_protect(t->mem,t->L.size);im.dirty_stamp=im.dirty_seen=nvn_dirty_now();im.stable_checks=4;}
-        if(reupload)++hud::reuploads;else ++hud::uploads;hud::upload_bytes+=linear.size();hud::upload_ns+=timing_clock()-up_t0;upl_full_ns+=timing_clock()-up_t0;upl_full_bytes+=linear.size();++upl_full_n;
+        im.uploaded=true;provenance_write(im,__LINE__);texdiscard::note_upload(im,false);
+        // [r5] DM_GFX_DESWZ_DIRECT=1: no hash of the whole texture (up to 89 MB for a VT cache) when it is write-protected right below.
+        // From then on the tracker answers: a dirty check re-uploads the written blocks (partial_upload) and never reads cpu_hash. Only
+        // two checks would compare it: the tracked fallback when partial_upload cannot handle the layout, and the untracked check once
+        // the A/B texdirty phase turns tracking off; both see hash_unknown and re-upload the whole texture (a correct, rarer upload
+        // instead of a hash per upload; NVN r5 textures unknown_reup=). The pages written between the deswizzle and the protect are
+        // missed exactly as before (the old hash was also taken after the deswizzle, before the protect).
+        if(dz_direct && partial_eligible(im,t) && !ab_off("texdirty")){im.cpu_hash=0;im.hash_unknown=true;++r5_dz_hash_skips;}
+        else{hash_site=3;im.cpu_hash=hash_memory(t->mem,t->L.size);hash_site=0;im.hash_unknown=false;}
+        im.checked_submission=stats.submissions;
+        if(partial_eligible(im,t) && !ab_off("texdirty")){dirty_protect_im(im,t,true);im.dirty_stamp=im.dirty_seen=nvn_dirty_now();im.stable_checks=4;}
+        if(r5_deswz){if(dz_direct){++r5_dz_full;r5_dz_bytes+=up_bytes;r5_dz_ns+=timing_clock()-up_t0;}else{++r5_dz_old;r5_dz_old_ns+=timing_clock()-up_t0;}}
+        if(reupload)++hud::reuploads;else ++hud::uploads;hud::upload_bytes+=up_bytes;hud::upload_ns+=timing_clock()-up_t0;upl_full_ns+=timing_clock()-up_t0;upl_full_bytes+=up_bytes;++upl_full_n;
     }
     provenance_image(upload?"GET_UPLOAD":"GET",t,im);im.slot_use=slot_serial;return im;
 }
@@ -2685,8 +2881,74 @@ void tidy_rewrite(std::vector<uint32_t> &words,uint32_t skip=0){
     if(f2i_notrunc && !(skip&R3_F2I)){size_t k=xbg_spirv_f2i_notrunc(words.data(),words.size(),out);if(k){words.swap(out);if(!skip)r3_f2i+=k;}}
     if(texcoord_unguard && !(skip&R3_TEXNAN)){size_t k=xbg_spirv_texcoord_unguard(words.data(),words.size(),out);if(k){words.swap(out);if(!skip)r3_texnan+=k;}}
 }
+// [r5] DM_GFX_SHADER_RAWCACHE (pipeline_audit.md 3.13). The shader directory is on FUSE external storage (".../Download/DOOM Mobile/
+// dm/shaders", boot: runtime), where an open costs ~2 ms whatever the size: entering the TV room loads ~50 shaders on the translation
+// thread and their file reads were 76-166 ms of a 390-480 ms frame, although the warm-up threads had read 95 % of those bundles at
+// start-up (reused=1) and kept only the rewritten words. Bit 1: the warm-up keeps the raw bundle bytes it read (same file, same bytes;
+// warm::load_module), load_shader takes them and frees them; a bundle load_shader read first is not stored later. Bounded by
+// DM_GFX_SHADER_RAWCACHE_MB (32 by default; work/shaders-vk-next: 863 bundles, 38.4 MB in all, the largest 0.37 MB; the warm list is
+// a fraction of them). Bit 2: a mirror of the bundles in internal storage (DM_FILES_DIR/dm-shader-mirror, set by jni_android.c; not
+// FUSE), refreshed by a background thread at start-up: size + mtime of every source bundle against its manifest, changed or missing
+// ones copied (first launch: all, ~38 MB); a bundle is read from the mirror only once its copy is known to match the source, and
+// from the source again if the mirror file cannot be opened. Either bit: the spv-override directory is listed once instead of
+// probed with an open per shader (a file put there while the game runs is no longer seen).
+namespace r5raw{
+std::mutex mu;std::unordered_map<std::string,std::vector<uint8_t>> bytes;std::unordered_set<std::string> loaded;size_t total=0,peak=0,cap=32u<<20;
+void put(const std::string &k,const std::vector<uint8_t> &b){std::lock_guard<std::mutex> l(mu);if(loaded.count(k) || bytes.count(k))return;
+    if(total+b.size()>cap){++r5_raw_dropped;return;}bytes.emplace(k,b);total+=b.size();peak=std::max(peak,total);++r5_raw_stored;}
+bool get(const std::string &k,std::vector<uint8_t> &out){std::lock_guard<std::mutex> l(mu);auto it=bytes.find(k);if(it==bytes.end())return false;out=it->second;return true;}
+bool take(const std::string &k,std::vector<uint8_t> &out){std::lock_guard<std::mutex> l(mu);loaded.insert(k);auto it=bytes.find(k);if(it==bytes.end())return false;
+    out.swap(it->second);total-=out.size();bytes.erase(it);return true;}
+std::string mirror_dir;std::unordered_set<std::string> ready;std::atomic<bool> mirror_stop{false};std::thread mirror_thread;
+std::string source_path(const std::string &file){return std::string(cfg.shader_directory)+"/"+file+".xgs";}
+// The bundle's path: the mirror copy once it is known to match the source, else the source.
+std::string bundle_path(const std::string &file,bool &mirror){mirror=false;
+    if(!mirror_dir.empty()){std::lock_guard<std::mutex> l(mu);if(ready.count(file))mirror=true;}
+    if(mirror){++r5_mirror_reads;return mirror_dir+"/"+file+".xgs";}return source_path(file);}
+FILE *open_bundle(const std::string &file,std::string &path,bool &mirror){
+    path=bundle_path(file,mirror);FILE *f=fopen(path.c_str(),"rb");
+    if(!f && mirror){mirror=false;path=source_path(file);f=fopen(path.c_str(),"rb");}return f;}
+void mirror_main(std::string src,std::string dst){
+    setpriority(PRIO_PROCESS,0,10);const uint64_t t0=timing_clock();mkdir(dst.c_str(),0700);
+    std::unordered_map<std::string,std::pair<long long,long long>> man;   // bundle -> source size, source mtime (ns) of its copy
+    if(FILE *f=fopen((dst+"/manifest.txt").c_str(),"rb")){char name[256];long long sz,mt;while(fscanf(f,"%255s %lld %lld",name,&sz,&mt)==3)man[name]={sz,mt};fclose(f);}
+    DIR *d=opendir(src.c_str());if(!d){xbg_logf("NVN r5 shader mirror: cannot list %s (errno %d)",src.c_str(),errno);return;}
+    std::vector<std::string> names;while(dirent *e=readdir(d)){std::string n=e->d_name;if(n.size()>4 && !n.compare(n.size()-4,4,".xgs"))names.push_back(n.substr(0,n.size()-4));}closedir(d);
+    size_t same=0,copied=0,failed=0;uint64_t copied_bytes=0;bool changed=false;std::vector<char> buf;
+    auto mtime=[](const struct stat &s){return (long long)s.st_mtim.tv_sec*1000000000ll+(long long)s.st_mtim.tv_nsec;};
+    for(auto &n:names){if(mirror_stop.load())break;
+        const std::string from=src+"/"+n+".xgs",to=dst+"/"+n+".xgs";struct stat s{},m{};
+        if(stat(from.c_str(),&s)){++failed;continue;}const long long sz=(long long)s.st_size,mt=mtime(s);
+        auto it=man.find(n);
+        if(it!=man.end() && it->second.first==sz && it->second.second==mt && !stat(to.c_str(),&m) && (long long)m.st_size==sz){{std::lock_guard<std::mutex> l(mu);ready.insert(n);}++same;continue;}
+        bool ok=sz>=32 && sz<=16*1024*1024;
+        if(ok){FILE *in=fopen(from.c_str(),"rb");ok=in!=nullptr;if(in){buf.resize(size_t(sz));ok=fread(buf.data(),1,buf.size(),in)==buf.size() && fgetc(in)==EOF;fclose(in);}}
+        if(ok){struct stat s2{};ok=!stat(from.c_str(),&s2) && (long long)s2.st_size==sz && mtime(s2)==mt;}   // unchanged while it was read
+        if(ok){const std::string tmp=to+".tmp";FILE *out=fopen(tmp.c_str(),"wb");ok=out && fwrite(buf.data(),1,buf.size(),out)==buf.size();if(out)ok=fclose(out)==0 && ok;ok=ok && rename(tmp.c_str(),to.c_str())==0;if(!ok)remove(tmp.c_str());}
+        if(!ok){++failed;if(man.erase(n))changed=true;continue;}
+        man[n]={sz,mt};changed=true;++copied;copied_bytes+=uint64_t(sz);{std::lock_guard<std::mutex> l(mu);ready.insert(n);}}
+    if(changed){const std::string mp=dst+"/manifest.txt",tmp=mp+".tmp";FILE *f=fopen(tmp.c_str(),"wb");bool ok=f!=nullptr;
+        if(f){for(auto &e:man)fprintf(f,"%s %lld %lld\n",e.first.c_str(),e.second.first,e.second.second);ok=fclose(f)==0;}ok=ok && rename(tmp.c_str(),mp.c_str())==0;if(!ok)remove(tmp.c_str());}
+    xbg_logf("NVN r5 shader mirror %s: %zu bundles, %zu up to date, %zu copied (%.1f MB), %zu failed, %.0f ms%s",dst.c_str(),names.size(),same,copied,copied_bytes/1048576.0,failed,(timing_clock()-t0)/1e6,mirror_stop.load()?" (stopped)":"");
+}
+void mirror_join(){if(mirror_thread.joinable()){mirror_stop=true;mirror_thread.join();}}
+void mirror_start(){
+    mirror_join();{std::lock_guard<std::mutex> l(mu);ready.clear();}mirror_dir.clear();mirror_stop=false;
+    const char *fd=getenv("DM_FILES_DIR");const std::string src=cfg.shader_directory;
+    if(!fd || !*fd){xbg_logf("NVN r5 shader mirror off: DM_FILES_DIR is not set");return;}
+    const std::string files=fd;if(!src.compare(0,files.size(),files)){xbg_logf("NVN r5 shader mirror off: the shader directory %s is internal already",src.c_str());return;}
+    mirror_dir=files+"/dm-shader-mirror";mirror_thread=std::thread(mirror_main,src,mirror_dir);}
+void clear(){mirror_join();std::lock_guard<std::mutex> l(mu);bytes.clear();loaded.clear();ready.clear();total=peak=0;mirror_dir.clear();}
+std::mutex spv_mu;bool spv_listed=false;std::unordered_set<std::string> spv_names;
+bool spv_may_exist(const std::string &key){std::lock_guard<std::mutex> l(spv_mu);
+    if(!spv_listed){spv_listed=true;std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');dir=(cut==std::string::npos?dir:dir.substr(0,cut))+"/spv-override";
+        if(DIR *d=opendir(dir.c_str())){while(dirent *e=readdir(d)){std::string n=e->d_name;if(n.size()>4 && !n.compare(n.size()-4,4,".spv"))spv_names.insert(n.substr(0,n.size()-4));}closedir(d);}}
+    if(spv_names.count(key))return true;++r5_spv_skips;return false;}
+}
+void r5raw_stats(size_t &mem,size_t &peak,size_t &ready){std::lock_guard<std::mutex> l(r5raw::mu);mem=r5raw::total;peak=r5raw::peak;ready=r5raw::ready.size();}
 // Diagnostic (files/dm/spv-override/<key>.spv): this SPIR-V replaces the bundle's, for offline-optimized test modules.
 bool spv_override(const std::string &key,std::vector<uint32_t> &words){
+    if(r5_rawcache && !r5raw::spv_may_exist(key))return false;   // [r5] listed once
     std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string path=(cut==std::string::npos?dir:dir.substr(0,cut))+"/spv-override/"+key+".spv";
     FILE *f=fopen(path.c_str(),"rb");if(!f)return false;fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n<20 || n%4){fclose(f);return false;}
     std::vector<uint32_t> w(size_t(n)/4);bool ok=fread(w.data(),1,size_t(n),f)==size_t(n);fclose(f);if(!ok || w[0]!=0x07230203u)return false;
@@ -2695,8 +2957,12 @@ bool spv_override(const std::string &key,std::vector<uint32_t> &words){
 Shader *load_shader(const void *control){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
     const uint64_t load_t0=timing_clock();
-    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";FILE *f=fopen(path.c_str(),"rb");if(!f)xbg_fatalf("Missing genuine shader bundle %s",path.c_str());
-    fseek(f,0,SEEK_END);long length=ftell(f);rewind(f);need(length>=32 && length<=16*1024*1024,"Invalid shader bundle length");std::vector<uint8_t> bytes(length);need(fread(bytes.data(),1,bytes.size(),f)==bytes.size(),"Shader bundle read failed");fclose(f);
+    std::vector<uint8_t> bytes;int r5_from=0;   // [r5] DM_GFX_SHADER_RAWCACHE: 1 the warm-up's raw bytes, 2 the internal mirror, 3 the source
+    if(!(r5_rawcache&1) || !r5raw::take(key,bytes)){
+    std::string path=std::string(cfg.shader_directory)+"/"+key+".xgs";bool mirror=false;FILE *f=r5_rawcache&2?r5raw::open_bundle(key,path,mirror):fopen(path.c_str(),"rb");if(!f)xbg_fatalf("Missing genuine shader bundle %s",path.c_str());
+    fseek(f,0,SEEK_END);long length=ftell(f);rewind(f);need(length>=32 && length<=16*1024*1024,"Invalid shader bundle length");bytes.resize(size_t(length));need(fread(bytes.data(),1,bytes.size(),f)==bytes.size(),"Shader bundle read failed");fclose(f);
+    r5_from=mirror?2:3;}else r5_from=1;
+    if(r5_rawcache){const uint64_t dt=timing_clock()-load_t0;if(r5_from==1){++r5_ld_mem;r5_ld_mem_ns+=dt;}else if(r5_from==2){++r5_ld_mirror;r5_ld_mirror_ns+=dt;}else{++r5_ld_fuse;r5_ld_fuse_ns+=dt;}}
     xbg_shader_header h;memcpy(&h,bytes.data(),sizeof(h));need(h.magic==0x31534758 && h.version==1 && h.stage<6 && h.binding_count<=256 && h.input_count<=16 && h.c1_bytes<=65536 && h.spirv_bytes%4==0,"Invalid shader bundle header");
     size_t offset=sizeof(h),expected=offset+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes+h.spirv_bytes;need(expected==bytes.size(),"Shader bundle extent mismatch");
     // 载入各段耗时（读文件、SPIR-V 改写、分析、建模块），写进下面的 loaded 行。
@@ -2853,8 +3119,13 @@ VkShaderModule load_module(const std::string &key){
     if(file.size()>3 && !file.compare(file.size()-3,3,"!np")){vnp=true;file.resize(file.size()-3);}
     if(file.size()>3 && !file.compare(file.size()-3,3,"!ab")){vab=true;file.resize(file.size()-3);}
     if((vab && !r3_ab_bit) || (vnp && !no_psize))return VK_NULL_HANDLE;
-    FILE *f=fopen((std::string(cfg.shader_directory)+"/"+file+".xgs").c_str(),"rb");if(!f)return VK_NULL_HANDLE;
-    fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n<32 || n>16*1024*1024){fclose(f);return VK_NULL_HANDLE;}std::vector<uint8_t> b(static_cast<size_t>(n));bool ok=fread(b.data(),1,b.size(),f)==b.size();fclose(f);if(!ok)return VK_NULL_HANDLE;
+    std::vector<uint8_t> b;
+    if((r5_rawcache&1) && r5raw::get(file,b))++r5_warm_mem;   // [r5] DM_GFX_SHADER_RAWCACHE: a variant (!ab / !np) of a bundle read already
+    else{
+    std::string path=std::string(cfg.shader_directory)+"/"+file+".xgs";bool mirror=false;
+    FILE *f=r5_rawcache&2?r5raw::open_bundle(file,path,mirror):fopen(path.c_str(),"rb");if(!f)return VK_NULL_HANDLE;
+    fseek(f,0,SEEK_END);long n=ftell(f);rewind(f);if(n<32 || n>16*1024*1024){fclose(f);return VK_NULL_HANDLE;}b.resize(static_cast<size_t>(n));bool ok=fread(b.data(),1,b.size(),f)==b.size();fclose(f);if(!ok)return VK_NULL_HANDLE;
+    if(r5_rawcache&1)r5raw::put(file,b);}
     xbg_shader_header h;memcpy(&h,b.data(),sizeof(h));if(h.magic!=0x31534758 || h.version!=1 || h.spirv_bytes%4)return VK_NULL_HANDLE;
     size_t off=sizeof(h)+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes;if(off+h.spirv_bytes!=b.size())return VK_NULL_HANDLE;
     std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(file,w);gscull_rewrite(w,h.stage,file.c_str(),"warm");lone_rewrite(w,h.stage,file.c_str(),"warm");early_tests_rewrite(w,h.stage,file.c_str());invariant_rewrite(w,h.stage,file.c_str());relaxed_rewrite(w,h.stage,file.c_str());gather_ext_rewrite(w,file.c_str());quad_rewrite(w,h.stage,file.c_str(),"warm");warp_rewrite(w,h.stage,file.c_str(),"warm");tidy_rewrite(w,vab?r3_ab_bit:0);
@@ -3132,7 +3403,7 @@ struct Descriptors {
     bool needs_writeback()const{return !written.empty();}
     void defer_writeback(){const void *slot=&slots[slot_index];
         if((gscull_mask()&0x100) && state.shader[3]){if(gscull_ranges.size()>8192)gscull_ranges.clear();for(auto &v:written)gscull_ranges[v.first.first]=v.first.second;}
-        for(auto &v:written){alias_check(v.first.first,v.first.second,"storage-writeback");if(draw_detail)draw_timing.storage(v.first.second);snapshot_invalidate(v.first.first,v.first.second);pending_writebacks.push_back({v.first.first,v.first.second,*v.second,slot});}}
+        for(auto &v:written){alias_check(v.first.first,v.first.second,"storage-writeback");if(draw_detail)draw_timing.storage(v.first.second);snapshot_invalidate(v.first.first,v.first.second);pending_writebacks.push_back({v.first.first,v.first.second,*v.second,slot});++pend_gen;}}
     void writeback(){for(auto &v:written){if(draw_detail)draw_timing.storage(v.first.second);v.second->invalidate();invalidate_cpu_range(v.first.first,v.first.second);memcpy(reinterpret_cast<void*>(v.first.first),v.second->mapped,v.first.second);}}
     void capture_read_images(){for(auto &i:capture_inputs)capture_image(*i.image,i.has_view?&i.view:nullptr,i.label.c_str());}
 };
@@ -3239,8 +3510,27 @@ void frame(){if((min_bytes<=0 && race<=0) || stats.presents.load()-last_logged<3
     xbg_logf("NVN zc-ubo frames=300 bypassed=%llu tracked=%llu checks=%llu changed=%llu changed_KB=%llu",(unsigned long long)bypassed,(unsigned long long)tracked,(unsigned long long)checks,(unsigned long long)changed,(unsigned long long)(changed_bytes>>10));
     bypassed=tracked=checks=changed=changed_bytes=0;}
 }
+// [r4] DM_GFX_UBO_VIEWCACHE=1 (pipeline_audit.md 1.3 / section 5): a draw binds ~7.6 zero-copy uniform blocks and each one was
+// resolved again (a linear scan of pending_writebacks, zc::find over the chunks, the sticky-page loop). A successful view is
+// remembered per (address, bound size) with the two things that can take it away: pend_gen (a pending GPU result may now cover
+// it) and zc::sticky_gen (a page turned sticky). Chunks are only ever added, so a found chunk stays the chunk. Only successes are
+// kept; anything else takes the old path. =2: compare mode, both are computed, the old result is used, differences are counted
+// (NVN PERF r4 uboview mism=) and the first ones logged. A/B target uboview.
+namespace uboview {
+struct Entry{uint64_t addr=0,n=0,pend=0,sticky=0;Buffer b;};Entry table[1024];
+inline Entry &slot(uint64_t a,uint64_t n){return table[((a^(n<<40))*0x9E3779B97F4A7C15ull)>>54];}
+inline bool same(const Buffer &x,const Buffer &y){return x.buffer==y.buffer && x.memory==y.memory && x.offset==y.offset && x.size==y.size && x.mapped==y.mapped && x.coherent==y.coherent;}
+void clear(){for(auto &e:table)e=Entry{};}
+}
 Buffer uniform_snapshot(uint64_t address,size_t copy){
-    if(zc::enabled>0 && !(g_ui_moff!=0 && address==g_ui_moff_addr) && !zcubo::bypass(copy)){Buffer z;size_t n=uniform_range(copy);if(!overlaps_pending(address,n) && zc::view(address,n,properties.limits.minUniformBufferOffsetAlignment,z)){zcubo::bound(address,n);return z;}}
+    if(zc::enabled>0 && !(g_ui_moff!=0 && address==g_ui_moff_addr) && !zcubo::bypass(copy)){Buffer z;size_t n=uniform_range(copy);
+        if(ubo_vc && !r4_off("uboview")){uboview::Entry &e=uboview::slot(address,n);const bool hit=e.addr==address && e.n==n && e.pend==pend_gen && e.sticky==zc::sticky_gen;
+            if(hit && ubo_vc==1){++r4_uvc_hits;++zc::hits;zcubo::bound(address,n);return e.b;}
+            const bool ok=!overlaps_pending(address,n) && zc::view(address,n,properties.limits.minUniformBufferOffsetAlignment,z);
+            if(hit){++r4_uvc_hits;if(!ok || !uboview::same(e.b,z)){++r4_uvc_mism;++r4_uvc_mism_total;static unsigned told=0;if(told++<16)xbg_logf("NVN r4 uboview mismatch addr=%#llx bytes=%llu cached=%p+%llu now ok=%d %p+%llu",(unsigned long long)address,(unsigned long long)n,(void*)e.b.buffer,(unsigned long long)e.b.offset,int(ok),ok?(void*)z.buffer:nullptr,ok?(unsigned long long)z.offset:0ull);}}
+            else ++r4_uvc_misses;
+            if(ok){e.addr=address;e.n=n;e.pend=pend_gen;e.sticky=zc::sticky_gen;e.b=z;zcubo::bound(address,n);return z;}}
+        else if(!overlaps_pending(address,n) && zc::view(address,n,properties.limits.minUniformBufferOffsetAlignment,z)){zcubo::bound(address,n);return z;}}
     if(g_ui_moff!=0 && address==g_ui_moff_addr && copy>=64){   // 界面下移：投影矩阵另拷一份加纵向偏移，不进快照缓存 | UI shift: a separate copy of the projection matrix with a vertical offset, kept out of the snapshot caches
         Buffer src=uniform_snapshot_cached(address,copy);Buffer b=stream_buffer(uniform_range(copy),src.mapped,copy);
         float m[16],o=float(g_ui_moff);memcpy(m,b.mapped,64);m[1]+=o*m[3];m[5]+=o*m[7];m[9]+=o*m[11];m[13]+=o*m[15];memcpy(b.mapped,m,64);b.flush();return b;}
@@ -3427,13 +3717,23 @@ bool storage_gpu_merge(uint64_t base,uint64_t bytes,Descriptors &out,Buffer *&b,
 void descriptors(Descriptors &out,Commands &commands,bool compute){storage_images_bound.clear();
     need(!read_preflight || (pending_writebacks.empty() && pending_reports.empty()),"Unresolved CPU reads at descriptor entry");
     uint64_t tm0=perf_clock();struct MemoClock{uint64_t t0;~MemoClock(){}} mc{tm0};
-    static std::vector<uint64_t> key;key.clear();static std::vector<uint8_t> ktag;ktag.clear();
     // ktag (which part of the key each word is) only feeds the keydiff census, so it is filled on timed frames only (one in
     // perf_sample); a miss without tags skips the census. A/B target ktag tags every frame again.
     const bool tags=timing_now()!=nullptr || ab_off("ktag");
     bool ok=desc_memo_enabled && !compute && !capture.active && !provenance_file && g_ui_moff==0;
+    // [r4] DM_GFX_STATEGEN (sg above): the previous call's key and dynamic-uniform list are still right when that call was the
+    // last one, built a memoizable key, no command touching the key's inputs ran since and the shaders / pool memory are the same.
+    // =2 builds the key anyway and compares it with the one the fast path would have kept.
+    if(stategen)++sg::desc_calls;
+    const void *const sg_tp=state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,*const sg_sp=state.sampler_pool.pool?state.sampler_pool.pool->mem:nullptr;
+    const bool sg_same=stategen && ok && !tags && sg::desc_valid && sg::desc_call+1==sg::desc_calls && sg::desc_gen_at==sg::desc_gen && sg::desc_tp==sg_tp && sg::desc_sp==sg_sp
+        && sg::desc_sh[0]==state.shader[0] && sg::desc_sh[1]==state.shader[1] && sg::desc_sh[2]==state.shader[2] && sg::desc_sh[3]==state.shader[3] && sg::desc_sh[4]==state.shader[4] && !r4_off("stategen");
+    const bool sg_hit=sg_same && stategen==1;
+    static std::vector<uint64_t> key;static std::vector<uint8_t> ktag;if(!sg_hit){key.clear();ktag.clear();}
     if(ok){CPU_SCOPE(Descriptor);
-        static std::vector<DynUbo> dyn_ubos;dyn_ubos.clear();
+        static std::vector<DynUbo> dyn_ubos;
+        if(sg_hit){++r4_sg_desc;sg::desc_call=sg::desc_calls;}
+        else{dyn_ubos.clear();
         bool no_ubo=false;const unsigned dmode=dyn_mode_for(false,&no_ubo);memo_dyn_ok=dmode!=0 || no_ubo;
         for(unsigned st=0;st<5;st++){key.push_back(uint64_t(uintptr_t(state.shader[st])));if(tags)ktag.push_back(0);}
         key.push_back(state.texture_pool.pool?uint64_t(uintptr_t(state.texture_pool.pool->mem)):0);key.push_back(uint64_t(state.texture_pool.off));key.push_back(uint64_t(state.texture_pool.n));if(tags)ktag.insert(ktag.end(),3,1);
@@ -3463,9 +3763,16 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){storage_image
                 }
                 if(!ok)break;
             }}
+        if(stategen){static std::vector<uint64_t> k0;static std::vector<DynUbo> d0;   // k0 / d0: =2 only, the previous build
+            if(sg_same){bool eq=ok && k0==key && d0.size()==dyn_ubos.size();for(size_t i=0;eq && i<d0.size();i++)eq=d0[i].order==dyn_ubos[i].order && d0[i].address==dyn_ubos[i].address && d0[i].copy==dyn_ubos[i].copy;
+                if(!eq){++r4_sg_desc_mism;++r4_sg_mism_total;static unsigned told=0;if(told++<16)xbg_logf("NVN r4 stategen descriptor key mismatch vs=%s ps=%s ok=%d words %zu/%zu dyn %zu/%zu",state.shader[0]?state.shader[0]->key.c_str():"-",state.shader[4]?state.shader[4]->key.c_str():"-",int(ok),k0.size(),key.size(),d0.size(),dyn_ubos.size());}}
+            if(stategen==2){k0=key;d0=dyn_ubos;}
+            sg::desc_valid=ok;sg::desc_call=sg::desc_calls;sg::desc_gen_at=sg::desc_gen;sg::desc_tp=sg_tp;sg::desc_sp=sg_sp;for(unsigned i=0;i<5;i++)sg::desc_sh[i]=state.shader[i];++sg::key_ver;}
+        }
         DRAW_SUB(1);if(ok){memo_check_epoch();auto hit=desc_memo.end();
-            if(memo_front_gen==memo_mod_gen && memo_front_slot==slot_index && !ab_off("memofront") && memo_front_key==key){hit=memo_front_it;++memo_front_hits;}
-            else{hit=desc_memo.find(key);if(hit!=desc_memo.end()){memo_front_key=key;memo_front_it=hit;memo_front_gen=memo_mod_gen;memo_front_slot=slot_index;}}
+            if(sg_hit && memo_front_gen==memo_mod_gen && memo_front_slot==slot_index && sg::front_ver==sg::key_ver && !ab_off("memofront")){hit=memo_front_it;++memo_front_hits;}   // [r4] the front was found for this very key
+            else if(memo_front_gen==memo_mod_gen && memo_front_slot==slot_index && !ab_off("memofront") && memo_front_key==key){hit=memo_front_it;++memo_front_hits;}
+            else{hit=desc_memo.find(key);if(hit!=desc_memo.end()){memo_front_key=key;memo_front_it=hit;memo_front_gen=memo_mod_gen;memo_front_slot=slot_index;sg::front_ver=sg::key_ver;}}
             if(hit==desc_memo.end() && ktag.size()==key.size()){   // diagnostic: which key part differs from the last key of the same shaders
                 static std::unordered_map<std::vector<uint64_t>,std::vector<uint64_t>,SetKeyHash> last;std::vector<uint64_t> pre(key.begin(),key.begin()+5);
                 auto &prev=last[pre];if(prev.size()==key.size()){bool any=false;for(size_t i=0;i<key.size();i++)if(prev[i]!=key[i]){++key_diff[ktag[i]<12?ktag[i]:11];any=true;}if(!any)++key_diff[11];}else ++key_diff[prev.empty()?12:13];
@@ -3473,7 +3780,8 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){storage_image
             DRAW_SUB(2);if(hit!=desc_memo.end()){DescMemo &m=hit->second;
                 static std::vector<std::pair<uint64_t,Buffer>> fresh;fresh.clear();
                 for(auto &u:dyn_ubos)fresh.push_back({u.order,uniform_snapshot(u.address,u.copy)});
-                std::sort(fresh.begin(),fresh.end(),[](const std::pair<uint64_t,Buffer> &a,const std::pair<uint64_t,Buffer> &b){return a.first<b.first;});
+                {auto by_order=[](const std::pair<uint64_t,Buffer> &a,const std::pair<uint64_t,Buffer> &b){return a.first<b.first;};   // [r4] uboview: most lists come in order
+                 if(ubo_vc && !r4_off("uboview") && std::is_sorted(fresh.begin(),fresh.end(),by_order))++r4_uvc_sorted;else std::sort(fresh.begin(),fresh.end(),by_order);}
                 static std::vector<uint32_t> offsets;offsets.clear();bool same=true;size_t fi=0;
                 // Room for keep() below (support / driver blocks) and draw()'s vertex/index buffers. The count of the shaders' bindings
                 // is stored in the entry when it is made: the shaders are part of the key. A/B target descreserve counts them again.
@@ -3572,7 +3880,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
             if(storage_chain && !capture.active)for(auto w=pending_writebacks.rbegin();w!=pending_writebacks.rend();++w){
                 if(!xbg_wb_overlaps(base,bytes,w->addr,w->bytes))continue;
                 if(w->addr==base && w->bytes==bytes && (!pad || !(bytes&3)) && !w->viewed && w->slot==&slots[slot_index] && w->buffer.offset%properties.limits.minStorageBufferOffsetAlignment==0){
-                    b=out.keep(w->buffer);pending_writebacks.erase(std::next(w).base());++storage_chained;}
+                    b=out.keep(w->buffer);pending_writebacks.erase(std::next(w).base());++pend_gen;++storage_chained;}
                 else{static unsigned n=0;if(n++<30)xbg_logf("NVN storage-chain miss bind=%#llx+%llu newest=%#llx+%llu viewed=%d same_slot=%d align=%llu pending=%zu",(unsigned long long)base,(unsigned long long)bytes,(unsigned long long)w->addr,(unsigned long long)w->bytes,int(w->viewed),int(w->slot==&slots[slot_index]),(unsigned long long)(w->buffer.offset%properties.limits.minStorageBufferOffsetAlignment),pending_writebacks.size());}
                 break;}
             if(b){}
@@ -4174,8 +4482,23 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(ui_vs==1 && g_ui_moff==0)ui_uy=0;}
     DRAW_MARK(1);   // [perf4] section boundary (DM_GFX_DRAW_PROFILE): time since the previous mark goes to section 1-1
     draw_sub_on=true;Commands c(true);Descriptors &d=acquire_descriptors();DRAW_SUB(0);descriptors(d,c,false);DRAW_SUB(6);Pass p;create_pass(p,c);DRAW_SUB(7);draw_sub_on=false;DRAW_MARK(2);
+    // [r4] DM_GFX_STATEGEN: when no command that feeds the pipeline ran since the draw that last set the pipeline memo (sg::pso_gen)
+    // and this draw's own inputs (shaders and modules, layouts, render pass, primitive, samples, targets, restart, row order) are
+    // that draw's, its pipeline and vertex bindings are reused without rebuilding the create info and the memo key. It needs the
+    // pipeline memo (DM_GFX_PIPE_MEMO, set by the app): every place that drops pipelines clears pipe_memo_valid. =2 rebuilds and
+    // compares.
+    int zero_binding=-1;static std::vector<VkVertexInputBindingDescription> bindings;PipelineLease pipeline;
+    bool sg_pipe_same=false;uint32_t sg_restart=0;const VkPipeline sg_pred=pipe_memo_pipeline;
+    if(stategen && pipe_memo && pipe_memo_valid && sg::pipe_valid && sg::pso_gen_at==sg::pso_gen && !capture.active && pipeline_fast_enabled && !ab_off("pipefast") && !ab_off("pipememo") && !r4_off("stategen")){
+        const sg::Pipe &q=sg::pipe;bool same=q.prim==prim && q.layout==&d.entry->definition && q.pass_def==p.definition && q.pass==p.pass && q.pl==d.pipeline_layout && q.samples==uint32_t(p.samples) && q.colors==active_colors
+            && q.rt_n==uint32_t(state.rt.n) && q.depth==state.rt.depth && q.depth_format==(state.rt.depth?uint32_t(state.rt.depth->d.format):0u) && q.ll==taafix::lower_left() && d.entry->definition.valid && p.definition->valid;
+        for(unsigned i=0;i<5 && same;i++)same=q.sh[i]==state.shader[i] && q.mod[i]==modules[i];
+        if(same && state.restart.on && indexed){const VkPrimitiveTopology t=topology(prim);const bool strip=t==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || t==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+            const uint32_t ones=indexed->itype==0?0xffu:indexed->itype==1?0xffffu:0xffffffffu;sg_restart=strip && state.restart.index==ones;}
+        sg_pipe_same=same && q.restart==sg_restart;}
+    if(sg_pipe_same && stategen==1){bindings=sg::pipe.bindings;zero_binding=sg::pipe.zero_binding;state.restart_eff=sg_restart;pipeline.pipeline=sg_pred;++r4_sg_pipe;DRAW_MARK(3);}
+    else{
     static std::vector<VkVertexInputAttributeDescription> attributes;attributes.clear();VkVertexInputBindingDescription binding_slots[16];uint32_t binding_used=0;
-    int zero_binding=-1;
     for(size_t input=0;input<state.shader[0]->inputs.size();input++){
         uint32_t loc=state.shader[0]->inputs[input];need(loc<16,"Vertex input location out of bounds");va_st a;memcpy(&a,&state.attrib[loc],4);
         if(!a.fmt){
@@ -4190,7 +4513,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         }
         need(a.stream<16,"Vertex stream out of bounds");VkFormat fmt=format(a.fmt);const VkFormatProperties &fp=format_properties(fmt);need(fp.bufferFeatures&VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT,"Vertex format unsupported");need(state.stream[a.stream].divisor<=1,"Instance divisor >1 unsupported");attributes.push_back({loc,a.stream,fmt,a.offset});binding_slots[a.stream]={a.stream,state.stream[a.stream].stride,state.stream[a.stream].divisor?VK_VERTEX_INPUT_RATE_INSTANCE:VK_VERTEX_INPUT_RATE_VERTEX};binding_used|=1u<<a.stream;if(capture.active)capture_log("ATTRIBUTE location=%u stream=%u format=%u vk=%u offset=%u stride=%u divisor=%u",loc,a.stream,a.fmt,unsigned(fmt),a.offset,state.stream[a.stream].stride,state.stream[a.stream].divisor);
     }
-    static std::vector<VkVertexInputBindingDescription> bindings;bindings.clear();for(uint32_t i=0;i<16;i++)if(binding_used&(1u<<i))bindings.push_back(binding_slots[i]);   // ascending binding order, as the former std::map
+    bindings.clear();for(uint32_t i=0;i<16;i++)if(binding_used&(1u<<i))bindings.push_back(binding_slots[i]);   // ascending binding order, as the former std::map
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};vi.vertexBindingDescriptionCount=bindings.size();vi.pVertexBindingDescriptions=bindings.data();vi.vertexAttributeDescriptionCount=attributes.size();vi.pVertexAttributeDescriptions=attributes.data();
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};ia.topology=topology(prim);
     // Primitive restart: only on indexed strips / fans, and only when the restart index is the type's all-ones value (Vulkan's only one)
@@ -4219,7 +4542,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkPipelineTessellationStateCreateInfo tess{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};tess.patchControlPoints=state.patch_size;need((state.shader[1]!=nullptr)==(state.shader[2]!=nullptr),"Incomplete tessellation shader pair");
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.stageCount=stages.size();ci.pStages=stages.data();ci.pVertexInputState=&vi;ci.pInputAssemblyState=&ia;ci.pViewportState=&vp;ci.pRasterizationState=&rs;ci.pMultisampleState=&ms;ci.pDepthStencilState=&ds;ci.pColorBlendState=&blend;ci.pDynamicState=&dy;ci.pTessellationState=state.shader[1]?&tess:nullptr;ci.layout=d.pipeline_layout;ci.renderPass=p.pass;
     DRAW_MARK(3);   // [perf4] section boundary (DM_GFX_DRAW_PROFILE): time since the previous mark goes to section 3-1
-    PipelineLease pipeline;{CPU_SCOPE(Pipeline);
+    {CPU_SCOPE(Pipeline);
         static std::vector<uint32_t> fast;fast.clear();bool use_fast=pipeline_fast_enabled && !ab_off("pipefast") && d.entry->definition.valid && p.definition->valid;
         bool memo=use_fast && pipe_memo && !ab_off("pipememo");
         if(memo){pipe_memo_fill(pipe_memo_next,&d.entry->definition,p.definition,p.pass,d.pipeline_layout,prim,p.samples,active_colors);
@@ -4230,6 +4553,13 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(!pipeline.pipeline){XbgPipelineKey key;bool cacheable=xbg_graphics_pipeline_key(key,ci,d.entry->definition.view(),p.definition->view());pipeline_lookup(pipeline,key,cacheable,&ci,nullptr,async_skippable(attachments,ds));
             if(use_fast && cacheable && !pipeline.transient)pipeline_fast.emplace(fast,pipeline.pipeline);}
         if(memo && use_fast && pipeline.pipeline && !pipeline.transient){pipe_memo_key=pipe_memo_next;pipe_memo_pipeline=pipeline.pipeline;pipe_memo_valid=true;}}
+    if(stategen){   // [r4] compare (=2) and record the draw that set the pipeline memo
+        if(sg_pipe_same && (pipeline.pipeline!=sg_pred || !sg::same_bindings(bindings,sg::pipe.bindings) || zero_binding!=sg::pipe.zero_binding || state.restart_eff!=sg::pipe.restart)){++r4_sg_pipe_mism;++r4_sg_mism_total;
+            static unsigned told=0;if(told++<16)xbg_logf("NVN r4 stategen pipeline mismatch vs=%s ps=%s prim=%d predicted=%p built=%p bindings %zu/%zu",state.shader[0]?state.shader[0]->key.c_str():"-",state.shader[4]?state.shader[4]->key.c_str():"-",prim,(void*)sg_pred,(void*)pipeline.pipeline,sg::pipe.bindings.size(),bindings.size());}
+        sg::pipe_valid=pipe_memo_valid && pipeline.pipeline && pipeline.pipeline==pipe_memo_pipeline && !pipeline.transient;
+        if(sg::pipe_valid){sg::Pipe &q=sg::pipe;for(unsigned i=0;i<5;i++){q.sh[i]=state.shader[i];q.mod[i]=modules[i];}q.layout=&d.entry->definition;q.pass_def=p.definition;q.pass=p.pass;q.pl=d.pipeline_layout;q.prim=prim;q.samples=uint32_t(p.samples);q.colors=active_colors;
+            q.rt_n=uint32_t(state.rt.n);q.depth=state.rt.depth;q.depth_format=state.rt.depth?uint32_t(state.rt.depth->d.format):0u;q.restart=state.restart_eff;q.ll=taafix::lower_left();q.bindings=bindings;q.zero_binding=zero_binding;sg::pso_gen_at=sg::pso_gen;}}
+    }
     // gfx-async-pipelines: this draw is skipped while its pipeline builds in the background
     if(!pipeline.pipeline)return;
     if(pipe_stats){uint64_t fr=stats.presents.load();uint64_t w0=pstat_from;if(pstat_period && fr>=pstat_from)w0=pstat_from+(fr-pstat_from)/pstat_period*pstat_period;
@@ -4780,7 +5110,7 @@ bool gpu_buffer_copy(uint64_t src,uint64_t dst,uint64_t n){preflight_cpu_reads()
     invalidate_cpu_range(dst,n);
     Slot &s=recording_slot();end_open_pass();Buffer b=readback_buffer(n);
     VkBufferCopy region{view.offset,b.offset,n};vkCmdCopyBuffer(s.cmd,view.buffer,b.buffer,1,&region);full_barrier(s.cmd);
-    pending_writebacks.push_back({dst,n,b,&s});return true;
+    pending_writebacks.push_back({dst,n,b,&s});++pend_gen;return true;
 }
 void resolve_texture(const p_copy_t2t &p){preflight_cpu_reads();
     Image &s=get_image(p.src,true),&d=get_image(p.dst,false);
@@ -4841,7 +5171,7 @@ bool gpu_indirect_try(const xbg_indirect &p,bool single){
     const bool args_gpu=overlaps_pending(a0,range),count_gpu=!single && overlaps_pending(p.count_address,4),index_gpu=p.index_type>0 && overlaps_pending(p.index_address,4);
     if(!args_gpu && !count_gpu && !index_gpu){++gpu_indirect_cpu;return false;}   // everything final in guest memory: the CPU path reads it without a sync
     if(!single && !pfn_draw_indexed_indirect_count){++gpu_indirect_fallbacks;return false;}
-    GpuIndirect gi;gi.max_count=n;gi.stride=stride;Buffer view,args_b,count_b,index_b;
+    GpuIndirect gi;gi.max_count=n;gi.stride=stride;Buffer view,args_b,count_b,index_b;size_t tail_lim=0,tail_check=0;
     if(args_gpu){if(!pending_view(a0,range,4,view)){++gpu_indirect_fallbacks;return false;}args_b=view;}
     else args_b=snapshot(a0,size_t(range));gi.args=&args_b;
     if(!single){if(count_gpu){if(!pending_view(p.count_address,4,4,view)){++gpu_indirect_fallbacks;return false;}count_b=view;}else count_b=snapshot(p.count_address,4);gi.count=&count_b;}
@@ -4849,13 +5179,40 @@ bool gpu_indirect_try(const xbg_indirect &p,bool single){
         if(index_gpu){if(!pending_tail(p.index_address,view)){++gpu_indirect_fallbacks;return false;}index_b=view;}
         else{size_t avail=std::min<size_t>(command_available(reinterpret_cast<const uint8_t*>(p.index_address)),8u<<20);
             if(uint64_t t=zc::tail(p.index_address))avail=std::min<size_t>(avail,size_t(t));
+            // [r4] DM_GFX_INDEX_TAIL_CLAMP (pipeline_audit.md 3.6): the indices start in final guest memory (index_gpu is false), and the
+            // draw count / first index are GPU results not known yet, so the old copy took everything up to the 8 MB / chunk cap
+            // (7.4-8 MB a frame). Bytes from the first pending GPU result above index_address on are not in guest memory yet: the old
+            // plain copy (snap_no_sync) handed the draw stale bytes there, never the GPU's: a draw whose indices run into that range
+            // already read garbage. Only a draw whose first index jumps over the whole GPU range could lose valid indices; the CPU
+            // cannot rule that out (the arguments are GPU results), so =2 measures it before =1 is trusted (in DOOM the GPU range
+            // above the indices is the 256-byte argument block of the culling pass). The clamp copies [index_address, that start)
+            // and never less than one index. =1 clamps; =2 compare: copies the old size, and after each such draw the GPU arguments it consumed
+            // are copied back and checked at retire (first + count past the clamp = NVN PERF r4 tail bad=, logged). A/B tailclamp.
+            tail_lim=avail;
+            if(tail_clamp && !r4_off("tailclamp")){for(auto &w:pending_writebacks)if(w.addr>p.index_address && w.addr-p.index_address<tail_lim)tail_lim=size_t(w.addr-p.index_address);
+                tail_lim=std::max<size_t>(tail_lim,size_t(4));if(tail_lim>avail)tail_lim=avail;
+                ++r4_tail_draws;if(tail_lim<avail)++r4_tail_clamped;r4_tail_saved+=tail_clamp==1?avail-tail_lim:0;if(tail_clamp==1)avail=tail_lim;}
+            r4_tail_bytes+=tail_clamp?avail:0;
             // zero-copy: bind the guest indices themselves (a pending result elsewhere in the range is not an index the draw reads)
             static int zc_index=-1;if(zc_index<0){const char *e=getenv("DM_GFX_ZC_INDEX");zc_index=e?atoi(e)!=0:0;}   // binding AHB memory as an indirect draw's index buffer crashed the Adreno driver later (vkCmdBeginRenderPass)
             if(!(zc_index && zc::view(p.index_address,avail&~size_t(3),4,index_b))){snap_no_sync=true;index_b=snapshot(p.index_address,avail);snap_no_sync=false;}}
         gi.index=&index_b;
+        if(tail_clamp==2 && !index_gpu && !r4_off("tailclamp"))tail_check=tail_lim;
     }
     p_draw_idx indexed{p.primitive,p.index_type,1,0,0,1,p.index_address};
     draw(p.primitive,0,1,p.index_type>=0?&indexed:nullptr,1,0,&gi);++gpu_indirect_draws;
+    // [r4] DM_GFX_INDEX_TAIL_CLAMP=2: the arguments this draw consumed, checked against the clamp once the slot retires
+    if(tail_check && gi.args && gi.index){const uint32_t n=single?1u:std::min<uint32_t>(gi.max_count,16u);const int isz=p.index_type;const size_t lim=tail_check;const uint64_t idx=p.index_address;
+        Buffer host=readback_buffer(size_t(n)*20+4);VkCommandBuffer cmd=recording_slot().cmd;end_open_pass();
+        for(uint32_t i=0;i<n;i++){VkBufferCopy r{gi.args->offset+VkDeviceSize(i)*gi.stride,host.offset+VkDeviceSize(i)*20,20};vkCmdCopyBuffer(cmd,gi.args->buffer,host.buffer,1,&r);}
+        if(gi.count){VkBufferCopy r{gi.count->offset,host.offset+VkDeviceSize(n)*20,4};vkCmdCopyBuffer(cmd,gi.count->buffer,host.buffer,1,&r);}
+        VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};hb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;hb.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&hb,0,nullptr,0,nullptr);
+        const bool has_count=gi.count!=nullptr;
+        recording_slot().retire.handles.push_back([host,n,isz,lim,idx,has_count]()mutable{host.invalidate();const uint8_t *m=static_cast<const uint8_t*>(host.mapped);
+            uint32_t draws=n;if(has_count){uint32_t c;memcpy(&c,m+size_t(n)*20,4);draws=std::min(draws,c);}
+            for(uint32_t i=0;i<draws;i++){uint32_t v[5];memcpy(v,m+size_t(i)*20,20);++r4_tail_checked;if(!v[0])continue;
+                const uint64_t end=(uint64_t(v[2])+v[0])<<isz;
+                if(end>lim){++r4_tail_bad;++r4_tail_bad_total;static unsigned told=0;if(told++<24)xbg_logf("NVN r4 tail clamp would cut a draw: idx=%#llx clamp=%zu first=%u count=%u end=%llu",(unsigned long long)idx,lim,v[2],v[0],(unsigned long long)end);}}});}
     // [DOOM] DM_GFX_GSCULL_FIX 0x100 on the GPU path (never blocks): for one in 8 indexed draws whose indices come from a
     // culling GS range, the arguments the draw consumed are copied to a host buffer after it and checked when the slot retires
     // (count + firstIndex past the range, count not a multiple of 3, start not at the range). Costs a pass split per sample.
@@ -4952,6 +5309,7 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         {Slot &cur=slots[slot_index];if(cur.recording && cur.stream.used_total+cur.readback.used_total>arena_flush_bytes){SiteScope site(SITE_ARENA);submit_slots(false);}}
         if(chunk::mid)chunk_mid_check();   // [DOOM] DM_GFX_CHUNK_MID: same boundary, after the previous command is fully recorded
         size_t available=command_available(pc);need(available>=8,"Truncated command header");op_hdr h;memcpy(&h,pc,8);need(h.size>=8 && !(h.size&7) && h.size<=available,"NVN command size outside pool");const uint8_t *p=pc+8;size_t n=h.size-8;cur_op=h.op;
+        if(stategen){const unsigned o=unsigned(h.op);if(o>=256 || !sg::quiet_desc[o])++sg::desc_gen;if(o>=256 || !sg::quiet_pso[o])++sg::pso_gen;}   // [r4] DM_GFX_STATEGEN
         switch(h.op){
         case OP_END:return;
         case OP_BEGIN:break;
@@ -5054,7 +5412,7 @@ PerfCounts perf_counts(){return {pipeline_objects.size(),layout_cache.size(),sam
 void destroy_slots(){
     poolreset::drain();for(auto &s:slots)s.reset_queued=false;
     for(unsigned i=0;i<slot_max;i++)texel_evict(i,true);
-    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();s.viewed.clear();s.guard.clear();s.pro_ops.clear();s.pro=VK_NULL_HANDLE;if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
+    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();s.readback_alt.release();s.viewed.clear();s.guard.clear();s.pro_ops.clear();s.pro=VK_NULL_HANDLE;if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
     slot_index=0;snapshot_reset();
 }
 } // namespace
@@ -5168,6 +5526,17 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
       r3_variants=r3_ab_bit!=0 || no_psize;r3_memo_flip=r3_ab_bit!=0 || (no_psize && period>0 && (!strcmp(target,"psize") || !strcmp(target,"r3")));}
      r3_log=ldc_canon || halfflag_fold || f2i_notrunc || texcoord_unguard || no_psize || lazy_clear_on || flip_fold_on || dead_box_on;
      if(r3_log)xbg_logf("NVN r3 switches: ldc_canon=%d halfflag_fold=%d f2i_notrunc=%d texcoord_nan_guard=%d no_psize=%d lazy_clear=%d present_flip_fold=%d skip_dead_box=%d ab_variant=%#x",int(ldc_canon),int(halfflag_fold),int(f2i_notrunc),int(!texcoord_unguard),int(no_psize),int(lazy_clear_on),int(flip_fold_on),int(dead_box_on),r3_ab_bit);}
+    // [r5] round-5 switches (the r5 globals), read before the warm-up starts: DM_GFX_SHADER_RAWCACHE keeps what the warm-up reads.
+    // Since 01.11 RAWCACHE=3 and DESWZ_DIRECT=1 are the defaults (Mi 13 Pro: TV-room entry hitch 565-744 -> 256-275 ms, level-start
+    // texture upload 348-399 -> 138-217 ms, compare mode 0 mismatches in 421942 blocks); ARENA_KEEP / PROTECT_CHURN stay opt-in.
+    {auto env_int=[](const char *n,int d){const char *e=getenv(n);return e && *e?atoi(e):d;};
+     r5raw::clear();r5_rawcache=std::clamp(env_int("DM_GFX_SHADER_RAWCACHE",3),0,3);r5raw::cap=size_t(std::clamp(env_int("DM_GFX_SHADER_RAWCACHE_MB",32),1,512))<<20;
+     r5_deswz=std::clamp(env_int("DM_GFX_DESWZ_DIRECT",1),0,2);r5_churn=env_int("DM_GFX_PROTECT_CHURN",0)!=0;
+     {const char *e=getenv("DM_GFX_ARENA_KEEP");r5_decay=e && !strncmp(e,"decay",5);r5_decay_ns=8000000000ull;if(r5_decay && e[5]==':')r5_decay_ns=uint64_t(std::clamp(atof(e+6),1.0,600.0)*1e9);}
+     r5_log=r5_rawcache || r5_deswz || r5_churn || r5_decay || env_int("DM_GFX_R5_LOG",0)!=0;r5_log_t=0;
+     if(r5_rawcache&2)r5raw::mirror_start();
+     if(r5_log)xbg_logf("NVN r5 switches: shader_rawcache=%d (memory cap %zu MB, mirror %s) deswz_direct=%d arena_keep=%s (window %.0f s) protect_churn=%d",r5_rawcache,r5raw::cap>>20,r5raw::mirror_dir.empty()?"off":r5raw::mirror_dir.c_str(),
+                        r5_deswz,r5_decay?"decay":"peak",r5_decay_ns/1e9,r5_churn);}
     xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;sampler_minmax_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-async-pool-reset").c_str(),"rb");poolreset::enabled=false;if(w){poolreset::enabled=fgetc(w)!='0';fclose(w);}else if(const char *e=getenv("DM_GFX_ASYNC_POOL_RESET"))poolreset::enabled=atoi(e)!=0;poolreset::start();xbg_logf("NVN async command pool reset=%d (marker gfx-async-pool-reset)",int(poolreset::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;unsigned long long from=0,period=0,count=0;if(fscanf(w,"%llu %llu %llu",&from,&period,&count)>=2){pass_prof_next=from;pass_prof_period=period?period:1;if(count)pass_prof_until=from+count;}fclose(w);}}
@@ -5215,6 +5584,27 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
        xbg_logf("NVN compatibility format_feature_flags2=%d depth16_as_d24=%d",int(format_feature_flags2),int(depth16_as_d24));}
       for(size_t at=0;at<list.size();at+=900)xbg_logf("NVN caps extensions[%zu] %s",at/900,list.substr(at,900).c_str());
       xbg_logf("NVN caps api=%u.%u.%u driver=%u maxUBdyn=%u maxPerStageUB=%u minUBAlign=%llu maxBoundSets=%u",VK_API_VERSION_MAJOR(properties.apiVersion),VK_API_VERSION_MINOR(properties.apiVersion),VK_API_VERSION_PATCH(properties.apiVersion),properties.driverVersion,properties.limits.maxDescriptorSetUniformBuffersDynamic,properties.limits.maxPerStageDescriptorUniformBuffers,(unsigned long long)properties.limits.minUniformBufferOffsetAlignment,properties.limits.maxBoundDescriptorSets);}
+     // [r4] round-4 switches (the r4 block after ab_enabled). Read once per session. 4a / 4c / 4d (and 4b in nvn_dirty.c) are on by
+     // default since 01.11: compare modes on the Mi 13 Pro found 0 mismatches (501 indirect draws, tail clamp; UBO view cache; state
+     // gen), and at the heaviest spot the translator CPU fell 12.9 -> 12.5 ms per frame (fps unchanged: the frame is GPU-bound). =0 off.
+     {auto env_int=[](const char *n,int d){const char *e=getenv(n);return e && *e?atoi(e):d;};
+      tail_clamp=std::clamp(env_int("DM_GFX_INDEX_TAIL_CLAMP",1),0,2);ubo_vc=std::clamp(env_int("DM_GFX_UBO_VIEWCACHE",1),0,2);stategen=std::clamp(env_int("DM_GFX_STATEGEN",1),0,2);
+      pbgen_mode=nvn_dirty_pbgen_mode && nvn_dirty_protect_gen && nvn_dirty_since_bits && nvn_dirty_page_shift?nvn_dirty_pbgen_mode():0;   // the tracker's own reading of DM_DIRTY_PROTECT_BGEN
+      {FILE *q=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-verbose").c_str(),"rb");int c=-1;if(q){c=fgetc(q);fclose(q);}const char *e=getenv("DM_GFX_PERF_VERBOSE");perf_quiet=c>=0?c=='0':(e && *e && atoi(e)==0);}
+      {const char *e=getenv("DM_GFX_DRAW_PROFILE");perf_force_verbose=e && *e && *e!='0';}
+      rb_ab=readback_cached;uboview::clear();sg::invalidate();sg::desc_calls=sg::desc_call=0;
+      for(auto &q:sg::quiet_desc)q=false;for(auto &q:sg::quiet_pso)q=false;
+      for(unsigned o:{unsigned(OP_BEGIN),unsigned(OP_END),unsigned(OP_JUMP),unsigned(OP_CALL),unsigned(OP_DRAW),unsigned(OP_DRAW_IDX),unsigned(OP_X_MULTI_DRAW_INDIRECT),unsigned(OP_X_DRAW_CALL),unsigned(OP_X_DRAW_INDIRECT),
+                      unsigned(OP_BIND_VBUF),unsigned(OP_UPDATE_UB),unsigned(OP_COPY_STRIDE),unsigned(OP_COPY_IMAGE_STRIDE),unsigned(OP_X_FENCE_SYNC),unsigned(OP_X_WAIT_SYNC)})if(o<256)sg::quiet_desc[o]=sg::quiet_pso[o]=true;
+      // the descriptor key does not read the targets, scissor, depth range, vertex layout or the fixed-function pipeline state
+      for(unsigned o:{unsigned(OP_SET_RT),unsigned(OP_SCISSOR),unsigned(OP_DEPTH_RANGE),unsigned(OP_BIND_VATTR),unsigned(OP_BIND_VSTREAM),unsigned(OP_STENCIL),unsigned(OP_POLY_OFFSET),unsigned(OP_BLEND_COLOR),
+                      unsigned(OP_X_PRIM_RESTART),unsigned(OP_X_DEPTH_CLAMP),unsigned(OP_X_RAST_DISCARD),unsigned(OP_X_DEPTH_BOUNDS),unsigned(OP_X_PATCH_SIZE)})if(o<256)sg::quiet_desc[o]=true;
+      // the pipeline does not read buffer / texture bindings, pools or the (dynamic) viewport and scissor
+      for(unsigned o:{unsigned(OP_BIND_UBO),unsigned(OP_BIND_SSBO),unsigned(OP_BIND_TEX),unsigned(OP_BIND_SAMP),unsigned(OP_BIND_IMG),unsigned(OP_VIEWPORTS),unsigned(OP_SCISSOR),unsigned(OP_DEPTH_RANGE),
+                      unsigned(OP_SET_TEX_POOL),unsigned(OP_SET_SAMP_POOL)})if(o<256)sg::quiet_pso[o]=true;
+      if(stategen && !pipe_memo)xbg_logf("NVN r4 DM_GFX_STATEGEN: the pipeline part needs the pipeline memo (DM_GFX_PIPE_MEMO=1), only the descriptor key part works");
+      r4_log=tail_clamp || pbgen_mode || ubo_vc || stategen || perf_quiet || rb_ab;
+      if(r4_log)xbg_logf("NVN r4 switches: index_tail_clamp=%d dirty_protect_bgen=%d ubo_viewcache=%d stategen=%d perf_quiet=%d (forced verbose=%d) readback_cached=%d (A/B targets tailclamp pbgen uboview stategen perfquiet rbcached, group r4)",tail_clamp,pbgen_mode,ubo_vc,stategen,int(perf_quiet),int(perf_force_verbose),int(rb_ab));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-toggle").c_str(),"rb");ab_period=0;if(m){if(fscanf(m,"%d",&ab_period)!=1)ab_period=0;fclose(m);}{FILE *t=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-target").c_str(),"rb");memset(ab_target,0,sizeof ab_target);if(t){if(fscanf(t,"%15s",ab_target)!=1)ab_target[0]=0;fclose(t);}}xbg_logf("NVN PERF ab_period=%d",ab_period);}
      ++slot_serial;gfx_enqueued=0;gfx_executed=0;gfx_presents_queued=0;gfx_async=false; /* Android game command memory remains guest-owned. */if(gfx_async)gfx_worker=std::thread(gfx_worker_loop);xbg_logf("NVN async translation=%d",int(gfx_async));}
     return 0;
@@ -5300,7 +5690,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();bright::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();++pend_gen;pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();r5raw::clear();bright::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 extern "C" void xbg_game_frame_counters(xbg_frame_counters *out){if(out)*out={hud::pipelines.load(),hud::pipeline_ns.load(),hud::shaders.load(),hud::shader_ns.load(),hud::uploads.load(),hud::reuploads.load(),hud::upload_bytes.load(),hud::upload_ns.load()};}
 extern "C" void xbg_game_set_frame(uint64_t frame){hud::frame.store(frame,std::memory_order_relaxed);}

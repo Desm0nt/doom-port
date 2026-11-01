@@ -49,7 +49,7 @@ enum { PG_GONE = 3, PG_REST = 4 };
 // 跟踪区间 = 各内存池（MemoryPoolInitialize 登记）。池销毁后复用 live=0 的槽，信号处理里无锁扫描。
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 #define MAX_RANGE 4096   // 原为 256：内存池多于它时超出的池不跟踪，里面的贴图每次取用都当成脏的重传（暗黑实测峰值见内存读数行的「内存池」；塞尔达约 300 个，踩过）。扫描只到已用的槽数，容量大不增加开销 | was 256: with more memory pools than that the excess pools are untracked and their textures are treated as dirty and re-uploaded on every use (for Diablo's measured peak see "memory pools" in the memory readout line; Zelda has about 300 and hit this). The scan only covers slots in use, so a larger capacity costs nothing
-typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; _Atomic uint64_t *bgen; size_t bcap; } range_t;
+typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live; _Atomic uint64_t *bgen; size_t bcap; uint64_t reg; } range_t;   // reg: [r4] registration number (nvn_dirty_protect_gen cookies)
 // [perf6] DM_DIRTY_BLOCKS=1 (default 1 since 30.10): bgen[b] = newest page generation in block b (64 pages = 256 KB), kept with a CAS max on
 // every unprotect, so nvn_dirty_since skips clean blocks instead of loading every page's generation. The engine asks once per
 // guest submit per sampled texture (~7 submits a frame); DOOM's VT caches are 33-89 MB (8-22k pages each).
@@ -98,10 +98,23 @@ static range_t *find(uintptr_t a) {
     for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) return &g_r[i];
     return NULL;
 }
+// [r4] DM_DIRTY_PROTECT_BGEN (engine round 4b, read once at the first pool registration, before any page is protected): while
+// set, every unprotect is counted in flight from before it takes its generation until its page is NONE (generation and block
+// summary stored). nvn_dirty_protect_gen takes a new floor only when it saw none in flight right after reading g_now, so an
+// unprotect with a generation <= that floor has its block summary visible to the walk. Unset: nothing below changes.
+static int g_pbgen = -1;   // -1 = not read yet (pbgen_read)
+static int pbgen_read(void) {
+    if (g_pbgen < 0) { const char *e = getenv("DM_DIRTY_PROTECT_BGEN"); int v = e && *e ? atoi(e) : 1; if (v < 0 || v > 3) v = 0; g_pbgen = v;   /* on (1) by default since 01.11 */
+        if (v) LOG("[nvn] DM_DIRTY_PROTECT_BGEN=%d (1 windows, 2 safe part only, 3 windows + verify)", v); }
+    return g_pbgen;
+}
+static _Atomic int g_unprot_inflight;
 static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态从 PROT 改成 BUSY | The caller has already changed the state from PROT to BUSY
+    const int count = g_pbgen > 0; if (count) atomic_fetch_add(&g_unprot_inflight, 1);
     mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
     { uint64_t g = atomic_fetch_add(&g_now, 1) + 1; atomic_store(&r->gen[p], g); bgen_note(r, p, g); }
     atomic_store(&r->state[p], PG_NONE);
+    if (count) atomic_fetch_sub(&g_unprot_inflight, 1);
 }
 // ---------- [DOOM] DM_TEX_DISCARD: restore requests (signal-safe: atomics, futex, nanosleep only) ----------
 enum { NREQ = 64, GONE_WAIT_MS = 60000 };
@@ -183,7 +196,9 @@ static void prep_write(void *addr, size_t len) {
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
     static int inited;
-    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb); dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
+    if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb);
+        pbgen_read();   // before any page can be protected, so unprotect_page always sees the final value
+        dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -216,6 +231,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     if (blocks_on()) { if (r->bcap < nb) { bgen = calloc(nb, sizeof *bgen); if (!bgen) die("dirty block table allocation failed (%zu)", nb); r->bcap = nb; } else memset((void *)bgen, 0, nb * sizeof *bgen); }
     else bgen = NULL;
     r->base = base; r->end = end; r->state = state; r->gen = gen; r->bgen = bgen;
+    { static uint64_t reg_seq; r->reg = ++reg_seq; }   // under g_slot_mu
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     pthread_mutex_unlock(&g_slot_mu);
@@ -265,6 +281,71 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     }
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // 上传前最后一次写的代号 ≤ 戳；之后的写必 > 戳 | The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
+}
+// ---------- [r4] DM_DIRTY_PROTECT_BGEN (engine round 4b; nvn_dirty.h) ----------
+int nvn_dirty_pbgen_mode(void) { return pbgen_read(); }   // the engine may ask before the first pool registration
+unsigned nvn_dirty_page_shift(void) { return (unsigned)g_shift; }
+// Pages p..q: NONE -> BUSY -> one mprotect per run -> PROT, like nvn_dirty_protect, but the state byte is loaded first and the CAS
+// is tried only on NONE (test-and-test-and-set; a CAS on a PROT page fails anyway). verify_floor != UINT64_MAX: count the pages
+// taken whose generation is <= verify_floor into *missed (a page the window walk should have protected).
+static void protect_run(range_t *r, uintptr_t p, uintptr_t q, uint64_t verify_floor, uint64_t *missed) {
+    uintptr_t run = 0; int open = 0;
+    for (uintptr_t i = p; i <= q + 1; i++) {
+        int took = 0;
+        if (i <= q) { uint8_t st = atomic_load(&r->state[i]); if (st == PG_NONE) took = atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY); }
+        if (took && verify_floor != UINT64_MAX && atomic_load(&r->gen[i]) <= verify_floor) ++*missed;
+        if (took && !open) { run = i; open = 1; }
+        if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+    }
+}
+// Why visiting only the windows (64-page blocks) whose summary bgen is above the cookie's floor protects every writable page:
+// a page becomes writable (NONE) only through unprotect_page, which takes generation g from g_now and stores gen and bgen
+// before it stores NONE, all inside the in-flight count. The walk reads s = g_now first, then the in-flight count, then the
+// block summaries. If the count was 0, every unprotect with g <= s had finished (its bgen >= g is visible) before the summaries
+// were read; any later unprotect gets g > s. So after a walk that visited every block with bgen > F, every NONE page has
+// gen > s, and s is the next floor; by induction every NONE page has a generation above the floor at the next call, i.e.
+// lies in a block whose summary is above it. A count != 0 keeps the old floor (still valid: protecting never adds NONE
+// pages). The first call of a cookie (floor 0), another range or registration (pool re-created) and ranges without block
+// summaries (DM_DIRTY_BLOCKS=0) walk every page.
+void nvn_dirty_protect_gen(const void *addr, size_t len, nvn_dirty_cookie *ck, int mode, nvn_dirty_pstat *st) {
+    if (!len) return;
+    range_t *r = find((uintptr_t)addr);   // one lookup (nvn_dirty_protect does nvn_dirty_tracked and then find again)
+    if (!r || (uintptr_t)addr + len > r->end) return;
+    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    const int same = ck->reg == r->reg && ck->addr == a && ck->len == len;
+    const int windows = (mode & 1) && g_pbgen > 0 && r->bgen;
+    const uint64_t floor = windows && same ? ck->floor : 0;
+    // s, then the in-flight count (both seq_cst, before any block summary is read); a few retries ride out a fault in progress
+    uint64_t s = atomic_load(&g_now); int quiet = atomic_load(&g_unprot_inflight) == 0;
+    for (int k = 0; !quiet && windows && k < 32; k++) { sched_yield(); s = atomic_load(&g_now); quiet = atomic_load(&g_unprot_inflight) == 0; }
+    ++st->calls;
+    if (!floor) { protect_run(r, p, q, UINT64_MAX, NULL); st->pages += q - p + 1; ++st->full; }
+    else for (uintptr_t b = p >> BLK_SHIFT, bq = q >> BLK_SHIFT; b <= bq; b++) {
+        if (atomic_load(&r->bgen[b]) <= floor) continue;
+        uintptr_t lo = b << BLK_SHIFT, hi = lo + (1u << BLK_SHIFT) - 1; if (lo < p) lo = p; if (hi > q) hi = q;
+        protect_run(r, lo, hi, UINT64_MAX, NULL); st->pages += hi - lo + 1; ++st->windows;
+    }
+    if (floor && (mode & 2)) protect_run(r, p, q, quiet ? s : floor, &st->missed);   // verify: a full walk after it must find nothing old
+    if (windows) { if (quiet) ck->floor = s; else { if (!same) ck->floor = 0; ++st->kept; } }
+    ck->reg = r->reg; ck->addr = a; ck->len = len;
+}
+size_t nvn_dirty_since_bits(const void *addr, size_t len, uint64_t stamp, uint64_t *bits, size_t nwords, uint64_t *windows) {
+    if (!len) return 0;
+    range_t *r = find((uintptr_t)addr);
+    if (!r || (uintptr_t)addr + len > r->end) return 0;
+    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    const size_t np = q - p + 1, nw = (np + 63) >> 6;
+    if (nw > nwords) return 0;
+    memset(bits, 0, nw * sizeof *bits);
+    if (r->bgen) {   // the same block-summary shortcut as nvn_dirty_since
+        for (uintptr_t b = p >> BLK_SHIFT, bq = q >> BLK_SHIFT; b <= bq; b++) {
+            if (atomic_load(&r->bgen[b]) <= stamp) continue;
+            ++*windows;
+            uintptr_t lo = b << BLK_SHIFT, hi = lo + (1u << BLK_SHIFT) - 1; if (lo < p) lo = p; if (hi > q) hi = q;
+            for (uintptr_t i = lo; i <= hi; i++) if (atomic_load(&r->gen[i]) > stamp) bits[(i - p) >> 6] |= 1ull << ((i - p) & 63);
+        }
+    } else for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) bits[(i - p) >> 6] |= 1ull << ((i - p) & 63);
+    return np;
 }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;
