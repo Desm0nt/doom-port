@@ -1,14 +1,20 @@
-"""Extract ExeFS (main, sdk, subsdk*, main.npdm) from the program NCZ inside an NSZ.
+"""Extract ExeFS (main, sdk, subsdk*, main.npdm) from the program NCZ inside an NSZ or XCZ.
 
 NCZ layout (nsz project): first 0x4000 bytes are the original NCA header area (encrypted),
-then "NCZSECTN" + section table, then either an "NCZBLOCK" header + blocks or one zstd stream.
-The decompressed stream is the *plaintext* NCA body starting at offset 0x4000, so section data
-needs no AES once decompressed. The stream is read forward only; bytes before the requested
-offset are discarded, so memory stays bounded even when ExeFS sits at the end of the NCA.
+then "NCZSECTN" + section table, then either an "NCZBLOCK" header + blocks or one zstd stream
+(both read by ncz2nsp.NczBody). The decompressed stream is the *plaintext* NCA body starting at
+offset 0x4000, so section data needs no AES once decompressed. The stream is read forward only;
+bytes before the requested offset are discarded, so memory stays bounded even when ExeFS sits at
+the end of the NCA. extract(..., entry=NAME) picks one NCZ (e.g. the update's program when the
+package also holds the base game); by default the first program NCZ is used.
 """
 from pathlib import Path
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-import argparse, hashlib, json, os, re, struct, zstandard
+import argparse, hashlib, json, os, re, struct, sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from content_reader import open_package, entries_of
+from ncz2nsp import NczBody
 
 KEYS = Path(os.environ.get('NX_PROD_KEYS', Path.home() / '.switch' / 'prod.keys'))   # your own console keys (hactool format); never part of this repository
 
@@ -35,17 +41,9 @@ def xts_header(key, raw):
 class NczStream:
     """Forward-only reader over the plaintext NCA body (absolute NCA offsets >= 0x4000)."""
 
-    def __init__(self, f, body_off):
-        f.seek(body_off)
-        magic = f.read(8)
-        assert magic == b'NCZSECTN', magic
-        count = struct.unpack('<Q', f.read(8))[0]
-        self.sections = [struct.unpack('<QQQQ16s16s', f.read(0x40)) for _ in range(count)]
-        pos = f.tell()
-        if f.read(8) == b'NCZBLOCK':
-            raise NotImplementedError('NCZBLOCK mode: add block-table decoding')
-        f.seek(pos)
-        self.z = zstandard.ZstdDecompressor().stream_reader(f, read_size=1 << 22)
+    def __init__(self, f, entry_off):
+        self.z = NczBody(f, entry_off)
+        self.sections = self.z.sections
         self.pos = 0x4000          # absolute offset of buf[0]
         self.buf = bytearray()
 
@@ -69,20 +67,24 @@ class NczStream:
         return c
 
 
-def extract(nsz, dest, keys_path=KEYS):
-    """ExeFS members of the program NCZ in `nsz` -> `dest`; returns the report dict."""
-    keys = {k: bytes.fromhex(v) for k, v in re.findall(r'^\s*(\w+)\s*=\s*([0-9a-fA-F]+)\s*$', Path(keys_path).read_text(), re.M)}
+def extract(nsz, dest, keys_path=KEYS, entry=None):
+    """ExeFS members of the program NCZ in `nsz` (an NSZ / XCZ, or a split dump of one) -> `dest`; returns the report dict.
+    entry: name of the NCZ to read (default: the first program NCZ)."""
+    keys = {k.lower(): bytes.fromhex(v) for k, v in re.findall(r'^\s*(\w+)\s*=\s*([0-9a-fA-F]+)\s*$', Path(keys_path).read_text(errors='replace'), re.M)}
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    with open(nsz, 'rb') as f:
-        entries = pfs(lambda o, n: (f.seek(o), f.read(n))[1], Path(nsz).stat().st_size)
+    f, fsize = open_package(nsz)
+    with f:
+        entries = entries_of(f, fsize)
         report = {'package': Path(nsz).name, 'entries': [(n, s) for n, _, s in entries], 'modules': {}}
         for name, off, size in entries:
-            if not name.endswith('.ncz'):
+            if not name.endswith('.ncz') or (entry is not None and name != entry):
                 continue
             f.seek(off)
             h = xts_header(keys['header_key'], f.read(0xc00))
             assert h[0x200:0x204] == b'NCA3'
+            if entry is None and h[0x205] != 0:   # not a program NCA
+                continue
             report['title_id'] = f'{struct.unpack_from("<Q", h, 0x210)[0]:016x}'
             report['content_type'] = h[0x205]
             secs = []
@@ -91,7 +93,7 @@ def extract(nsz, dest, keys_path=KEYS):
                 if s:
                     secs.append((i, s * 512, (e - s) * 512, h[0x400 + i * 512:0x600 + i * 512]))
             report['sections'] = [(i, st, sz, fsh[2], fsh[3], fsh[4]) for i, st, sz, fsh in secs]
-            z = NczStream(f, off + 0x4000)
+            z = NczStream(f, off)
             for i, st, sz, fsh in sorted(secs, key=lambda s: s[1]):
                 if fsh[3] != 2:  # 2 = PFS0 (ExeFS / logo); RomFS handled elsewhere
                     continue

@@ -54,3 +54,7 @@ dev.keys
 dm/android/doom/*.apk
 dm/gfx/tools/dmsh_xlate_doom/bin/
 dm/gfx/tools/dmsh_xlate_doom/obj/
+# Setup: private Python / .NET runtimes (setup.bat / setup.sh) and the player's game-file drop folder.
+/tools/.runtime/
+/put-game-files-here/*
+!/put-game-files-here/README.txt

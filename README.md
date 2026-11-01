@@ -6,6 +6,11 @@ You bring the game: this repository contains no game content.
 
 Русский: [ниже](#по-русски).
 
+**Install:** step-by-step guide for players — [docs/INSTALL.md](docs/INSTALL.md) (English) ·
+[docs/INSTALL.ru.md](docs/INSTALL.ru.md) (по-русски). In short: dump your own game + update v262144 and `prod.keys`,
+put them into `put-game-files-here/`, double-click `setup.bat` (or `bash setup.sh`), copy `work/DOOM Mobile` to the
+phone's `Download` folder and install the [APK](https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk).
+
 > **Tested so far on Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) and Adreno 740 (Snapdragon 8 Gen 2).** Other GPUs
 > are untested. Adreno 6xx/7xx use the bundled Mesa **Turnip** Vulkan driver by default; other Adreno generations get
 > their Turnip package, and non-Adreno GPUs (Mali, PowerVR, Xclipse) use the phone's own driver, with engine fallbacks
@@ -146,21 +151,18 @@ The script reads every tool path from the environment (`ANDROID_HOME`, `JAVA_HOM
 
 ## Installing
 
-1. Dump your own copy (base game + update v262144) and your console's `prod.keys` — e.g. with nxdumptool and
-   Lockpick_RCM on your Switch.
-2. Prepare the game files with one command (it checks the inputs are the supported DOOM version, extracts ExeFS and
-   RomFS, patches the code for Android and translates the shaders):
+Full guide: **[docs/INSTALL.md](docs/INSTALL.md)** (English) / **[docs/INSTALL.ru.md](docs/INSTALL.ru.md)** (Russian).
 
-   ```sh
-   ./setup.sh check                                                # what is missing; changes nothing
-   ./setup.sh <base .nsp/.nsz/.xci> <update .nsp/.nsz> <prod.keys> [--push <adb serial>]
-   ```
-
-   On Windows: `setup.bat` with the same arguments. Needs Python 3, the **.NET 10 SDK** (shader translator) and ~70 GB
-   of free space while unpacking NSZ. Details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
-3. Install the APK (from [Releases](https://github.com/Desm0nt/doom-port/releases/latest), or build it yourself, see
-   *Building*) and copy `work/DOOM Mobile` to the phone's `Download` folder (or let `--push` / `./setup.sh push
-   <serial>` do it over adb).
+1. Dump your own copy (base game `0100416004C00000` + update `0100416004C00800` **v262144**, as NSP / NSZ / XCI / XCZ)
+   and your console's `prod.keys` — e.g. with nxdumptool and Lockpick_RCM on your Switch.
+2. Put the files into `put-game-files-here/` (any names) and double-click `setup.bat`, or run `bash setup.sh` on
+   Linux / macOS (explicit files in any order work too; `setup check` reports what is missing and changes nothing).
+   Setup provides Python, its packages and the .NET 10 SDK in `tools/.runtime` when they are missing (it asks first),
+   checks the inputs and the free space (~50 GB while preparing), then extracts, patches and translates everything into
+   `work/DOOM Mobile` (~22 GB). Technical details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
+3. Copy `work/DOOM Mobile` to the phone's `Download` folder (or let setup copy it over adb) and install the APK
+   ([latest](https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk), or build it yourself,
+   see *Building*).
 4. Start *DOOM Mobile* and allow *All files access* when asked.
 
 ## Vulkan drivers
@@ -259,8 +261,9 @@ MIT — see [LICENSE](LICENSE). The d2r-mobile copyright notice is kept; third-p
 прямо на процессоре телефона (без эмулятора и JIT); небольшой хост подменяет системные сервисы Switch, а графический API
 NVN воспроизводится через Vulkan. Основа — проект [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) (MIT).
 
-- **Игры в репозитории нет.** Нужна своя копия DOOM для Switch (база + обновление v262144) и свои ключи консоли;
-  подготовка файлов описана в [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md) (англ.).
+- **Игры в репозитории нет.** Нужна своя копия DOOM для Switch (база + обновление v262144) и свои ключи консоли.
+  **Установка по шагам: [docs/INSTALL.ru.md](docs/INSTALL.ru.md).** Технические подробности подготовки файлов —
+  [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md) (англ.).
 - Проверено на Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) и Adreno 740 (Snapdragon 8 Gen 2); другие GPU не проверялись.
   Драйвер выбирается по GPU: Adreno 6xx/7xx — встроенный Turnip (Mesa), другие Adreno — свой пакет Turnip, Mali/PowerVR/Xclipse —
   системный драйвер с обходами в движке; если драйвер не запустился, игра переходит на системный и сообщает об этом. Производительность (1600×720): 45–60 fps на большей части кампании, в самых
@@ -278,9 +281,10 @@ NVN воспроизводится через Vulkan. Основа — прое�
 - Известные ограничения: GPU-куллинг треугольников игры выключен (на нашем пути он терял видимые треугольники),
   динамическое разрешение выключено по умолчанию, поддерживается только обновление v262144, мультиплеер убран, сетевые
   сервисы отвечают как у консоли без сети.
-- Подготовка файлов игры одной командой: `./setup.sh <база> <обновление> <prod.keys> [--push <serial>]`
-  (на Windows — `setup.bat`), проверка без изменений — `./setup.sh check`. Нужны Python 3, **.NET 10 SDK** и ~70 ГБ
-  свободного места на время распаковки NSZ. Готовый APK — в [Releases](https://github.com/Desm0nt/doom-port/releases/latest).
+- Подготовка файлов игры: положите базу, обновление (NSP / NSZ / XCI / XCZ) и `prod.keys` в `put-game-files-here/` и
+  дважды щёлкните `setup.bat` (Linux / macOS: `bash setup.sh`); проверка без изменений — `setup check`. Python, его пакеты
+  и .NET 10 SDK установка при необходимости ставит сама в `tools/.runtime` (спросив разрешения); нужно ~50 ГБ свободного
+  места на время подготовки. Готовый APK — в [Releases](https://github.com/Desm0nt/doom-port/releases/latest).
 - Сборка: `cmake -S dm/android -B work/build-android … -DDM_GAME=doom`, затем `build.bat` / `tools/build_apk.ps1` (см. «Building»).
 
 Подробности о состоянии порта, переключателях и истории исправлений — в [docs/doom/](docs/doom/) и [docs/research/](docs/research/).

@@ -12,14 +12,17 @@ W = Path(__file__).resolve().parents[1] / 'work'
 KEYS = str(Path(os.environ.get('NX_PROD_KEYS', Path.home() / '.switch' / 'prod.keys')))   # your own console keys; never part of this repository
 
 
-def program(nsp, keys=KEYS):
-    nca = next(n for n in Package(nsp, keys).ncas() if n.type == 0)
+def program(nsp, keys=KEYS, name=None):
+    """RomFS section of the program NCA in a package; name: that NCA's content id (needed when the package holds several
+    programs, e.g. an XCI with the base game and its update)."""
+    want = name.split('.')[0].lower() if name else None
+    nca = next(n for n in Package(nsp, keys).ncas() if n.type == 0 and (want is None or n.name.split('.')[0].lower() == want))
     return next(s for s in nca.sections if s.h[3] == 3)
 
 
-def romfs_view(s, verify):
+def romfs_view(s, verify, progress=None):
     if verify:
-        off, size, _ = verify_ivfc(s)
+        off, size, _ = verify_ivfc(s, progress)
     else:
         lv = [struct.unpack_from('<QQI', s.h, 0x18 + i * 24) for i in range(6)]
         off, size = lv[-1][0], lv[-1][1]
@@ -46,12 +49,16 @@ def walk(read, h):
     return out
 
 
-def extract(base_pkg, update_pkg, keys, dest, manifest):
-    """IVFC-verify the merged RomFS, then write every file under `dest` and a manifest (path, size, sha256)."""
+def extract(base_pkg, update_pkg, keys, dest, manifest, base_nca=None, update_nca=None, verify_progress=None, file_progress=None):
+    """IVFC-verify the merged RomFS, then write every file under `dest` and a manifest (path, size, sha256).
+    base_nca / update_nca: program NCA names (see program()); verify_progress(done, total) during the IVFC check and
+    file_progress(index, count, bytes_done, bytes_total) per file replace the default prints."""
     import hashlib
-    read, h = romfs_view(Patched(program(update_pkg, keys), program(base_pkg, keys)), True)
+    read, h = romfs_view(Patched(program(update_pkg, keys, update_nca), program(base_pkg, keys, base_nca)), True, verify_progress)
     man = []
-    for p, o, s in walk(read, h):
+    files = walk(read, h)
+    total, done = sum(s for *_, s in files), 0
+    for i, (p, o, s) in enumerate(files):
         t = Path(dest) / p.lstrip('/')
         t.parent.mkdir(parents=True, exist_ok=True)
         d = hashlib.sha256()
@@ -59,7 +66,9 @@ def extract(base_pkg, update_pkg, keys, dest, manifest):
             for pos in range(0, s, 1 << 24):
                 b = read(o + pos, min(1 << 24, s - pos)); f.write(b); d.update(b)
         man.append({'path': p, 'size': s, 'sha256': d.hexdigest()})
-        print(p, s, flush=True)
+        done += s
+        if file_progress: file_progress(i + 1, len(files), done, total)
+        else: print(p, s, flush=True)
     Path(manifest).write_text(json.dumps(man, indent=1))
     return man
 

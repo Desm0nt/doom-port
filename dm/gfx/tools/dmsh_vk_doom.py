@@ -28,6 +28,7 @@
 # storage_pointer -> SSBO binding, uniform_pointer (compute) -> UBO binding, texture -> sampler binding, image -> image binding).
 # Usage: dmsh_vk_doom.py <jobs dir> <output dir> [keys...]
 #   environment: XLATE (dmsh_xlate executable), J (parallelism, default 8), SPIRV_OPT / SPIRV_VAL, DM_VK_INLINE_CS,
+#                (without SPIRV-Tools: py_trim as with the NDK r29 spirv-opt, and no spirv-val check; the bundles are the same)
 #                DMSH_VK_KEEP=1 (keep the work dir), META=<dir> (also write <key>.vk.json / .res.json / .spv there),
 #                DOOM_LINK=0 (no stage linking), DOOM_C1_GUARD=0 (no c1 padding)
 import ast, collections, concurrent.futures as cf, hashlib, json, os, re, shutil, struct, subprocess, sys, tempfile, pathlib
@@ -117,6 +118,7 @@ def py_trim(spv):
 
 
 def opt_has_trim():
+    if not shutil.which(OPT): return False
     r = subprocess.run([OPT, '--help'], capture_output=True, text=True, errors='replace')
     return '--trim-capabilities' in r.stdout + r.stderr
 
@@ -207,6 +209,7 @@ def sha16(data): return hashlib.sha256(data).hexdigest()[:16]
 
 
 def tool_version(exe):
+    if not shutil.which(exe): return 'missing'
     r = subprocess.run([exe, '--version'], capture_output=True, text=True, errors='replace')
     t = (r.stdout.strip() or r.stderr.strip())
     return t.splitlines()[0] if t else 'missing'
@@ -271,6 +274,7 @@ def main():
             m = re.search(r'([0-9a-f]{16})\W{0,3}(\w+(?:Exception|Error)\W{0,3}.*)', ln)
             if m: xerr[m.group(1)] = re.sub(r'[^\x20-\x7e]+', ': ', m.group(2))[:200]
     use_opt = opt_has_trim()
+    have_opt, have_val = bool(shutil.which(OPT)), bool(shutil.which(VAL))
     trim_stats = collections.Counter(); spvs = {}
 
     def one(key):
@@ -286,13 +290,14 @@ def main():
             t, dropped = py_trim(spv); open(f2, 'wb').write(t)
             for c in dropped: trim_stats[c] += 1
         if INLINE_CS and stage == 'cs' and NS['helper_has_subgroup'](open(f2, 'rb').read()):
+            if not have_opt: return key, 'spirv-opt inline failed', 'DM_VK_INLINE_CS=1 needs spirv-opt', None
             f3 = os.path.join(work, key + '.i.spv')
             r = subprocess.run([OPT, '--merge-return', '--inline-entry-points-exhaustive', '--eliminate-dead-functions', f2, '-o', f3], capture_output=True, text=True, errors='replace')
             if r.returncode: return key, 'spirv-opt inline failed', r.stderr.strip()[:200], None
             os.replace(f3, f2)
         spv = NS['add_format_caps'](open(f2, 'rb').read()); open(f2, 'wb').write(spv)
-        r = subprocess.run([VAL, '--target-env', 'vulkan1.1', f2], capture_output=True, text=True, errors='replace')
-        if r.returncode: return key, 'spirv-val failed', (r.stderr.strip() or r.stdout.strip() or '?').splitlines()[0][:200], None
+        r = subprocess.run([VAL, '--target-env', 'vulkan1.1', f2], capture_output=True, text=True, errors='replace') if have_val else None
+        if r and r.returncode: return key, 'spirv-val failed', (r.stderr.strip() or r.stdout.strip() or '?').splitlines()[0][:200], None
         res = json.load(open(os.path.join(work, key + '.res.json'), encoding='utf-8'))
         try: vk = NS['export'](key, stage, c1s[key], spv, res)
         except (ValueError, KeyError) as e: return key, 'export failed', re.sub(r'[^\x20-\x7e]+', ' ', str(e))[:200], None

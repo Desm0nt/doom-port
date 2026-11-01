@@ -7,7 +7,7 @@ dm/third_party/ryujinx (unmodified Ryujinx 1.3.2).
 (Before 2026-10-27 this script patched a copy of the D2R Program.cs with two text substitutions; the DOOM source now carries
 them and more, so there is nothing to substitute.)
 Usage: build_dmsh_xlate_doom.py [out dir] (default work/build/dmsh_xlate_doom); DOTNET=<dotnet executable> (default: dotnet on PATH)
-Result: <out>/bin/dmsh_xlate.exe; <out>/bin/source.sha = the embedded source sha (dmsh_xlate --source-sha), checked against the tree.
+Result: <out>/bin/dmsh_xlate.exe (dmsh_xlate on Linux / macOS); <out>/bin/source.sha = the embedded source sha (dmsh_xlate --source-sha), checked against the tree.
 """
 import hashlib, os, shutil, subprocess, sys
 from pathlib import Path
@@ -33,7 +33,7 @@ def main():
                         '-o', str(out / 'bin'), '--artifacts-path', str(out / 'obj')], capture_output=True, text=True, errors='replace')
     print(r.stdout[-1500:], r.stderr[-1500:])
     if r.returncode: sys.exit(r.returncode)
-    exe = out / 'bin' / 'dmsh_xlate.exe'
+    exe = out / 'bin' / ('dmsh_xlate.exe' if os.name == 'nt' else 'dmsh_xlate')
     got = subprocess.run([str(exe), '--source-sha'], capture_output=True, text=True).stdout.strip()
     if got != source_sha(): sys.exit(f'[red] built translator embeds source {got}, tree has {source_sha()}')
     (out / 'bin' / 'source.sha').write_text(got + '\n')
