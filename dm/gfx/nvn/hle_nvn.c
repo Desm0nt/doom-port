@@ -1593,12 +1593,13 @@ static double present_cap_hz(void) {
 // [r6b] DM_PRESENT_MENU_HZ=<hz> (default 60; 0 = the limit applies everywhere, the v0.4.4 behaviour): with a frame rate limit above
 // it, presents are capped at <hz> outside gameplay (menus, the level-load pacifier). Measured on the Mi 13 Pro (02.11): limit 60 ->
 // loading screen 60 fps, level load 48 s; limit 120 -> loading screen 90 fps, load 86 s -- every pacifier frame takes CPU / GPU time
-// from the loader. g_menu_cap is set by present_play_tick (once per present) from the game's own gameplay signal; game speed is not
-// affected (menus run the fixed 30 Hz tic, gameplay keeps the full limit and com_adaptiveTickMaxHz = the limit).
+// from the loader. g_menu_cap is set by present_play_tick (once per present) from the game's own gameplay signal; gameplay keeps the
+// full limit and com_adaptiveTickMaxHz = the limit; menu speed: below.
 static double present_menu_hz(void) {
     static double v = -1;
-    // Default 60 (owner, 02.11: 30 felt sluggish). Outside gameplay the game runs com_fixedTic = one 33 ms tic per frame, so at 60
-    // menus / pause / loading animations run at 2x speed ([tick] "0 adaptive frames ... speed 2.00x"); DM_PRESENT_MENU_HZ=30 = Switch rate.
+    // Default 60 (owner, 02.11: 30 felt sluggish). Outside gameplay the game runs com_fixedTic = one tic per frame, reset to 33 ms, so
+    // at 60 menus / pause ran at 2x ([tick] "speed 2.00x"); host hle_doom_tick.c (DM_DOOM_MENU_REALTIME, default on) now sets that tic's
+    // Hz from the real frame time, so menus follow real time at any <hz>. DM_PRESENT_MENU_HZ=30 = Switch rate.
     if (v < 0) { const char *e = getenv("DM_PRESENT_MENU_HZ"); v = e && *e ? atof(e) : 60; if (!(v >= 10 && v <= 240)) v = 0; }
     return v;
 }
