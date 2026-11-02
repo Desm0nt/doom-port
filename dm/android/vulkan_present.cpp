@@ -7,6 +7,7 @@
 #ifdef DM_GAME_DOOM
 extern "C" void dm_aperf_present(ANativeWindow*,float);
 extern "C" void dm_aperf_note_wait(int64_t);   // [r2] perf_android.c: the present thread's acquire wait (DM_ADPF_WORK=wall)
+extern "C" void dm_aperf_frame_tid(int);   // [mt 2a] perf_android.c: the ADPF session's frame thread when presents run elsewhere
 #endif
 #include "../gfx/vulkan/nvn_vk.h"
 #include "../gfx/xtrace.h"
@@ -25,6 +26,9 @@ extern "C" void dm_aperf_note_wait(int64_t);   // [r2] perf_android.c: the prese
 #include <cstring>
 #include <cerrno>
 #include <sched.h>
+#include <pthread.h>
+#include <sys/resource.h>
+#include <thread>
 #include <unistd.h>
 #include <time.h>
 extern "C" double dm_present_period(void);
@@ -289,10 +293,35 @@ bool record(VkCommandBuffer cmd,unsigned f,VkImage source,VkFormat format,uint32
 // scale 1). -1 = not decided yet: at the first frame, crop when DM_DOOM_WIDE_LIVE=1 and the gear option is off (DM_DOOM_WIDE=0).
 static std::atomic<int> crop169{-1};
 static std::atomic<int> mirror_next{0};   // [r3] DM_GFX_PRESENT_FLIP_FOLD: mirror the next present vertically (dm_present_mirror_next)
+// [mt 2a] DM_GFX_PRESENT_THREAD (xbg_game.cpp reads it and calls dm_present_thread_set; docs/SWITCHES.md, BUGS_AND_FIXES 3.20). 1: the
+// engine hands each present (source image, format, size, crop, the mirror flag captured on its thread) to a present thread that runs the
+// same present_body as before: wait for the flight's fence, acquire, letterbox clear, RCAS, blit, submit, queue present, swapchain and
+// surface recreation, window waits while backgrounded, ADPF report / frame-rate vote (dm_aperf_present). Order on the one VkQueue: the
+// engine waits until every handed present has its blit submitted before it submits a slot (dm_present_wait_submitted), and every queue
+// call of both threads takes queue_mutex, so the queue sees the same sequence as presenting inline. The translation thread keeps the core
+// pin (pin_update at the handoff) and stays the ADPF session's frame thread (dm_aperf_frame_tid). 2: the same protocol (queue lock,
+// captured mirror flag) run inline on the caller, no thread. 0 / unset: none of this runs; QLock is a no-op.
+int pt_cfg=0;std::mutex queue_mutex;thread_local bool pt_on_thread=false;
+struct QLock{bool on;QLock():on(pt_cfg!=0){if(on)queue_mutex.lock();}~QLock(){if(on)queue_mutex.unlock();}};
+VkResult queue_wait_idle(){QLock l;return vkQueueWaitIdle(queue);}
+namespace pt {
+struct Job{VkImage src;VkFormat fmt;uint32_t w,h;int32_t crop[4];bool has_crop,mirror;uint64_t ticket;};
+constexpr unsigned depth=4;Job ring[depth];
+std::mutex mu;std::condition_variable cv;uint64_t enq=0,sub=0,done=0,cur=0;bool started=false;   // tickets: handed, blit submitted, finished; cur: present thread only
+std::atomic<int> err{0};std::atomic<uint64_t> jobs{0},busy_ns{0},full_ns{0};
+int64_t now_ns(){timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return int64_t(ts.tv_sec)*1000000000+ts.tv_nsec;}
+void mark_submitted(){if(!pt_on_thread || !cur)return;{std::lock_guard<std::mutex> l(mu);if(sub<cur)sub=cur;}cv.notify_all();}
+void loop();
+}
+int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t height,const int32_t crop[4],bool mirror);
 int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t){
     std::lock_guard<std::mutex> render_lock(render_mutex);
     pin_update();
     const bool mirror=mirror_next.exchange(0,std::memory_order_relaxed)!=0;
+    return present_body(source,source_format,width,height,crop,mirror);
+}
+// The present itself; the caller holds render_mutex (present(), the present thread, or the inline protocol of DM_GFX_PRESENT_THREAD=2).
+int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t height,const int32_t crop[4],bool mirror){
     VkFormatProperties sp;vkGetPhysicalDeviceFormatProperties(physical,source_format,&sp);if(!(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT))return VK_ERROR_FORMAT_NOT_SUPPORTED;
     int x=0,y=0,w=int(width),h=int(height);if(crop&&crop[2]>0&&crop[3]>0){x=std::clamp(crop[0],0,w);y=std::clamp(crop[1],0,h);w=std::min(crop[2],int(width)-x);h=std::min(crop[3],int(height)-y);}if(w<=0||h<=0)return VK_ERROR_INITIALIZATION_FAILED;
     {int c=crop169.load(std::memory_order_relaxed);
@@ -313,14 +342,14 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     wait_window();
     VkResult r;
     if(!surface||window_changed()){
-        if((r=vkQueueWaitIdle(queue)))return r;
+        if((r=queue_wait_idle()))return r;
         r=VkResult(create_surface());
         if(r==VK_NOT_READY)continue;
         if(r==VK_ERROR_SURFACE_LOST_KHR){uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
         if(r)return r;swap_dirty=true;
     }
     if(swap_dirty){
-        if((r=vkQueueWaitIdle(queue)))return r;
+        if((r=queue_wait_idle()))return r;
         r=VkResult(create_swap());
         if(r==VK_NOT_READY||r==VK_ERROR_OUT_OF_DATE_KHR){wait_resize();continue;}
         if(r==VK_ERROR_SURFACE_LOST_KHR){uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
@@ -339,11 +368,11 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
 #endif
     XTRACE_BEGIN("dm-acquire");r=vkAcquireNextImageKHR(device,swapchain,50000000ull,acq,VK_NULL_HANDLE,&index);XTRACE_END();
 #ifdef DM_GAME_DOOM
-    {timespec aq1;clock_gettime(CLOCK_MONOTONIC,&aq1);dm_aperf_note_wait((int64_t(aq1.tv_sec)-aq0.tv_sec)*1000000000+(aq1.tv_nsec-aq0.tv_nsec));}   // [r2] DM_ADPF_WORK=wall
+    {timespec aq1;clock_gettime(CLOCK_MONOTONIC,&aq1);if(!pt_on_thread)dm_aperf_note_wait((int64_t(aq1.tv_sec)-aq0.tv_sec)*1000000000+(aq1.tv_nsec-aq0.tv_nsec));}   // [r2] DM_ADPF_WORK=wall
 #endif
     if(r==VK_TIMEOUT||r==VK_NOT_READY)continue;
     if(r==VK_ERROR_OUT_OF_DATE_KHR){swap_dirty=true;wait_resize();continue;}
-    if(r==VK_ERROR_SURFACE_LOST_KHR){if((r=vkQueueWaitIdle(queue)))return r;uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
+    if(r==VK_ERROR_SURFACE_LOST_KHR){if((r=queue_wait_idle()))return r;uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
     bool rebuild=r==VK_SUBOPTIMAL_KHR;if(r!=VK_SUCCESS&&!rebuild)return r;
     r=vkResetCommandPool(device,pool,0);if(r)return r;VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;if((r=vkBeginCommandBuffer(cmd,&bi)))return r;
     bool stamp=present_timing && overlap;if(stamp && !present_queries){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=4;if(vkCreateQueryPool(device,&q,nullptr,&present_queries))stamp=false;
@@ -379,7 +408,7 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
     barrier.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;barrier.newLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=0;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&barrier);
     if(stamp){vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,present_queries,f*2+1);present_stamped[f]=true;}
     if((r=vkEndCommandBuffer(cmd)))return r;VkPipelineStageFlags stage=VK_PIPELINE_STAGE_TRANSFER_BIT;VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.waitSemaphoreCount=1;submit.pWaitSemaphores=&acq;submit.pWaitDstStageMask=&stage;submit.commandBufferCount=1;submit.pCommandBuffers=&cmd;submit.signalSemaphoreCount=1;submit.pSignalSemaphores=&finished[index];
-    if((r=vkQueueSubmit(queue,1,&submit,done)))return r;in_flight[f]=true;VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};pi.waitSemaphoreCount=1;pi.pWaitSemaphores=&finished[index];pi.swapchainCount=1;pi.pSwapchains=&swapchain;pi.pImageIndices=&index;
+    {QLock ql;r=vkQueueSubmit(queue,1,&submit,done);}if(r)return r;in_flight[f]=true;pt::mark_submitted();VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};pi.waitSemaphoreCount=1;pi.pWaitSemaphores=&finished[index];pi.swapchainCount=1;pi.pSwapchains=&swapchain;pi.pImageIndices=&index;
 #ifdef __OHOS__
     // 期望上屏时刻（鸿蒙 SET_DESIRED_PRESENT_TIMESTAMP）：上屏节奏 = 上次期望时刻 + 一个出图档周期；早到的帧由合成器按时放出，翻译线程不等；
     // 落后时从当前时刻重新起拍。翻译完成时刻的抖动（±5 ms）不再让一帧在屏上停 3 或 5 个刷新。DM_PRESENT_TS=0 关。
@@ -392,11 +421,11 @@ int present(void*,void*,VkImage source,VkFormat source_format,uint32_t width,uin
 #ifdef DM_GAME_DOOM
     dm_aperf_present(active,frame_rate_vote);   // ADPF work report + display rate vote (perf_android.c)
 #endif
-    XTRACE_BEGIN("dm-queue-present");VkResult pr=vkQueuePresentKHR(queue,&pi);XTRACE_END();
+    XTRACE_BEGIN("dm-queue-present");VkResult pr;{QLock ql;pr=vkQueuePresentKHR(queue,&pi);}XTRACE_END();
     // 呈现失败时先排空，拆除路径要求队列空闲。
     // Drain a failed present before teardown, which requires an idle queue.
-    if(overlap){flight^=1;if(pr!=VK_SUCCESS && pr!=VK_SUBOPTIMAL_KHR && (r=vkQueueWaitIdle(queue)))return r;}
-    else{if((r=vkWaitForFences(device,1,&done,VK_TRUE,10000000000ull)))return r;if((r=vkResetFences(device,1,&done)))return r;in_flight[0]=false;if((r=vkQueueWaitIdle(queue)))return r;}
+    if(overlap){flight^=1;if(pr!=VK_SUCCESS && pr!=VK_SUBOPTIMAL_KHR && (r=queue_wait_idle()))return r;}
+    else{if((r=vkWaitForFences(device,1,&done,VK_TRUE,10000000000ull)))return r;if((r=vkResetFences(device,1,&done)))return r;in_flight[0]=false;if((r=queue_wait_idle()))return r;}
     if(pr==VK_ERROR_SURFACE_LOST_KHR){uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
     if(pr==VK_ERROR_OUT_OF_DATE_KHR){swap_dirty=true;wait_resize();continue;}
     if(pr!=VK_SUCCESS&&pr!=VK_SUBOPTIMAL_KHR)return pr;
@@ -413,6 +442,43 @@ extern "C" void dm_present_crop169(int on){crop169.store(on?1:0,std::memory_orde
 // vertically in the swapchain blit instead of blitting it upside down into a flip image first (one full-screen blit and the
 // 3 flip images less). Declined (0) while RCAS sharpening is on: its pass reads the source as given.
 extern "C" int dm_present_mirror_next(int on){if(on && rcas::enabled())return 0;mirror_next.store(on?1:0,std::memory_order_relaxed);return 1;}
+// [mt 2a] DM_GFX_PRESENT_THREAD: the present thread and the engine's side of the protocol (see pt_cfg above).
+void pt::loop(){
+    pt_on_thread=true;pthread_setname_np(pthread_self(),"dm-present");
+    int pr=setpriority(PRIO_PROCESS,0,-8);if(pr)pr=setpriority(PRIO_PROCESS,0,-4);
+    // Off the translation thread's pinned core(s): it is the one that must not be slowed.
+    int ar=1;if(pin_mask){cpu_set_t set;CPU_ZERO(&set);if(!sched_getaffinity(0,sizeof set,&set)){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_CLR(c,&set);if(CPU_COUNT(&set))ar=sched_setaffinity(0,sizeof set,&set);}}
+    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present thread started tid=%d nice=%d (setpriority %d) off-pin-mask=%x affinity=%d",int(gettid()),getpriority(PRIO_PROCESS,0),pr,pin_mask,ar);
+    for(;;){Job j;{std::unique_lock<std::mutex> l(mu);cv.wait(l,[]{return done<enq;});j=ring[(done+1)%depth];cur=j.ticket;}
+        const int64_t t0=now_ns();int r;{std::lock_guard<std::mutex> rl(render_mutex);r=present_body(j.src,j.fmt,j.w,j.h,j.has_crop?j.crop:nullptr,j.mirror);}
+        busy_ns+=uint64_t(now_ns()-t0);++jobs;
+        if(r){int z=0;if(err.compare_exchange_strong(z,r))__android_log_print(ANDROID_LOG_ERROR,"dm-vulkan","NVN present thread: present %llu failed: VkResult %d",(unsigned long long)j.ticket,r);}
+        {std::lock_guard<std::mutex> l(mu);if(sub<j.ticket)sub=j.ticket;done=j.ticket;cur=0;}cv.notify_all();}
+}
+extern "C" void dm_present_thread_set(int mode){pt_cfg=mode>0?mode:0;if(pt_cfg)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present thread mode=%d (DM_GFX_PRESENT_THREAD: 1 own thread, 2 same protocol inline)",pt_cfg);}
+// Returns 0, or the VkResult of an earlier failed present on the thread (the engine stops with it, as it did for an inline failure).
+extern "C" int dm_present_async(VkImage source,VkFormat format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t){
+    if(pt_cfg==2){std::lock_guard<std::mutex> render_lock(render_mutex);pin_update();const bool mirror=mirror_next.exchange(0,std::memory_order_relaxed)!=0;++pt::jobs;return present_body(source,format,width,height,crop,mirror);}
+    pin_update();   // the translation thread (the caller), as present() pinned it
+#ifdef DM_GAME_DOOM
+    {static bool told=false;if(!told){told=true;dm_aperf_frame_tid(int(gettid()));}}
+#endif
+    const bool mirror=mirror_next.exchange(0,std::memory_order_relaxed)!=0;   // this present's flag, set by the engine just before
+    std::unique_lock<std::mutex> l(pt::mu);
+    if(!pt::started){pt::started=true;std::thread(pt::loop).detach();}
+    if(pt::enq-pt::done>=pt::depth){const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::enq-pt::done<pt::depth;});pt::full_ns+=uint64_t(pt::now_ns()-t0);}
+    if(int e=pt::err.load())return e;
+    pt::Job &j=pt::ring[(pt::enq+1)%pt::depth];j.src=source;j.fmt=format;j.w=width;j.h=height;j.has_crop=crop!=nullptr;if(crop)memcpy(j.crop,crop,sizeof j.crop);else memset(j.crop,0,sizeof j.crop);j.mirror=mirror;j.ticket=pt::enq+1;
+    ++pt::enq;l.unlock();pt::cv.notify_all();return 0;
+}
+// Nanoseconds waited until every handed present has its blit submitted / has finished (0 = nothing pending).
+extern "C" uint64_t dm_present_wait_submitted(void){std::unique_lock<std::mutex> l(pt::mu);if(pt::sub>=pt::enq)return 0;const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::sub>=pt::enq;});return uint64_t(pt::now_ns()-t0);}
+extern "C" uint64_t dm_present_drain(void){std::unique_lock<std::mutex> l(pt::mu);if(pt::done>=pt::enq)return 0;const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::done>=pt::enq;});return uint64_t(pt::now_ns()-t0);}
+extern "C" int dm_present_last_error(void){return pt::err.load();}
+extern "C" void dm_present_queue_lock(void){if(pt_cfg)queue_mutex.lock();}
+extern "C" void dm_present_queue_unlock(void){if(pt_cfg)queue_mutex.unlock();}
+// Totals since start: presents run by the thread (or inline with =2), the thread's time in them, the engine's waits on a full hand-off ring.
+extern "C" void dm_present_thread_stats(uint64_t out[4]){out[0]=pt::jobs.load();out[1]=pt::busy_ns.load();out[2]=pt::full_ns.load();out[3]=0;}
 extern "C" void dm_android_vk_set_window(ANativeWindow *window){if(window)ANativeWindow_acquire(window);{std::lock_guard<std::mutex> l(window_mutex);if(desired)ANativeWindow_release(desired);desired=window;++generation;}window_cv.notify_all();}
 extern "C" int dm_android_vk_has_window(){return has_window(nullptr);}
 extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t bytes){

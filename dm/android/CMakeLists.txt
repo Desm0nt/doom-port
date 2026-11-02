@@ -152,6 +152,9 @@ target_compile_options(dmcore PUBLIC $<$<COMPILE_LANGUAGE:C>:${DM_CFLAGS} -std=g
 # libadrenotools (BSD-2, third_party/libadrenotools); its hook libraries are packaged next to libdm.so (tools/build_apk.ps1).
 set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
 set(BUILD_SHARED_LIBS OFF)
+# [mt S4] The GOB deswizzle (VT partial uploads and first texture uploads on the translation thread) is a pure function with a
+# byte-for-byte test (gfx/tests/t_deswz_direct.c): -O3 for it alone (source options come after dmcore's -O1, so they win).
+set_source_files_properties(${DM}/gfx/tex/nvn_deswizzle.c PROPERTIES COMPILE_OPTIONS "-O3;-mtune=cortex-x3")
 add_subdirectory(${DM_PATH_ROOT}/third_party/libadrenotools ${CMAKE_CURRENT_BINARY_DIR}/adrenotools)
 if(DM_GAME_DOOM)
   # [DOOM] zlib-ng 2.3.3 (zlib license, third_party/zlib-ng, docs/THIRD_PARTY.md): NEON inflate for the game's zlib 1.2.3

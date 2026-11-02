@@ -128,6 +128,15 @@ extern "C" __attribute__((weak)) int nvn_pool_flags(const void *addr,size_t len)
 // narrower than 16:9 the host lays the UI out at 16:9 at the bottom of the picture (dm/host/dm_uiscreen.c); the front end registers the UI rectangle's vertical position
 // and height (fractions of the picture height). UI draws (4 vertices, 2 attributes, 20-byte vertices) get a vertical offset in the projection matrix and a shifted
 // scissor; the untextured block covering the whole UI rectangle (panel dimming, transition curtain) gets its viewport scaled to the whole picture.
+// [mt 2a] DM_GFX_PRESENT_THREAD: the Android presenter's present thread (vulkan_present.cpp). Weak: absent on other platforms (pt_mode stays 0).
+extern "C" __attribute__((weak)) void dm_present_thread_set(int mode);
+extern "C" __attribute__((weak)) int dm_present_async(VkImage source,VkFormat format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t interval);
+extern "C" __attribute__((weak)) uint64_t dm_present_wait_submitted(void);
+extern "C" __attribute__((weak)) uint64_t dm_present_drain(void);
+extern "C" __attribute__((weak)) int dm_present_last_error(void);
+extern "C" __attribute__((weak)) void dm_present_queue_lock(void);
+extern "C" __attribute__((weak)) void dm_present_queue_unlock(void);
+extern "C" __attribute__((weak)) void dm_present_thread_stats(uint64_t out[4]);
 static void (*g_ui_rect_fn)(double *y,double *h);
 static double g_ui_moff;static uint64_t g_ui_moff_addr;
 extern "C" void xbg_set_ui_rect_fn(void (*fn)(double *y,double *h)){g_ui_rect_fn=fn;}
@@ -643,6 +652,31 @@ std::atomic<uint64_t> r5_ld_mem{0},r5_ld_mirror{0},r5_ld_fuse{0},r5_ld_mem_ns{0}
 uint64_t r5_dz_full=0,r5_dz_bytes=0,r5_dz_ns=0,r5_dz_old=0,r5_dz_old_ns=0,r5_dz_blocks=0,r5_dz_cmp=0,r5_dz_mism=0,r5_dz_hash_skips=0,r5_dz_unknown_reup=0;
 uint64_t r5_ar_released=0,r5_ar_released_bytes=0,r5_ar_memo_drops=0;
 uint64_t r5_ch_same=0,r5_ch_untracked=0,r5_ch_retracked=0;
+// [mt] Round "mt" (translator CPU without threads, present on its own thread; mt_translator_design.md S1-S3 and phase 2a; docs/SWITCHES.md,
+// BUGS_AND_FIXES 3.20). All off by default: with a switch unset nothing it guards runs and no line is added (the generation counters below
+// only count). A/B targets (gfx-ab-toggle + gfx-ab-target): pmemo, hzepoch, drvblk, presthread; mt = all of them. Counters: NVN PERF mt.
+//  DM_GFX_PIPE_MEMO_N=<entries> (S1, namespace pmn, draw()): direct-mapped pipeline memo checked before the create info is built;
+//    DM_GFX_PIPE_MEMO_CHECK=1: the hit is not used, everything is built and compared (mism=).
+//  DM_GFX_DESC_HAZARD_EPOCH=1|2 (S2, descriptors()): a descriptor-memo hit skips its get_image / prepare_read loop while the hazard epoch
+//    mt_hz_gen and the submission / slot / image generations are those of the entry's last clean pass; =2 runs the loop and counts the
+//    hits where a skip would have lost an action (mism=).
+//  DM_GFX_DRVBLK_CACHE=1|2 (S3, driver_block / support_block): a driver block is reused inside a slot when the state it is built from is
+//    unchanged (4 blocks per stage and bank); the support block gets a one-entry front; =2 builds as before and compares the bytes.
+//  DM_GFX_PRESENT_THREAD=1|2 (2a, xbg_present_texture_now, submit_slots, vulkan_present.cpp): acquire / blit / RCAS / queue present on the
+//    presenter's own thread; =2 the same protocol (queue lock, tickets, captured mirror flag) run inline.
+int pmn_n=0,hz_mode=0,drv_mode=0,pt_mode=0;bool pmn_check=false,mt_log=false;
+inline bool mt_off(const char *name){return ab_off(name) || ab_off("mt");}
+// [mt S2] Hazard epoch: moves on every event that can change what prepare_read / get_image do for an image that is not an attachment of the
+// open pass: a full barrier, a render pass beginning or ending, any layout change, a write mark of an image outside the open pass, a storage
+// write mark of an image that is also sampled, an image becoming sampled, an upload or CPU invalidation. Only counts (one increment).
+uint64_t mt_hz_gen=1;
+uint64_t pmn_gen=1;   // [mt S1] moves wherever pipe_memo_valid is cleared: no pipeline memo entry outlives its pipeline, pass or layout
+uint64_t drv_support_gen=1;   // [mt S3] moves when support_static is cleared (front of support_block)
+uint64_t pmn_hits=0,pmn_misses=0,pmn_inserts=0,pmn_checked=0,pmn_mism=0,pmn_mism_total=0,pmn_gen_w=1;
+uint64_t hz_skips=0,hz_runs=0,hz_stamps=0,hz_mism=0,hz_mism_total=0;
+uint64_t drv_reuse=0,drv_builds=0,drv_front=0,drv_mism=0,drv_mism_total=0;
+uint64_t pt_jobs=0,pt_wait_ns=0,pt_waits=0,pt_drain_ns=0;
+void mt_window_reset(){pmn_hits=pmn_misses=pmn_inserts=pmn_checked=pmn_mism=0;pmn_gen_w=pmn_gen;hz_skips=hz_runs=hz_stamps=hz_mism=0;drv_reuse=drv_builds=drv_front=drv_mism=0;pt_jobs=pt_wait_ns=pt_waits=pt_drain_ns=0;}
 // [r4] DM_GFX_STATEGEN state generations. execute() moves desc_gen / pso_gen for every command except the ones listed as not
 // touching what the descriptor key / the pipeline is built from (quiet_desc / quiet_pso, filled at init), so a missed case can
 // only cost a rebuild. The fast paths also compare the per-draw inputs that change without a command (shader pointers: GS
@@ -868,8 +902,8 @@ void begin_occlusion_query(VkCommandBuffer cmd,VkQueryPool pool,uint32_t index){
     need(!open_occlusion.cmd,"Nested occlusion query");
     vkCmdBeginQuery(cmd,pool,index,VK_QUERY_CONTROL_PRECISE_BIT);open_occlusion={cmd,pool,index};++occlusion_queries_started;
 }
-void end_open_pass(int line){if(open_pass.cmd){if(lazy_pending)lazy_clear_flush();++pass_end_lines[line];end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd,line);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];}}
-void full_barrier(VkCommandBuffer cmd){storage_unbarriered=false;storage_dirty.clear();VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];}
+void end_open_pass(int line){if(open_pass.cmd){++mt_hz_gen;if(lazy_pending)lazy_clear_flush();++pass_end_lines[line];end_occlusion_query();vkCmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd,line);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];}}
+void full_barrier(VkCommandBuffer cmd){++mt_hz_gen;storage_unbarriered=false;storage_dirty.clear();VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];}
 struct PerfCounts{size_t pipelines,layouts,samplers,passes,images,host_segments,host_bytes;};
 PerfCounts perf_counts();
 struct Perf {
@@ -1064,17 +1098,23 @@ Slot &recording_slot(){
             }
         }
         // Order against work of earlier submissions on this queue.
-        {VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(s.cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;}
+        {VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkCmdPipelineBarrier(s.cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++mt_hz_gen;}
         for(auto q:s.occlusion_pools)vkCmdResetQueryPool(s.cmd,q,0,256);
         for(auto q:s.timestamp_pools)vkCmdResetQueryPool(s.cmd,q,0,64);
     }
     return s;
 }
+// [mt 2a] DM_GFX_PRESENT_THREAD: a queue submission goes after every present handed to the present thread has its blit submitted (the
+// blit reads the frame's image, and the next slots transition and write it again: the same queue order as presenting inline), and under
+// the presenter's queue lock (one VkQueue, two threads). A failed present thread reports here, on the translation thread.
+void pt_check(){if(int e=dm_present_last_error())xbg_fatalf("Game presentation failed: %d (present thread)",e);}
+void pt_before_submit(){const uint64_t w=dm_present_wait_submitted();if(w){pt_wait_ns+=w;++pt_waits;}pt_check();}
+void pt_drain(){pt_drain_ns+=dm_present_drain();pt_check();}
 // Submit the recording slot. With wait, block until all submitted work is done.
 void submit_slots(bool wait){
     Slot &s=slots[slot_index];
     if(s.recording){
-        if(open_pass.cmd==s.cmd){unsigned saved=cur_op;cur_op=60;end_open_pass();cur_op=saved;}barrier_seq=0;
+        if(open_pass.cmd==s.cmd){unsigned saved=cur_op;cur_op=60;end_open_pass();cur_op=saved;}barrier_seq=0;++mt_hz_gen;
         // Occlusion results: GPU copies them into mapped memory (vkGetQueryPoolResults is slow on this driver).
         s.query_copied=0;if(s.occlusion_used){size_t used=s.occlusion_used;s.query_results=s.readback.alloc(used*8);
             for(size_t i=0;i*256<used;i++){uint32_t n=uint32_t(std::min<size_t>(256,used-i*256));vkCmdCopyQueryPoolResults(s.cmd,s.occlusion_pools[i],0,n,s.query_results.buffer,s.query_results.offset+i*256*8,8,VK_QUERY_RESULT_64_BIT);}
@@ -1106,7 +1146,7 @@ void submit_slots(bool wait){
             vkCmdPipelineBarrier(s.pro,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&after,0,nullptr,0,nullptr);
             VK(vkEndCommandBuffer(s.pro));cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;
-        {CPU_SCOPE(Submit);VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}++submit_by[sync_site];poolreset::queue(s);
+        {CPU_SCOPE(Submit);if(pt_mode){pt_before_submit();dm_present_queue_lock();const VkResult qr=vkQueueSubmit(cfg.queue,1,&si,s.fence);dm_present_queue_unlock();VK(qr);}else VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}++submit_by[sync_site];poolreset::queue(s);
         s.recording=false;s.pending=true;s.covers=submitted;s.serial=slot_serial;s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index=slot_index+1<slot_count?slot_index+1:0;++perf.submits;snapshot_reset();++slot_serial;
         pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
     }
@@ -1183,7 +1223,7 @@ void perf_frame(){
     {texel_distinct+=texel_frame_keys.size();for(auto k:texel_frame_keys)if(texel_prev_keys.count(k))++texel_reused;texel_prev_keys.swap(texel_frame_keys);texel_frame_keys.clear();}
     if(completion_wait_enabled)fold_completion_wait_stats();
     if(perf_frame_timed)++perf_timed_frames;perf_frame_timed=perf_sample && stats.presents.load()%perf_sample==0;   // the next frame
-    {bool was=ab_frame_on;ab_frame_on=ab_enabled();tls_gate=!ab_off("tlsgate");img_fast=!ab_off("imgfast");if(was!=ab_frame_on && ab_period>0){if(r3_memo_flip)pipe_memo_valid=false;if(stategen)sg::invalidate();r4_window_reset();perf=Perf{};perf.window_start=timing_clock();set_cache_hits=set_cache_misses=0;chunk::end_cuts=chunk::mid_cuts=chunk::not_ready=chunk::checks=chunk::busy_ticks=0;return;}}
+    {bool was=ab_frame_on;ab_frame_on=ab_enabled();tls_gate=!ab_off("tlsgate");img_fast=!ab_off("imgfast");if(was!=ab_frame_on && ab_period>0){if(r3_memo_flip){pipe_memo_valid=false;++pmn_gen;}if(stategen)sg::invalidate();r4_window_reset();mt_window_reset();perf=Perf{};perf.window_start=timing_clock();set_cache_hits=set_cache_misses=0;chunk::end_cuts=chunk::mid_cuts=chunk::not_ready=chunk::checks=chunk::busy_ticks=0;return;}}
     pipelines_unsaved+=size_t(warm::compiled.exchange(0));
     if(pipelines_unsaved && stats.presents.load()>=pipeline_save_frame+300){pipeline_save_frame=stats.presents.load();save_pipeline_cache();}
     uint64_t now=timing_clock();if(!perf.window_start){perf.window_start=now;perf.frames=0;return;}
@@ -1217,6 +1257,15 @@ void perf_frame(){
         ubo_vc,r4_uvc_hits/f,r4_uvc_misses/f,(unsigned long long)r4_uvc_mism,(unsigned long long)r4_uvc_mism_total,r4_uvc_sorted/f,stategen,r4_sg_desc/f,r4_sg_pipe/f,(unsigned long long)r4_sg_desc_mism,(unsigned long long)r4_sg_pipe_mism,(unsigned long long)r4_sg_mism_total,
         int(perf_quiet),(unsigned long long)r4_quiet_lines,int(rb_ab),(unsigned long long)r4_rb_swaps);
      r4_window_reset();}
+    if(mt_log){   // [mt] per frame unless named total; present thread: handoffs, translation-thread waits, the present thread's own time
+     static uint64_t ps0[4]={};uint64_t ps[4]={};if(pt_mode && dm_present_thread_stats)dm_present_thread_stats(ps);
+     xbg_logf("NVN PERF mt ab=%d pmemo=%d check=%d hits=%.1f misses=%.1f inserts=%.1f checked=%.1f mism=%llu mism_total=%llu drops=%llu"
+        " hzepoch=%d skips=%.1f runs=%.1f stamps=%.1f mism=%llu mism_total=%llu drvblk=%d reuse=%.1f builds=%.1f support_front=%.1f mism=%llu mism_total=%llu"
+        " presthread=%d handoffs=%.2f wait_ms=%.3f waits=%.2f drain_ms=%.3f thread_jobs=%.2f thread_ms=%.3f full_ms=%.3f",
+        int(ab_frame_on),pmn_n,int(pmn_check),pmn_hits/f,pmn_misses/f,pmn_inserts/f,pmn_checked/f,(unsigned long long)pmn_mism,(unsigned long long)pmn_mism_total,(unsigned long long)(pmn_gen-pmn_gen_w),
+        hz_mode,hz_skips/f,hz_runs/f,hz_stamps/f,(unsigned long long)hz_mism,(unsigned long long)hz_mism_total,drv_mode,drv_reuse/f,drv_builds/f,drv_front/f,(unsigned long long)drv_mism,(unsigned long long)drv_mism_total,
+        pt_mode,pt_jobs/f,pt_wait_ns/1e6/f,pt_waits/f,pt_drain_ns/1e6/f,(ps[0]-ps0[0])/f,(ps[1]-ps0[1])/1e6/f,(ps[2]-ps0[2])/1e6/f);
+     memcpy(ps0,ps,sizeof ps0);mt_window_reset();}
     perf_vlogf("NVN PERF snapfront front_hits=%.1f map_hits=%.1f invalidations=%.1f erased=%.1f",snap_front_hits/f,snap_map_hits/f,snap_invalidations/f,snap_invalidated/f);perf_vlogf("NVN PERF textures bc_native=%llu bc_decoded=%llu live_images=%.1fMB bc_images=%.1fMB bc_payload=%.1fMB",(unsigned long long)native_bc_images,(unsigned long long)decoded_bc_images,image_bytes_live/1048576.0,bc_image_bytes_live/1048576.0,bc_data_bytes_live/1048576.0);snap_front_hits=snap_map_hits=snap_invalidations=snap_invalidated=0;
     if(bright::enabled){perf_vlogf("NVN PERF bright applied=%.2f k=%.2f",bright::applied/f,bright::last_k);bright::applied=0;}
     if(tex_dirty){perf_vlogf("NVN PERF texdirty tracked=%.1f checks=%.1f changed=%.1f",tex_dirty_tracked/f,tex_dirty_checks/f,tex_dirty_changed/f);tex_dirty_tracked=tex_dirty_checks=tex_dirty_changed=0;}{char buf[512];int at=0;std::vector<std::pair<uint64_t,int>> v;for(auto &e:pass_end_lines)v.push_back({e.second,e.first});std::sort(v.rbegin(),v.rend());for(size_t i=0;i<v.size() && i<8;i++)at+=snprintf(buf+at,sizeof buf-at," L%d=%.1f",v[i].second,v[i].first/f);pass_end_lines.clear();perf_vlogf("NVN PERF pass_end_lines%s read_break layout/written/attach=%.1f/%.1f/%.1f/%.1f depth_feedback_reads=%.1f",at?buf:"",read_break_why[1]/f,read_break_why[2]/f,read_break_why[4]/f,(read_break_why[3]+read_break_why[5]+read_break_why[6]+read_break_why[7])/f,depth_feedback_reads/f);memset(read_break_why,0,sizeof read_break_why);depth_feedback_reads=0;}perf_vlogf("NVN PERF hash_sites MB/calls other=%.2f/%.0f texcheck=%.2f/%.0f texel=%.2f/%.0f upload=%.2f/%.0f",hash_site_bytes[0]/f/1048576,hash_site_calls[0]/f,hash_site_bytes[1]/f/1048576,hash_site_calls[1]/f,hash_site_bytes[2]/f/1048576,hash_site_calls[2]/f,hash_site_bytes[3]/f/1048576,hash_site_calls[3]/f);memset(hash_site_bytes,0,sizeof hash_site_bytes);memset(hash_site_calls,0,sizeof hash_site_calls);if(zc::enabled>0){perf_vlogf("NVN PERF zerocopy hits=%.1f sticky_miss=%.1f align_miss=%.1f pending_miss=%.1f mapped=%.0fMB",zc::hits/f,zc::sticky_misses/f,zc::align_misses/f,zc::pending_misses/f,zc::mapped_bytes/1048576.0);zc::hits=zc::sticky_misses=zc::align_misses=zc::pending_misses=0;}if(storage_chained || guest_barriers_skipped){perf_vlogf("NVN PERF storage-chain reused=%.1f gpu_merges=%.1f prologue_copies=%.1f guest_barriers_skipped=%.1f barriers_avoided=%.1f",storage_chained/f,storage_merges/f,pro_copies/f,guest_barriers_skipped/f,barriers_avoided/f);storage_chained=storage_merges=pro_copies=guest_barriers_skipped=barriers_avoided=0;}if(gpu_indirect_draws || gpu_indirect_fallbacks){perf_vlogf("NVN PERF gpu-indirect draws=%.1f fallbacks=%.1f cpu=%.1f",gpu_indirect_draws/f,gpu_indirect_fallbacks/f,gpu_indirect_cpu/f);gpu_indirect_draws=gpu_indirect_fallbacks=gpu_indirect_cpu=0;}if(partial_uploads){perf_vlogf("NVN PERF partial-tex uploads=%.1f blocks=%.1f KB=%.1f prologue=%.1f",partial_uploads/f,partial_blocks/f,partial_bytes/f/1024,partial_prologue/f);partial_uploads=partial_blocks=partial_bytes=partial_prologue=0;}
@@ -1740,7 +1789,7 @@ struct Image {
     uint64_t up_first_ns=0,up_last_ns=0;uint32_t up_full=0,up_partial=0;uint64_t discard_id=0;uint8_t discard_undos=0;
     std::map<std::array<uint32_t,8>,VkImageView> views;std::vector<std::vector<uint64_t>> fb_keys; // fb_keys: persistent framebuffers using these views
     ~Image(){if(discard_id)texdiscard::undo(*this);image_bytes_live-=mem_bytes;bc_image_bytes_live-=bc_bytes;bc_data_bytes_live-=bc_data;forget_framebuffers(*this);for(auto &v:views)vkDestroyImageView(cfg.device,v.second,nullptr);if(image)vkDestroyImage(cfg.device,image,nullptr);if(memory)vkFreeMemory(cfg.device,memory,nullptr);}
-    void transition(VkCommandBuffer cmd,VkImageLayout next){
+    void transition(VkCommandBuffer cmd,VkImageLayout next){++mt_hz_gen;   // [mt S2]
         if(discard_id && next!=VK_IMAGE_LAYOUT_GENERAL)texdiscard::undo(*this);   // the restore worker reads it in GENERAL on another queue
         VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.oldLayout=layout;b.newLayout=next;b.image=image;b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
         b.subresourceRange={aspects,0,levels,0,layers};b.srcAccessMask=layout==VK_IMAGE_LAYOUT_UNDEFINED?0:VK_ACCESS_MEMORY_WRITE_BIT|VK_ACCESS_MEMORY_READ_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1855,10 +1904,11 @@ void prepare_read(Image &im,VkCommandBuffer cmd,int storage=-1){
         end_open_pass();if(im.layout!=VK_IMAGE_LAYOUT_GENERAL)im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);full_barrier(cmd);
     }
 }
-void mark_storage_images(){for(Image *im:storage_images_bound){im->storage_write=++write_seq;im->storage_dirty=true;}storage_images_bound.clear();}
+void mark_storage_images(){for(Image *im:storage_images_bound){im->storage_write=++write_seq;im->storage_dirty=true;if(im->sampled_ever)++mt_hz_gen;}storage_images_bound.clear();}
 void prepare_attachment(Image &im,VkCommandBuffer cmd){
     bool in_open=open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),&im)!=open_pass.images.end();
     if(im.layout!=VK_IMAGE_LAYOUT_GENERAL && !in_open){end_open_pass();im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);}
+    if(!in_open)++mt_hz_gen;   // [mt S2] a write mark outside the open pass
     im.prior_write=im.last_write;im.last_write=++write_seq;
 }
 void provenance_image(const char *event,const tex_t *t,const Image &im,const view_t *v=nullptr){
@@ -1866,7 +1916,9 @@ void provenance_image(const char *event,const tex_t *t,const Image &im,const vie
     provenance_log("IMAGE event=%s requested=%llu source=%llu image=%p mem=%p pool=%p off=%lld bytes=%llu createEpoch=%llu currentEpoch=%llu writer=%llu writeSite=%u writerPhase=declared-or-complete-range-unspecified uploaded=%u gpu=%u fmt=%d target=%d extent=%dx%dx%d levels=%d samples=%d flags=%x stride=%d pkg=%d viewFmt=%d mip=%d/%d layer=%d/%d",
     event,(unsigned long long)t->serial,(unsigned long long)im.source.serial,(void*)im.image,t->mem,(void*)(t->mem && t->off>=0 && uint64_t(t->off)<=uint64_t(t->mem)?uint64_t(t->mem)-uint64_t(t->off):0),(long long)t->off,(unsigned long long)t->L.size,(unsigned long long)im.provenance_epoch,(unsigned long long)provenance.epoch((t->mem && t->off>=0 && uint64_t(t->off)<=uint64_t(t->mem)?uint64_t(t->mem)-uint64_t(t->off):0)),(unsigned long long)im.provenance_writer,im.provenance_write_site,im.uploaded,im.gpu_written,t->d.format,t->d.target,t->d.width,t->d.height,t->d.depth,t->d.levels,t->d.samples,t->d.flags,t->d.stride,t->d.pkg_block_h,v&&v->set_format?v->format:t->d.format,v&&v->set_levels?v->base_level:0,v&&v->set_levels?v->nlevels:int(im.levels),v&&v->set_layers?v->min_layer:0,v&&v->set_layers?v->nlayers:int(im.layers));
 }
-void provenance_write(Image &im,unsigned site){if(im.discard_id)texdiscard::undo(im);   // [DOOM] DM_TEX_DISCARD: a GPU write (or new upload) is coming: guest copy back first
+void provenance_write(Image &im,unsigned site){if(im.discard_id)texdiscard::undo(im);
+    if(hz_mode && !(open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),&im)!=open_pass.images.end()))++mt_hz_gen;   // [mt S2] a GPU write outside the open pass
+      // [DOOM] DM_TEX_DISCARD: a GPU write (or new upload) is coming: guest copy back first
     im.provenance_writer=++provenance.sequence;im.provenance_write_site=site;provenance_image("WRITE",&im.source,im);}
 
 // Invoked only after a completed game draw/clear fence. Read the real Vulkan
@@ -2110,7 +2162,7 @@ void invalidate_cpu_range(uint64_t address,uint64_t bytes){CPU_SCOPE(CpuWrite);
         // A full storage overwrite replaces the prior GPU contents. A partial
         // overwrite requires GPU-to-NVN readback/merge before applying CPU data.
         need(!im.gpu_written || (address<=begin && address+bytes>=end),"Partial CPU write aliases GPU-written texture; readback/merge required");
-        im.gpu_written=false;provenance_write(im,__LINE__);im.uploaded=false;im.checked_submission=UINT64_MAX;
+        im.gpu_written=false;provenance_write(im,__LINE__);im.uploaded=false;++mt_hz_gen;im.checked_submission=UINT64_MAX;
     });
 }
 
@@ -2319,7 +2371,7 @@ bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
         // (no earlier command read the old blocks). The in-pass path ended the open render pass and put two full barriers
         // around the copy: ~5 partial uploads a frame in the VT-streaming scenes (pass_end_lines L1373, prof31).
         if(upload_prologue && partial_prologue_on() && im.slot_use!=slot_serial && !ab_off("partpro")){Slot &s=recording_slot();
-            s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++partial_prologue;}
+            s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++mt_hz_gen;++partial_prologue;}
         else{Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,uint32_t(copies.size()),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
         partial_bytes+=linear.size();++partial_uploads;texdiscard::note_upload(im,true);
         if(vt_diag_on()){auto &e=vtdiag::partial[t->serial];++e.first;e.second+=copies.size();}
@@ -2393,8 +2445,8 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 struct UplCheck{uint64_t t0;~UplCheck(){upl_check_ns+=timing_clock()-t0;++upl_check_n;}} upl_check{ck0};
                 bool part_ok=false;if(partial_eligible(im,t)){const uint64_t pt0=timing_clock();part_ok=partial_upload(im,t,im.dirty_stamp,stamp);const uint64_t dt=timing_clock()-pt0;upl_part_ns+=dt;upl_check.t0+=dt;}
                 if(part_ok){im.dirty_stamp=stamp;}
-                else if(im.hash_unknown){im.uploaded=false;im.stable_checks=0;++tex_dirty_changed;++r5_dz_unknown_reup;}   // [r5] no hash at the upload: treated as changed
-                else if((big_hash_note(im,t,"tracked"),hash_site=1,hash_memory(t->mem,t->L.size))!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;++tex_dirty_changed;im.churn_same=0;}
+                else if(im.hash_unknown){im.uploaded=false;++mt_hz_gen;im.stable_checks=0;++tex_dirty_changed;++r5_dz_unknown_reup;}   // [r5] no hash at the upload: treated as changed
+                else if((big_hash_note(im,t,"tracked"),hash_site=1,hash_memory(t->mem,t->L.size))!=im.cpu_hash){im.uploaded=false;++mt_hz_gen;im.stable_checks=0;++tex_dirty_changed;im.churn_same=0;}
                 else{im.dirty_stamp=stamp;
                     // [r5] DM_GFX_PROTECT_CHURN (pipeline_audit.md section 5): the third tracked check in a row that finds the pages written
                     // but the bytes the same (a texture rewritten with identical contents, ~9.6k write faults a second in menus / loads)
@@ -2411,7 +2463,7 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         else if(im.stable_checks<4 || im.churn_off || ((stats.submissions+t->serial)&15)==0){   // [r5] churn_off: every submission
             const bool track=tex_dirty && im.stable_checks==3 && !im.churn_off && !ab_off("texdirty") && nvn_dirty_tracked && nvn_dirty_protect && nvn_dirty_now && nvn_dirty_since && nvn_dirty_tracked(t->mem,t->L.size);
             uint64_t stamp=0;if(track){dirty_protect_im(im,t,true);stamp=nvn_dirty_now();}
-            big_hash_note(im,t,"untracked");hash_site=1;uint64_t hash=hash_memory(t->mem,t->L.size);hash_site=0;if(im.hash_unknown || hash!=im.cpu_hash){im.uploaded=false;im.stable_checks=0;if(im.hash_unknown)++r5_dz_unknown_reup;}else{++im.stable_checks;if(track){im.dirty_stamp=im.dirty_seen=stamp;++tex_dirty_tracked;}
+            big_hash_note(im,t,"untracked");hash_site=1;uint64_t hash=hash_memory(t->mem,t->L.size);hash_site=0;if(im.hash_unknown || hash!=im.cpu_hash){im.uploaded=false;++mt_hz_gen;im.stable_checks=0;if(im.hash_unknown)++r5_dz_unknown_reup;}else{++im.stable_checks;if(track){im.dirty_stamp=im.dirty_seen=stamp;++tex_dirty_tracked;}
                 if(im.churn_off && ++im.churn_quiet>=1024){im.churn_off=false;im.churn_same=0;im.stable_checks=3;++r5_ch_retracked;}}}
         im.checked_submission=stats.submissions;}
     // Diagnostic: CPU writes into textures whose contents the GPU produced (copies) are invisible to us.
@@ -2476,10 +2528,10 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         // gfx-upload-prologue: no command of this submission used this image yet, so its new contents can go ahead of the whole
         // submission; no earlier command read the old contents.
         if(upload_prologue && im.slot_use!=slot_serial && !ab_off("uppro")){Slot &s=recording_slot();
-            s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++uploads_prologue;}
+            s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++mt_hz_gen;++uploads_prologue;}
         else{++uploads_inpass;if(open_pass.cmd)++uploads_broke_pass;
             Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
-        im.uploaded=true;provenance_write(im,__LINE__);texdiscard::note_upload(im,false);
+        im.uploaded=true;++mt_hz_gen;provenance_write(im,__LINE__);texdiscard::note_upload(im,false);
         // [r5] DM_GFX_DESWZ_DIRECT=1: no hash of the whole texture (up to 89 MB for a VT cache) when it is write-protected right below.
         // From then on the tracker answers: a dirty check re-uploads the written blocks (partial_upload) and never reads cpu_hash. Only
         // two checks would compare it: the tracked fallback when partial_upload cannot handle the layout, and the untracked check once
@@ -2630,6 +2682,16 @@ void pipe_memo_fill(PipeMemoKey &k,const void *layout,const void *pass_def,VkRen
     memset(&k,0,sizeof k);for(unsigned i=0;i<5;i++)k.shader[i]=state.shader[i];k.layout=layout;k.pass_def=pass_def;k.pass=pass;k.pipeline_layout=pipeline_layout;k.prim=prim;k.samples=uint32_t(samples);
     k.rt_n=uint32_t(state.rt.n);k.colors=colors;k.depth=state.rt.depth!=nullptr;k.depth_format=state.rt.depth?uint32_t(state.rt.depth->d.format):0;
     const uint8_t *b=reinterpret_cast<const uint8_t*>(&state);memcpy(k.fixed,b+offsetof(State,attrib),sizeof k.fixed);memcpy(k.stencil,b+offsetof(State,blend_color),sizeof k.stencil);memcpy(k.tail,b+offsetof(State,patch_size),sizeof k.tail);
+}
+// [mt S1] DM_GFX_PIPE_MEMO_N: direct-mapped memo of pipelines (pmn::table, a power of two >= the asked entries). Key = PipeMemoKey (every
+// state field the create info reads) + the five modules (round-3 variants) + the lower-left flag; value = what the create-info build gives
+// a draw: the pipeline, its vertex bindings, the zero binding and restart_eff. gen = pmn_gen at insertion (0 = empty).
+namespace pmn {
+struct Key{PipeMemoKey k;VkShaderModule mod[5];uint32_t ll,pad;};
+struct Ent{Key key;uint64_t gen=0;VkPipeline pipe=VK_NULL_HANDLE;int zero_binding=-1;uint32_t restart=0,nb=0;VkVertexInputBindingDescription b[16];};
+std::vector<Ent> table;
+inline uint64_t hash(const Key &k){const uint8_t *p=reinterpret_cast<const uint8_t*>(&k);uint64_t h=0x9E3779B97F4A7C15ull,w;size_t i=0;
+    for(;i+8<=sizeof k;i+=8){memcpy(&w,p+i,8);h=(h^w)*0x100000001B3ull;h^=h>>29;}for(;i<sizeof k;i++)h=(h^p[i])*0x100000001B3ull;return h^(h>>31);}
 }
 // [nonadreno] With cap_soft set (module loaders), a missing capability we can degrade (2 Geometry, 55/56 formatless storage
 // reads/writes without VK_KHR_format_feature_flags2) does not abort: cap_gap names it and the caller marks the module unusable.
@@ -3353,11 +3415,11 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
         // All prior draws/dispatches waited their fence. This lookup occurs
         // before binding the current pipeline; no retained entry is in flight.
         auto oldest=std::min_element(pipeline_objects.begin(),pipeline_objects.end(),[](const auto &a,const auto &b){return a.second.last_used<b.second.last_used;});
-        {VkPipeline old=oldest->second.pipeline;retire_handle([old]{vkDestroyPipeline(cfg.device,old,nullptr);});for(auto f=pipeline_fast.begin();f!=pipeline_fast.end();)if(f->second==old)f=pipeline_fast.erase(f);else ++f;pipe_memo_valid=false;}pipeline_objects.erase(oldest);++pipeline_counts.evictions;
+        {VkPipeline old=oldest->second.pipeline;retire_handle([old]{vkDestroyPipeline(cfg.device,old,nullptr);});for(auto f=pipeline_fast.begin();f!=pipeline_fast.end();)if(f->second==old)f=pipeline_fast.erase(f);else ++f;pipe_memo_valid=false;++pmn_gen;}pipeline_objects.erase(oldest);++pipeline_counts.evictions;
     }
     pipeline_objects.emplace(std::string(bytes),PipelineEntry{out.pipeline,++pipeline_tick});
 }
-void clear_pipeline_objects(){for(auto &p:pipeline_objects)vkDestroyPipeline(cfg.device,p.second.pipeline,nullptr);pipeline_objects.clear();pipeline_fast.clear();pipe_memo_valid=false;}
+void clear_pipeline_objects(){for(auto &p:pipeline_objects)vkDestroyPipeline(cfg.device,p.second.pipeline,nullptr);pipeline_objects.clear();pipeline_fast.clear();pipe_memo_valid=false;++pmn_gen;}
 struct PipelineDefinition {
     std::vector<uint32_t> words;bool valid=false;
     void assign(const XbgPipelineKey &k,bool ok){valid=ok && k.valid;if(valid)words.assign(k.words,k.words+k.count);}
@@ -3378,10 +3440,10 @@ std::map<std::pair<float,float>,Buffer> support_static; // support block per vie
 struct SamplerFastKey{std::array<uint32_t,11> w;bool operator==(const SamplerFastKey &o)const{return w==o.w;}};
 struct SamplerFastHash{size_t operator()(const SamplerFastKey &k)const{uint64_t h=1469598103934665603ull;for(uint32_t v:k.w){h^=v;h*=1099511628211ull;}return size_t(h);}};
 std::unordered_map<SamplerFastKey,VkSampler,SamplerFastHash> sampler_fast;
-void clear_descriptor_caches(){sampler_fast.clear();pipeline_fast.clear();pipe_memo_valid=false;
+void clear_descriptor_caches(){sampler_fast.clear();pipeline_fast.clear();pipe_memo_valid=false;++pmn_gen;
     for(auto &l:layout_cache){if(l.second.tmpl)vkDestroyDescriptorUpdateTemplate(cfg.device,l.second.tmpl,nullptr);vkDestroyPipelineLayout(cfg.device,l.second.pipeline_layout,nullptr);vkDestroyDescriptorSetLayout(cfg.device,l.second.layout,nullptr);}layout_cache.clear();shader_layouts.clear();
     for(auto &x:sampler_cache)vkDestroySampler(cfg.device,x.second,nullptr);sampler_cache.clear();
-    static_arena.release();support_static.clear();
+    static_arena.release();support_static.clear();++drv_support_gen;
 }
 VkDescriptorSet allocate_set(VkDescriptorSetLayout layout){
     Slot &s=recording_slot();
@@ -3599,12 +3661,13 @@ void upgrade_mutable(Image &im,VkFormat want){
     VkImage old_image=im.image;VkDeviceMemory old_memory=im.memory;std::vector<VkImageView> old_views;for(auto &v:im.views)old_views.push_back(v.second);im.views.clear();
     std::vector<VkFramebuffer> old_fbs;forget_framebuffers(im,&old_fbs);
     retire_handle([old_image,old_memory,old_views,old_fbs]{for(auto f:old_fbs)vkDestroyFramebuffer(cfg.device,f,nullptr);for(auto v:old_views)vkDestroyImageView(cfg.device,v,nullptr);vkDestroyImage(cfg.device,old_image,nullptr);vkFreeMemory(cfg.device,old_memory,nullptr);});
-    im.image=image;im.memory=memory;im.create=ci;im.mutable_format=true;im.layout=VK_IMAGE_LAYOUT_GENERAL;
+    im.image=image;im.memory=memory;im.create=ci;im.mutable_format=true;im.layout=VK_IMAGE_LAYOUT_GENERAL;++mt_hz_gen;
     ++memo_epoch;img_cache.clear();++mutable_upgrades;last_pass_reset();
     xbg_logf("NVN mutable upgrade serial=%llu fmt=%d listed_formats=%zu %ux%ux%u levels=%u layers=%u copied=%d total=%llu",(unsigned long long)im.source.serial,int(im.fmt),im.view_formats.size(),im.width,im.height,im.depth,im.levels,im.layers,int(copied),(unsigned long long)mutable_upgrades);
 }
 struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<MemoImage> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;
-    struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;uint64_t checked_gen=0;size_t reserve=0;};   // checked_gen: memo_check_gen at its last passed image checks   // texel: resident uniform texel buffers (texel_acquire)
+    struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;uint64_t checked_gen=0;size_t reserve=0;
+    uint64_t hz_gen=0,hz_sub=0,hz_slot=0,hz_img=0,hz_chk=0;};   // [mt S2] epochs at the last clean pass of the image loop (hz_gen 0 = none)   // checked_gen: memo_check_gen at its last passed image checks   // texel: resident uniform texel buffers (texel_acquire)
 struct DynUbo{uint64_t order,address;size_t copy;};
 // Cross-frame memo (Claude C147): the memo lives per frame slot and survives submits. An entry is persistent when its set
 // holds no per-frame snapshot except dynamic uniform buffers (re-snapshotted on every hit, only the offset moves) and the
@@ -3645,11 +3708,45 @@ void desc_memo_reset(){img_cache.clear();
     // none was ~1% of the D2R camp's render thread on the Redmi K50 Ultra.
     if(!desc_memo_local[slot_index])return;
     auto &m=desc_memo_slot[slot_index];for(auto it=m.begin();it!=m.end();){if(it->second.persistent)++it;else it=m.erase(it);}desc_memo_local[slot_index]=0;++memo_mod_gen;}
-Buffer &support_block(){size_t n=1392;auto k=std::make_pair(state.viewport.width,state.viewport.height);
-    auto it=support_static.find(k);if(it!=support_static.end())return it->second;
-    Buffer s=static_arena.alloc(uniform_range(n));xbg_support_defaults(s.mapped,state.viewport.width,state.viewport.height);s.flush();return support_static.emplace(k,s).first->second;}
+// [mt S3] DM_GFX_DRVBLK_CACHE (mt_translator_design.md S3): a driver block (4 KB: storage table, or texture / sampler / image handles) is
+// rebuilt whenever tex_gen / buf_gen of its stage moved, and BIND_UBO / BIND_TEX move them on nearly every material draw although the
+// handles the block holds are often the same. Its bytes are fill_driver of exactly the state copied into the entry (stream_buffer zeroes the
+// rest), so equal state means equal bytes: the last 4 blocks of each stage and bank are kept for the slot being recorded (their arena memory
+// lives until that slot retires) and one with the same state is handed out again (the memo hit checks only the buffer handle; the offset
+// is dynamic). support_block: a one-entry front before the std::map lookup (drv_support_gen moves when the map is cleared). =2: blocks
+// are built as before and a reusable block's bytes are compared with the new ones (mism=).
+namespace drvblk {
+struct Ent{uint64_t slot=0;Buffer buf;uint64_t tex[128],samp[128],img[9];NVNbufferRange sb[16],ub[16];std::vector<uint8_t> shadow;};
+constexpr unsigned ways=4;Ent ring[6][2][ways];unsigned next[6][2]={};
+bool same(const Ent &e,unsigned ns,unsigned bank){
+    if(bank)return !memcmp(e.tex,state.tex[ns],sizeof e.tex) && !memcmp(e.samp,state.samp[ns],sizeof e.samp) && !memcmp(e.img,state.img[ns],sizeof e.img);
+    return !memcmp(e.sb,state.sb[ns],sizeof e.sb) && (ns!=5 || !memcmp(e.ub,state.ub[ns],sizeof e.ub));}
+void save(Ent &e,unsigned ns,unsigned bank){
+    if(bank){memcpy(e.tex,state.tex[ns],sizeof e.tex);memcpy(e.samp,state.samp[ns],sizeof e.samp);memcpy(e.img,state.img[ns],sizeof e.img);}
+    else{memcpy(e.sb,state.sb[ns],sizeof e.sb);if(ns==5)memcpy(e.ub,state.ub[ns],sizeof e.ub);}}
+struct Front{float w=0,h=0;uint64_t gen=0;Buffer *b=nullptr;} front;
+}
+Buffer &support_block(){size_t n=1392;
+    const bool on=drv_mode && !mt_off("drvblk");const bool fh=on && drvblk::front.b && drvblk::front.gen==drv_support_gen && drvblk::front.w==state.viewport.width && drvblk::front.h==state.viewport.height;
+    if(fh && drv_mode==1){++drv_front;return *drvblk::front.b;}   // [mt S3]
+    auto k=std::make_pair(state.viewport.width,state.viewport.height);
+    auto it=support_static.find(k);if(it!=support_static.end()){
+        if(on){if(fh){++drv_front;if(drvblk::front.b!=&it->second){++drv_mism;++drv_mism_total;}}drvblk::front={k.first,k.second,drv_support_gen,&it->second};}
+        return it->second;}
+    Buffer s=static_arena.alloc(uniform_range(n));xbg_support_defaults(s.mapped,state.viewport.width,state.viewport.height);s.flush();Buffer &r=support_static.emplace(k,s).first->second;
+    if(on)drvblk::front={k.first,k.second,drv_support_gen,&r};
+    return r;}
 Buffer &driver_block(unsigned ns,unsigned bank){uint64_t gen=bank?tex_gen[ns]:buf_gen[ns];
-    DriverCache &dc=driver_cache[ns][bank];if(dc.slot!=slot_serial || dc.gen!=gen || !dc.slot){Buffer s=stream_buffer(0x1000);fill_driver(static_cast<uint8_t*>(s.mapped),ns,bank?2:0);s.flush();dc.gen=gen;dc.slot=slot_serial;dc.buffer=s;}
+    DriverCache &dc=driver_cache[ns][bank];if(dc.slot!=slot_serial || dc.gen!=gen || !dc.slot){
+        const bool on=drv_mode && !mt_off("drvblk") && ns<6 && bank<2;drvblk::Ent *hit=nullptr;   // [mt S3]
+        if(on)for(auto &e:drvblk::ring[ns][bank])if(e.slot==slot_serial && drvblk::same(e,ns,bank)){hit=&e;break;}
+        if(hit && drv_mode==1){dc.gen=gen;dc.slot=slot_serial;dc.buffer=hit->buf;++drv_reuse;return dc.buffer;}
+        Buffer s=stream_buffer(0x1000);fill_driver(static_cast<uint8_t*>(s.mapped),ns,bank?2:0);s.flush();dc.gen=gen;dc.slot=slot_serial;dc.buffer=s;
+        if(on){++drv_builds;static uint8_t fresh[0x1000];
+            if(drv_mode==2){memset(fresh,0,sizeof fresh);fill_driver(fresh,ns,bank?2:0);   // the bytes just written to s
+                if(hit){++drv_reuse;if(hit->shadow.size()!=sizeof fresh || memcmp(hit->shadow.data(),fresh,sizeof fresh)){++drv_mism;++drv_mism_total;
+                    static unsigned told=0;if(told++<16)xbg_logf("NVN mt drvblk mismatch stage=%u bank=%u: a reusable block differs from the rebuilt one (frame %llu)",ns,bank,(unsigned long long)stats.presents.load());}}}
+            if(!hit){drvblk::Ent &e=drvblk::ring[ns][bank][drvblk::next[ns][bank]++%drvblk::ways];e.slot=slot_serial;e.buf=s;drvblk::save(e,ns,bank);if(drv_mode==2)e.shadow.assign(fresh,fresh+sizeof fresh);}}}
     return dc.buffer;}
 // Uniform texel buffers held in resident per-slot copies, so descriptor sets that bind them can be memoized across frames
 // (D2R camp: 558 of 2188 draws per frame bind one and were rebuilt every time, ~21 us each against ~2.5 us for a memo hit).
@@ -3827,9 +3924,29 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){storage_image
                 if(same){
                 // 命中也走既有按 submit 节流的 CPU 内容复核，不强制重传。
                 // Hits retain get_image's bounded per-submit CPU checks, without forcing uploads.
-                DRAW_SUB(4);for(auto &ti:m.images){Image &im=get_image(ti.first,true);prepare_read(im,commands.command,ti.storage?1:-1);
+                DRAW_SUB(4);
+                // [mt S2] DM_GFX_DESC_HAZARD_EPOCH (mt_translator_design.md S2): the loop below can only act (barrier, layout change, pass end,
+                // upload, first use in the slot) after an event that moves mt_hz_gen or a new submission / slot / image set. When the entry's
+                // last pass found every image already used in this slot, none of them an attachment of the open pass and no storage image
+                // also sampled, and did nothing, the same epochs mean it would do nothing again: only the storage write marks are replayed.
+                // The cached Image pointers are the live ones (images_epoch / memo_check_gen unchanged). =2 runs the loop and counts a skip
+                // that would have lost an action (mism=).
+                const bool hz_try=hz_mode && !read_preflight && img_fast && !provenance_file && !capture.active && !mt_off("hzepoch");
+                const bool hz_same=hz_try && m.hz_gen==mt_hz_gen && m.hz_slot==slot_serial && m.hz_sub==stats.submissions.load(std::memory_order_relaxed) && m.hz_img==images_epoch && m.hz_chk==memo_check_gen;
+                if(hz_same && hz_mode==1){++hz_skips;for(auto &ti:m.images)if(ti.storage){Image &im=*ti.second;storage_images_bound.push_back(&im);im.gpu_written=true;im.storage_write=++write_seq;cpu_visible_mark(im,*ti.first);++memo_simg_hits;}}
+                else{const uint64_t hz0=mt_hz_gen;bool clean=hz_try;int hz_bad=-1;unsigned hz_why=0;
+                for(auto &ti:m.images){
+                    if(clean){const Image *pi=ti.second;const unsigned why=(pi->slot_use!=slot_serial?1u:0u)|(open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),pi)!=open_pass.images.end()?2u:0u)|(ti.storage && pi->sampled_ever?4u:0u);
+                        if(why){clean=false;hz_why=why;hz_bad=int(&ti-m.images.data());}}
+                    const uint64_t hzi=mt_hz_gen;Image &im=get_image(ti.first,true);prepare_read(im,commands.command,ti.storage?1:-1);
                     // Same as descriptors_build's storage-image bind: written now and again after the draw (mark_storage_images).
-                    if(ti.storage){storage_images_bound.push_back(&im);im.gpu_written=true;im.storage_write=++write_seq;cpu_visible_mark(im,*ti.first);++memo_simg_hits;}}
+                    if(ti.storage){storage_images_bound.push_back(&im);im.gpu_written=true;im.storage_write=++write_seq;if(im.sampled_ever)++mt_hz_gen;cpu_visible_mark(im,*ti.first);++memo_simg_hits;}
+                    if(clean && mt_hz_gen!=hzi){clean=false;hz_why=8;hz_bad=int(&ti-m.images.data());}}
+                if(hz_try){++hz_runs;
+                    if(hz_same && !clean){++hz_mism;++hz_mism_total;static unsigned told=0;
+                        if(told++<16)xbg_logf("NVN mt hzepoch mismatch: a skipped image loop would have acted (image %d of %zu serial=%llu why=%#x: 1 first use in the slot, 2 open-pass attachment, 4 sampled storage image, 8 barrier/layout/pass/upload) vs=%s ps=%s frame=%llu",
+                            hz_bad,m.images.size(),hz_bad>=0?(unsigned long long)m.images[size_t(hz_bad)].first->serial:0ull,hz_why,state.shader[0]?state.shader[0]->key.c_str():"-",state.shader[4]?state.shader[4]->key.c_str():"-",(unsigned long long)stats.presents.load());}
+                    if(clean && mt_hz_gen==hz0){m.hz_gen=mt_hz_gen;m.hz_slot=slot_serial;m.hz_sub=stats.submissions.load(std::memory_order_relaxed);m.hz_img=images_epoch;m.hz_chk=memo_check_gen;++hz_stamps;}else m.hz_gen=0;}}
                 DRAW_SUB(5);out.entry=m.entry;out.set=m.set;out.pipeline_layout=m.pipeline_layout;out.dynamic_offsets=offsets;++desc_memo_hits;if(m.persistent)++xmemo_hits;desc_ns[5]+=perf_clock()-tm0;return;}
                 ++desc_memo_why[3];
                 if(m.persistent){auto pin=memo_pinned[slot_index].find(m.set);if(pin!=memo_pinned[slot_index].end() && --pin->second.refs==0){slots[slot_index].used_sets[pin->second.layout].push_back(m.set);memo_pinned[slot_index].erase(pin);}}
@@ -3943,9 +4060,9 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 else if(b.source==XBG_SOURCE_C1){
                     if(!shader.c1_ready){size_t bytes=uniform_range(shader.c1.size());shader.c1_buffer=static_arena.alloc(bytes);memset(shader.c1_buffer.mapped,0,bytes);if(!shader.c1.empty())memcpy(shader.c1_buffer.mapped,shader.c1.data(),shader.c1.size());shader.c1_buffer.flush();shader.c1_ready=true;}
                     data=shader.c1.data();copy=shader.c1.size();n=shader.c1_buffer.size;buffer=&shader.c1_buffer;}
-                else if(b.source==XBG_SOURCE_DRIVER0 || b.source==XBG_SOURCE_DRIVER2){n=0x1000;unsigned bank=b.source==XBG_SOURCE_DRIVER0?0:1;uint64_t gen=bank?tex_gen[ns]:buf_gen[ns]+(ns==5?0:0);
-                    DriverCache &dc=driver_cache[ns][bank];if(dc.slot!=slot_serial || dc.gen!=gen || !dc.slot){Buffer s=stream_buffer(n);fill_driver(static_cast<uint8_t*>(s.mapped),ns,bank?2:0);s.flush();dc.gen=gen;dc.slot=slot_serial;dc.buffer=s;}
-                    data=dc.buffer.mapped;copy=n;buffer=out.keep(dc.buffer);}
+                else if(b.source==XBG_SOURCE_DRIVER0 || b.source==XBG_SOURCE_DRIVER2){n=0x1000;unsigned bank=b.source==XBG_SOURCE_DRIVER0?0:1;
+                    Buffer &blk=driver_block(ns,bank);   // [mt S3] the memo-hit path's block cache (this was the same code inline)
+                    data=blk.mapped;copy=n;buffer=out.keep(blk);}
                 else xbg_fatalf("Unsupported shader buffer source %u",b.source);
                 need(n && n<=size_t(is_storage?properties.limits.maxStorageBufferRange:properties.limits.maxUniformBufferRange),"Descriptor range exceeds device limit");
                 if(write.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC){buffer_infos.push_back({buffer->buffer,0,n});if(desc_memo_recording)desc_memo_dyn.push_back({(uint64_t(b.binding)<<32)|element,buffer->buffer,uint32_t(buffer->offset+buffer_offset),b.source==XBG_SOURCE_UNIFORM,uint8_t(b.source),uint8_t(ns),uint8_t(b.source==XBG_SOURCE_DRIVER0?0:1)});dynamic_list.push_back({(uint64_t(b.binding)<<32)|element,uint32_t(buffer->offset+buffer_offset)});}
@@ -3964,7 +4081,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                         auto live=it==img_cache.end()?images.end():images.find(it->second.tex->serial);
                         if(it!=img_cache.end() && it->second.record->revision==it->second.revision &&
                             live!=images.end() && live->second.get()==it->second.im){Image *im=&get_image(it->second.tex,true);
-                            {Image &sm=*im;if(b.type!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && !sm.sampled_ever){sm.sampled_ever=true;}}prepare_read(*im,commands.command,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);if(desc_memo_recording)desc_memo_images.push_back({it->second.tex,im,it->second.record,it->second.revision});
+                            {Image &sm=*im;if(b.type!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && !sm.sampled_ever){sm.sampled_ever=true;++mt_hz_gen;}}prepare_read(*im,commands.command,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);if(desc_memo_recording)desc_memo_images.push_back({it->second.tex,im,it->second.record,it->second.revision});
                             VkDescriptorImageInfo ii{};ii.imageView=it->second.view;ii.sampler=b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER?it->second.sampler:VK_NULL_HANDLE;ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
                             image_infos.push_back(ii);write.pImageInfo=&image_infos.back();img_fast=true;++img_cache_hits;}
                         else if(it!=img_cache.end())img_cache.erase(it);
@@ -3990,7 +4107,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                     VkBufferViewCreateInfo v{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};v.buffer=buf->buffer;v.offset=buf->offset;v.format=format(texture.d.format);v.range=bytes;VkBufferView bv;{auto &cache=recording_slot().texel_views;std::array<uint64_t,4> key{uint64_t(v.buffer),v.offset,v.range,uint64_t(v.format)};auto f=cache.find(key);if(f!=cache.end())bv=f->second;else{VK(vkCreateBufferView(cfg.device,&v,nullptr,&bv));cache.emplace(key,bv);}}texel_views.push_back(bv);write.pTexelBufferView=&texel_views.back();}}
                 else{if(aspect(texture.d.format)!=VK_IMAGE_ASPECT_COLOR_BIT){auto prior=images.find(texture.serial);if(prior==images.end() || (!prior->second->uploaded && !prior->second->gpu_written))xbg_logf("NVN initial depth descriptor shader=%s stage=%u slot=%u id=%d serial=%llu format=%#x",shader.key.c_str(),ns,slot,id,(unsigned long long)texture.serial,texture.d.format);}
                     VkDescriptorImageInfo ii{};
-                    Image &im=get_image(&texture,true);provenance_log("BIND shader=%s stage=%u slot=%u id=%d handle=%llu descriptorMem=%p descriptorOff=%lld type=%u",shader.key.c_str(),ns,slot,id,(unsigned long long)handle,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off,unsigned(b.type));provenance_image("BIND",&texture,im,registered.has_view?&registered.view:nullptr);{Image &sm=im;if(b.type!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && !sm.sampled_ever){sm.sampled_ever=true;}}DESC_CALL(ImageTransition, prepare_read(im,commands.command,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));if(desc_memo_recording)desc_memo_images.push_back({&texture,&im,record,record->revision,uint8_t(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)});ii.imageView=DESC_CALL(ImageView, im.view(registered.has_view?&registered.view:nullptr,false,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,storage_int_view(b,im,registered.has_view?&registered.view:nullptr)));ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
+                    Image &im=get_image(&texture,true);provenance_log("BIND shader=%s stage=%u slot=%u id=%d handle=%llu descriptorMem=%p descriptorOff=%lld type=%u",shader.key.c_str(),ns,slot,id,(unsigned long long)handle,state.texture_pool.pool?state.texture_pool.pool->mem:nullptr,(long long)state.texture_pool.off,unsigned(b.type));provenance_image("BIND",&texture,im,registered.has_view?&registered.view:nullptr);{Image &sm=im;if(b.type!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && !sm.sampled_ever){sm.sampled_ever=true;++mt_hz_gen;}}DESC_CALL(ImageTransition, prepare_read(im,commands.command,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE));if(desc_memo_recording)desc_memo_images.push_back({&texture,&im,record,record->revision,uint8_t(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)});ii.imageView=DESC_CALL(ImageView, im.view(registered.has_view?&registered.view:nullptr,false,b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,storage_int_view(b,im,registered.has_view?&registered.view:nullptr)));ii.imageLayout=VK_IMAGE_LAYOUT_GENERAL;
                     if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-input",st,b.binding,element);out.capture_inputs.push_back({&im,registered.view,registered.has_view,label});capture_log("TEXTURE label=%s shader=%s nvnStage=%u slot=%u handle=%#llx id=%d serial=%llu cachedSerial=%llu image=%p view=%p viewFormat=%u sourceKind=%u",label,shader.key.c_str(),ns,slot,(unsigned long long)handle,id,(unsigned long long)texture.serial,(unsigned long long)im.source.serial,(void*)im.image,(void*)ii.imageView,unsigned(im.view_format(registered.has_view?&registered.view:nullptr)),b.source);}
                     if(b.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.type==VK_DESCRIPTOR_TYPE_SAMPLER){DESC_SCOPE(SamplerBind);uint64_t sh=handle;if(b.sampler_slot!=UINT32_MAX){need(b.sampler_slot<128,"Sampler slot out of range");sh=state.samp[ns][b.sampler_slot];}int sid=int(sh>>20);samp_par parameters{};if(sid==0){parameters.ws=parameters.wt=parameters.wr=7;parameters.aniso=1;parameters.cmp_func=1;}
                         else{auto sp=samplers.find(pool_key(&state.sampler_pool));auto &table=sp==samplers.end()?legacy_samplers:sp->second;auto sa=table.find(sid);if(sa==table.end())xbg_fatalf("Unregistered sampler id=%d",sid);parameters=sa->second;}ii.sampler=sampler(parameters,im,im.view_format(registered.has_view?&registered.view:nullptr),((b.flags>>16)&3)!=0);if(capture.active)capture_log("SAMPLER st=%u binding=%u sid=%d samplerSlot=%u min=%u mag=%u wrap=%u/%u/%u lod=%g/%g bias=%g",st,b.binding,sid,b.sampler_slot,parameters.minf,parameters.magf,parameters.ws,parameters.wt,parameters.wr,parameters.lod_min,parameters.lod_max,parameters.lod_bias);}
@@ -4065,7 +4182,7 @@ std::unordered_map<VkRenderPass,LazyInfo> lazy_info;std::map<std::pair<VkRenderP
 // compatible with pass and its pipelines and framebuffers.
 struct RenderPassEntry {VkRenderPass pass{},noload{};PipelineDefinition definition;};
 std::map<std::vector<uint32_t>,RenderPassEntry> render_pass_cache;
-void clear_render_pass_cache(){for(auto &t:lazy_twins)if(t.second)vkDestroyRenderPass(cfg.device,t.second,nullptr);lazy_twins.clear();lazy_info.clear();lazy_pending=false;for(auto &r:render_pass_cache){vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);if(r.second.noload)vkDestroyRenderPass(cfg.device,r.second.noload,nullptr);}render_pass_cache.clear();pipeline_fast.clear();pipe_memo_valid=false;}
+void clear_render_pass_cache(){for(auto &t:lazy_twins)if(t.second)vkDestroyRenderPass(cfg.device,t.second,nullptr);lazy_twins.clear();lazy_info.clear();lazy_pending=false;for(auto &r:render_pass_cache){vkDestroyRenderPass(cfg.device,r.second.pass,nullptr);if(r.second.noload)vkDestroyRenderPass(cfg.device,r.second.noload,nullptr);}render_pass_cache.clear();pipeline_fast.clear();pipe_memo_valid=false;++pmn_gen;}
 bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,bool soft=false){CPU_SCOPE(Pass);
     const bool plain_draw=c.draw && clear_color<0 && !clear_depth && !soft && !provenance_file && !capture.active && !ab_off("passfast");
     if(plain_draw && last_pass.valid && open_pass.cmd==c.command && open_pass.pass==last_pass.pass.pass && open_pass.framebuffer==last_pass.pass.framebuffer && !memcmp(&state.rt,&last_pass.rt,sizeof state.rt)){
@@ -4175,7 +4292,7 @@ void lrz_touch_before(const Pass &p,VkCommandBuffer cmd){
                 vkCmdCopyBufferToImage(cmd,b.buffer,pi.image,VK_IMAGE_LAYOUT_GENERAL,1,&c);full_barrier(cmd);++lrz_touches;}}}
     lrz_prev_serial=dim->source.serial;
 }
-void begin_pass(Pass &p,Commands &c){lrz_touch_before(p,c.command);pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
+void begin_pass(Pass &p,Commands &c){++mt_hz_gen;lrz_touch_before(p,c.command);pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkCmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
 // [r3] DM_GFX_LAZY_CLEAR (pipeline_audit.md 3.12). lazy_clear_open records the pass instead of beginning it; the clears of the
 // whole framebuffer that follow collect in lazy (later ones of the same aspect replace earlier ones, as they would overwrite them).
 // The next draw in that pass (draw() matched open_pass, so nothing read or wrote the attachments in between: every other use
@@ -4195,7 +4312,7 @@ void lazy_clear_add(const VkClearAttachment &a){
         x.aspectMask|=a.aspectMask;++r3_lazy_appended;return;}
     lazy.clears.push_back(a);if(lazy.clears.size()>1)++r3_lazy_appended;}
 void lazy_clear_flush(){   // the former recording: begin the pass with its load ops, then the clears
-    lazy_pending=false;VkCommandBuffer cmd=open_pass.cmd;
+    lazy_pending=false;++mt_hz_gen;VkCommandBuffer cmd=open_pass.cmd;
     lrz_touch_before(lazy.pass,cmd);pass_prof_begin(lazy.pass,cmd);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=lazy.pass.pass;b.framebuffer=lazy.pass.framebuffer;b.renderArea.extent={lazy.pass.width,lazy.pass.height};vkCmdBeginRenderPass(cmd,&b,VK_SUBPASS_CONTENTS_INLINE);
     VkClearRect r{{{0,0},{lazy.pass.width,lazy.pass.height}},0,1};if(r.rect.extent.width && r.rect.extent.height)for(auto &a:lazy.clears)vkCmdClearAttachments(cmd,1,&a,1,&r);
     ++r3_lazy_flushed;}
@@ -4219,7 +4336,7 @@ void lazy_clear_begin(Pass &p,VkCommandBuffer cmd){
         else{if(a.aspectMask&VK_IMAGE_ASPECT_DEPTH_BIT)values[k].depthStencil.depth=a.clearValue.depthStencil.depth;if(a.aspectMask&VK_IMAGE_ASPECT_STENCIL_BIT)values[k].depthStencil.stencil=a.clearValue.depthStencil.stencil;}}
     VkRenderPass twin=ok?lazy_twin(lazy.pass.pass,mask):VK_NULL_HANDLE;
     if(!twin){lazy_clear_flush();return;}
-    lazy_pending=false;lrz_touch_before(p,cmd);pass_prof_begin(p,cmd);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=twin;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};b.clearValueCount=n;b.pClearValues=values;
+    lazy_pending=false;++mt_hz_gen;lrz_touch_before(p,cmd);pass_prof_begin(p,cmd);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=twin;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};b.clearValueCount=n;b.pClearValues=values;
     vkCmdBeginRenderPass(cmd,&b,VK_SUBPASS_CONTENTS_INLINE);++r3_lazy_folded;}
 void capture_pass(Pass &pass){
     if(!capture.active)return;
@@ -4507,7 +4624,26 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(same && state.restart.on && indexed){const VkPrimitiveTopology t=topology(prim);const bool strip=t==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || t==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
             const uint32_t ones=indexed->itype==0?0xffu:indexed->itype==1?0xffffu:0xffffffffu;sg_restart=strip && state.restart.index==ones;}
         sg_pipe_same=same && q.restart==sg_restart;}
+    // [mt S1] DM_GFX_PIPE_MEMO_N (mt_translator_design.md S1): look the draw up in the multi-entry memo before the create info is built. A hit
+    // gives the pipeline, the vertex bindings and the zero binding of the draw that built this key; restart_eff is computed here exactly as
+    // the build below does (it is part of the key). Not with the state-gen fast path or its compare mode (sg_pipe_same), capture, or the
+    // pipefast / pipememo A/B off phases. DM_GFX_PIPE_MEMO_CHECK=1: the hit is not used; the build runs and is compared below.
+    pmn::Key pmn_key;pmn::Ent *pmn_e=nullptr;bool pmn_on=false,pmn_hit=false;
+    if(pmn_n && !sg_pipe_same && pipe_memo && pipeline_fast_enabled && !capture.active && d.entry->definition.valid && p.definition->valid && !ab_off("pipefast") && !ab_off("pipememo") && !mt_off("pmemo")){CPU_SCOPE(Pipeline);
+        pmn_on=true;uint32_t restart=0;
+        if(state.restart.on && indexed){const VkPrimitiveTopology t=topology(prim);const bool strip=t==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN || t==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY || t==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+            const uint32_t ones=indexed->itype==0?0xffu:indexed->itype==1?0xffffu:0xffffffffu;restart=strip && state.restart.index==ones;}
+        state.restart_eff=restart;   // the create-info build below sets the same value; the key reads it
+        memset(&pmn_key,0,sizeof pmn_key);pipe_memo_fill(pmn_key.k,&d.entry->definition,p.definition,p.pass,d.pipeline_layout,prim,p.samples,active_colors);
+        for(unsigned i=0;i<5;i++)pmn_key.mod[i]=modules[i];pmn_key.ll=taafix::lower_left();
+        pmn_e=&pmn::table[pmn::hash(pmn_key)&(pmn::table.size()-1)];
+        if(pmn_e->gen==pmn_gen && pmn_e->pipe && !memcmp(&pmn_e->key,&pmn_key,sizeof pmn_key)){pmn_hit=true;++pmn_hits;
+            if(!pmn_check){bindings.assign(pmn_e->b,pmn_e->b+pmn_e->nb);zero_binding=pmn_e->zero_binding;pipeline.pipeline=pmn_e->pipe;pipe_memo_key=pmn_key.k;pipe_memo_pipeline=pmn_e->pipe;pipe_memo_valid=true;}}
+        else ++pmn_misses;}
     if(sg_pipe_same && stategen==1){bindings=sg::pipe.bindings;zero_binding=sg::pipe.zero_binding;state.restart_eff=sg_restart;pipeline.pipeline=sg_pred;++r4_sg_pipe;DRAW_MARK(3);}
+    else if(pmn_hit && !pmn_check){DRAW_MARK(3);   // [mt S1] the memo's pipeline; record it for the state-gen fast path as the build path does
+        if(stategen){sg::pipe_valid=true;sg::Pipe &q=sg::pipe;for(unsigned i=0;i<5;i++){q.sh[i]=state.shader[i];q.mod[i]=modules[i];}q.layout=&d.entry->definition;q.pass_def=p.definition;q.pass=p.pass;q.pl=d.pipeline_layout;q.prim=prim;q.samples=uint32_t(p.samples);q.colors=active_colors;
+            q.rt_n=uint32_t(state.rt.n);q.depth=state.rt.depth;q.depth_format=state.rt.depth?uint32_t(state.rt.depth->d.format):0u;q.restart=state.restart_eff;q.ll=taafix::lower_left();q.bindings=bindings;q.zero_binding=zero_binding;sg::pso_gen_at=sg::pso_gen;}}
     else{
     static std::vector<VkVertexInputAttributeDescription> attributes;attributes.clear();VkVertexInputBindingDescription binding_slots[16];uint32_t binding_used=0;
     for(size_t input=0;input<state.shader[0]->inputs.size();input++){
@@ -4564,6 +4700,11 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         if(!pipeline.pipeline){XbgPipelineKey key;bool cacheable=xbg_graphics_pipeline_key(key,ci,d.entry->definition.view(),p.definition->view());pipeline_lookup(pipeline,key,cacheable,&ci,nullptr,async_skippable(attachments,ds));
             if(use_fast && cacheable && !pipeline.transient)pipeline_fast.emplace(fast,pipeline.pipeline);}
         if(memo && use_fast && pipeline.pipeline && !pipeline.transient){pipe_memo_key=pipe_memo_next;pipe_memo_pipeline=pipeline.pipeline;pipe_memo_valid=true;}}
+    if(pmn_on && pipeline.pipeline && !pipeline.transient){   // [mt S1] compare mode (a hit that was not used), else fill the entry
+        if(pmn_hit){++pmn_checked;const pmn::Ent &e=*pmn_e;bool eq=e.pipe==pipeline.pipeline && e.zero_binding==zero_binding && e.restart==state.restart_eff && e.nb==bindings.size();
+            for(size_t i=0;eq && i<bindings.size();i++)eq=e.b[i].binding==bindings[i].binding && e.b[i].stride==bindings[i].stride && e.b[i].inputRate==bindings[i].inputRate;
+            if(!eq){++pmn_mism;++pmn_mism_total;static unsigned told=0;if(told++<16)xbg_logf("NVN mt pmemo mismatch vs=%s ps=%s prim=%d memo=%p built=%p bindings %u/%zu zero %d/%d restart %u/%u",state.shader[0]?state.shader[0]->key.c_str():"-",state.shader[4]?state.shader[4]->key.c_str():"-",prim,(void*)e.pipe,(void*)pipeline.pipeline,e.nb,bindings.size(),e.zero_binding,zero_binding,e.restart,state.restart_eff);}}
+        else if(bindings.size()<=16){pmn::Ent &e=*pmn_e;e.key=pmn_key;e.gen=pmn_gen;e.pipe=pipeline.pipeline;e.zero_binding=zero_binding;e.restart=state.restart_eff;e.nb=uint32_t(bindings.size());for(size_t i=0;i<bindings.size();i++)e.b[i]=bindings[i];++pmn_inserts;}}
     if(stategen){   // [r4] compare (=2) and record the draw that set the pipeline memo
         if(sg_pipe_same && (pipeline.pipeline!=sg_pred || !sg::same_bindings(bindings,sg::pipe.bindings) || zero_binding!=sg::pipe.zero_binding || state.restart_eff!=sg::pipe.restart)){++r4_sg_pipe_mism;++r4_sg_mism_total;
             static unsigned told=0;if(told++<16)xbg_logf("NVN r4 stategen pipeline mismatch vs=%s ps=%s prim=%d predicted=%p built=%p bindings %zu/%zu",state.shader[0]?state.shader[0]->key.c_str():"-",state.shader[4]?state.shader[4]->key.c_str():"-",prim,(void*)sg_pred,(void*)pipeline.pipeline,sg::pipe.bindings.size(),bindings.size());}
@@ -4596,7 +4737,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         // Proven full overwrite: begin with the color-DONT_CARE twin; open_pass keeps p.pass, so later draws continue this pass.
         if(!gi && p.pass_noload && quad_indices.empty() && !ab_off("noload") && ui_uy==0 && ui_vs==1 && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}
         else begin_pass(p,c);
-        open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;for(auto *pi:p.images)if(pi->prior_write>barrier_seq)open_pass.dirty_begin=true;++perf.passes;}
+        ++mt_hz_gen;open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;for(auto *pi:p.images)if(pi->prior_write>barrier_seq)open_pass.dirty_begin=true;++perf.passes;}
     if(lazy_pending)lazy_clear_begin(p,c.command);   // [r3] the pending pass of a lazy clear (same pass and framebuffer): begin it, clears as load ops
     if(state.ds.dt || state.ds.st || state.bounds.enable)open_pass.depth_used=true;
     if(state.rt.depth && (state.ds.dw || state.ds.st))open_pass.depth_written=true;if(active_colors)open_pass.color_targets=true;
@@ -4794,7 +4935,7 @@ void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int sca
                 // [r3] DM_GFX_LAZY_CLEAR: a clear of the whole framebuffer that would begin its own pass keeps it pending (see lazy_pending)
                 VkClearRect r{scissor(p),0,1};const bool whole=r.rect.offset.x==0 && r.rect.offset.y==0 && r.rect.extent.width==p.width && r.rect.extent.height==p.height;
                 const bool lazy=lazy_clear_on && whole && !r3_off("lazyclear") && lazy_clear_known(p);
-                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();if(lazy)lazy_clear_open(p);else begin_pass(p,c);open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();if(lazy)lazy_clear_open(p);else begin_pass(p,c);++mt_hz_gen;open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
                 // [r3] with DM_GFX_LAZY_CLEAR a stencil-only clear no longer counts as a depth clear for the depth-feedback shortcut
                 // (prepare_read): the depth aspect keeps its contents; a packed D24S8 counts it as a depth/stencil write instead.
                 if(depth){open_pass.depth_used=true;if(!lazy_clear_on || (a.aspectMask&VK_IMAGE_ASPECT_DEPTH_BIT))open_pass.depth_cleared=true;else if(ti.fmt==VK_FORMAT_D24_UNORM_S8_UINT)open_pass.depth_written=true;}
@@ -4912,7 +5053,7 @@ void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu
         XbgBcCopyRows plan{};need(xbg_bc_copy_rows(p.r.width,p.r.height,p.r.depth,bpb,state.copy_stride,state.copy_image_stride,&plan)==0,"Invalid BC copy row/image stride/extent");
         need(p.src<=UINT64_MAX-plan.guest_bytes,"BC copy address overflow");
         if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){cpu_access(p.src,plan.guest_bytes,9);invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
-            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),plan.row,plan.image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
+            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),plan.row,plan.image)){im.uploaded=false;++mt_hz_gen;im.checked_submission=UINT64_MAX;return;}}
         std::vector<uint8_t> packed;
         if(!to_buffer){
             cpu_access(p.src,plan.guest_bytes,9);
@@ -4941,7 +5082,7 @@ void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu
         need(p.src<=UINT64_MAX-source_bytes,"BC copy address overflow");
         size_t bytes=size_t(p.r.width)*p.r.height*p.r.depth*im.bpp;
         if(!im.gpu_written && !(p.tex->d.flags&0x10)){invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
-            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
+            if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;++mt_hz_gen;im.checked_submission=UINT64_MAX;return;}}
         need(bytes<=256ull*1024*1024,"Decoded BC staging exceeds memory bound");std::vector<uint8_t> decoded(bytes);
         int result=xbg_decode_bc_linear(p.tex->d.format,p.r.width,p.r.height,p.r.depth,reinterpret_cast<const void*>(p.src),source_bytes,row,image,decoded.data(),decoded.size());
         if(result)xbg_fatalf("NVN BC staging decode failed format=%#x level=%u result=%d",p.tex->d.format,level,result);
@@ -4954,7 +5095,7 @@ void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu
     need(nvn_copy_pitch(p.r.width,p.r.height,p.r.depth,1,1,im.bpp,state.copy_stride,state.copy_image_stride,&row,&image,&n) && n<=256ull*1024*1024,"Invalid or oversized color copy stride/extent");
     need(p.src<=UINT64_MAX-n,"Color copy address overflow");
     if(!to_buffer && !im.gpu_written && !(p.tex->d.flags&0x10)){invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
-        if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;im.checked_submission=UINT64_MAX;return;}}
+        if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;++mt_hz_gen;im.checked_submission=UINT64_MAX;return;}}
     size_t slice_alignment=4;while(slice_alignment%im.bpp)slice_alignment+=4;
     size_t staging_row=size_t(p.r.width)*im.bpp;
     size_t staging_image=((staging_row*size_t(p.r.height)+slice_alignment-1)/slice_alignment)*slice_alignment,staging_bytes=staging_image*size_t(p.r.depth);
@@ -5566,7 +5707,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
       xbg_logf("NVN pipeline statistics=%d env=%d from=%llu period=%llu (marker gfx-pipe-stats / DM_GFX_PIPE_STATS)",int(pipe_stats),int(pstat_env),(unsigned long long)pstat_from,(unsigned long long)pstat_period);}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-wb-skip").c_str(),"rb");wb_skip=false;if(m){wb_skip=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_WB_SKIP"))wb_skip=atoi(e)!=0;
       xbg_logf("NVN superseded storage writebacks skipped=%d pool_flags=%d (marker gfx-wb-skip)",int(wb_skip),int(nvn_pool_flags!=nullptr));}
-     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-memo").c_str(),"rb");pipe_memo=false;pipe_memo_valid=false;if(m){pipe_memo=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_PIPE_MEMO"))pipe_memo=atoi(e)!=0;
+     {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-memo").c_str(),"rb");pipe_memo=false;pipe_memo_valid=false;++pmn_gen;if(m){pipe_memo=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_PIPE_MEMO"))pipe_memo=atoi(e)!=0;
       xbg_logf("NVN pipeline memo for repeated draw state=%d (marker gfx-pipe-memo)",int(pipe_memo));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-read-preflight").c_str(),"rb");read_preflight=true;if(m){read_preflight=fgetc(m)!='0';fclose(m);}else if(const char *e=getenv("DM_GFX_READ_PREFLIGHT"))read_preflight=atoi(e)!=0;
       xbg_logf("NVN CPU reads resolved before each operation=%d (marker gfx-read-preflight)",int(read_preflight));}
@@ -5615,6 +5756,17 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
                       unsigned(OP_SET_TEX_POOL),unsigned(OP_SET_SAMP_POOL)})if(o<256)sg::quiet_pso[o]=true;
       if(stategen && !pipe_memo)xbg_logf("NVN r4 DM_GFX_STATEGEN: the pipeline part needs the pipeline memo (DM_GFX_PIPE_MEMO=1), only the descriptor key part works");
       r4_log=tail_clamp || pbgen_mode || ubo_vc || stategen || perf_quiet || rb_ab;
+      // [mt] round-mt switches (docs/SWITCHES.md, BUGS_AND_FIXES 3.20). On by default since 02.11 (Mi 13 Pro: compare modes 0 mismatches,
+      // in-process A/B translator CPU -0.65..-0.77 ms at 1500 draws; PIPE_MEMO_N 1024, HAZARD_EPOCH 1, DRVBLK 1, PRESENT_THREAD 1); =0 off.
+      {auto env_int=[](const char *n,int d){const char *e=getenv(n);return e && *e?atoi(e):d;};
+       pmn_n=std::clamp(env_int("DM_GFX_PIPE_MEMO_N",1024),0,65536);pmn_check=pmn_n>0 && env_int("DM_GFX_PIPE_MEMO_CHECK",0)!=0;
+       if(pmn_n){size_t sz=16;while(sz<size_t(pmn_n))sz<<=1;pmn::table.assign(sz,pmn::Ent{});pmn_n=int(sz);}else pmn::table.clear();
+       hz_mode=std::clamp(env_int("DM_GFX_DESC_HAZARD_EPOCH",1),0,2);drv_mode=std::clamp(env_int("DM_GFX_DRVBLK_CACHE",1),0,2);
+       pt_mode=std::clamp(env_int("DM_GFX_PRESENT_THREAD",1),0,2);const bool pt_have=dm_present_thread_set && dm_present_async && dm_present_wait_submitted && dm_present_drain && dm_present_last_error && dm_present_queue_lock && dm_present_queue_unlock;
+       if(pt_mode && !pt_have){xbg_logf("NVN mt DM_GFX_PRESENT_THREAD=%d ignored: this presenter has no present thread",pt_mode);pt_mode=0;}
+       if(pt_have)dm_present_thread_set(pt_mode);mt_window_reset();
+       mt_log=pmn_n || hz_mode || drv_mode || pt_mode || env_int("DM_GFX_MT_LOG",0)!=0;
+       if(mt_log)xbg_logf("NVN mt switches: pipe_memo_n=%d (check %d, %zu bytes an entry) desc_hazard_epoch=%d drvblk_cache=%d present_thread=%d (A/B targets pmemo hzepoch drvblk presthread, group mt)",pmn_n,int(pmn_check),sizeof(pmn::Ent),hz_mode,drv_mode,pt_mode);}
       if(r4_log)xbg_logf("NVN r4 switches: index_tail_clamp=%d dirty_protect_bgen=%d ubo_viewcache=%d stategen=%d perf_quiet=%d (forced verbose=%d) readback_cached=%d (A/B targets tailclamp pbgen uboview stategen perfquiet rbcached, group r4)",tail_clamp,pbgen_mode,ubo_vc,stategen,int(perf_quiet),int(perf_force_verbose),int(rb_ab));}
      {FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-toggle").c_str(),"rb");ab_period=0;if(m){if(fscanf(m,"%d",&ab_period)!=1)ab_period=0;fclose(m);}{FILE *t=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-ab-target").c_str(),"rb");memset(ab_target,0,sizeof ab_target);if(t){if(fscanf(t,"%15s",ab_target)!=1)ab_target[0]=0;fclose(t);}}xbg_logf("NVN PERF ab_period=%d",ab_period);}
      ++slot_serial;gfx_enqueued=0;gfx_executed=0;gfx_presents_queued=0;gfx_async=false; /* Android game command memory remains guest-owned. */if(gfx_async)gfx_worker=std::thread(gfx_worker_loop);xbg_logf("NVN async translation=%d",int(gfx_async));}
@@ -5701,7 +5853,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();++pend_gen;pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();r5raw::clear();bright::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();++pend_gen;pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();VkResult r;if(pt_mode){dm_present_drain();dm_present_queue_lock();r=vkQueueWaitIdle(cfg.queue);dm_present_queue_unlock();}else r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();r5raw::clear();bright::shutdown();clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 extern "C" void xbg_game_frame_counters(xbg_frame_counters *out){if(out)*out={hud::pipelines.load(),hud::pipeline_ns.load(),hud::shaders.load(),hud::shader_ns.load(),hud::uploads.load(),hud::reuploads.load(),hud::upload_bytes.load(),hud::upload_ns.load()};}
 extern "C" void xbg_game_set_frame(uint64_t frame){hud::frame.store(frame,std::memory_order_relaxed);}
@@ -5712,7 +5864,7 @@ static void xbg_register_texture_now(const dpool_t *p,int id,const tex_t *t,cons
 static void xbg_register_sampler_now(const dpool_t *p,int id,const samp_par *s){std::lock_guard<std::recursive_mutex> lock(mutex);need(p&&id>=0&&id<p->n&&s,"Invalid sampler registration");auto &slot=samplers[pool_key(p)][id];if(memcmp(&slot,s,sizeof(*s))){++memo_epoch;++memo_bump[1];}slot=*s;}
 static void xbg_legacy_tex_release_now(tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){provenance_image("RELEASE",t,*i->second);retire_object(i->second);++memo_bump[2];}images.erase(t->serial);image_index_dirty=true;++images_epoch;++memo_check_gen;}}
 static void xbg_legacy_prog_release_now(prog_t *p){/* Immutable shader modules are keyed by original control digest, shared safely. */std::lock_guard<std::recursive_mutex> lock(mutex);if(p && p->serial)program_cache.erase(p->serial);}
-static void xbg_texture_invalidate_now(const tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){need(!i->second->gpu_written,"CPU invalidation of GPU-written texture needs explicit range merge");i->second->uploaded=false;}}}
+static void xbg_texture_invalidate_now(const tex_t *t){std::lock_guard<std::recursive_mutex> lock(mutex);if(t){auto i=images.find(t->serial);if(i!=images.end()){need(!i->second->gpu_written,"CPU invalidation of GPU-written texture needs explicit range merge");i->second->uploaded=false;++mt_hz_gen;}}}
 extern "C" void *xbg_host_command_memory(cmd_t *owner,size_t n){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);need(n<=64*1024*1024 && host_bytes+n<=256ull*1024*1024,"Host command memory cap reached; finalize handles before reusing");auto p=std::make_unique<uint8_t[]>(n);void *out=p.get();host_ranges[uintptr_t(out)]=n;host_segments.push_back({owner,std::move(p),n});host_bytes+=n;return out;}
 extern "C" void xbg_release_command_handle(uint64_t handle){
     // A handle can CALL another handle and game-supplied segments can point to
@@ -5836,12 +5988,14 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     return fence<=completed;
 }
 extern "C" void xbg_legacy_finish(){gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return;   // [DOOM] suspended (screen off / app backgrounded) before the device came up: nothing to drain
-    ++perf.why_finish;complete_all();VK(vkQueueWaitIdle(cfg.queue));}
+    ++perf.why_finish;complete_all();if(pt_mode){pt_drain();dm_present_queue_lock();const VkResult qr=vkQueueWaitIdle(cfg.queue);dm_present_queue_unlock();VK(qr);}else VK(vkQueueWaitIdle(cfg.queue));}   // [mt 2a] the present thread drains first
 static void xbg_present_texture_now(const win_t *window,const tex_t *texture){std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();cpu_visible_flush();debug_dump_frame(texture);{SiteScope site(SITE_PRESENT);cur_op=61;TimingRoot timing_root;CPU_SCOPE(Other);need(initialized&&cfg.present,"Game presentation callback not installed");uint64_t present_begin=timing_clock();Image &im=get_image(texture,false);need(im.gpu_written,"Game tried to present a texture never rendered");Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     // [r3] DM_GFX_PRESENT_FLIP_FOLD: the presenter mirrors in its own blit (dm_present_mirror_next; it declines with RCAS on)
     const bool fold=taafix::lower_left() && flip_fold_on && !r3_off("flipfold") && dm_present_mirror_next && dm_present_mirror_next(1)!=0;if(fold)++r3_flipfold;
     const VkImage shown=taafix::lower_left() && !fold?taafix::flip(c.command,im):im.image;   // DM_GFX_TAA_FIX 2: the lower-left window is stored bottom-up
-    c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);r=cfg.present(cfg.userdata,window->native,shown,im.fmt,im.width,im.height,window->crop,window->interval);}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;zcubo::frame();texdiscard::tick();if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
+    c.finish();submit_slots(false);int r;{CPU_SCOPE(Present);   // [mt 2a] DM_GFX_PRESENT_THREAD: hand the present over (A/B off phase: drain the thread, present inline as before)
+     if(pt_mode && !mt_off("presthread")){r=dm_present_async(shown,im.fmt,im.width,im.height,window->crop,window->interval);++pt_jobs;}
+     else{if(pt_mode)pt_drain();r=cfg.present(cfg.userdata,window->native,shown,im.fmt,im.width,im.height,window->crop,window->interval);}}if(r)xbg_fatalf("Game presentation failed: %d",r);++stats.presents;zcubo::frame();texdiscard::tick();if(pass_prof_enabled && stats.presents.load()==pass_prof_frame)xbg_logf("NVN GPASS boundary frame=%llu slots=%u skipped_slots=%u reserved_queries=%u max_queries=%u max_slots=%u",(unsigned long long)pass_prof_frame,pass_prof_slots,pass_prof_skipped_slots,pass_prof_queries,pass_prof_query_limit,pass_prof_slot_limit);perf.present_cpu_ns+=timing_clock()-present_begin;perf_frame();if(provenance_file && stats.presents.load()>=provenance.target)provenance_close("END");if(capture.trace && stats.presents==capture.frame){capture_log("END frame=%llu events=%u bytes=%llu presentedSerial=%llu image=%p",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes,(unsigned long long)texture->serial,(void*)im.image);fclose(capture.trace);capture.trace=nullptr;capture.active=false;xbg_logf("NVN one-frame capture complete frame=%llu events=%u bytes=%llu",(unsigned long long)capture.frame,capture.events,(unsigned long long)capture.bytes);}}timing_boundary();}
 extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned layer,const NVNcopyRegion *r,uint8_t *dst,size_t row,size_t image){{static std::map<uint64_t,unsigned> rs;if(alias_log>0 && t && rs[t->serial]++<3)xbg_logf("NVN ReadTexels serial=%llu fmt=%#x",(unsigned long long)t->serial,t->d.format);}gfx_drain();std::lock_guard<std::recursive_mutex> lock(mutex);preflight_cpu_reads();need(t&&r&&dst,"Invalid ReadTexels arguments");auto found=images.find(t->serial);if(found==images.end() || !found->second->gpu_written){int bw,bh,bpp=nvn_fmt_bpb(t->d.format,&bw,&bh);need(bpp && r->xoffset==0 && r->yoffset==0 && r->zoffset==0 && r->depth==1 && uint32_t(r->width)==std::max(1u,t->d.width>>level) && uint32_t(r->height)==std::max(1u,t->d.height>>level),"CPU ReadTexels partial region unsupported");need(!(t->d.flags&0x10),"Linear CPU ReadTexels not implemented");need(nvn_deswizzle(&t->d,level,layer,t->mem,dst,row)==0,"ReadTexels deswizzle failed");}
     else{p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride,old_image=state.copy_image_stride;state.copy_stride=row;state.copy_image_stride=image;copy_texture_buffer(p,true);state.copy_stride=old;state.copy_image_stride=old_image;}}
 

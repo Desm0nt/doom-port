@@ -94,6 +94,11 @@ void dm_aperf_guest_present(void) {
     if (atomic_load_explicit(&g_guest_present_tid, memory_order_relaxed) != t) atomic_store_explicit(&g_guest_present_tid, t, memory_order_relaxed);
 }
 static int64_t g_present_wait;   // presenting thread only: acquire waits since its last dm_aperf_present
+// [mt 2a] DM_GFX_PRESENT_THREAD=1 (vulkan_present.cpp): presents run on their own thread, so the session's first thread is the translation
+// thread that hands them over (dm_aperf_frame_tid, once), not the caller of dm_aperf_present. Unset (0): the caller, as before.
+static _Atomic int g_frame_tid;
+void dm_aperf_frame_tid(int tid) { atomic_store(&g_frame_tid, tid); LOG("[perf] ADPF frame thread %d (presents on their own thread)", tid); }
+static int32_t frame_self(void) { int t = atomic_load(&g_frame_tid); return t ? (int32_t)t : (int32_t)gettid(); }
 void dm_aperf_note_wait(int64_t ns) { if (ns > 0) g_present_wait += ns; }
 
 // /proc/self/task/<tid>/stat: comm, utime + stime (clock ticks), the CPU it last ran on (field 39)
@@ -151,7 +156,7 @@ static void hint_init(int64_t target) {
     H.wd_gpu = dlsym(lib, "AWorkDuration_setActualGpuDurationNanos"); H.report2 = dlsym(lib, "APerformanceHint_reportActualWorkDuration2");
     if (!H.get || !H.create || !H.report) { LOG("[perf] no APerformanceHint on this Android: CPU hints off"); return; }
     APerformanceHintManager *m = H.get(); if (!m) return;
-    g_hint_tids[0] = (int32_t)gettid(); g_hint_n = 1;
+    g_hint_tids[0] = frame_self(); g_hint_n = 1;
     g_hint = H.create(m, g_hint_tids, (size_t)g_hint_n, target); g_hint_target = target;
     if (g_hint && H.wd_create && H.wd_start && H.wd_total && H.wd_cpu && H.wd_gpu && H.report2) g_wd = H.wd_create();
     LOG("[perf] ADPF session %s (target %.2f ms, thread %d%s%s%s)", g_hint ? "open" : "refused", target / 1e6, g_hint_tids[0],
@@ -470,9 +475,9 @@ void dm_aperf_present(ANativeWindow *w, float marker_vote) {
         hint_init(p);
         static int seen_big;
         int b = C.big_mask ? atomic_load(&g_big_tid) : 0;
-        if (frames++ % 300 == 0 || b != seen_big) { seen_big = b; hint_threads_scan((int32_t)gettid()); }
+        if (frames++ % 300 == 0 || b != seen_big) { seen_big = b; hint_threads_scan(frame_self()); }
         if (g_hint) {
-            if (!g_hint_n) { g_hint_tids[0] = (int32_t)gettid(); g_hint_n = 1; }
+            if (!g_hint_n) { g_hint_tids[0] = frame_self(); g_hint_n = 1; }
             int64_t cpu = frame_cpu_work(), iv = prev_t ? t - prev_t : 0, work = cpu;
             if (C.wall) { int64_t c = cpu < iv ? cpu : iv; work = iv - sleeps; if (work < c) work = c; }   // wall less the sleeps, never below the CPU work
             else if (!C.noclip && work > iv && iv > 0) work = iv;

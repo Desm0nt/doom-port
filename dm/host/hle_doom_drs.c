@@ -137,7 +137,7 @@ static _Atomic int g_drs_fps = 0;          // DRS target fps, 0 = keep the game'
 static float g_res;                        // DM_DOOM_RES fraction < 1 (0 = 100 %, nothing to manage)
 static int g_gpu_feed = 1;                 // DM_DOOM_DRS_GPU=0: the controller keeps the game's own GPU time
 static int g_gpubound = 1;                 // [r6b] DM_DOOM_DRS_GPUBOUND=0: report the real GPU time even when the frame is CPU-bound
-static int g_smart = 1;                    // [r6c] DM_DOOM_DRS_SMART: 0 off, 1 efficiency + reachability (default), 2 efficiency only
+static int g_smart = 2;                    // [r6c] DM_DOOM_DRS_SMART: 0 off, 1 efficiency + reachability, 2 efficiency only (default)
 static int g_cut_light = -1, g_cut_res = -1, g_set_ok = -1;
 __attribute__((weak)) uint64_t xbg_gpu_busy_total_ns(void) { return 0; }   // weak definition (see hle_oe.c); the Vulkan engine has the strong one
 
@@ -373,7 +373,9 @@ void doom_drs_gpu_svc(uint64_t *regs) {
     }
 
     int feed = on && g_gpu_feed && ours >= 0;
-    int mode = feed ? (g_gpubound && cpu_bound ? MODE_CPU : smode) : MODE_GPU;
+    // The CPU hold applies only while the GPU itself is within the target: when GPU time is over the drop threshold, lowering the
+    // resolution still shortens the frame (02.11 mt_drs2: bound=cpu at gpu 23.3 ms / frame 24.8 ms held 1.00x1.00 at ~40 fps).
+    int mode = feed ? (g_gpubound && cpu_bound && ours < drop ? MODE_CPU : smode) : MODE_GPU;
     double reported = ours;
     if (feed) {
         double r = 0, mid = 0.5 * (raise + drop);
@@ -434,7 +436,7 @@ static void r6_init(void) {
     if (e && *e) { double f = atof(e); g_res = f >= 0.25 && f < 0.999 ? (float)f : 0; }
     e = getenv("DM_DOOM_DRS_GPU"); g_gpu_feed = !(e && *e == '0');
     e = getenv("DM_DOOM_DRS_GPUBOUND"); g_gpubound = !(e && *e == '0');
-    e = getenv("DM_DOOM_DRS_SMART"); g_smart = e && *e == '0' ? 0 : e && *e == '2' ? 2 : 1;
+    e = getenv("DM_DOOM_DRS_SMART"); g_smart = e && *e == '0' ? 0 : e && *e == '1' ? 1 : 2;   // default 2 since 02.11: with 1 a heavy spot whose target is out of reach went back to full res (37 fps instead of ~50)
     LOG("[r6] light mode %s (patch %s), fixed 3D scale %.3f (patch %s), DRS target %d fps, GPU time for DRS: %s (host call 0x95 %s), "
         "CPU-bound hold %s (DM_DOOM_DRS_GPUBOUND), efficiency check %s (DM_DOOM_DRS_SMART)",
         atomic_load(&g_light_want) == 1 ? "on" : "off", cut_light() ? "present" : "MISSING", g_res, cut_res() ? "present" : "MISSING", atomic_load(&g_drs_fps),
