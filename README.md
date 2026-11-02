@@ -110,6 +110,8 @@ Other Snapdragon devices may work; other GPUs are untested.
   v0.4.7 records the Vulkan commands on their own thread (about −2.7 ms of translator CPU per frame), fixes the game
   speed (game time ran 4 % slow in gameplay and 2× fast in menus at 60 fps; both now follow real time) and adds an optional GSR upscale to the
   screen's native resolution in the gear settings.
+  v0.4.8 makes swipe-look follow the finger exactly, including slow, smooth movements: the swipe now drives the game's
+  own gyro-aim channel like a touchpad, instead of tilting the right stick.
   Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
 - Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
   on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level

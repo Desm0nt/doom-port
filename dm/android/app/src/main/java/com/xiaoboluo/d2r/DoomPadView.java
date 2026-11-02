@@ -13,10 +13,13 @@ import android.view.View;
 //   left:  ZL / L in the top corner, "-" toward the middle, the move stick above the d-pad;
 //   right: R / ZR in the top corner, "+" toward the middle, A/B/X/Y, and for the right thumb a large FIRE (ZR) button with MELEE
 //          (R3, the right stick click: melee and DOOM's "press R" prompts) next to it.
-// Looking around works like a mouse: drag on any free spot (not a button, not around the move stick), or drag a held FIRE. Each bit of
-// finger travel is added to a pending turn, which is played out through the right stick as tilt x time (hle_args.c makes DOOM's stick
-// response linear: no dead zone, curve, acceleration or smoothing). So a given finger offset always gives the same view angle, whether
-// the swipe is fast or slow; a resting finger stops the view.
+// Looking around works like a mouse: drag on any free spot (not a button, not around the move stick), or drag a held FIRE. Every
+// sample of the finger's travel (MotionEvent history included) is measured in dp x the look sensitivity and handed to the native side
+// (DmActivity.nativeLookDelta): by default (DM_TOUCH_LOOK=gyro) hle_hid.c adds it to the game's gyro aim channel at the game's next
+// input read, so the view turns by exactly that much in the next frame, however slow or fast the finger is, and stops with it.
+// DM_TOUCH_LOOK=stick (or a host that cannot use the gyro channel) keeps the older path: the travel is added to a pending turn, played
+// out through the right stick as tilt x time (hle_args.c makes DOOM's stick response linear: no dead zone, curve, acceleration or
+// smoothing). Both use the same unit (tilt-seconds), so a sensitivity value means the same turn on either path.
 // The move stick is linear too (DOOM's dead zone is off); the gear dialog can add an offset if the game keeps one anyway.
 // It feeds the same native controller channel as a physical gamepad (DmActivity.nativePadKey / nativePadAxes, device PAD_DEVICE)
 // with the keycodes front_android.c maps to Switch buttons (Enter=A, Esc=B, R=X, F=Y, Q=L, E=R, Shift=ZL, Ctrl=ZR, Tab=+, M=-,
@@ -48,6 +51,8 @@ public class DoomPadView extends View {
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), line = new Paint(Paint.ANTI_ALIAS_FLAG), text = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final float dp, stickR;
     private float deadzone = 0f, lookGain = 1.0f, lookX, lookY, pendX, pendY;
+    private float lookDx, lookDy;          // finger travel (dp) not yet handed over (flushLook)
+    private static boolean hostLook = true;   // false when libdm.so lacks nativeLookDelta
     private long lookNanos;
 
     public DoomPadView(Context c) {
@@ -106,7 +111,7 @@ public class DoomPadView extends View {
     // Every held key up, stick centred, look stopped (the caller sends the zero axes when this pad drives the game).
     private void releaseAll() {
         for (Btn b : btns) if (b.pointer >= 0) { if (b.key != SETTINGS) DmActivity.nativePadKey(PAD_DEVICE, b.key, false); b.pointer = -1; }
-        left.pointer = -1; left.x = left.y = 0; look.pointer = fireLook.pointer = -1; pendX = pendY = lookX = lookY = 0;
+        left.pointer = -1; left.x = left.y = 0; look.pointer = fireLook.pointer = -1; pendX = pendY = lookX = lookY = lookDx = lookDy = 0;
     }
     private void openSettings() { if (getContext() instanceof DmActivity) ((DmActivity) getContext()).showDoomSettings(); }
 
@@ -152,9 +157,19 @@ public class DoomPadView extends View {
     }
 
     private void lookStart(Look l, int id, float x, float y) { l.pointer = id; l.x = x; l.y = y; }
-    private void lookMove(Look l, float x, float y) {   // finger travel -> pending turn, in tilt-seconds
-        float k = lookGain / (DP_PER_TILT_SECOND * dp);
-        pendX += (x - l.x) * k; pendY += (y - l.y) * k; l.x = x; l.y = y;
+    private void lookMove(Look l, float x, float y) {   // finger travel, in dp
+        lookDx += (x - l.x) / dp; lookDy += (y - l.y) / dp; l.x = x; l.y = y;
+    }
+    // Hand the travel over in tilt-seconds (dp x sensitivity / DP_PER_TILT_SECOND): to the gyro aim channel (hle_hid.c dm_touch_look_add,
+    // applied whole at the game's next read: no smoothing, no dead zone, nothing left over), or, when the host does not take it, to the
+    // pending stick turn below.
+    private void flushLook() {
+        if (lookDx == 0 && lookDy == 0) return;
+        float k = lookGain / DP_PER_TILT_SECOND;
+        boolean taken = false;
+        if (hostLook) try { taken = DmActivity.nativeLookDelta(lookDx, lookDy, k); } catch (UnsatisfiedLinkError err) { hostLook = false; }
+        if (!taken) { pendX += lookDx * k; pendY += lookDy * k; }
+        lookDx = lookDy = 0;
     }
     // Play the pending turn out: tilt = pending / PLAYOUT_S (at most full tilt); what was played since the last tick leaves the pending
     // turn, so the total rotation equals the finger travel. A very fast flick just takes a little longer than its swipe to finish.
@@ -206,9 +221,13 @@ public class DoomPadView extends View {
                 int pid = e.getPointerId(k);
                 float px = e.getX(k), py = e.getY(k);
                 if (pid == left.pointer) moveStick(left, px, py);
-                if (pid == look.pointer) lookMove(look, px, py);
-                if (pid == fireLook.pointer) lookMove(fireLook, px, py);
+                Look l = pid == look.pointer ? look : pid == fireLook.pointer ? fireLook : null;
+                if (l != null) {   // every batched sample (getHistoricalX/Y), then the current position
+                    for (int h = 0, n = e.getHistorySize(); h < n; h++) lookMove(l, e.getHistoricalX(k, h), e.getHistoricalY(k, h));
+                    lookMove(l, px, py);
+                }
             }
+            flushLook();
             break;
         case MotionEvent.ACTION_UP: case MotionEvent.ACTION_POINTER_UP: case MotionEvent.ACTION_CANCEL: {
             boolean all = a == MotionEvent.ACTION_CANCEL || a == MotionEvent.ACTION_UP;

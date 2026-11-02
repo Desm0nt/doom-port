@@ -67,6 +67,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native boolean nativePadKey(int device, int keyCode, boolean down);
     static native void nativePadAxes(int device, float x, float y, float z, float rz, float lt, float rt, float hatX, float hatY);
     static native void nativePadRemoved(int device);
+    static native boolean nativeLookDelta(float dxDp, float dyDp, float tiltSecPerDp);   // [DOOM] DoomPadView look -> the game's gyro aim channel (hle_hid.c); false = use the stick
     static native boolean nativeWideLive(boolean on);   // [DOOM] live widescreen switch (DM_DOOM_WIDE_LIVE=1); false = applies at the next launch
     static native int nativeGetDrs();                   // [DOOM] the game's rs_enable (hle_doom_drs.c): -1 not known yet, 0 off, 1 on
     static native boolean nativeSetDrs(boolean on);     // [DOOM] queue a live rs_enable change + profile save; false = cannot be written here

@@ -411,6 +411,15 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativePadRemoved(JNIEnv
     (void)env; (void)cls;
     front_android_pad_removed(device);
 }
+#ifdef DM_GAME_DOOM
+// [DOOM] On-screen look (DoomPadView): a finger delta in dp and the stick tilt-seconds per dp (look sensitivity / 500). The host turns it
+// through the game's gyro aim channel (hle_hid.c dm_touch_look_add, DM_TOUCH_LOOK); false = not taken, DoomPadView plays it out on the stick.
+int dm_touch_look_add(float dx_dp, float dy_dp, float k);   // hle_hid.c
+JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeLookDelta(JNIEnv *env, jclass cls, jfloat dx, jfloat dy, jfloat k) {
+    (void)env; (void)cls;
+    return dm_touch_look_add(dx, dy, k) ? JNI_TRUE : JNI_FALSE;
+}
+#endif
 // [DOOM] Gear dialog, "wide" checkbox changed (DmActivity save): live widescreen switch (DM_DOOM_WIDE_LIVE=1, BUGS_AND_FIXES 2.12).
 // The game always renders wide under that switch; "off" is the presenter's centre 16:9 crop. Returns false when the switch is not
 // available (the change then applies at the next launch through DM_DOOM_WIDE).

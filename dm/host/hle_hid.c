@@ -682,6 +682,12 @@ static void aa_own(NpadState *s) {
     if (t != t0) { if (t0 && n) LOG("hid: aim assist own: %u polls on target, stick scale avg %.3f (%u scaled), game friction %.3f", n, fsum / n, nadj, last_f); n = nadj = 0; fsum = 0; t0 = t; }
     (void)last_t;
 }
+#ifdef DM_HID_SIXAXIS_HERE
+static void tl_npad(NpadState *s);   // touch look through the gyro channel (below, with the six-axis sensor)
+#define TL_NPAD(s) tl_npad(s)
+#else
+#define TL_NPAD(s) ((void)(s))
+#endif
 static void aa_gate(void) {
     static int force = -1, logon, nset; static struct { int k; float v; } set[AA_N];
     uint8_t *ug; if (!aa_cvar(0, &ug) || !ug) return;
@@ -773,7 +779,7 @@ HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", "全键手柄�
 #endif
     fill(s, *id, STYLE_FULLKEY);
 #ifdef DM_GAME_DOOM
-    aa_own(s);
+    aa_own(s); TL_NPAD(s);
 #endif
 }
 HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", "掌机手柄状态；取 dm_input", void, h_hid_GetHandheld, NpadState *s, const uint32_t *id) {
@@ -782,12 +788,12 @@ HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", "掌机手柄
 #endif
     fill(s, *id, STYLE_HANDHELD);
 #ifdef DM_GAME_DOOM
-    aa_own(s);
+    aa_own(s); TL_NPAD(s);
 #endif
 }
 #ifdef DM_GAME_DOOM
 // DOOM also polls the dual Joy-Con style; same state layout, reported through the full-key path.
-HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", "Joy-Con pair state: same as full key", void, h_hid_GetJoyDual, NpadState *s, const uint32_t *id) { fill(s, *id, STYLE_FULLKEY); aa_own(s); }
+HLE_FORCE("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", "Joy-Con pair state: same as full key", void, h_hid_GetJoyDual, NpadState *s, const uint32_t *id) { fill(s, *id, STYLE_FULLKEY); aa_own(s); TL_NPAD(s); }
 #endif
 
 #ifdef DM_GAME_DOOM
@@ -965,10 +971,14 @@ static uint8_t *six_cvar(int i) {
     }
     return state > 0 ? cv[i] : NULL;
 }
-static void six_gate(void) {
-    if (!six_cvar(0)) return;
+static float six_force(void) {   // DM_GYRO_FORCE: 0 off, else the sensitivity a zeroed CurrentSensitivity is kept at
     static float force = -1;
     if (force < 0) { const char *e = getenv("DM_GYRO_FORCE"); force = e && *e && strcmp(e, "0") ? (atof(e) > 0 && atof(e) != 1 ? (float)atof(e) : 0.15f) : 0; }
+    return force;
+}
+static void six_gate(void) {
+    if (!six_cvar(0)) return;
+    float force = six_force();
     int32_t *en = (int32_t *)(six_cvar(CV_ENABLED) + 0x30), *aim = (int32_t *)(six_cvar(CV_AIM) + 0x30);
     float *cur = (float *)(six_cvar(CV_CURSENS) + 0x34);
     if (force > 0) { if (!*en) *en = 1; if (!*aim) *aim = 1; if (*cur == 0) *cur = force; }   // the value fields the readers load; the weapon code's SetFloat overwrites them again
@@ -980,6 +990,222 @@ static void six_gate(void) {
             "GlobalScale %.1f, NXThreshold %.3f%s -> gyro look %s", le, la, lc, ls, lg, lt, force > 0 ? " [DM_GYRO_FORCE]" : "",
             le && la && (lc > 0 || (lc < 0 && ls > 0)) && lg != 0 ? "on" : "OFF");
     }
+}
+// ---- [DOOM] Touch look through the gyro aim channel (DM_TOUCH_LOOK, default "gyro"; "stick" = the old right-stick playout in
+// DoomPadView). BUGS_AND_FIXES 4.8. DoomPadView hands each finger delta here (dm_touch_look_add, UI thread) in "tilt-seconds" (dp x the
+// gear's look sensitivity / 500 dp: the same unit its stick path plays out, so the sensitivity keeps its meaning); every gyro read the
+// game makes (one per usercmd, DOOM's Joystick() -> idNXJoystick::ReadNpad main+0x1d0fc00 -> ProcessSixAxisStates main+0x1d0ef60 ->
+// GetSixAxisSensorState) takes all of it and adds the angular velocity that turns the view by exactly that much in this frame.
+// The game's chain (1.1 update, all per frame, no frame time anywhere -- a per-frame delta, like a mouse):
+//   ProcessSixAxisStates: |w| < joy_sixAxisNXThreshold -> 0; only when joy_sixAxisAimToggle: yaw axis = trunc(gz x -50 x 32767 x HorScale)
+//     (handheld: gy + gz), pitch axis = trunc(gx x -50 x 32767 x VertScale) -> npad events 0x30 / 0x31 when they change (main+0x1d0f6d8)
+//   Joystick (main+0x1f2dec0): axis / 32767 -> usercmdGen state +0x174 / +0x178 (a level, kept until the next event)
+//   GetUsercmd (main+0x1f2e3f0): when joy_sixAxisEnabled and sens = (CurrentSensitivity < 0 ? Sensitivity : CurrentSensitivity) > 0:
+//     mouse delta +0x6c0 = level x (InvertX/Y ? -1 : 1) x sens x joy_sixAxisGlobalScale
+//   MouseMove (main+0x1f2bb70): optional m_smoothing average, x (+0x654 look scale incl. aim assist friction) x (+0x668);
+//     yaw -= dx x m_yaw, pitch += dy x m_pitch, each clamped to +0x66c / +0x670 degrees a frame when those are > 0; and it clears
+//     useAimAssist (+0x76c) whenever the delta is non-zero (JoystickMove, right after, sets it again while a stick is off centre).
+// The old stick path turned yaw by tilt x (+0x65c yaw speed) x (+0x654) per second, pitch by tilt x (+0x658) x (+0x654), the look stick
+// y inverted by +0x674 (JoystickMove main+0x1f2cbe0). So the gyro delta for a pending turn (tx, ty tilt-seconds) is
+//   gz = sx x (-tx x yawSpeed) / (50 Hor sens GS m668 m_yaw), gx = -sy x (+-ty x pitchSpeed) / (50 Vert sens GS m668 m_pitch)
+// (+0x654 cancels: aim assist friction still scales it, as it scaled the stick). All read live each frame (cvars via their GOT slots,
+// usercmdGen via aa_cvar), so the profile sensitivity, zoom and invert settings apply as before.
+// Gates: while touch look runs (a delta in the last 0.5 s) the closed ones are opened through their value fields (+0x30 / +0x34):
+// joy_sixAxisEnabled (checked before the read, so already at the npad read), AimToggle, a zero / negative sensitivity (-> 0.15 or
+// DM_GYRO_FORCE's value), GlobalScale <= 0 (-> 30), NXThreshold > 0 (-> 0), Hor/VertScale ~0 (-> 1), m_smoothing (-> 0); afterwards each
+// gets back what the game set (its value string, idCVar +0x10, which we never write), unless the game wrote a new value meanwhile.
+// While a gyro gate had to be opened the phone's own rotation is zeroed in the state, so motion aiming stays off when the player has it
+// off (or the weapon state has it off); with it on the two add up. A phone without gyroscope / DM_GYRO=0 still gets a connected state.
+// Aim assist: since MouseMove clears useAimAssist, the right stick gets a +-1 / 32767 nudge (alternating sign: no net turn) while touch
+// look runs and the stick is centred, so JoystickMove keeps the flag on as the stick path did (needs the linear sticks, hle_args.c).
+// DM_TOUCH_LOOK_AA=0 drops the nudge. DM_TOUCH_LOOK_LOG=1: one line a second (finger dp, degrees sent, degrees the usercmd turned).
+static uint8_t *tl_cvar(int i);
+enum { TL_HOR, TL_VERT, TL_INVX, TL_INVY, TL_MSMOOTH, TL_MYAW, TL_MPITCH, TL_N };
+static const struct { uint32_t got; const char *name; } k_tl_cv[TL_N] = {   // gyro ones: by their use in main+0x1d0f17c / 0x1f2e43c (name only checked by prefix)
+    {0x48d7780, "joy_sixAxis"}, {0x48d7788, "joy_sixAxis"}, {0x48da1b8, "joy_sixAxis"}, {0x4895830, "joy_sixAxis"},
+    {0x48da108, "m_smoothing"}, {0x48da120, "m_yaw"}, {0x48da128, "m_pitch"}};
+static uint8_t *tl_cvar(int i) {
+    static uint8_t *cv[TL_N]; static int state;   // 0 unresolved, 1 resolved, -1 not this executable
+    if (state == 0) {
+        uint8_t *base = NULL; size_t size = 0;
+        for (int m = 0; m < g_nmod; m++) if (!strcmp(g_mod[m].name, "main")) { base = g_mod[m].base; size = g_mod[m].size; }
+        if (!base) return NULL;
+        state = 1;
+        char names[160] = ""; size_t nl = 0;
+        for (int k = 0; k < TL_N; k++) {
+            uint64_t o = k_tl_cv[k].got + 8 <= size ? *(uint64_t *)(base + k_tl_cv[k].got) : 0;
+            const char *nm = aa_ptr_ok(o) ? *(const char **)(uintptr_t)(o + 0x50) : NULL;
+            int pre = k <= TL_INVY;
+            if (!nm || !aa_ptr_ok((uint64_t)(uintptr_t)nm & ~7ull) || (pre ? strncmp(nm, k_tl_cv[k].name, strlen(k_tl_cv[k].name)) : strcmp(nm, k_tl_cv[k].name))) { state = -1; break; }
+            cv[k] = (uint8_t *)(uintptr_t)o;
+            if (pre && nl < sizeof names) nl += (size_t)snprintf(names + nl, sizeof names - nl, "%s%s", k ? ", " : "", nm);
+        }
+        if (state < 0) LOG("hid: touch look: gyro scale / invert / mouse cvars not found at the 1.1 update's GOT slots: touch look stays on the stick");
+        else LOG("hid: touch look: gyro cvars %s", names);
+    }
+    return state > 0 ? cv[i] : NULL;
+}
+static float six_force(void);
+static struct {
+    int state;                    // 0 not decided yet, 1 gyro path, -1 unusable (the stick path in DoomPadView takes over), -2 no gyro reads lately
+    double px, py;                // pending turn, tilt-seconds (x right, y down, as the finger)
+    double dpx, dpy;              // finger dp since the last log line
+    uint64_t t_read, t_nz;        // last gyro read; last read that carried a turn (or a delta added)
+    unsigned npad_no_read, no_ug, reads;
+} g_tl;
+static int tl_mode(void) {
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("DM_TOUCH_LOOK"); m = !(e && !strcmp(e, "stick")); LOG("hid: touch look: %s (DM_TOUCH_LOOK)", m ? "gyro aim channel" : "right stick (DoomPadView)"); }
+    return m;
+}
+// UI thread (jni_android.c nativeLookDelta): a finger delta in dp and the tilt-seconds per dp. 0 = not taken: play it out on the stick.
+int dm_touch_look_add(float dx_dp, float dy_dp, float k) {
+    if (!tl_mode()) return 0;
+    pthread_mutex_lock(&g_six_mu);
+    int st = g_tl.state;
+    if (st >= 0) {
+        uint64_t now = now_ns();
+        if (!g_tl.t_read || now - g_tl.t_read > 250000000ull) g_tl.px = g_tl.py = 0;   // the game is not reading: no stale turn later
+        g_tl.px += (double)dx_dp * k; g_tl.py += (double)dy_dp * k; g_tl.dpx += dx_dp; g_tl.dpy += dy_dp;
+        if (dx_dp != 0 || dy_dp != 0) g_tl.t_nz = now;
+    }
+    pthread_mutex_unlock(&g_six_mu);
+    return st >= 0;
+}
+// Gates touch look opens (value fields only), the value it wrote, and what the field held before.
+enum { TF_EN, TF_AIM, TF_CUR, TF_GS, TF_TH, TF_HOR, TF_VERT, TF_SMOOTH, TF_N, TF_GYRO_GATES = 1u << TF_EN | 1u << TF_AIM | 1u << TF_CUR | 1u << TF_GS };
+static unsigned g_tf_mask; static float g_tf_val[TF_N], g_tf_orig[TF_N];
+static uint8_t *tf_cvar(int i) {
+    switch (i) {
+    case TF_EN: return six_cvar(CV_ENABLED); case TF_AIM: return six_cvar(CV_AIM); case TF_CUR: return six_cvar(CV_CURSENS);
+    case TF_GS: return six_cvar(CV_GSCALE); case TF_TH: return six_cvar(CV_THRESH); case TF_HOR: return tl_cvar(TL_HOR);
+    case TF_VERT: return tl_cvar(TL_VERT); default: return tl_cvar(TL_MSMOOTH);
+    }
+}
+static int tf_int(int i) { return i == TF_EN || i == TF_AIM || i == TF_SMOOTH; }
+static float tf_get(int i) { const uint8_t *c = tf_cvar(i); return tf_int(i) ? (float)*(const int32_t *)(c + 0x30) : *(const float *)(c + 0x34); }
+static void tf_set(int i, float v) { uint8_t *c = tf_cvar(i); *(int32_t *)(c + 0x30) = (int32_t)v; *(float *)(c + 0x34) = v; }
+// What the game last set: the value string (idStr at +0, data +0x10; idCVar::Set / UpdateValue, 1.1 main+0x11f9d0).
+static int tf_string(int i, float *out) {
+    uint64_t p = *(const uint64_t *)(tf_cvar(i) + 0x10);
+    if (p < 0x10000 || p >= (1ull << 48)) return 0;
+    const char *s = (const char *)(uintptr_t)p; char *e; float v = strtof(s, &e);
+    if (e == s) { if (!strcmp(s, "true")) v = 1; else if (!strcmp(s, "false")) v = 0; else return 0; }
+    *out = v; return 1;
+}
+static void tl_gates(int on) {
+    if (!six_cvar(0) || !tl_cvar(0)) return;
+    int gforce = six_force() > 0;   // DM_GYRO_FORCE keeps Enabled / AimToggle / CurrentSensitivity itself (six_gate)
+    for (int i = 0; i < TF_N; i++) {
+        if (gforce && (i == TF_EN || i == TF_AIM || i == TF_CUR)) continue;
+        float v = tf_get(i);
+        if ((g_tf_mask >> i & 1) && v != g_tf_val[i]) g_tf_mask &= ~(1u << i);   // the game wrote a new value: that one counts now
+        if (on) {
+            float n = NAN;
+            switch (i) {
+            case TF_EN: case TF_AIM: if (v == 0) n = 1; break;
+            case TF_CUR: if (!(v > 0) && !(v < 0 && *(const float *)(six_cvar(CV_SENS) + 0x34) > 0)) n = 0.15f; break;
+            case TF_GS: if (!(v > 0)) n = 30; break;
+            case TF_TH: if (v > 0) n = 0; break;
+            case TF_HOR: case TF_VERT: if (!(fabsf(v) >= 1e-3f)) n = 1; break;
+            case TF_SMOOTH: if (v != 0) n = 0; break;
+            }
+            if (!isnan(n) && !(g_tf_mask >> i & 1)) { g_tf_orig[i] = v; g_tf_val[i] = n; g_tf_mask |= 1u << i; tf_set(i, n); }
+        } else if (g_tf_mask >> i & 1) {
+            float s; tf_set(i, tf_string(i, &s) ? s : g_tf_orig[i]);
+            g_tf_mask &= ~(1u << i);
+        }
+    }
+    static unsigned last = ~0u;
+    if (g_tf_mask != last) { last = g_tf_mask; static int n; if (n++ < 40) LOG("hid: touch look: opened gates %#x (1 Enabled, 2 AimToggle, 4 sensitivity, 8 GlobalScale, 0x10 NXThreshold, 0x20/0x40 Hor/VertScale, 0x80 m_smoothing)", g_tf_mask); }
+}
+static int tl_active(uint64_t now) {   // a turn pending or one in the last 0.5 s (callers hold g_six_mu or accept a racy read)
+    return g_tl.px != 0 || g_tl.py != 0 || (g_tl.t_nz && now - g_tl.t_nz < 500000000ull);
+}
+// The npad read (GetNpadState, right before the game's six-axis read): open joy_sixAxisEnabled, which ProcessSixAxisStates checks before
+// it reads the sensor, and nudge the centred right stick so useAimAssist survives MouseMove.
+static void tl_npad(NpadState *s) {
+    if (!tl_mode() || g_tl.state == -1) return;
+    pthread_mutex_lock(&g_six_mu);
+    int on = tl_active(now_ns());
+    if (on && ++g_tl.npad_no_read > 90 && g_tl.state >= 0) { g_tl.state = -2; g_tl.px = g_tl.py = 0; LOG("hid: touch look: npad read 90 times without a gyro read: stick path until the game reads the gyro again"); }
+    unsigned reads = g_tl.reads;
+    pthread_mutex_unlock(&g_six_mu);
+    tl_gates(on);
+    static int nudge = -1; if (nudge < 0) { const char *e = getenv("DM_TOUCH_LOOK_AA"); nudge = !(e && !strcmp(e, "0")); }
+    if (on && nudge && !s->rx && !s->ry && (s->attributes & ATTR_CONNECTED)) s->rx = reads & 1 ? 1 : -1;
+}
+static float tl_angdiff(float a, float b) { float d = fmodf(a - b, 360.0f); return d > 180 ? d - 360 : d < -180 ? d + 360 : d; }
+// The game's gyro read: add the pending turn as angular velocity (see above).
+static void tl_read(SixAxisState *s, uint32_t h, int why) {
+    if (!tl_mode() || g_tl.state == -1) return;
+    uint64_t now = now_ns();
+    pthread_mutex_lock(&g_six_mu);
+    if (g_tl.state == -2) { g_tl.state = 0; LOG("hid: touch look: gyro reads again"); }
+    double px = g_tl.px, py = g_tl.py, dpx = g_tl.dpx, dpy = g_tl.dpy;
+    g_tl.px = g_tl.py = 0; g_tl.t_read = now; g_tl.npad_no_read = 0; g_tl.reads++;
+    if (px != 0 || py != 0) g_tl.t_nz = now;
+    int on = tl_active(now);
+    pthread_mutex_unlock(&g_six_mu);
+    uint8_t *ug = NULL;
+    if (!six_cvar(0) || !tl_cvar(0)) { if (g_tl.state != -1) { g_tl.state = -1; LOG("hid: touch look: gyro path unusable (cvars): stick path"); } return; }
+    if (!aa_cvar(0, &ug) || !ug) {
+        if (on && ++g_tl.no_ug > 300) { g_tl.state = -1; LOG("hid: touch look: usercmdGen not found: stick path"); }
+        return;
+    }
+    if (g_tl.state == 0) { g_tl.state = 1; LOG("hid: touch look: gyro path ready"); }
+    if (why == 1) return;   // this handle's style is not connected
+    tl_gates(on);
+    static int logon = -1; if (logon < 0) logon = getenv("DM_TOUCH_LOOK_LOG") != NULL;
+    static float last_yaw, last_pitch; static int have_last; static double s_dpx, s_dpy, s_sy, s_sp, s_ay, s_ap; static unsigned s_reads, s_turn, s_zero, s_clamp; static uint64_t t0;
+    const uint8_t *cmd = aa_ptr_ok(*(const uint64_t *)(ug + 0x648)) ? (const uint8_t *)(uintptr_t)*(const uint64_t *)(ug + 0x648) : NULL;
+    if (logon && cmd) {   // what the previous usercmd turned (every source), read before this frame's turn is added
+        float yw = *(const float *)(cmd + 8), pt = *(const float *)(cmd + 4);
+        if (have_last) { s_ay += tl_angdiff(yw, last_yaw); s_ap += tl_angdiff(pt, last_pitch); }
+        last_yaw = yw; last_pitch = pt; have_last = 1;
+    }
+    float yaw_deg = 0, pitch_deg = 0;
+    if (on) {
+        if (why) {   // no gyroscope (DM_GYRO=0) / no sample yet: still a connected, still controller
+            static int64_t smp; s->delta_ns = 5000000; s->sampling = ++smp; s->attributes = 1;
+            s->acc[2] = -1; s->dir[0] = s->dir[4] = s->dir[8] = 1;
+        }
+        if (g_tf_mask & TF_GYRO_GATES) { s->gyro[0] = s->gyro[1] = s->gyro[2] = 0; s_zero++; }   // motion aiming is off for the player: touch only
+        float yawsp = *(const float *)(ug + 0x65c), pitchsp = *(const float *)(ug + 0x658), scale = *(const float *)(ug + 0x654), m668 = *(const float *)(ug + 0x668);
+        float cur = *(const float *)(six_cvar(CV_CURSENS) + 0x34), sens = cur < 0 ? *(const float *)(six_cvar(CV_SENS) + 0x34) : cur;
+        float gs = *(const float *)(six_cvar(CV_GSCALE) + 0x34), hor = *(const float *)(tl_cvar(TL_HOR) + 0x34), vert = *(const float *)(tl_cvar(TL_VERT) + 0x34);
+        float myaw = *(const float *)(tl_cvar(TL_MYAW) + 0x34), mpitch = *(const float *)(tl_cvar(TL_MPITCH) + 0x34);
+        float sx = *(const int32_t *)(tl_cvar(TL_INVX) + 0x30) ? -1.0f : 1.0f, sy = *(const int32_t *)(tl_cvar(TL_INVY) + 0x30) ? -1.0f : 1.0f;
+        float kx = 50 * hor * sens * gs * m668 * myaw, ky = 50 * vert * sens * gs * m668 * mpitch;
+        float yu = (float)(-px * yawsp), pu = (float)((ug[0x674] ? -py : py) * pitchsp);   // stick-path degrees before the +0x654 scale
+        if (!(fabsf(kx) > 1e-9f) || !(fabsf(ky) > 1e-9f) || !isfinite(kx) || !isfinite(ky) || !isfinite(yu) || !isfinite(pu)) {
+            static int n; if (n++ < 5) LOG("hid: touch look: no usable gyro scale (sens %.3f GlobalScale %.1f Hor %.2f Vert %.2f +0x668 %.3f m_yaw %.4f m_pitch %.4f): turn dropped",
+                                           sens, gs, hor, vert, m668, myaw, mpitch);
+        } else {
+            // MouseMove's per-frame clamps (+0x66c yaw, +0x670 pitch, degrees after the scale): what does not fit waits for the next frame
+            float c1 = *(const float *)(ug + 0x66c), c2 = *(const float *)(ug + 0x670), f = 1, yd = yu * scale, pd = pu * scale;
+            if (c1 > 0 && fabsf(yd) > c1) f = c1 / fabsf(yd);
+            if (c2 > 0 && fabsf(pd * f) > c2) f *= c2 / fabsf(pd * f);
+            if (f < 1) { pthread_mutex_lock(&g_six_mu); g_tl.px += px * (1 - f); g_tl.py += py * (1 - f); pthread_mutex_unlock(&g_six_mu); s_clamp++; }
+            s->gyro[2] += sx * f * yu / kx;
+            s->gyro[0] -= sy * f * pu / ky;
+            yaw_deg = f * yd; pitch_deg = f * pd; s_turn += px != 0 || py != 0;
+        }
+    }
+    if (logon) {
+        s_reads++; s_sy += yaw_deg; s_sp += pitch_deg;
+        if (dpx != 0 || dpy != 0) { pthread_mutex_lock(&g_six_mu); g_tl.dpx -= dpx; g_tl.dpy -= dpy; pthread_mutex_unlock(&g_six_mu); s_dpx += dpx; s_dpy += dpy; }
+        uint64_t t = now / 1000000000ull;
+        if (t != t0) {
+            if (t0 && (s_turn || s_dpx != 0 || s_dpy != 0))
+                LOG("hid: touch look: finger %+.0f/%+.0f dp; sent yaw %+.2f pitch %+.2f deg (yaw + = left, pitch + = down) in %u of %u reads (%u clamped); "
+                    "usercmd turned yaw %+.2f pitch %+.2f deg (all sources); phone gyro zeroed %u; gates %#x; yaw/pitch speed %.0f/%.0f x scale %.3f, +0x668 %.3f, sens %.3f",
+                    s_dpx, s_dpy, s_sy, s_sp, s_turn, s_reads, s_clamp, s_ay, s_ap, s_zero, g_tf_mask, *(const float *)(ug + 0x65c), *(const float *)(ug + 0x658),
+                    *(const float *)(ug + 0x654), *(const float *)(ug + 0x668), *(const float *)(six_cvar(CV_CURSENS) + 0x34));
+            s_dpx = s_dpy = s_sy = s_sp = s_ay = s_ap = 0; s_reads = s_turn = s_zero = s_clamp = 0; t0 = t;
+        }
+    } else if (dpx != 0 || dpy != 0) { pthread_mutex_lock(&g_six_mu); g_tl.dpx -= dpx; g_tl.dpy -= dpy; pthread_mutex_unlock(&g_six_mu); }
+    (void)h;
 }
 // What the game was given. The first reads and every change of the zero reason are always logged (one line each), so a session shows
 // whether the state reaches the game at all; DM_GYRO_LOG=1 adds one line a second with the read count and the peak rate.
@@ -1013,7 +1239,9 @@ HLE_FORCE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS
     return k;
 }
 HLE_FORCE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor: the front end samples while the app is in front", void, h_hid_SixStart, const uint32_t *h) { (void)h; }
-HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor state: the phone's gyroscope / accelerometer", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_gate(); int why = six_fill(s, *h); six_trace(s, *h, why); }
+HLE_FORCE("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", "six-axis sensor state: the phone's gyroscope / accelerometer", void, h_hid_SixState, SixAxisState *s, const uint32_t *h) { six_gate(); int why = six_fill(s, *h); tl_read(s, *h, why); six_trace(s, *h, why); }
+#else
+int dm_touch_look_add(float dx_dp, float dy_dp, float k) { (void)dx_dp; (void)dy_dp; (void)k; return 0; }   // no gyro here: DoomPadView keeps the stick
 #endif
 #else   // D2R: unchanged
 // 震动：设备数 0，游戏不会再初始化 / 发送
