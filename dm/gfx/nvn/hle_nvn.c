@@ -1597,7 +1597,9 @@ static double present_cap_hz(void) {
 // affected (menus run the fixed 30 Hz tic, gameplay keeps the full limit and com_adaptiveTickMaxHz = the limit).
 static double present_menu_hz(void) {
     static double v = -1;
-    if (v < 0) { const char *e = getenv("DM_PRESENT_MENU_HZ"); v = e && *e ? atof(e) : 60; if (!(v >= 10 && v <= 240)) v = 0; }
+    // Default 30 since 02.11: outside gameplay the game runs com_fixedTic = one 33 ms tic per frame, so at 60 presents menus,
+    // pause and loading-screen animations ran at 2x speed ([tick] log "0 adaptive frames ... speed 2.00x"); 30 = the Switch rate.
+    if (v < 0) { const char *e = getenv("DM_PRESENT_MENU_HZ"); v = e && *e ? atof(e) : 30; if (!(v >= 10 && v <= 240)) v = 0; }
     return v;
 }
 static _Atomic int g_menu_cap;   // 1 = outside gameplay: present_auto_hz uses present_menu_hz instead of the limit

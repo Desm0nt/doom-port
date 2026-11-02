@@ -83,7 +83,8 @@ void dm_guest_frame_tick(void) {
     crash_watch_frame();
     atomic_fetch_add(&g_guest_frame, 1);
 #ifdef DM_GAME_DOOM
-    // DM_DOOM_TICKLOG=1: once per wall second log present rate vs estimated game time (hle_doom_tick.c); a getenv-cached no-op otherwise
+    // hle_doom_tick.c: the game-speed fix (DM_DOOM_TICK_SCALE, default 1.0: tops up the game's adaptive-tick factor 0.96 through its
+    // carry) and DM_DOOM_TICKLOG=1 (once per wall second: present rate vs estimated game time); a getenv-cached no-op when both are off
     void dm_doom_tick_diag(void); dm_doom_tick_diag();
 #endif
     if (!detclock_cfg()) return;

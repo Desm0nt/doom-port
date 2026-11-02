@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">FPS ve kare süresi sayacı</string>
     <string name="gear_res">3D çözünürlük (arayüz 720p kalır)</string>
     <string name="gear_sharpen">Keskinlik (FSR RCAS)</string>
+    <string name="gear_upscale">Ekran çözünürlüğüne ölçekle (GSR): daha keskin kenarlar, biraz daha fazla GPU yükü</string>
     <string name="gear_off">Kapalı</string>
     <string name="gear_low">Düşük</string>
     <string name="gear_medium">Orta</string>

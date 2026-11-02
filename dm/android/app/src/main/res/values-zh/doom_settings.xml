@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">帧率和帧时间显示</string>
     <string name="gear_res">3D 分辨率（界面保持 720p）</string>
     <string name="gear_sharpen">锐化（FSR RCAS）</string>
+    <string name="gear_upscale">放大到屏幕分辨率（GSR）：边缘更清晰，GPU 负载略增</string>
     <string name="gear_off">关</string>
     <string name="gear_low">弱</string>
     <string name="gear_medium">中</string>

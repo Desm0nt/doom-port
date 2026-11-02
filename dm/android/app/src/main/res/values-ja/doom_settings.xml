@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">FPS とフレーム時間の表示</string>
     <string name="gear_res">3D 解像度（UI は 720p のまま）</string>
     <string name="gear_sharpen">シャープネス（FSR RCAS）</string>
+    <string name="gear_upscale">画面解像度にアップスケール（GSR）：輪郭がくっきり、GPU負荷はやや増加</string>
     <string name="gear_off">オフ</string>
     <string name="gear_low">弱</string>
     <string name="gear_medium">中</string>

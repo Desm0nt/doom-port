@@ -107,6 +107,9 @@ Other Snapdragon devices may work; other GPUs are untested.
   v0.4.6 trims the translation thread further (bigger pipeline cache, cached driver constant blocks, fewer image
   checks, present on its own thread, -O3 engine build) and makes dynamic resolution keep lowering while it still saves
   GPU time: in the heaviest spots on 8 Gen 2 with dynamic resolution on, about 38 → 48 fps.
+  v0.4.7 records the Vulkan commands on their own thread (about −2.7 ms of translator CPU per frame), fixes the game
+  speed (game time ran 4 % slow at high frame rates; menus ran 2× fast at 60) and adds an optional GSR upscale to the
+  screen's native resolution in the gear settings.
   Optimisation is ongoing. The game's adaptive tick keeps game speed equal to real time at any frame rate.
 - Memory: the game uses about 1.2–2 GB of RAM; its VRAM pools get extra headroom only on phones with 14 GB or more (half
   on 12 GB phones). On 8–12 GB phones close background apps before playing: when Android has to swap them out, level

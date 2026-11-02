@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">FPS- und Frametime-Anzeige</string>
     <string name="gear_res">3D-Auflösung (die Oberfläche bleibt bei 720p)</string>
     <string name="gear_sharpen">Schärfe (FSR RCAS)</string>
+    <string name="gear_upscale">Auf Bildschirmauflösung hochskalieren (GSR): schärfere Kanten, etwas mehr GPU-Last</string>
     <string name="gear_off">Aus</string>
     <string name="gear_low">Schwach</string>
     <string name="gear_medium">Mittel</string>

@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">Счётчик FPS и времени кадра</string>
     <string name="gear_res">Разрешение 3D (интерфейс остаётся 720p)</string>
     <string name="gear_sharpen">Резкость (FSR RCAS)</string>
+    <string name="gear_upscale">Масштабировать до разрешения экрана (GSR): чётче края, чуть больше нагрузка на GPU</string>
     <string name="gear_off">Выкл</string>
     <string name="gear_low">Слабая</string>
     <string name="gear_medium">Средняя</string>

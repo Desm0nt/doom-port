@@ -155,3 +155,12 @@ run-m3:
 
 t_copy_pitch: t_copy_pitch.c ../nvn/nvn_copy_pitch.h
 	clang -O1 -Wall -Werror -o $@ t_copy_pitch.c
+
+# [mtb] DM_GFX_RECORD_THREAD packets (xbg_game.cpp namespace vkrec, cut out into vkrec_block.inc) against mock Vulkan calls: the same
+# command stream direct, replayed inline (=2) and on the dm-record thread (=1) gives the same call trace. Linux (WSL); Vulkan headers from the
+# NDK sysroot (searched after the system headers): make t_vkrec && ./t_vkrec
+VK_INC ?= $(firstword $(wildcard /mnt/g/Tools/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/sysroot/usr/include) /usr/include)
+t_vkrec: t_vkrec.cpp ../vulkan/engine/xbg_game.cpp
+	awk '/^\/\/ \[mtb\] DM_GFX_RECORD_THREAD=1\|2/{p=1} /^struct Slot \{/{p=0} p' ../vulkan/engine/xbg_game.cpp | tr -d '
+' > vkrec_block.inc
+	g++ -std=c++17 -O2 -g -Wall -Wno-unused-function -pthread -idirafter $(VK_INC) -o $@ t_vkrec.cpp

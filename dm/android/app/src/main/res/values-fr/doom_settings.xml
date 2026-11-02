@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">Compteur d\'IPS et de temps d\'image</string>
     <string name="gear_res">Résolution 3D (l\'interface reste en 720p)</string>
     <string name="gear_sharpen">Netteté (FSR RCAS)</string>
+    <string name="gear_upscale">Mise à l\'échelle à la résolution de l\'écran (GSR) : contours plus nets, un peu plus de charge GPU</string>
     <string name="gear_off">Désactivée</string>
     <string name="gear_low">Faible</string>
     <string name="gear_medium">Moyenne</string>

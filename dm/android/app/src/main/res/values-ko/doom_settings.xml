@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">FPS 및 프레임 시간 표시</string>
     <string name="gear_res">3D 해상도(인터페이스는 720p 유지)</string>
     <string name="gear_sharpen">선명도(FSR RCAS)</string>
+    <string name="gear_upscale">화면 해상도로 업스케일(GSR): 윤곽이 선명해지고 GPU 부하가 약간 늘어남</string>
     <string name="gear_off">끄기</string>
     <string name="gear_low">약하게</string>
     <string name="gear_medium">보통</string>

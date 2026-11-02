@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">Лічильник FPS і часу кадру</string>
     <string name="gear_res">Роздільність 3D (інтерфейс лишається 720p)</string>
     <string name="gear_sharpen">Різкість (FSR RCAS)</string>
+    <string name="gear_upscale">Масштабувати до роздільності екрана (GSR): чіткіші краї, трохи більше навантаження на GPU</string>
     <string name="gear_off">Вимк</string>
     <string name="gear_low">Слабка</string>
     <string name="gear_medium">Середня</string>

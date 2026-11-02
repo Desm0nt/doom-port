@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">Contador de FPS y tiempo de fotograma</string>
     <string name="gear_res">Resolución 3D (la interfaz se queda en 720p)</string>
     <string name="gear_sharpen">Nitidez (FSR RCAS)</string>
+    <string name="gear_upscale">Escalar a la resolución de la pantalla (GSR): bordes más nítidos, algo más de carga de GPU</string>
     <string name="gear_off">Desactivada</string>
     <string name="gear_low">Baja</string>
     <string name="gear_medium">Media</string>

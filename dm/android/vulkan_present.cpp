@@ -111,7 +111,8 @@ void pin_update(){
 }
 void log_message(void*,const char *text){__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","%s",text);}
 [[noreturn]] void fatal(void*,const char *text){__android_log_print(ANDROID_LOG_FATAL,"dm-vulkan","%s",text);abort();}
-void destroy_present_semaphores(){for(auto s:finished)if(s)vkDestroySemaphore(device,s,nullptr);finished.clear();}
+namespace upscale{bool enabled();void fail(const char*,int);void drop_targets();bool targets(const std::vector<VkImage>&,VkFormat,VkExtent2D);}   // [DOOM] DM_GFX_UPSCALE, below
+void destroy_present_semaphores(){for(auto s:finished)if(s)vkDestroySemaphore(device,s,nullptr);finished.clear();upscale::drop_targets();}   // [DOOM] + the upscale pass's views of the swapchain images
 // 调用者先等队列空闲；基础WSI销毁仍沿用WaitIdle惯例，不声称提供呈现栅栏保证。
 // Call only after queue idle. Base WSI teardown follows the WaitIdle convention,
 // which is not the explicit presentation-fence guarantee of swapchain_maintenance1.
@@ -173,6 +174,8 @@ int create_swap(){
 #endif
     if(cap.maxImageCount)ci.minImageCount=std::min(ci.minImageCount,cap.maxImageCount);ci.imageFormat=sf.format;ci.imageColorSpace=sf.colorSpace;ci.imageExtent=extent;ci.imageArrayLayers=1;ci.imageUsage=VK_IMAGE_USAGE_TRANSFER_DST_BIT;ci.imageSharingMode=VK_SHARING_MODE_EXCLUSIVE;ci.preTransform=VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;ci.compositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if(!(cap.supportedCompositeAlpha&ci.compositeAlpha))for(uint32_t b=1;b<=8;b<<=1)if(cap.supportedCompositeAlpha&b){ci.compositeAlpha=VkCompositeAlphaFlagBitsKHR(b);break;}
+    // [DOOM] DM_GFX_UPSCALE: the upscale pass renders into the swapchain images (the blit fallback still needs TRANSFER_DST)
+    if(upscale::enabled()){if(cap.supportedUsageFlags&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)ci.imageUsage|=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;else upscale::fail("swapchain colour-attachment usage",0);}
     ci.presentMode=VK_PRESENT_MODE_FIFO_KHR;ci.clipped=VK_TRUE;ci.oldSwapchain=swapchain;VkSwapchainKHR replacement=VK_NULL_HANDLE;r=vkCreateSwapchainKHR(device,&ci,nullptr,&replacement);
     // 创建失败也会退休oldSwapchain；重试不得继续传入退休句柄。
     // Even failed creation retires oldSwapchain; never pass that retired handle on retry.
@@ -180,6 +183,7 @@ int create_swap(){
     created_transform=cap.currentTransform;created_surface_extent=cap.currentExtent;
     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Swapchain: window=%dx%d extent=%ux%u currentTransform=%u supported=%u selected=%u",ANativeWindow_getWidth(active),ANativeWindow_getHeight(active),extent.width,extent.height,unsigned(cap.currentTransform),unsigned(cap.supportedTransforms),unsigned(ci.preTransform));
     r=vkGetSwapchainImagesKHR(device,swapchain,&n,nullptr);if(r)return r;images.resize(n);r=vkGetSwapchainImagesKHR(device,swapchain,&n,images.data());if(r)return r;images.resize(n);
+    if(upscale::enabled())upscale::targets(images,swap_format,extent);   // [DOOM] DM_GFX_UPSCALE: views + framebuffers (a failure turns the pass off, the blit stays)
     // 呈现完成信号量按交换链图像分配；重新获取该图像后才能再次发信号。
     // Index present-wait semaphores by acquired image, not by CPU frame/fence.
     finished.resize(n,VK_NULL_HANDLE);VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
@@ -288,6 +292,139 @@ bool record(VkCommandBuffer cmd,unsigned f,VkImage source,VkFormat format,uint32
     return true;
 }
 }
+// [DOOM] DM_GFX_UPSCALE=gsr (default off; gear "Upscale to screen resolution (GSR)", next launch; docs/SWITCHES.md, BUGS_AND_FIXES 2.19):
+// the swapchain takes the window's own size (e.g. 2400x1080) instead of the game's output size (1600x720), and one fragment pass
+// upscales the game's frame into it with a Snapdragon-GSR-style edge-adaptive filter (shaders/gsr.frag, BSD-3-Clause, docs/THIRD_PARTY.md)
+// instead of the 1:1 blit + the compositor's bilinear. With DM_GFX_SHARPEN the same pass also RCAS-sharpens (no separate RCAS pass).
+// The crop (wide-live crop169, the engine's crop), the letterbox bars (render pass clear), the vertical mirror of
+// DM_GFX_PRESENT_FLIP_FOLD and DM_PRESENT_STRETCH are all in the pass's coordinate mapping (push constants). Two timestamps per present;
+// every ~3 s "NVN present upscale gsr WxH -> WxH gpu_us=..". Only 8-bit / 10-bit UNORM frames; any other format, a frame that is not
+// enlarged, or a setup failure falls back to the old blit (linear filter, since the buffer is the window size). Off: nothing here runs.
+namespace upscale {
+const uint32_t vert_code[]={
+#include "shaders/upscale.vert.spv.inc"
+};
+const uint32_t frag_code[]={
+#include "shaders/gsr.frag.spv.inc"
+};
+int on=-1;const float edge_sharpness=2.0f;   // SGSR EdgeSharpness
+VkSampler sampler{};VkDescriptorSetLayout set_layout{};VkPipelineLayout layout{};VkDescriptorPool pool{};VkDescriptorSet sets[2]{};VkImageView source_views[2]{};
+VkFormat target_format=VK_FORMAT_UNDEFINED;VkRenderPass passes[2]{};VkPipeline pipeline{};   // passes[0] load DONT_CARE, [1] load CLEAR (letterbox bars); compatible
+std::vector<VkImageView> views;std::vector<VkFramebuffer> framebuffers;VkExtent2D fb_extent{};
+VkQueryPool queries{};bool stamped[2]{};double tick_ns=0;double sum_ns=0,max_ns=0;unsigned timed=0;int64_t window_t0=0;int last_sw=0,last_sh=0,last_dw=0,last_dh=0;
+int64_t mono_ns(){timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return int64_t(ts.tv_sec)*1000000000+ts.tv_nsec;}
+bool enabled(){
+    if(on<0){const char *e=getenv("DM_GFX_UPSCALE");on=e && (!strcmp(e,"gsr") || !strcmp(e,"1"));
+        if(on)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale gsr on (DM_GFX_UPSCALE=%s): swapchain at the window size, Snapdragon GSR-style pass%s",e,rcas::enabled()?" with RCAS in the same pass (DM_GFX_SHARPEN)":"");
+        else if(e && *e && strcmp(e,"0") && strcmp(e,"off"))__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","NVN present upscale: DM_GFX_UPSCALE=%s is not known (gsr | 0): off",e);}
+    return on>0;
+}
+void fail(const char *what,int r){if(on>0)__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","NVN present upscale off: %s failed (VkResult %d); the plain blit from now on",what,r);on=0;}
+// Frames the pass takes: sampled as UNORM and written to the UNORM swapchain (sRGB / float frames keep the blit).
+bool takes(VkFormat f,VkFormatFeatureFlags features){return enabled() && (f==VK_FORMAT_R8G8B8A8_UNORM || f==VK_FORMAT_B8G8R8A8_UNORM || f==VK_FORMAT_A2B10G10R10_UNORM_PACK32) && (features&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);}
+void drop_targets(){for(auto fb:framebuffers)if(fb)vkDestroyFramebuffer(device,fb,nullptr);for(auto v:views)if(v)vkDestroyImageView(device,v,nullptr);framebuffers.clear();views.clear();fb_extent={};}
+bool setup(){
+    if(layout)return true;VkResult r;
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};si.magFilter=si.minFilter=VK_FILTER_LINEAR;si.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST;si.addressModeU=si.addressModeV=si.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if((r=vkCreateSampler(device,&si,nullptr,&sampler))){fail("sampler",r);return false;}
+    VkDescriptorSetLayoutBinding b{};b.binding=0;b.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;b.descriptorCount=1;b.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};dl.bindingCount=1;dl.pBindings=&b;if((r=vkCreateDescriptorSetLayout(device,&dl,nullptr,&set_layout))){fail("descriptor set layout",r);return false;}
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2};VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dp.maxSets=2;dp.poolSizeCount=1;dp.pPoolSizes=&ps;
+    if((r=vkCreateDescriptorPool(device,&dp,nullptr,&pool))){fail("descriptor pool",r);return false;}
+    VkDescriptorSetLayout ls[2]={set_layout,set_layout};VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};ai.descriptorPool=pool;ai.descriptorSetCount=2;ai.pSetLayouts=ls;
+    if((r=vkAllocateDescriptorSets(device,&ai,sets))){fail("descriptor sets",r);return false;}
+    VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT,0,32};VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pl.setLayoutCount=1;pl.pSetLayouts=&set_layout;pl.pushConstantRangeCount=1;pl.pPushConstantRanges=&pc;
+    if((r=vkCreatePipelineLayout(device,&pl,nullptr,&layout))){fail("pipeline layout",r);return false;}
+    // GPU cost: timestamps need a queue family with timestamp bits
+    uint32_t n=0;vkGetPhysicalDeviceQueueFamilyProperties(physical,&n,nullptr);std::vector<VkQueueFamilyProperties> q(n);vkGetPhysicalDeviceQueueFamilyProperties(physical,&n,q.data());
+    VkPhysicalDeviceProperties pp;vkGetPhysicalDeviceProperties(physical,&pp);
+    if(family<n && q[family].timestampValidBits && pp.limits.timestampPeriod>0){VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};qi.queryType=VK_QUERY_TYPE_TIMESTAMP;qi.queryCount=4;if(vkCreateQueryPool(device,&qi,nullptr,&queries))queries=VK_NULL_HANDLE;else tick_ns=pp.limits.timestampPeriod;}
+    if(!queries)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale: no timestamps on this queue, gpu_us is not measured");
+    return true;
+}
+// Render passes and the pipeline for the swapchain's format (made again only when the format changes).
+bool make_pipeline(VkFormat format){
+    if(pipeline && format==target_format)return true;
+    if(pipeline)vkDestroyPipeline(device,pipeline,nullptr);pipeline={};for(auto &p:passes){if(p)vkDestroyRenderPass(device,p,nullptr);p={};}target_format=VK_FORMAT_UNDEFINED;VkResult r;
+    for(int k=0;k<2;k++){
+        VkAttachmentDescription a{};a.format=format;a.samples=VK_SAMPLE_COUNT_1_BIT;a.loadOp=k?VK_ATTACHMENT_LOAD_OP_CLEAR:VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+        a.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;a.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;a.finalLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        VkAttachmentReference ref{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};VkSubpassDescription sp{};sp.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sp.colorAttachmentCount=1;sp.pColorAttachments=&ref;
+        // The layout transition waits for the acquire semaphore (the submit waits it at COLOR_ATTACHMENT_OUTPUT); the present after it.
+        VkSubpassDependency d[2]{};d[0].srcSubpass=VK_SUBPASS_EXTERNAL;d[0].dstSubpass=0;d[0].srcStageMask=d[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;d[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        d[1].srcSubpass=0;d[1].dstSubpass=VK_SUBPASS_EXTERNAL;d[1].srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;d[1].dstStageMask=VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;d[1].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};rp.attachmentCount=1;rp.pAttachments=&a;rp.subpassCount=1;rp.pSubpasses=&sp;rp.dependencyCount=2;rp.pDependencies=d;
+        if((r=vkCreateRenderPass(device,&rp,nullptr,&passes[k]))){passes[k]={};fail("render pass",r);return false;}
+    }
+    VkShaderModule m[2]{};VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize=sizeof vert_code;mi.pCode=vert_code;if((r=vkCreateShaderModule(device,&mi,nullptr,&m[0]))){fail("vertex shader",r);return false;}
+    mi.codeSize=sizeof frag_code;mi.pCode=frag_code;if((r=vkCreateShaderModule(device,&mi,nullptr,&m[1]))){vkDestroyShaderModule(device,m[0],nullptr);fail("GSR shader",r);return false;}
+    VkPipelineShaderStageCreateInfo st[2]{};for(int k=0;k<2;k++){st[k].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;st[k].stage=k?VK_SHADER_STAGE_FRAGMENT_BIT:VK_SHADER_STAGE_VERTEX_BIT;st[k].module=m[k];st[k].pName="main";}
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vp.viewportCount=vp.scissorCount=1;
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};rs.polygonMode=VK_POLYGON_MODE_FILL;rs.cullMode=VK_CULL_MODE_NONE;rs.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE;rs.lineWidth=1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba{};ba.colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};cb.attachmentCount=1;cb.pAttachments=&ba;
+    VkDynamicState dyn[2]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};ds.dynamicStateCount=2;ds.pDynamicStates=dyn;
+    VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};gp.stageCount=2;gp.pStages=st;gp.pVertexInputState=&vi;gp.pInputAssemblyState=&ia;gp.pViewportState=&vp;gp.pRasterizationState=&rs;
+    gp.pMultisampleState=&ms;gp.pColorBlendState=&cb;gp.pDynamicState=&ds;gp.layout=layout;gp.renderPass=passes[0];gp.subpass=0;
+    r=vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&pipeline);vkDestroyShaderModule(device,m[0],nullptr);vkDestroyShaderModule(device,m[1],nullptr);
+    if(r){pipeline={};fail("GSR pipeline",r);return false;}
+    target_format=format;return true;
+}
+// After a swapchain (re)creation: one view + framebuffer per image (create_swap; the old ones went with destroy_present_semaphores).
+bool targets(const std::vector<VkImage> &imgs,VkFormat format,VkExtent2D ext){
+    drop_targets();if(!enabled() || !setup() || !make_pipeline(format))return false;VkResult r;
+    for(VkImage im:imgs){
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};vi.image=im;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=format;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        VkImageView v{};if((r=vkCreateImageView(device,&vi,nullptr,&v))){drop_targets();fail("swapchain image view",r);return false;}views.push_back(v);
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};fi.renderPass=passes[0];fi.attachmentCount=1;fi.pAttachments=&v;fi.width=ext.width;fi.height=ext.height;fi.layers=1;
+        VkFramebuffer fb{};if((r=vkCreateFramebuffer(device,&fi,nullptr,&fb))){drop_targets();fail("framebuffer",r);return false;}framebuffers.push_back(fb);
+    }
+    fb_extent=ext;__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale gsr targets: %zu swapchain images %ux%u format %d",imgs.size(),ext.width,ext.height,int(format));
+    return true;
+}
+// Once the flight's fence has signalled: its two timestamps; every ~3 s the average / max GPU time of the pass.
+void collect(unsigned f){
+    if(!stamped[f])return;stamped[f]=false;uint64_t t[2]{};
+    if(vkGetQueryPoolResults(device,queries,f*2,2,sizeof t,t,8,VK_QUERY_RESULT_64_BIT)!=VK_SUCCESS || t[1]<t[0])return;
+    const double ns=double(t[1]-t[0])*tick_ns;sum_ns+=ns;max_ns=std::max(max_ns,ns);++timed;
+    const int64_t now=mono_ns();if(!window_t0)window_t0=now;
+    if(now-window_t0<3000000000ll)return;
+    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale gsr %dx%d -> %dx%d gpu_us=%.0f max_us=%.0f presents=%u rcas=%s",last_sw,last_sh,last_dw,last_dh,sum_ns/timed/1e3,max_ns/1e3,timed,rcas::enabled()?"on":"off");
+    sum_ns=max_ns=0;timed=0;window_t0=now;
+}
+// Records the pass into swapchain image `index`: render pass (clear only with letterbox bars), the source sampled in
+// SHADER_READ_ONLY_OPTIMAL and returned to TRANSFER_SRC_OPTIMAL (the layout the engine tracks). Crop (x,y,w,h) of the upright
+// frame goes to the rectangle (dx,dy,dw,dh); mirror = the source is stored bottom-up. false = nothing recorded (the caller blits).
+bool record(VkCommandBuffer cmd,unsigned f,uint32_t index,VkImage source,VkFormat format,uint32_t width,uint32_t height,int x,int y,int w,int h,bool mirror,int dx,int dy,int dw,int dh,VkExtent2D ext,bool bars){
+    if(!enabled() || !pipeline || index>=framebuffers.size() || fb_extent.width!=ext.width || fb_extent.height!=ext.height)return false;
+    if(source_views[f])vkDestroyImageView(device,source_views[f],nullptr);source_views[f]={};   // this flight's previous frame has retired (its fence was waited)
+    VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};vi.image=source;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=format;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    if(VkResult r=vkCreateImageView(device,&vi,nullptr,&source_views[f])){source_views[f]={};fail("source view",r);return false;}
+    VkDescriptorImageInfo ii{sampler,source_views[f],VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};wr.dstSet=sets[f];wr.dstBinding=0;wr.descriptorCount=1;wr.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;wr.pImageInfo=&ii;vkUpdateDescriptorSets(device,1,&wr,0,nullptr);
+    if(queries){vkCmdResetQueryPool(cmd,queries,f*2,2);vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,queries,f*2);}
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;b.image=source;b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    b.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;b.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,0,nullptr,0,nullptr,1,&b);
+    VkClearValue black{};VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};rb.renderPass=passes[bars?1:0];rb.framebuffer=framebuffers[index];rb.renderArea={{0,0},ext};rb.clearValueCount=1;rb.pClearValues=&black;
+    vkCmdBeginRenderPass(cmd,&rb,VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&sets[f],0,nullptr);
+    VkViewport v{float(dx),float(dy),float(dw),float(dh),0,1};VkRect2D sc{{dx,dy},{uint32_t(dw),uint32_t(dh)}};vkCmdSetViewport(cmd,0,1,&v);vkCmdSetScissor(cmd,0,1,&sc);
+    // source position p = gl_FragCoord * scale + offset (pixels); mirrored: stored row = height - upright row (gsr.frag)
+    const double sx=double(w)/dw,sy=double(h)/dh;
+    struct{float sx,sy,ox,oy,tx,ty,rcas,edge;}pc{float(sx),float(mirror?-sy:sy),float(x-dx*sx),float(mirror?double(height)-y+dy*sy:y-dy*sy),1.f/float(width),1.f/float(height),rcas::enabled()?rcas::sharpness:0.f,edge_sharpness};
+    vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof pc,&pc);vkCmdDraw(cmd,3,1,0,0);vkCmdEndRenderPass(cmd);
+    // back to the engine's layout; later writes to the source wait for these reads
+    b.oldLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;b.srcAccessMask=0;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
+    if(queries){vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,queries,f*2+1);stamped[f]=true;}
+    last_sw=w;last_sh=h;last_dw=dw;last_dh=dh;return true;
+}
+}
 // [DOOM] Live widescreen switch (DM_DOOM_WIDE_LIVE=1, BUGS_AND_FIXES 2.12): the game always renders W x 720 and "wide off" shows its
 // centre 16:9 (the Hor+ projection keeps the vertical FOV, so the centre crop is exactly the 16:9 view; the SWF HUD is centred at
 // scale 1). -1 = not decided yet: at the first frame, crop when DM_DOOM_WIDE_LIVE=1 and the gear option is off (DM_DOOM_WIDE=0).
@@ -331,12 +468,16 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     // [DOOM] The buffer keeps the window's aspect ratio: a 16:9 buffer on a 20:9 screen was stretched sideways by the
     // compositor (round HUD prompts looked squashed). It keeps the game's height, so the blit below adds side bars.
     // DM_PRESENT_STRETCH=1 restores the old fill-the-screen stretch.
-    int bw=w,bh=h;{static int stretch=-1;if(stretch<0){const char*e=getenv("DM_PRESENT_STRETCH");stretch=e&&*e=='1';}
+    // [DOOM] DM_GFX_UPSCALE (namespace upscale): the buffer is the window's own size and the pass below fills it.
+    const bool up_want=upscale::takes(source_format,sp.optimalTilingFeatures);bool stretched=false;
+    int bw=w,bh=h;{static int stretch=-1;if(stretch<0){const char*e=getenv("DM_PRESENT_STRETCH");stretch=e&&*e=='1';}stretched=stretch>0;
         int ww=active?ANativeWindow_getWidth(active):0,wh=active?ANativeWindow_getHeight(active):0;
-        if(!stretch&&ww>0&&wh>0){if(int64_t(ww)*h>int64_t(wh)*w)bw=int((int64_t(h)*ww/wh+1)&~1);else bh=int((int64_t(w)*wh/ww+1)&~1);}}
+        if(!stretch&&ww>0&&wh>0){if(int64_t(ww)*h>int64_t(wh)*w)bw=int((int64_t(h)*ww/wh+1)&~1);else bh=int((int64_t(w)*wh/ww+1)&~1);}
+        if(up_want&&ww>0&&wh>0){bw=ww;bh=wh;}}
     if(present_native && surface && active && (native_w!=bw || native_h!=bh)){   // the next swapchain takes this size (currentExtent follows the buffer geometry)
         int g=ANativeWindow_setBuffersGeometry(active,bw,bh,0);native_w=bw;native_h=bh;swap_dirty=true;
-        __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present at the game's output size %dx%d in a %dx%d buffer result=%d (marker gfx-present-native)",w,h,bw,bh,g);}
+        if(up_want)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present upscale: the game's output %dx%d into a %dx%d window-size buffer result=%d (DM_GFX_UPSCALE)",w,h,bw,bh,g);
+        else __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present at the game's output size %dx%d in a %dx%d buffer result=%d (marker gfx-present-native)",w,h,bw,bh,g);}
     // 后台等待释放UI锁；保留同一源帧，恢复并真正呈现后才返回成功。
     // Suspend without the UI lock; keep this source frame until it is presented.
     wait_window();
@@ -360,6 +501,7 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     // A bounded acquire lets rendering observe lifecycle changes; UI never waits on the driver.
     unsigned f=overlap?flight:0;VkCommandPool pool=f?overlap_pool:command_pool;VkCommandBuffer cmd=f?overlap_command:command;VkSemaphore acq=f?overlap_acquired:acquired;VkFence done=f?overlap_fence:fence;
     if(in_flight[f]){XTRACE_BEGIN("dm-present-fence");r=vkWaitForFences(device,1,&done,VK_TRUE,10000000000ull);XTRACE_END();if(r)return r;if((r=vkResetFences(device,1,&done)))return r;in_flight[f]=false;
+        upscale::collect(f);   // [DOOM] DM_GFX_UPSCALE: the pass's timestamps of this flight's previous present
         if(present_stamped[f]){uint64_t t[2]{};if(vkGetQueryPoolResults(device,present_queries,f*2,2,sizeof t,t,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS && t[1]>=t[0]){present_gpu_ns+=double(t[1]-t[0])*present_tick_ns;
             if(++present_timed==300){__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN PERF present_gpu_us=%.0f extent=%ux%u (marker gfx-present-timing)",present_gpu_ns/present_timed/1e3,extent.width,extent.height);present_gpu_ns=0;present_timed=0;}}present_stamped[f]=false;}}
     uint32_t index=0;
@@ -378,6 +520,12 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     bool stamp=present_timing && overlap;if(stamp && !present_queries){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=4;if(vkCreateQueryPool(device,&q,nullptr,&present_queries))stamp=false;
         VkPhysicalDeviceProperties pp;vkGetPhysicalDeviceProperties(physical,&pp);present_tick_ns=pp.limits.timestampPeriod;}
     if(stamp){vkCmdResetQueryPool(cmd,present_queries,f*2,2);vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,present_queries,f*2);}
+    double scale=std::min(double(extent.width)/w,double(extent.height)/h);int dw=std::max(1,int(w*scale)),dh=std::max(1,int(h*scale)),dx=(int(extent.width)-dw)/2,dy=(int(extent.height)-dh)/2;
+    // [DOOM] DM_GFX_UPSCALE: the pass renders the swapchain image itself (letterbox clear, crop, mirror, RCAS); only when it enlarges.
+    // DM_PRESENT_STRETCH=1: the whole buffer, unequal x / y scale (as the compositor stretched before).
+    if(up_want && stretched){dx=dy=0;dw=int(extent.width);dh=int(extent.height);}
+    const bool upscaled=up_want && (dw>w || dh>h) && upscale::record(cmd,f,index,source,source_format,width,height,x,y,w,h,mirror,dx,dy,dw,dh,extent,dx || dy || dw!=int(extent.width) || dh!=int(extent.height));
+    if(!upscaled){
     VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.image=images[index];barrier.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};barrier.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;barrier.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
     // 换布局须在获取信号量的等待阶段（下面提交的 TRANSFER）之后：源阶段写 TOP_OF_PIPE 时，换布局不等信号量，可能在呈现引擎
     // 读完这张图之前就发生（验证层同步检查：SYNC-HAZARD-WRITE-AFTER-READ）。
@@ -385,7 +533,6 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     // TOP_OF_PIPE as the source stage it does not wait for the semaphore and can happen before the presentation engine has
     // finished reading the image (synchronization validation: SYNC-HAZARD-WRITE-AFTER-READ).
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);
-    double scale=std::min(double(extent.width)/w,double(extent.height)/h);int dw=std::max(1,int(w*scale)),dh=std::max(1,int(h*scale)),dx=(int(extent.width)-dw)/2,dy=(int(extent.height)-dh)/2;
     if(dx || dy || dw!=int(extent.width) || dh!=int(extent.height)){   // letterbox bars only where the blit leaves part of the image
         VkClearColorValue black{};vkCmdClearColorImage(cmd,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&barrier.subresourceRange);
         barrier.oldLayout=barrier.newLayout;barrier.srcAccessMask=barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);}
@@ -399,6 +546,8 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
 #ifdef __OHOS__
     if(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)filter=VK_FILTER_LINEAR;
 #endif
+    // [DOOM] DM_GFX_UPSCALE without its pass (format not taken, setup failed): the buffer is the window size, so scale linearly
+    if(upscale::enabled() && (dw!=w || dh!=h) && (sp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))filter=VK_FILTER_LINEAR;
     const bool sharpened=rcas::record(cmd,f,source,source_format,width,height);
     vkCmdBlitImage(cmd,sharpened?rcas::image:source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,filter);
     // 同队列后续写入必须等源图读取完成；即使下一次图像布局未改变也建立 WAR 执行依赖。
@@ -406,8 +555,10 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     VkMemoryBarrier source_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};source_read.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;source_read.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&source_read,0,nullptr,0,nullptr);
     barrier.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;barrier.newLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=0;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+    }
     if(stamp){vkCmdWriteTimestamp(cmd,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,present_queries,f*2+1);present_stamped[f]=true;}
-    if((r=vkEndCommandBuffer(cmd)))return r;VkPipelineStageFlags stage=VK_PIPELINE_STAGE_TRANSFER_BIT;VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.waitSemaphoreCount=1;submit.pWaitSemaphores=&acq;submit.pWaitDstStageMask=&stage;submit.commandBufferCount=1;submit.pCommandBuffers=&cmd;submit.signalSemaphoreCount=1;submit.pSignalSemaphores=&finished[index];
+    // the acquire semaphore gates the first write to the swapchain image: the blit (TRANSFER) or the upscale pass's attachment
+    if((r=vkEndCommandBuffer(cmd)))return r;VkPipelineStageFlags stage=upscaled?VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT:VK_PIPELINE_STAGE_TRANSFER_BIT;VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};submit.waitSemaphoreCount=1;submit.pWaitSemaphores=&acq;submit.pWaitDstStageMask=&stage;submit.commandBufferCount=1;submit.pCommandBuffers=&cmd;submit.signalSemaphoreCount=1;submit.pSignalSemaphores=&finished[index];
     {QLock ql;r=vkQueueSubmit(queue,1,&submit,done);}if(r)return r;in_flight[f]=true;pt::mark_submitted();VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};pi.waitSemaphoreCount=1;pi.pWaitSemaphores=&finished[index];pi.swapchainCount=1;pi.pSwapchains=&swapchain;pi.pImageIndices=&index;
 #ifdef __OHOS__
     // 期望上屏时刻（鸿蒙 SET_DESIRED_PRESENT_TIMESTAMP）：上屏节奏 = 上次期望时刻 + 一个出图档周期；早到的帧由合成器按时放出，翻译线程不等；
@@ -425,7 +576,7 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     // 呈现失败时先排空，拆除路径要求队列空闲。
     // Drain a failed present before teardown, which requires an idle queue.
     if(overlap){flight^=1;if(pr!=VK_SUCCESS && pr!=VK_SUBOPTIMAL_KHR && (r=queue_wait_idle()))return r;}
-    else{if((r=vkWaitForFences(device,1,&done,VK_TRUE,10000000000ull)))return r;if((r=vkResetFences(device,1,&done)))return r;in_flight[0]=false;if((r=queue_wait_idle()))return r;}
+    else{if((r=vkWaitForFences(device,1,&done,VK_TRUE,10000000000ull)))return r;if((r=vkResetFences(device,1,&done)))return r;in_flight[0]=false;upscale::collect(0);if((r=queue_wait_idle()))return r;}
     if(pr==VK_ERROR_SURFACE_LOST_KHR){uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
     if(pr==VK_ERROR_OUT_OF_DATE_KHR){swap_dirty=true;wait_resize();continue;}
     if(pr!=VK_SUCCESS&&pr!=VK_SUBOPTIMAL_KHR)return pr;
@@ -440,14 +591,19 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
 extern "C" void dm_present_crop169(int on){crop169.store(on?1:0,std::memory_order_relaxed);__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","[wide] live: %s",on?"centre 16:9 crop":"full wide frame");}
 // [r3] DM_GFX_PRESENT_FLIP_FOLD (xbg_game.cpp xbg_present_texture_now): the engine asks the next present to mirror the source
 // vertically in the swapchain blit instead of blitting it upside down into a flip image first (one full-screen blit and the
-// 3 flip images less). Declined (0) while RCAS sharpening is on: its pass reads the source as given.
-extern "C" int dm_present_mirror_next(int on){if(on && rcas::enabled())return 0;mirror_next.store(on?1:0,std::memory_order_relaxed);return 1;}
+// 3 flip images less). Declined (0) while RCAS sharpening is on: its pass reads the source as given. [DOOM] Taken with DM_GFX_UPSCALE:
+// its pass mirrors in its own mapping (RCAS included); its blit fallback mirrors from rcas::image, which keeps the source's orientation.
+extern "C" int dm_present_mirror_next(int on){if(on && rcas::enabled() && !upscale::enabled())return 0;mirror_next.store(on?1:0,std::memory_order_relaxed);return 1;}
 // [mt 2a] DM_GFX_PRESENT_THREAD: the present thread and the engine's side of the protocol (see pt_cfg above).
 void pt::loop(){
     pt_on_thread=true;pthread_setname_np(pthread_self(),"dm-present");
     int pr=setpriority(PRIO_PROCESS,0,-8);if(pr)pr=setpriority(PRIO_PROCESS,0,-4);
     // Off the translation thread's pinned core(s): it is the one that must not be slowed.
-    int ar=1;if(pin_mask){cpu_set_t set;CPU_ZERO(&set);if(!sched_getaffinity(0,sizeof set,&set)){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_CLR(c,&set);if(CPU_COUNT(&set))ar=sched_setaffinity(0,sizeof set,&set);}}
+    // [mtb] DM_GFX_PRESENT_UNPIN=1: start from every core, not from the creator's affinity. The thread is created by the pinned translation
+    // thread and inherits its pin, so clearing the pin left an empty set and it stayed on the translation thread's core (affinity=1 in the log).
+    const char *unpin_e=getenv("DM_GFX_PRESENT_UNPIN");const bool unpin=!(unpin_e && *unpin_e=='0');   // on by default since 02.11 (the present thread inherited the translator pin)
+    int ar=1;if(pin_mask){cpu_set_t set;CPU_ZERO(&set);if(unpin){long n=sysconf(_SC_NPROCESSORS_CONF);if(n<1 || n>32)n=n<1?8:32;for(long c=0;c<n;c++)CPU_SET(int(c),&set);}
+     if(unpin || !sched_getaffinity(0,sizeof set,&set)){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_CLR(c,&set);if(CPU_COUNT(&set))ar=sched_setaffinity(0,sizeof set,&set);}}
     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present thread started tid=%d nice=%d (setpriority %d) off-pin-mask=%x affinity=%d",int(gettid()),getpriority(PRIO_PROCESS,0),pr,pin_mask,ar);
     for(;;){Job j;{std::unique_lock<std::mutex> l(mu);cv.wait(l,[]{return done<enq;});j=ring[(done+1)%depth];cur=j.ticket;}
         const int64_t t0=now_ns();int r;{std::lock_guard<std::mutex> rl(render_mutex);r=present_body(j.src,j.fmt,j.w,j.h,j.has_crop?j.crop:nullptr,j.mirror);}
@@ -471,6 +627,30 @@ extern "C" int dm_present_async(VkImage source,VkFormat format,uint32_t width,ui
     pt::Job &j=pt::ring[(pt::enq+1)%pt::depth];j.src=source;j.fmt=format;j.w=width;j.h=height;j.has_crop=crop!=nullptr;if(crop)memcpy(j.crop,crop,sizeof j.crop);else memset(j.crop,0,sizeof j.crop);j.mirror=mirror;j.ticket=pt::enq+1;
     ++pt::enq;l.unlock();pt::cv.notify_all();return 0;
 }
+// [mtb] DM_GFX_RECORD_THREAD (xbg_game.cpp vkrec): the hand-off in two halves. dm_present_handoff_prepare runs on the translation thread where
+// dm_present_async ran: the core pin, the ADPF frame thread, this present's mirror flag (set by the engine just before), and it starts the
+// present thread there, so that thread's placement does not depend on the record thread. dm_present_async_m runs on the record thread after
+// the frame's slot submission and hands the job over with that flag (DM_GFX_PRESENT_THREAD=2: presents inline on the caller, as dm_present_async).
+extern "C" int dm_present_handoff_prepare(void){
+    pin_update();
+    if(pt_cfg==1){
+#ifdef DM_GAME_DOOM
+        {static bool told=false;if(!told){told=true;dm_aperf_frame_tid(int(gettid()));}}
+#endif
+        std::lock_guard<std::mutex> l(pt::mu);if(!pt::started){pt::started=true;std::thread(pt::loop).detach();}}
+    return mirror_next.exchange(0,std::memory_order_relaxed)!=0;
+}
+extern "C" int dm_present_async_m(VkImage source,VkFormat format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t,int mirror){
+    if(pt_cfg==2){std::lock_guard<std::mutex> render_lock(render_mutex);++pt::jobs;return present_body(source,format,width,height,crop,mirror!=0);}
+    std::unique_lock<std::mutex> l(pt::mu);
+    if(!pt::started){pt::started=true;std::thread(pt::loop).detach();}
+    if(pt::enq-pt::done>=pt::depth){const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::enq-pt::done<pt::depth;});pt::full_ns+=uint64_t(pt::now_ns()-t0);}
+    if(int e=pt::err.load())return e;
+    pt::Job &j=pt::ring[(pt::enq+1)%pt::depth];j.src=source;j.fmt=format;j.w=width;j.h=height;j.has_crop=crop!=nullptr;if(crop)memcpy(j.crop,crop,sizeof j.crop);else memset(j.crop,0,sizeof j.crop);j.mirror=mirror!=0;j.ticket=pt::enq+1;
+    ++pt::enq;l.unlock();pt::cv.notify_all();return 0;
+}
+// [mtb] The translation thread's core pin (0 = none): the record thread keeps off it.
+extern "C" unsigned dm_present_pin_mask(void){return pin_mask;}
 // Nanoseconds waited until every handed present has its blit submitted / has finished (0 = nothing pending).
 extern "C" uint64_t dm_present_wait_submitted(void){std::unique_lock<std::mutex> l(pt::mu);if(pt::sub>=pt::enq)return 0;const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::sub>=pt::enq;});return uint64_t(pt::now_ns()-t0);}
 extern "C" uint64_t dm_present_drain(void){std::unique_lock<std::mutex> l(pt::mu);if(pt::done>=pt::enq)return 0;const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::done>=pt::enq;});return uint64_t(pt::now_ns()-t0);}
@@ -489,6 +669,7 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     if(ready||!path||!*path)return fail("Initialization requires an external shader directory and an uninitialized renderer",VK_ERROR_INITIALIZATION_FAILED);
     // 每次初始化从缺省的 120 Hz 重新读标记。 | Each initialization starts again from the 120 Hz default before the marker.
     frame_rate_vote=120;
+    upscale::enabled();   // [DOOM] DM_GFX_UPSCALE: decided (and logged) once, before the first swapchain and any present-thread caller
     // [DOOM] Frame rate limit above 60 (DM_PRESENT_MAX_HZ 90 / 120, DmActivity): vote that rate, so a panel offering 60/90/120 runs at 90
     // for a 90 cap (a 120 vote would leave 120 Hz, where the cap paces at 60). DmActivity also asks for that display mode.
     if(const char *cap=getenv("DM_PRESENT_MAX_HZ")){float c=float(atof(cap));if(c>60.5f && c<=240)frame_rate_vote=c;}

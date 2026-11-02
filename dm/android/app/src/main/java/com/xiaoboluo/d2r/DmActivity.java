@@ -342,6 +342,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             Os.setenv("DM_DOOM_DRS_FPS", String.valueOf(p.getInt("drs_fps", DRS_FPS_DEFAULT)), true);
             int sh = p.getInt("sharpen", 0);
             if (sh > 0 && sh < SHARPEN_STOPS.length) Os.setenv("DM_GFX_SHARPEN", SHARPEN_STOPS[sh], true); else Os.unsetenv("DM_GFX_SHARPEN");
+            // Upscale to the screen resolution (vulkan_present.cpp DM_GFX_UPSCALE): the swapchain at the window size + a GSR pass; off by default.
+            if (p.getBoolean("upscale", false)) Os.setenv("DM_GFX_UPSCALE", "gsr", true); else Os.unsetenv("DM_GFX_UPSCALE");
             // Vulkan driver (vk_driver.c): adrenotools packages under <data>/drivers/<name>/ (meta.json + the library) are copied to
             // private storage (a driver must be loaded from there); the package chosen in the dialog sets DM_VK_DRIVER, which dm/env
             // can also set (DM_VK_DRIVER=<name>). The hooks adrenotools loads live in nativeLibraryDir.
@@ -606,6 +608,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             CheckBox light = new CheckBox(this); light.setText(when(R.string.gear_light, true)); light.setChecked(lightWas); box.addView(light);
             heading(box, when(R.string.gear_sharpen, false));
             RadioGroup sh = radios(box, texts(SHARPEN_LABELS), 2000, Math.min(Math.max(0, p.getInt("sharpen", 0)), SHARPEN_LABELS.length - 1), true);
+            CheckBox upscale = new CheckBox(this); upscale.setText(when(R.string.gear_upscale, false)); upscale.setChecked(p.getBoolean("upscale", false)); box.addView(upscale);
             // Frame rate limit: only the values this display can show evenly.
             java.util.ArrayList<Integer> lims = new java.util.ArrayList<>();
             for (int l : FPS_LIMITS) if (fpsLimitAvailable(l)) lims.add(l);
@@ -668,7 +671,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                     int drvPick = picked(drvG, 7000, drvNames.length + 1);
                     p.edit().putString("driver", drvPick > 0 ? drvNames[drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked())
                         .putFloat("aa", AA_STRENGTHS[picked(aaG, 6000, AA_STRENGTHS.length)]).putString("lang", LANG_CODES[picked(langG, 5000, LANG_CODES.length)])
-                        .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length))
+                        .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length)).putBoolean("upscale", upscale.isChecked())
                         .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size())))
                         .putBoolean("light", light.isChecked()).putInt("drs_fps", DRS_FPS[picked(drsFps, 9500, DRS_FPS.length)]).apply();
                     // [r6] live: light mode (the game's own dock / undock preset switch) and the DRS target; also set at the next start

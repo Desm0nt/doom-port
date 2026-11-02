@@ -28,6 +28,7 @@
     <string name="gear_fps_counter">Licznik FPS i czasu klatki</string>
     <string name="gear_res">Rozdzielczość 3D (interfejs zostaje w 720p)</string>
     <string name="gear_sharpen">Wyostrzanie (FSR RCAS)</string>
+    <string name="gear_upscale">Skalowanie do rozdzielczości ekranu (GSR): ostrzejsze krawędzie, nieco większe obciążenie GPU</string>
     <string name="gear_off">Wył.</string>
     <string name="gear_low">Słabe</string>
     <string name="gear_medium">Średnie</string>
