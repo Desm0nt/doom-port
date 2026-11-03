@@ -130,6 +130,10 @@ doom-port-main/
    bash setup.sh
    ```
 
+   (`./setup.sh` тоже работает, если у файла есть право на запуск; после некоторых распаковщиков ZIP его нет и терминал
+   пишет *Permission denied*: запускайте `bash setup.sh` или один раз выполните `chmod +x setup.sh`.) Если запустить
+   установку двойным щелчком в файловом менеджере, она откроет окно терминала и в конце не закроет его, пока вы не
+   нажмёте Enter.
 3. Отвечайте **Y** и ждите (этапы и время — как на Windows). Пакеты Python ставятся в `tools/.runtime/venv`, .NET — в
    `tools/.runtime/dotnet`; в систему ничего не устанавливается.
 
@@ -201,6 +205,14 @@ Lockpick_RCM: в ключах со старой прошивки нет новы
 
 **«personalized ticket» / «no ticket for rights id»**
 Снимите NSP заново в nxdumptool с включённой опцией *remove console specific data* (и с тикетом).
+
+**Linux / macOS: установка запускается и окно сразу закрывается, или ничего не происходит**
+Запустите её в терминале в папке установки, чтобы увидеть сообщение: `bash setup.sh` (окно, которое установка открыла
+сама, она не закрывает, а без терминала открывает его; любая проблема заканчивается строкой, начинающейся с `STOP:`).
+- `Permission denied`: запускайте `bash setup.sh` (или `chmod +x setup.sh`).
+- `/bin/bash^M: bad interpreter`: файл получил переводы строк Windows; `bash setup.sh` исправит их сам.
+- `Python 3.10 or newer was not found` / `could not create the Python virtual environment`: установите Python, указанный
+  в сообщении (Debian / Ubuntu: `sudo apt install python3-venv`); сначала установка сама пробует поставить pip.
 
 **«not enough free space»**
 Освободите место или вынесите рабочую папку на другой диск. В терминале в папке установки:

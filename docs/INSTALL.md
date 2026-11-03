@@ -130,6 +130,9 @@ Instead of using `put-game-files-here` you can also drag the three files onto `s
    bash setup.sh
    ```
 
+   (`./setup.sh` works too when the file is executable; after some ZIP tools it is not and the shell says
+   *Permission denied*: use `bash setup.sh`, or `chmod +x setup.sh` once.) Started by a double-click in a file manager,
+   setup opens a terminal window and keeps it open at the end until you press Enter.
 3. Answer the questions with **Y** and wait (same stages and times as on Windows). Python packages go into
    `tools/.runtime/venv`, .NET into `tools/.runtime/dotnet`; nothing is installed system-wide.
 
@@ -201,6 +204,14 @@ Windows shows as `prod.keys` but is really `prod.keys.txt` is fine.
 
 **"personalized ticket" / "no ticket for rights id"**
 Dump the NSP again with nxdumptool's *remove console specific data* option turned on (and keep the ticket).
+
+**Linux / macOS: setup starts and the window closes at once, or nothing happens**
+Run it in a terminal in the setup folder to see the message: `bash setup.sh` (setup itself keeps a window open that it
+opened, and opens one when started without a terminal; every problem ends with a line starting with `STOP:`).
+- `Permission denied`: use `bash setup.sh` (or `chmod +x setup.sh`).
+- `/bin/bash^M: bad interpreter`: the file got Windows line endings; `bash setup.sh` fixes them by itself.
+- `Python 3.10 or newer was not found` / `could not create the Python virtual environment`: install the Python shown in
+  the message (Debian / Ubuntu: `sudo apt install python3-venv`); setup also tries to get pip on its own first.
 
 **"not enough free space"**
 Free some space, or put the work folder on another disk. In a terminal in the setup folder:

@@ -180,12 +180,18 @@ def search(folders, depth=0):
     """Packages and key files inside the folders; `depth` levels of subfolders are searched too."""
     pkgs, keys = [], []
     for d in folders:
-        if not d.is_dir(): continue
-        for p in sorted(d.iterdir(), key=lambda q: q.name.lower()):
-            if is_package_path(p): pkgs.append(p)
-            elif p.is_file() and looks_like_keys(p): keys.append(p)
-            elif p.is_dir() and depth > 0:
-                p2, k2 = search([p], depth - 1); pkgs += p2; keys += k2
+        try:
+            items = sorted(d.iterdir(), key=lambda q: q.name.lower()) if d.is_dir() else []
+        except OSError:                         # e.g. a folder of another user in the current directory
+            continue
+        for p in items:
+            try:
+                if is_package_path(p): pkgs.append(p)
+                elif p.is_file() and looks_like_keys(p): keys.append(p)
+                elif p.is_dir() and depth > 0:
+                    p2, k2 = search([p], depth - 1); pkgs += p2; keys += k2
+            except OSError:                     # unreadable entry: not ours
+                continue
     return pkgs, keys
 
 
@@ -322,7 +328,41 @@ def resolve(pkgs, key_files, show=True):
         if not t.program:
             raise Fail(f'{t.pkg.path.name}: the {what} program content ({t.program_id}) is missing '
                        'from the package (incomplete dump?)')
+        check_program(t, keys)
     return base, upd, keys
+
+
+def check_program(t, keys):
+    """Open the program NCA now (title key from the ticket, key generation; for a plain NCA also its ExeFS hash table), so
+    that a missing ticket or key, or a wrong title key, stops setup at stage 1 instead of in the middle of the work."""
+    from content_reader import Package, Nca
+    p = Package(t.pkg.path, keys)
+    try:
+        name, o, n = next(e for e in p.entries if e[0] == t.program)
+        if name.endswith('.ncz'):                # compressed body: the NCA size comes from its (original) header
+            from extract_exefs_nsz import xts_header
+            p.f.seek(o)
+            n = struct.unpack_from('<Q', xts_header(p.keys['header_key'], p.f.read(0xc00)), 0x208)[0]
+        nca = Nca(p, name, o, n)
+        if name.endswith('.nca'):
+            for s in nca.sections:
+                if s.h[3] == 2:                  # PFS0 (ExeFS): its hash table must match the section header
+                    ho, hs = struct.unpack_from('<QQ', s.h, 0x30)
+                    import hashlib
+                    assert hashlib.sha256(s.read(ho, hs)).digest() == s.h[8:40]
+                    break
+    except KeyError as e:
+        k = e.args[0] if e.args else '?'
+        raise Fail(f'{t.pkg.path.name}: your prod.keys has no {k} (needed for the {t.describe()} program). Dump the keys '
+                   'again from your own console with an up-to-date Lockpick_RCM (keys from an older firmware lack the newer '
+                   'key generations).')
+    except ValueError as e:
+        raise Fail(f'{t.pkg.path.name}: {e}')
+    except (AssertionError, struct.error):
+        raise Fail(f'{t.pkg.path.name}: the {t.describe()} program does not decrypt with this prod.keys and the ticket in '
+                   'the package (wrong keys, a wrong or missing ticket, or a damaged dump)')
+    finally:
+        p.close()
 
 
 # ---------------------------------------------------------------- steps
@@ -754,3 +794,8 @@ if __name__ == '__main__':
         print(f'\nSTOP: {e}', file=sys.stderr); sys.exit(2)
     except KeyboardInterrupt:
         print('\ninterrupted; run setup again to continue where it stopped', file=sys.stderr); sys.exit(130)
+    except Exception as e:                      # never end with a bare traceback: say what to do with it
+        import traceback; traceback.print_exc()
+        why = f'{e.strerror}: {e.filename}' if isinstance(e, OSError) and e.strerror and e.filename else f'{type(e).__name__}: {e}'
+        print(f'\nSTOP: unexpected error ({why}). Run setup again (finished steps are kept); if it happens again, open an '
+              'issue at https://github.com/Desm0nt/doom-port/issues with the text above.', file=sys.stderr); sys.exit(1)
