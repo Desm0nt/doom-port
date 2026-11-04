@@ -88,6 +88,7 @@ uint64_t gate_dispatch(uint64_t ret_addr, uint64_t *regs) {
         const gate_t *g = &g_gate[i];
         if (g->ret == ret_addr) switch (g->kind) {
             case G_CNTPCT: case G_CNTVCT: {
+                guest_clock_read_wait();   // [front] waits while the pause menu holds the game
                 uint64_t t = guest_ns() * 12 / 625;    // 19.2 MHz 系统计数器；原指令 mrs xN, cntpct_el0，arg = N | 19.2 MHz system counter; original instruction mrs xN, cntpct_el0, arg = N
                 regs[g->arg] = t;
                 return t;

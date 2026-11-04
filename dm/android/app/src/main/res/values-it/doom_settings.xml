@@ -23,7 +23,9 @@
     <string name="gear_lang_system">Come nel sistema</string>
     <string name="gear_aa">Assistenza alla mira</string>
     <string name="gear_aa_switch">Come su Switch</string>
-    <string name="gear_wide">Schermo largo: visuale più ampia invece delle bande laterali</string>
+    <string name="gear_aspect">Proporzioni</string>
+    <string name="gear_aspect_auto">Auto (come lo schermo)</string>
+    <string name="gear_aspect_note">Auto: su uno schermo largo visuale più ampia, su uno schermo 4:3 immagine 4:3. Il 4:3 su uno schermo largo aggiunge bande laterali.</string>
     <string name="gear_rumble">Vibrazione</string>
     <string name="gear_fps_counter">Contatore FPS e tempo per fotogramma</string>
     <string name="gear_res">Risoluzione 3D (l\'interfaccia resta a 720p)</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">Grande</string>
     <string name="gear_look">Sensibilità della visuale (scorrimento e tasto di fuoco)</string>
     <string name="gear_deadzone">Stick di movimento: compensazione della zona morta del gioco</string>
-    <string name="toast_wide_now">Schermo largo: applicato</string>
-    <string name="toast_wide_next">Schermo largo: dal prossimo avvio</string>
+    <string name="toast_wide_now">Proporzioni: applicate</string>
+    <string name="toast_wide_next">Proporzioni: dal prossimo avvio</string>
     <string name="gear_button">Pulsante impostazioni</string>
     <string name="gear_button_normal">Normale</string>
     <string name="gear_button_faded">Sbiadito</string>

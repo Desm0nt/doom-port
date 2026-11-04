@@ -23,7 +23,9 @@
     <string name="gear_lang_system">As in the system</string>
     <string name="gear_aa">Aim assist</string>
     <string name="gear_aa_switch">As on Switch</string>
-    <string name="gear_wide">Widescreen: wider view instead of side bars</string>
+    <string name="gear_aspect">Aspect ratio</string>
+    <string name="gear_aspect_auto">Auto (match the screen)</string>
+    <string name="gear_aspect_note">Auto: a wider screen gets a wider view, a 4:3 screen a 4:3 picture. 4:3 on a wide screen adds side bars.</string>
     <string name="gear_rumble">Vibration</string>
     <string name="gear_fps_counter">FPS and frame time counter</string>
     <string name="gear_res">3D resolution (the interface stays at 720p)</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">Large</string>
     <string name="gear_look">Look sensitivity (swipe and fire button)</string>
     <string name="gear_deadzone">Move stick: game dead zone compensation</string>
-    <string name="toast_wide_now">Widescreen: applied</string>
-    <string name="toast_wide_next">Widescreen: from the next launch</string>
+    <string name="toast_wide_now">Aspect ratio: applied</string>
+    <string name="toast_wide_next">Aspect ratio: from the next launch</string>
     <string name="gear_button">Settings button</string>
     <string name="gear_button_normal">Normal</string>
     <string name="gear_button_faded">Faded</string>

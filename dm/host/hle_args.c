@@ -8,6 +8,7 @@
 //   DM_DOOM_LIGHT=1, DM_DOOM_DRS_FPS=30|45|60, DM_DOOM_DRS_GPU=0  light mode / DRS target / DRS on the game's own GPU timer
 //                          (hle_doom_drs.c, read by doom_drs_init below).
 //   DM_DOOM_WIDE=1|0|<w>   widescreen Hor+ output W x 720 (default off; 1 = screen aspect; see doom_wide below).
+//   DM_DOOM_ASPECT=auto|16:9|4:3|<a>:<b>|<w>  output aspect (the gear choice; auto = the screen's, also narrower; dm_doom_wide_w).
 //   DM_DOOM_WIDE_LIVE=1    always render wide; the gear checkbox switches live (off = presenter 16:9 centre crop; BUGS 2.12).
 //   DM_DOOM_DRS=<n>        debugging: +set rs_enable <n> at every launch. Unset (normal): nothing -- rs_enable's default is patched
 //                          to "0" and the Video menu / gear checkbox (one shared state, saved in the game profile) decide.
@@ -46,8 +47,9 @@ static void add(const char *s) { if (g_argc < 127) g_argv[g_argc++] = strdup(s);
 // screen without side bars.
 //   DM_DOOM_WIDE=1           W = 720 x screen aspect (front_game_res(0), rounded to 16), only when the screen is wider than 16:9
 //   DM_DOOM_WIDE unset / 0   original 1280x720 (the presenter letterboxes it with side bars)
-//   DM_DOOM_WIDE=<width>     explicit width (>= 1280, rounded to 16)
-// W is clamped to [1280, 2160]: 2160 = 720 x 3, the game's aspect clamp in its FOV math.
+//   DM_DOOM_WIDE=<width>     explicit width (>= 720, rounded to 16)
+// W is clamped to [720, 2160] (Auto: [960, 2160]; [4:3] narrower outputs below dm_doom_wide_w): 720 x 1 .. 720 x 3, the game's aspect
+// clamp in its FOV math.
 uint64_t front_game_res(int docked);
 // [DOOM] DM_DOOM_WIDE_LIVE=1 (default off until phone-tested, BUGS_AND_FIXES 2.12): the gear dialog's "wide" checkbox switches live.
 // The game has no runtime path that changes its output size (vid_restart = empty stub 0x1c06c40, the operation-mode message 30
@@ -56,28 +58,70 @@ uint64_t front_game_res(int docked);
 // vertical FOV) and the SWF stage is centred at scale 1.
 static int dm_doom_wide_live_env(void) { const char *e = getenv("DM_DOOM_WIDE_LIVE"); return e && *e == '1'; }
 static int g_wide_patched;   // the r_mode table really holds the wide size (doom_wide succeeded)
-// Output width for DM_DOOM_WIDE, or 0 = off (16:9). Pure computation from env + screen size, cached; also used by hle_svc.c app_pool()
-// (called earlier than the command line) through doom_pool_plan.
+// [4:3] Aspect ratio choice (DM_DOOM_ASPECT, gear "Aspect ratio", BUGS_AND_FIXES 2.20). The same r_mode table rewrite also gives
+// outputs NARROWER than 16:9 (W < 1280 at height 720); checked in the base main (symbols):
+//   * CalculateFovXandY 0x32c888: vfov = 2*atan(tan(clamp(g_fov,1,120)/2) * 0.5625), fovX = 2*atan(tan(vfov/2) * clamp(w*pa/h, 1, 3))
+//     -> vertical FOV is kept, a 4:3 output shows less on the sides (the native 4:3 look); the aspect floor 1.0 = W 720.
+//   * idSWF::RenderInternal 0x556d0: scale = min(vw/stageW, vh/stageH) * swf_safeFrame factor (+0x1cc), the stage centred on both
+//     axes (vw/vh = idRenderModelGui::GetVirtualWidth/Height 0x15667e4 = the GUI viewport = output size). At 960x720 the 1280x720 HUD /
+//     menus are scaled to 0.75 (960x540) and centred with 90 px empty above and below (3D fills them; SWFs with the bars flag +0x220
+//     draw black bars there) -- nothing is cut off. Only the horizontal offset is exported to the scripts (+0x1c8 = 0 here).
+//   * DRS / rs_forceFraction are fractions of the output size; the presenter (letterbox / GSR) takes any source size.
+// So the narrow width only needs a floor: Auto never goes below 960 (4:3; below it the HUD shrinks under 0.75 on 3.5-4" screens);
+// an explicit ratio / width may go down to 720 (the FOV aspect floor). The RenderTarget pool keeps its stock 117 MB minimum.
+int front_screen_size(int *w, int *h);   // front_android.c: the game view's size as Java reported it (also below 16:9)
+__attribute__((weak)) int front_screen_size(int *w, int *h) { (void)w; (void)h; return 0; }   // other front ends: unknown
+enum { ASPECT_169, ASPECT_AUTO, ASPECT_FIXED };
+static int g_aspect_choice = -1;   // what dm_doom_wide_w decided from (ASPECT_*)
+static int g_live_wide;            // DM_DOOM_WIDE_LIVE=1 and the output is wider than 16:9: the presenter crop can switch it to 16:9
+// "Match the screen": output width at height 720, unrounded and unclamped. Wider than 16:9: front_game_res(0) as before (exactly the
+// widths of the old DM_DOOM_WIDE=1). Narrower: the view size itself (front_game_res reports 1280x720 for those); a screen within 5 %
+// of 16:9 (e.g. a 16:9 handheld whose window lost a few pixels to a bar) stays 1280.
+static unsigned auto_width(void) {
+    const char *gr = getenv("DM_GAME_RES"); unsigned gw, gh, v = 1280;
+    if (gr && sscanf(gr, "%ux%u", &gw, &gh) == 2 && gh) v = (unsigned)(720.0 * gw / gh + 0.5);   // DM_GAME_RES only as an aspect here
+    else {
+        uint64_t r = front_game_res(0); int sw = 0, sh = 0;
+        if ((uint32_t)(r >> 32) == 720 && (uint32_t)r > 1280) v = (uint32_t)r;
+        else if (front_screen_size(&sw, &sh) && sw > 0 && sh > 0 && (int64_t)sw * 9 < (int64_t)sh * 16) v = (unsigned)(720.0 * sw / sh + 0.5);
+    }
+    return v < 1280 && v >= 1216 ? 1280 : v;   // 1216 = 720 x 16/9 x 0.95
+}
+// Output width, or 0 = the original 1280x720. Pure computation from env + screen size, cached; also used by hle_svc.c app_pool()
+// (called earlier than the command line) through doom_pool_plan. Inputs, first match wins:
+//   DM_DOOM_WIDE=<width>  (>= 720; dm/env)  explicit width
+//   DM_DOOM_ASPECT=auto | 16:9 | 4:3 | <a>:<b> | <width>  (the APK sets it from the gear choice)
+//   DM_DOOM_WIDE=1 (compatibility) = auto; unset / 0 = 16:9
+// With DM_DOOM_WIDE_LIVE=1 a 16:9 choice still renders at the screen aspect (wider than 16:9 only) and the presenter crops it (BUGS 2.12).
 unsigned dm_doom_wide_w(void) {
     static int done; static unsigned w;
     if (done) return w;
     done = 1;
-    const char *e = getenv("DM_DOOM_WIDE");
-    if (!e || !*e || (*e == '0' && !e[1])) {
-        if (!dm_doom_wide_live_env()) return w = 0;   // default OFF (diag30 29.10: white EmergencyRender = RenderTarget pool full; now sized below)
-        e = "1";   // DM_DOOM_WIDE_LIVE=1: always render at the screen aspect; "off" is a 16:9 centre crop in the presenter (BUGS 2.12)
-    }
-    long want = atol(e);
-    unsigned v;
-    if (want >= 1280) v = (unsigned)want;
-    else {   // DM_DOOM_WIDE=1: same height, widened to the screen aspect (the d2r-mobile rule, front_android.c)
-        const char *gr = getenv("DM_GAME_RES"); unsigned gw, gh;
-        if (gr && sscanf(gr, "%ux%u", &gw, &gh) == 2 && gh) v = (unsigned)(720.0 * gw / gh + 0.5);   // DM_GAME_RES only as an aspect here
-        else { uint64_t r = front_game_res(0); v = (uint32_t)(r >> 32) == 720 ? (uint32_t)r : 1280; }
-    }
-    v = (v + 8) / 16 * 16; if (v < 1280) v = 1280; if (v > 2160) v = 2160;
+    const char *e = getenv("DM_DOOM_WIDE"), *a = getenv("DM_DOOM_ASPECT");
+    long ew = e && *e ? atol(e) : 0;
+    unsigned v = 1280; int ch = ASPECT_169;
+    if (ew >= 720) { v = (unsigned)ew; ch = ASPECT_FIXED; }
+    else if (a && *a) {
+        double x = 0, y = 0;
+        if (!strcmp(a, "auto")) ch = ASPECT_AUTO;
+        else if (!strcmp(a, "16:9")) ch = ASPECT_169;
+        else if ((sscanf(a, "%lf:%lf", &x, &y) == 2 || sscanf(a, "%lf/%lf", &x, &y) == 2) && x > 0 && y > 0) { v = (unsigned)(720.0 * x / y + 0.5); ch = ASPECT_FIXED; }
+        else if (atol(a) >= 720) { v = (unsigned)atol(a); ch = ASPECT_FIXED; }
+        else { ch = ASPECT_AUTO; LOG("[aspect] DM_DOOM_ASPECT=%s not understood (auto | 16:9 | 4:3 | <a>:<b> | <width>): auto", a); }
+    } else if (e && *e && !(*e == '0' && !e[1])) ch = ASPECT_AUTO;
+    if (ch == ASPECT_AUTO) v = auto_width();
+    else if (ch == ASPECT_169 && dm_doom_wide_live_env()) { unsigned s = auto_width(); if (s > 1280) v = s; }   // render wide, crop to 16:9
+    v = (v + 8) / 16 * 16;
+    const unsigned lo = ch == ASPECT_AUTO ? 960 : 720;
+    if (v < lo) v = lo; if (v > 2160) v = 2160;
+    g_aspect_choice = ch; g_live_wide = dm_doom_wide_live_env() && v > 1280;
+    LOG("[aspect] %s -> output %ux720 (DM_DOOM_ASPECT=%s, DM_DOOM_WIDE=%s%s)", ch == ASPECT_AUTO ? "auto (screen aspect)" : ch == ASPECT_169 ? "16:9" : "fixed",
+        v, a ? a : "-", e ? e : "-", g_live_wide ? ", live crop available" : "");
     return w = v == 1280 ? 0 : v;
 }
+// vulkan_present.cpp (weak reference, first frame): 1 = start with the centre 16:9 crop (DM_DOOM_WIDE_LIVE=1, the choice is 16:9 and
+// the game really renders wider than 16:9), 0 = show the whole frame.
+int dm_doom_live_crop_initial(void) { dm_doom_wide_w(); return g_wide_patched && g_live_wide && g_aspect_choice == ASPECT_169; }
 // [DOOM] The game's NVN VRAM pools (idNvnVRamAllocator; cvars registered at 0x1c4a040..0x1c4a150, read once by the VRAM allocator
 // init 0x1c305e0, which renderer init calls at 0x1c054dc -- after the command line's +set are applied). Each pool is carved out of the
 // game heap (heap = app pool - image, hle_svc.c) and zeroed; with zero-copy (xbg_game.cpp map_pool) it becomes AHardwareBuffer
@@ -114,7 +158,7 @@ static int margin_level(void) {
 static int margin_on(void) { return margin_level() > 0; }
 static doom_pools doom_pool_plan(void) {
     doom_pools p = g_stock_pools; unsigned w = dm_doom_wide_w();
-    double rt_min = w ? (117u * w + 1279) / 1280 + 4 : 117;   // minimum for the output width
+    double rt_min = w > 1280 ? (117u * w + 1279) / 1280 + 4 : 117;   // minimum for the output width ([4:3] narrower: the stock 117)
     const int lv = margin_level();
     if (lv == 2) {
         p.tb = 1536; p.rt = ceil(rt_min * 1.35 / 4) * 4; p.unc = ceil(22.5 * 1.5); p.sh = ceil(5.5 * 1.5); p.dyn = ceil(23 * 1.5);
@@ -139,7 +183,7 @@ static void doom_pools_args(void) {
 }
 static void doom_wide(void) {
     unsigned w = dm_doom_wide_w();
-    if (!w) { LOG("[wide] DM_DOOM_WIDE off (or screen not wider than 16:9): 16:9 output 1280x720"); return; }
+    if (!w) { LOG("[wide] 16:9 output 1280x720 (aspect 16:9, or the screen is within 5 %% of 16:9)"); return; }
     uint8_t *mb = NULL; size_t msz = 0;
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) { mb = g_mod[i].base; msz = g_mod[i].size; }
     enum { TAB = 0x39f1b10, STR_RMODE = 0x39a107e, STR_RTPOOL = 0x395b436 };   // (the pool cvar name is checked so a wrong build does not widen without its pool)
@@ -150,13 +194,14 @@ static void doom_wide(void) {
     uint32_t t[4] = {w, 720, (w * 3 / 2 + 8) / 16 * 16, 1080};
     memcpy(mb + TAB, t, sizeof t);
     g_wide_patched = 1;
-    LOG("[wide] r_mode table main+%#x -> r_mode 0 = %ux720 (r_mode 1 = %ux1080); RenderTarget pool: see [pools]", TAB, t[0], t[2]);
+    LOG("[wide] r_mode table main+%#x -> r_mode 0 = %ux720 (r_mode 1 = %ux1080, %s than 16:9); RenderTarget pool: see [pools]", TAB, t[0], t[2],
+        w > 1280 ? "wider" : "narrower");
 }
 
 // JNI (jni_android.c nativeWideLive): 1 = the live switch is available (DM_DOOM_WIDE_LIVE=1 and the game renders wide), so the
 // presenter crop can follow the checkbox; 0 = the change applies at the next launch.
 int dm_doom_wide_live(void) {
-    int ok = dm_doom_wide_live_env() && g_wide_patched;
+    int ok = dm_doom_wide_live_env() && g_wide_patched && g_live_wide;   // [4:3] not for an output at or below 16:9
     LOG("[wide] live switch %s (DM_DOOM_WIDE_LIVE=%d, wide output %u)", ok ? "available" : "not available: next launch", dm_doom_wide_live_env(), g_wide_patched ? dm_doom_wide_w() : 0);
     return ok;
 }

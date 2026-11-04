@@ -16,6 +16,7 @@ and keeps the original copyright line.
 | zlib-ng 2.3.3 | zlib license, (C) 1995-2024 Jean-loup Gailly and Mark Adler (its `LICENSE.md`) | https://github.com/zlib-ng/zlib-ng tag 2.3.3 — `dm/third_party/zlib-ng` (unmodified subset, `VERSION.md`); used by `dm/host/hle_zlib.c` (`DM_ZLIB_FAST=1`) instead of the game's own zlib 1.2.3 inflate |
 | AMD FidelityFX Super Resolution 1.0 (RCAS) | MIT, Copyright (c) 2021 Advanced Micro Devices, Inc. | https://github.com/GPUOpen-Effects/FidelityFX-FSR — `dm/android/shaders/rcas.comp` |
 | Snapdragon Game Super Resolution 1 (SGSR1, mobile variant) | BSD-3-Clause, Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved. (licence text in the shader header) | https://github.com/quic/snapdragon-gsr — re-written from the published algorithm (nothing fetched) in `dm/android/shaders/gsr.frag` (`DM_GFX_UPSCALE`); the same pass reuses the RCAS math above |
+| nx2android gamepad themes | MIT, Copyright (c) 2026 seedds (`dm/android/front-assets/LICENSE-nx2android-themes.txt`) | https://github.com/shirai91/nx2android — the on-screen gamepad skins (`themes/`) and the default layout (`overlay_default.tsv`) in `dm/android/front-assets`, unmodified |
 
 Only the parts that DOOM uses were ported: its main imports, its SDK 6.4 code paths, its NVN calls, its shaders and its audio
 renderer, on an Adreno 750 target. Everything new is behind `DM_GAME_DOOM`, except where noted.

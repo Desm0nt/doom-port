@@ -23,7 +23,9 @@
     <string name="gear_lang_system">跟随系统</string>
     <string name="gear_aa">瞄准辅助</string>
     <string name="gear_aa_switch">与 Switch 相同</string>
-    <string name="gear_wide">宽屏：视野更宽，不留两侧黑边</string>
+    <string name="gear_aspect">画面比例</string>
+    <string name="gear_aspect_auto">自动（跟随屏幕）</string>
+    <string name="gear_aspect_note">自动：宽屏上视野更宽，4:3 屏幕上为 4:3 画面。在宽屏上选 4:3 会有两侧黑边。</string>
     <string name="gear_rumble">振动</string>
     <string name="gear_fps_counter">帧率和帧时间显示</string>
     <string name="gear_res">3D 分辨率（界面保持 720p）</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">大</string>
     <string name="gear_look">视角灵敏度（滑动和开火键）</string>
     <string name="gear_deadzone">移动摇杆：补偿游戏死区</string>
-    <string name="toast_wide_now">宽屏：已应用</string>
-    <string name="toast_wide_next">宽屏：下次启动生效</string>
+    <string name="toast_wide_now">画面比例：已应用</string>
+    <string name="toast_wide_next">画面比例：下次启动生效</string>
     <string name="gear_button">设置按钮</string>
     <string name="gear_button_normal">正常</string>
     <string name="gear_button_faded">半透明</string>

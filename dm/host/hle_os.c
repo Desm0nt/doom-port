@@ -108,8 +108,25 @@ void guest_clock_freeze_for(int reason, int on) {
     pthread_mutex_lock(&g_gfz_mu);
     if (on) g_gfz_reasons |= 1u << reason; else g_gfz_reasons &= ~(1u << reason);
     guest_clock_freeze_apply(g_gfz_reasons != 0);
+    void gfz_hold_sync_(void); gfz_hold_sync_();   // [front] pause-menu read wait
     pthread_mutex_unlock(&g_gfz_mu);
 }
+// [front] While the pause menu holds the game (reason 3, hle_hold.c) a guest read of the system counter (the cntpct gate, svc GetSystemTick) waits:
+// Horizon suspends a game behind its HOME menu, and a guest thread reading the frozen clock twice would otherwise see no time pass and spin or
+// divide by it (nx2android hle_os.c guest_clock_read_wait, Super Mario Galaxy 2). The hold suspends graphics before freezing, so no thread is inside
+// an NVN call; host code reads guest_ns() directly and never waits here.
+static pthread_cond_t g_gfz_cv = PTHREAD_COND_INITIALIZER; static _Atomic int g_gfz_hold;
+void guest_clock_read_wait(void) {
+    if (!atomic_load(&g_gfz_hold)) return;
+    pthread_mutex_lock(&g_gfz_mu);
+    while (g_gfz_reasons & (1u << 3)) pthread_cond_wait(&g_gfz_cv, &g_gfz_mu);
+    pthread_mutex_unlock(&g_gfz_mu);
+}
+static void gfz_hold_sync(void) {   // under g_gfz_mu, after the clock state changed
+    atomic_store(&g_gfz_hold, (g_gfz_reasons & (1u << 3)) != 0);
+    if (!(g_gfz_reasons & (1u << 3))) pthread_cond_broadcast(&g_gfz_cv);
+}
+void gfz_hold_sync_(void) { gfz_hold_sync(); }
 void guest_clock_freeze(int on) { guest_clock_freeze_for(0, on); }
 // 熵源：缺省真随机（arc4random）；DM_DETCLOCK 开时改为固定种子的 splitmix64 流（回放画面逐字节可比用，营地蓝火粒子两遍不同）。
 // 两处出口（libc getentropy、svc GetInfo RandomEntropy）共用一条流；调用次数在日志里报（首次与每 1000 次）

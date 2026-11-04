@@ -29,7 +29,8 @@ void dm_guest_clock_advanced(void);
 uint64_t dm_guest_frame(void);        // 宿主每次出图递增；不受机器负载影响 | Incremented each time the host presents a frame; unaffected by machine load
 uint64_t dm_server_tick(void);        // 局内服务端拍；不在局内或 DM_TICK_HOLD 冻结中返回 UINT64_MAX | In-run server tick; returns UINT64_MAX when not in a run or while DM_TICK_HOLD is frozen
 void guest_clock_freeze(int on);
-void guest_clock_freeze_for(int reason, int on);   // 按原因冻结（1 后台，2 系统键盘）；见 hle_os.c | Freeze by reason (1 background, 2 system keyboard); see hle_os.c
+void guest_clock_freeze_for(int reason, int on);
+void guest_clock_read_wait(void);   // [front] a guest read of the system counter: waits while the pause menu holds the game (hle_os.c, hle_hold.c)   // 按原因冻结（1 后台，2 系统键盘）；见 hle_os.c | Freeze by reason (1 background, 2 system keyboard); see hle_os.c
 
 // 强制接管：即使 SDK 模块里有定义，装载时所有对该符号的引用（JUMP_SLOT/GLOB_DAT/ABS64）一律解析到宿主实现。
 // 只用于服务层 nn::（fs/oe/aoc/pctl… 的服务客户端）；SDK 的 libc++、nn::os 内部不进这张表。

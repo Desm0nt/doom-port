@@ -50,7 +50,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Locale;
 
-public class DmActivity extends Activity implements SurfaceHolder.Callback, DisplayManager.DisplayListener, InputManager.InputDeviceListener {
+public class DmActivity extends Activity implements SurfaceHolder.Callback, DisplayManager.DisplayListener, InputManager.InputDeviceListener, FrontMenu.Host, FrontMenu.Owner {
     static final boolean DOOM = "doom".equals(BuildConfig.DM_GAME);
     private DoomPadView doomPad;
     static native int nativeStart(String filesDir, String extDir, String romfsSrc, String lang);
@@ -62,6 +62,15 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native void nativeTextResult(long id, boolean accepted, String text);
     // Platform services (jni_android.c): rumble needs the application Context; the motion sensors the display rotation; game controllers
     // (gamepad / joystick / d-pad sources) go to the native side, which answers whether the game took a key.
+    // [front] The unified front end (frontend-common, docs/FRONTEND_UNIFIED.md; the same names and signatures as nx2android's front_android.c): the
+    // pause menu holds the game (nativeHold), the graceful exit (nativeQuit), the Switch operation mode live (nativeOpmode / nativeSetOpmode)
+    static native void nativeHold(boolean on);
+    static native void nativeQuit();
+    static native int nativeOpmode();
+    static native void nativeSetOpmode(int mode);
+    static final String FRONT_DATA_DIR = "DOOM Mobile";   // Download/<this>: the player's data folder; save exports go to its saves/
+    private FrontMenu front;
+    private SaveTransfer saves;
     static native void nativeContext(Object context);
     static native void nativeRotation(int rotation);
     static native boolean nativePadKey(int device, int keyCode, boolean down);
@@ -110,10 +119,44 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         gameFrame = new FrameLayout(this);
         gameFrame.addView(view, new FrameLayout.LayoutParams(-1, -1));
         setContentView(gameFrame);
-        immersive();
+        immersiveBars();
+        // [front] Back (the key, the gesture) opens / closes the pause menu; targetSdk 36 delivers it only through this callback on Android 13+
+        if (DOOM && android.os.Build.VERSION.SDK_INT >= 33) getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::backPressed);
     }
 
-    private void immersive() {
+    // ---- [front] FrontMenu.Host: what the pause menu asks of this port (frontend-common, docs/FRONTEND_UNIFIED.md)
+    private void backPressed() { if (front != null && started) front.back(); else finish(); }
+    @Override public void onBackPressed() { if (DOOM) backPressed(); else super.onBackPressed(); }
+    @Override public FrontMenu frontMenu() { return front; }
+    @Override public boolean ready() { return started; }
+    @Override public void hold(boolean on) { if (!libraryLoaded) return; try { nativeHold(on); } catch (UnsatisfiedLinkError e) { android.util.Log.e("dm", "nativeHold missing: the game is not paused (" + e.getMessage() + ")"); } }
+    @Override public void gameSettings() { showDoomSettings(); }
+    @Override public FrontMenu.Saves saves() { if (saves == null) saves = SaveTransfer.forGame(this, FRONT_DATA_DIR); return saves; }
+    @Override public void quit() {
+        android.util.Log.i("dm", "[java] quit from the pause menu");
+        try { if (libraryLoaded) nativeQuit(); } catch (UnsatisfiedLinkError e) { /* an older library: just end */ }
+        finishAndRemoveTask(); System.exit(0);
+    }
+    @Override public void immersive() { immersiveBars(); }
+    // a save import asked for in the pause menu: done at the start, before the library loads and the game runs (SaveTransfer.applyPending)
+    private void applyPendingImport() {
+        String imp = ((SaveTransfer) saves()).applyPending();
+        if (imp != null) android.widget.Toast.makeText(this, imp.startsWith("!") ? imp.substring(1) : imp, android.widget.Toast.LENGTH_LONG).show();
+    }
+    @Override public String gameName() { return "DOOM"; }
+    // [DOOM] the mode row is the r6 light mode: the game's own Switch handheld quality preset, live (nativeSetLight); docked (full quality) stays the
+    // default (BUGS_AND_FIXES 2.18); the gear dialog's "light mode" box is the same setting
+    @Override public int modeKind() { return FrontMenu.MODE_LIGHT; }
+    @Override public boolean docked() { return !doomPrefs().getBoolean("light", false); }
+    @Override public boolean setDocked(boolean on) {
+        boolean ok = false;
+        try { ok = libraryLoaded && nativeSetLight(!on); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetLight: " + t); }
+        if (ok) doomPrefs().edit().putBoolean("light", !on).apply();
+        android.util.Log.i("dm", "[java] mode " + (on ? "docked (full quality)" : "handheld (light)") + (ok ? "" : ": not switched"));
+        return ok;
+    }
+
+    private void immersiveBars() {
         WindowInsetsController c = getWindow().getInsetsController();
         if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
     }
@@ -243,7 +286,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // ru uk de fr es pt it pl tr zh ja ko by the system locale). Two kinds of options, each labelled with when it applies:
     //   next launch: kept in SharedPreferences "doom_graphics" and handed to the native host as environment variables before the
     //     library loads (hle_args.c turns them into the game's +set arguments; vulkan_present.cpp, vk_driver.c, haptics_android.c,
-    //     hle_hid.c, hle_nvn.c read them once at start) -- 3D resolution, sharpening, frame rate limit, widescreen (unless the live
+    //     hle_hid.c, hle_nvn.c read them once at start) -- 3D resolution, sharpening, frame rate limit, aspect ratio (auto <-> 16:9 live when the
     //     switch DM_DOOM_WIDE_LIVE=1 is on), Vulkan driver, game language, aim assist, vibration;
     //   immediately: the controls in "doom_controls" (DoomPadView.reloadSettings: look sensitivity, dead zone, FPS counter, settings button look) and
     //     dynamic resolution, which is the game's own rs_enable cvar shared with Video -> Dynamic Resolution in the game menu
@@ -266,6 +309,18 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static final float[] DEADZONES = {0f, 0.08f, 0.15f, 0.25f};
     static final int[] DEADZONE_LABELS = {R.string.gear_none, R.string.gear_small, R.string.gear_medium_dz, R.string.gear_large};
     static final int[] GEAR_LABELS = {R.string.gear_button_normal, R.string.gear_button_faded};   // DoomPadView.GEAR_*
+    // [4:3] Aspect ratio (next launch; hle_args.c DM_DOOM_ASPECT, BUGS_AND_FIXES 2.20): 0 = auto (the screen's: wider -> Hor+ W x 720,
+    // narrower -> down to 960x720), 1 = 16:9 (the original 1280x720), 2 = 4:3 (960x720). Replaces the "wide" checkbox: wide=false -> 16:9.
+    static final String[] ASPECT_ENV = {"auto", "16:9", "4:3"};
+    static final String[] ASPECT_LABELS = {null /* gear_aspect_auto */, "16:9", "4:3"};
+    static int aspectPref(SharedPreferences p) {
+        if (!p.contains("aspect")) {   // migrate the old checkbox once
+            int a = p.getBoolean("wide", true) ? 0 : 1;
+            p.edit().putInt("aspect", a).remove("wide").apply();
+            return a;
+        }
+        return Math.min(Math.max(0, p.getInt("aspect", 0)), ASPECT_ENV.length - 1);
+    }
     // Frame rate limit (next launch): DM_PRESENT_MAX_HZ caps the present pacing (hle_nvn.c: the largest integer fraction of the refresh
     // rate not above it) and DM_DOOM_TICK_MAX the game's adaptive tick (hle_args.c) to the same value, so game time stays real time.
     // 90 / 120 are offered only when the display has a mode at a multiple of that rate; the window then asks for that mode
@@ -360,8 +415,11 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             Os.setenv("DM_AA_STRENGTH", String.valueOf(p.getFloat("aa", 1.0f)), true);
             // Rumble (haptics_android.c): off by default since 28.10 (owner: it only drains the battery); DM_RUMBLE=0 hides the vibration devices.
             Os.setenv("DM_RUMBLE", p.getBoolean("rumble", false) ? "1" : "0", true);
-            // Widescreen (hle_args.c doom_wide): the game renders at the screen aspect (e.g. 1600x720) with a wider Hor+ view; on by default.
-            Os.setenv("DM_DOOM_WIDE", p.getBoolean("wide", true) ? "1" : "0", true);
+            // Aspect ratio (hle_args.c dm_doom_wide_w): auto by default = the screen aspect (e.g. 1600x720 Hor+ on a 20:9 phone, 960x720
+            // on a 4:3 screen); DM_DOOM_WIDE mirrors it for the presenter's old crop rule and older tools.
+            int asp = aspectPref(p);
+            Os.setenv("DM_DOOM_ASPECT", ASPECT_ENV[asp], true);
+            Os.setenv("DM_DOOM_WIDE", asp == 0 ? "1" : "0", true);
             String lang = p.getString("lang", "");
             if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
             String drv = p.getString("driver", defaultDriver());
@@ -618,7 +676,11 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             heading(box, when(R.string.gear_fps_limit, false));
             RadioGroup fpsLim = radios(box, limLabels, 8000, limAt, true);
             if (lims.get(lims.size() - 1) > 60) { TextView n = new TextView(this); n.setText(R.string.gear_fps_note); box.addView(n); }
-            CheckBox wide = new CheckBox(this); wide.setText(when(R.string.gear_wide, false)); wide.setChecked(p.getBoolean("wide", true)); box.addView(wide);
+            heading(box, when(R.string.gear_aspect, false));
+            final int aspWas = aspectPref(p);
+            String[] aspLabels = ASPECT_LABELS.clone(); aspLabels[0] = getString(R.string.gear_aspect_auto);
+            RadioGroup aspG = radios(box, aspLabels, 9700, aspWas, true);
+            TextView aspNote = new TextView(this); aspNote.setText(R.string.gear_aspect_note); box.addView(aspNote);
             // Vulkan driver: the system one, or any adrenotools package under files/drivers/<name>/ (bundled, downloaded or imported from
             // Download/DOOM Mobile/drivers), labelled with the name from its meta.json; below it, what the running game actually uses.
             heading(box, when(R.string.gear_driver, false));
@@ -665,12 +727,22 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 public void onStartTrackingTouch(android.widget.SeekBar sb) {}
                 public void onStopTrackingTouch(android.widget.SeekBar sb) {}
             });
+            // [front] the on-screen controls, as in Diablo III's gear dialog: opacity and size (live, the pad shows them behind the dialog), the layout
+            // editor (the ABXY diamond moves as one) and its reset; the same settings as the pause menu's "Gamepad…"
+            heading(box, Ui.t(this, "Экранные контролы", "On-screen controls"));
+            padSlider(box, cp, Ui.t(this, "Прозрачность контролов: %d%%", "Controls' opacity: %d%%"), "opacity", 5, 100, DoomPadView.OPACITY_DEFAULT);
+            padSlider(box, cp, Ui.t(this, "Размер контролов: %d%%", "Controls' size: %d%%"), "size", 60, 160, DoomPadView.SIZE_DEFAULT);
+            android.widget.Button editB = new android.widget.Button(this); editB.setText(Ui.t(this, "Изменить раскладку…", "Edit the layout…")); box.addView(editB);
+            android.widget.Button resetB = new android.widget.Button(this); resetB.setText(Ui.t(this, "Сбросить раскладку", "Reset the layout")); box.addView(resetB);
+            resetB.setOnClickListener(v -> { if (doomPad != null) { doomPad.resetLayout(); android.widget.Toast.makeText(this, Ui.t(this, "Раскладка сброшена", "Layout reset"), android.widget.Toast.LENGTH_SHORT).show(); } });
             android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
-            new AlertDialog.Builder(this).setTitle(R.string.gear_title).setView(scroll)
+            final AlertDialog[] gearDlg = new AlertDialog[1];
+            editB.setOnClickListener(v -> { if (gearDlg[0] != null) gearDlg[0].dismiss(); if (front != null) front.edit(); else if (doomPad != null) doomPad.startEdit(null); });
+            gearDlg[0] = new AlertDialog.Builder(this).setTitle(R.string.gear_title).setView(scroll)
                 .setPositiveButton(R.string.gear_save, (d, w) -> {
-                    boolean wideChanged = wide.isChecked() != p.getBoolean("wide", true);
+                    final int aspPick = picked(aspG, 9700, ASPECT_ENV.length);
                     int drvPick = picked(drvG, 7000, drvNames.length + 1);
-                    p.edit().putString("driver", drvPick > 0 ? drvNames[drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putBoolean("wide", wide.isChecked())
+                    p.edit().putString("driver", drvPick > 0 ? drvNames[drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putInt("aspect", aspPick)
                         .putFloat("aa", AA_STRENGTHS[picked(aaG, 6000, AA_STRENGTHS.length)]).putString("lang", LANG_CODES[picked(langG, 5000, LANG_CODES.length)])
                         .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length)).putBoolean("upscale", upscale.isChecked())
                         .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size())))
@@ -693,13 +765,28 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                         try { ok = nativeSetDrs(drs.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetDrs: " + t); }
                         if (!ok) android.widget.Toast.makeText(this, R.string.toast_drs_failed, android.widget.Toast.LENGTH_LONG).show();
                     }
-                    if (wideChanged) {   // [DOOM] BUGS_AND_FIXES 2.12: native answers whether it switched live (needs DM_DOOM_WIDE_LIVE=1)
-                        boolean live = false;
-                        try { live = libraryLoaded && nativeWideLive(wide.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeWideLive: " + t); }
+                    if (aspPick != aspWas) {   // [DOOM] BUGS_AND_FIXES 2.12: native answers whether it switched live (needs DM_DOOM_WIDE_LIVE=1)
+                        boolean live = false;   // [4:3] only auto <-> 16:9 on a screen wider than 16:9 (a presenter crop); 4:3 needs a restart
+                        if (aspPick != 2 && aspWas != 2)
+                            try { live = libraryLoaded && nativeWideLive(aspPick == 0); } catch (Throwable t) { android.util.Log.e("dm", "nativeWideLive: " + t); }
                         android.widget.Toast.makeText(this, live ? R.string.toast_wide_now : R.string.toast_wide_next, android.widget.Toast.LENGTH_SHORT).show();
                     }
                 })
                 .setNegativeButton(R.string.gear_cancel, null).show();
+        });
+    }
+    // [front] a live slider for one of the pad's int prefs (min..max %), saved at once and shown on the pad behind the dialog
+    private void padSlider(android.widget.LinearLayout box, android.content.SharedPreferences cp, String fmt, String key, int min, int max, int def) {
+        final int was = Math.max(min, Math.min(max, cp.getInt(key, def)));
+        final TextView label = new TextView(this); label.setText(String.format(java.util.Locale.ROOT, fmt, was)); box.addView(label);
+        android.widget.SeekBar s = new android.widget.SeekBar(this); s.setMax(max - min); s.setProgress(was - min); box.addView(s);
+        s.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+            public void onProgressChanged(android.widget.SeekBar sb, int v, boolean user) {
+                label.setText(String.format(java.util.Locale.ROOT, fmt, v + min)); cp.edit().putInt(key, v + min).apply();
+                if (doomPad != null) doomPad.reloadSettings();
+            }
+            public void onStartTrackingTouch(android.widget.SeekBar sb) {}
+            public void onStopTrackingTouch(android.widget.SeekBar sb) {}
         });
     }
 
@@ -739,12 +826,13 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             File ext = getExternalFilesDir(null), internal = new File(getFilesDir(), "dm");
             File runtime = new File(internal, "out/main.patched.bin").canRead() || ext == null ? internal : new File(ext, "dm");
             try { Os.setenv("DM_DERIVED", new File(runtime, "derived.tsv").getAbsolutePath(), true); } catch (ErrnoException e) { showStartError(getString(R.string.dmAndroidStorage)); return; }
-            if (DOOM) applyDoomSettings();
+            if (DOOM) { applyPendingImport(); applyDoomSettings(); }   // [front] a requested save import first
             try { System.loadLibrary("dm"); libraryLoaded = true; }
             catch (UnsatisfiedLinkError error) { showStartError(getString(R.string.dmAndroidLibrary)); return; }
             nativeContext(getApplicationContext());
         }
-        if (DOOM && doomPad == null) { doomPad = new DoomPadView(this); gameFrame.addView(doomPad, new FrameLayout.LayoutParams(-1, -1)); updatePadVisibility(); }   // [DOOM] on-screen controller
+        if (DOOM && doomPad == null) { doomPad = new DoomPadView(this); gameFrame.addView(doomPad, new FrameLayout.LayoutParams(-1, -1)); updatePadVisibility();   // [DOOM] on-screen controller
+            front = new FrontMenu(this, this, doomPad, gameFrame); }   // [front] the pause menu over it (the gear button opens it)
         if (touchOverlay == null && !DOOM) {   // [DOOM] the D2R touch layout does not apply; a DOOM layout comes later
             int[] gameIds = {R.string.dmAndroidAttack, R.string.dmAndroidSkill1, R.string.dmAndroidSkill2, R.string.dmAndroidSkill3, R.string.dmAndroidSkill4,
                 R.string.dmAndroidPortal, R.string.dmAndroidPotion1, R.string.dmAndroidPotion2, R.string.dmAndroidPotion3, R.string.dmAndroidPotion4,
@@ -847,7 +935,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         dialog.setOnDismissListener(d -> {
             if (inputDialog == dialog) inputDialog = null;
             if (!finished[0]) { finished[0] = true; nativeTextResult(id, false, ""); }
-            if (resumed) immersive();
+            if (resumed) immersiveBars();
         });
         dialog.setOnShowListener(d -> {
             Runnable check = () -> {
@@ -925,6 +1013,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             || (source & InputDevice.SOURCE_DPAD) == InputDevice.SOURCE_DPAD;
     }
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
+        if (front != null && front.key(e)) return true;   // [front] the pause menu: Back / Home / Menu, its navigation; nothing reaches a held game
         if (DOOM && e.getAction() == KeyEvent.ACTION_DOWN) android.util.Log.i("dm", "[input] java key " + e.getKeyCode() + " source 0x" + Integer.toHexString(e.getSource()) + " device " + e.getDeviceId() + " started " + started + " dialog " + (inputDialog != null));
         if (started && inputDialog == null && (e.getAction() == KeyEvent.ACTION_DOWN || e.getAction() == KeyEvent.ACTION_UP)
             && (controller(e.getDevice(), e.getSource())
@@ -933,6 +1022,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         return super.dispatchKeyEvent(e);
     }
     @Override public boolean dispatchGenericMotionEvent(MotionEvent e) {
+        if (front != null && front.motion(e)) return true;   // [front] the menu's navigation by hat / stick; a held game gets no axes
         int src = e.getSource();
         if (started && inputDialog == null && e.getAction() == MotionEvent.ACTION_MOVE && e.getDevice() != null && !e.getDevice().isVirtual()
             && (src & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) {
@@ -965,12 +1055,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public void onDisplayAdded(int id) { updateRefresh(); }
     @Override public void onDisplayRemoved(int id) { updateRefresh(); }
     @Override public void onDisplayChanged(int id) { updateRefresh(); }
-    @Override protected void onResume() { super.onResume(); resumed = true; immersive(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); } }
+    @Override protected void onResume() { super.onResume(); resumed = true; immersiveBars(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); } }
     @Override protected void onPause() { resumed = false; if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
     @Override protected void onStart() { super.onStart(); if (started) nativeFocus(2); }
     @Override protected void onStop() { if (started) nativeFocus(1); com.xiaoboluo.d2r.widget.HeroWidgetProvider.requestUpdate(this); super.onStop(); }
     @Override protected void onDestroy() { if (displays != null) displays.unregisterDisplayListener(this); if (inputs != null) inputs.unregisterInputDeviceListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
-    @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersive(); else releaseTouches(); }
+    @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersiveBars(); else releaseTouches(); }
 
     @Override public void surfaceCreated(SurfaceHolder h) {}
     @Override public void surfaceChanged(SurfaceHolder h, int format, int w, int ht) {

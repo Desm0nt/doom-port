@@ -23,7 +23,9 @@
     <string name="gear_lang_system">시스템 설정과 동일</string>
     <string name="gear_aa">조준 보조</string>
     <string name="gear_aa_switch">Switch와 동일</string>
-    <string name="gear_wide">와이드 화면: 양옆 여백 대신 더 넓은 시야</string>
+    <string name="gear_aspect">화면비</string>
+    <string name="gear_aspect_auto">자동(화면에 맞춤)</string>
+    <string name="gear_aspect_note">자동: 넓은 화면에서는 시야가 넓어지고 4:3 화면에서는 4:3 화면이 됩니다. 넓은 화면에서 4:3을 고르면 양옆에 여백이 생깁니다.</string>
     <string name="gear_rumble">진동</string>
     <string name="gear_fps_counter">FPS 및 프레임 시간 표시</string>
     <string name="gear_res">3D 해상도(인터페이스는 720p 유지)</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">크게</string>
     <string name="gear_look">시점 감도(스와이프 및 발사 버튼)</string>
     <string name="gear_deadzone">이동 스틱: 게임 데드존 보정</string>
-    <string name="toast_wide_now">와이드 화면: 적용됨</string>
-    <string name="toast_wide_next">와이드 화면: 다음 실행부터</string>
+    <string name="toast_wide_now">화면비: 적용됨</string>
+    <string name="toast_wide_next">화면비: 다음 실행부터</string>
     <string name="gear_button">설정 버튼</string>
     <string name="gear_button_normal">기본</string>
     <string name="gear_button_faded">반투명</string>

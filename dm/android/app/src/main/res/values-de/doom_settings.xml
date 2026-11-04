@@ -23,7 +23,9 @@
     <string name="gear_lang_system">Wie im System</string>
     <string name="gear_aa">Zielhilfe</string>
     <string name="gear_aa_switch">Wie auf der Switch</string>
-    <string name="gear_wide">Breitbild: breitere Sicht statt seitlicher Balken</string>
+    <string name="gear_aspect">Seitenverhältnis</string>
+    <string name="gear_aspect_auto">Auto (wie der Bildschirm)</string>
+    <string name="gear_aspect_note">Auto: breiter Bildschirm – breitere Sicht, 4:3-Bildschirm – 4:3-Bild. 4:3 auf einem breiten Bildschirm zeigt seitliche Balken.</string>
     <string name="gear_rumble">Vibration</string>
     <string name="gear_fps_counter">FPS- und Frametime-Anzeige</string>
     <string name="gear_res">3D-Auflösung (die Oberfläche bleibt bei 720p)</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">Groß</string>
     <string name="gear_look">Blickempfindlichkeit (Wischen und Feuertaste)</string>
     <string name="gear_deadzone">Bewegungsstick: Ausgleich der Totzone des Spiels</string>
-    <string name="toast_wide_now">Breitbild: übernommen</string>
-    <string name="toast_wide_next">Breitbild: ab dem nächsten Start</string>
+    <string name="toast_wide_now">Seitenverhältnis: übernommen</string>
+    <string name="toast_wide_next">Seitenverhältnis: ab dem nächsten Start</string>
     <string name="gear_button">Einstellungen-Schaltfläche</string>
     <string name="gear_button_normal">Normal</string>
     <string name="gear_button_faded">Durchscheinend</string>

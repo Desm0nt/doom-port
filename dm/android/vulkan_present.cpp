@@ -429,6 +429,8 @@ bool record(VkCommandBuffer cmd,unsigned f,uint32_t index,VkImage source,VkForma
 // centre 16:9 (the Hor+ projection keeps the vertical FOV, so the centre crop is exactly the 16:9 view; the SWF HUD is centred at
 // scale 1). -1 = not decided yet: at the first frame, crop when DM_DOOM_WIDE_LIVE=1 and the gear option is off (DM_DOOM_WIDE=0).
 static std::atomic<int> crop169{-1};
+// [4:3] hle_args.c (DOOM builds): the initial crop from the resolved aspect choice (DM_DOOM_ASPECT / DM_DOOM_WIDE; BUGS_AND_FIXES 2.20).
+extern "C" int dm_doom_live_crop_initial(void) __attribute__((weak));
 static std::atomic<int> mirror_next{0};   // [r3] DM_GFX_PRESENT_FLIP_FOLD: mirror the next present vertically (dm_present_mirror_next)
 // [mt 2a] DM_GFX_PRESENT_THREAD (xbg_game.cpp reads it and calls dm_present_thread_set; docs/SWITCHES.md, BUGS_AND_FIXES 3.20). 1: the
 // engine hands each present (source image, format, size, crop, the mirror flag captured on its thread) to a present thread that runs the
@@ -462,7 +464,7 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     VkFormatProperties sp;vkGetPhysicalDeviceFormatProperties(physical,source_format,&sp);if(!(sp.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT))return VK_ERROR_FORMAT_NOT_SUPPORTED;
     int x=0,y=0,w=int(width),h=int(height);if(crop&&crop[2]>0&&crop[3]>0){x=std::clamp(crop[0],0,w);y=std::clamp(crop[1],0,h);w=std::min(crop[2],int(width)-x);h=std::min(crop[3],int(height)-y);}if(w<=0||h<=0)return VK_ERROR_INITIALIZATION_FAILED;
     {int c=crop169.load(std::memory_order_relaxed);
-        if(c<0){const char*l=getenv("DM_DOOM_WIDE_LIVE"),*e=getenv("DM_DOOM_WIDE");c=(l&&*l=='1'&&(!e||!*e||(e[0]=='0'&&!e[1])))?1:0;int u=-1;crop169.compare_exchange_strong(u,c);c=crop169.load(std::memory_order_relaxed);}
+        if(c<0){const char*l=getenv("DM_DOOM_WIDE_LIVE"),*e=getenv("DM_DOOM_WIDE");c=dm_doom_live_crop_initial?dm_doom_live_crop_initial():(l&&*l=='1'&&(!e||!*e||(e[0]=='0'&&!e[1])))?1:0;int u=-1;crop169.compare_exchange_strong(u,c);c=crop169.load(std::memory_order_relaxed);}
         if(c>0&&int64_t(w)*9>int64_t(h)*16+9){int nw=int((int64_t(h)*16/9)&~1);x+=(w-nw)/2;w=nw;}}   // wider than 16:9 by more than a pixel
     for(;;){
     // [DOOM] The buffer keeps the window's aspect ratio: a 16:9 buffer on a 20:9 screen was stretched sideways by the

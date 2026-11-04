@@ -23,7 +23,9 @@
     <string name="gear_lang_system">Sistemdeki gibi</string>
     <string name="gear_aa">Nişan yardımı</string>
     <string name="gear_aa_switch">Switch\'teki gibi</string>
-    <string name="gear_wide">Geniş ekran: yan şeritler yerine daha geniş görüş</string>
+    <string name="gear_aspect">En boy oranı</string>
+    <string name="gear_aspect_auto">Otomatik (ekrana göre)</string>
+    <string name="gear_aspect_note">Otomatik: geniş ekranda daha geniş görüş, 4:3 ekranda 4:3 görüntü. Geniş ekranda 4:3 yanlara şerit ekler.</string>
     <string name="gear_rumble">Titreşim</string>
     <string name="gear_fps_counter">FPS ve kare süresi sayacı</string>
     <string name="gear_res">3D çözünürlük (arayüz 720p kalır)</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">Büyük</string>
     <string name="gear_look">Bakış hassasiyeti (kaydırma ve ateş düğmesi)</string>
     <string name="gear_deadzone">Hareket çubuğu: oyunun ölü bölge telafisi</string>
-    <string name="toast_wide_now">Geniş ekran: uygulandı</string>
-    <string name="toast_wide_next">Geniş ekran: sonraki açılıştan itibaren</string>
+    <string name="toast_wide_now">En boy oranı: uygulandı</string>
+    <string name="toast_wide_next">En boy oranı: sonraki açılıştan itibaren</string>
     <string name="gear_button">Ayarlar düğmesi</string>
     <string name="gear_button_normal">Normal</string>
     <string name="gear_button_faded">Soluk</string>

@@ -23,7 +23,9 @@
     <string name="gear_lang_system">システムと同じ</string>
     <string name="gear_aa">エイムアシスト</string>
     <string name="gear_aa_switch">Switch と同じ</string>
-    <string name="gear_wide">ワイド画面：左右の帯の代わりに視野を広げる</string>
+    <string name="gear_aspect">アスペクト比</string>
+    <string name="gear_aspect_auto">自動（画面に合わせる）</string>
+    <string name="gear_aspect_note">自動：横長の画面では視野が広がり、4:3の画面では4:3の映像になります。横長の画面で4:3を選ぶと左右に帯が出ます。</string>
     <string name="gear_rumble">振動</string>
     <string name="gear_fps_counter">FPS とフレーム時間の表示</string>
     <string name="gear_res">3D 解像度（UI は 720p のまま）</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">大</string>
     <string name="gear_look">視点感度（スワイプと射撃ボタン）</string>
     <string name="gear_deadzone">移動スティック：ゲームのデッドゾーン補正</string>
-    <string name="toast_wide_now">ワイド画面：適用しました</string>
-    <string name="toast_wide_next">ワイド画面：次回起動時から</string>
+    <string name="toast_wide_now">アスペクト比：適用しました</string>
+    <string name="toast_wide_next">アスペクト比：次回起動時から</string>
     <string name="gear_button">設定ボタン</string>
     <string name="gear_button_normal">通常</string>
     <string name="gear_button_faded">半透明</string>

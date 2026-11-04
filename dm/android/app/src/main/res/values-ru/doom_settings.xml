@@ -23,7 +23,9 @@
     <string name="gear_lang_system">Как в системе</string>
     <string name="gear_aa">Помощь в прицеливании</string>
     <string name="gear_aa_switch">Как на Switch</string>
-    <string name="gear_wide">Широкий экран: обзор шире вместо полос по бокам</string>
+    <string name="gear_aspect">Соотношение сторон</string>
+    <string name="gear_aspect_auto">Авто (как у экрана)</string>
+    <string name="gear_aspect_note">Авто: на широком экране — шире обзор, на экране 4:3 — картинка 4:3. 4:3 на широком экране — с полосами по бокам.</string>
     <string name="gear_rumble">Вибрация</string>
     <string name="gear_fps_counter">Счётчик FPS и времени кадра</string>
     <string name="gear_res">Разрешение 3D (интерфейс остаётся 720p)</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">Большая</string>
     <string name="gear_look">Чувствительность обзора (свайп и кнопка огня)</string>
     <string name="gear_deadzone">Стик движения: компенсация мёртвой зоны игры</string>
-    <string name="toast_wide_now">Широкий экран: применено</string>
-    <string name="toast_wide_next">Широкий экран: со следующего запуска</string>
+    <string name="toast_wide_now">Соотношение сторон: применено</string>
+    <string name="toast_wide_next">Соотношение сторон: со следующего запуска</string>
     <string name="gear_button">Кнопка настроек</string>
     <string name="gear_button_normal">Обычная</string>
     <string name="gear_button_faded">Полупрозрачная</string>

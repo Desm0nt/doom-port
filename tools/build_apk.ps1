@@ -11,7 +11,9 @@
 #   DM_BUILD_TOOLS   build-tools version to sign with (default: the newest installed)
 # Keystores never go into this repository (.gitignore excludes *.keystore / *.jks).
 param([string]$Install = '', [switch]$Validation)
-$ErrorActionPreference = 'Stop'
+# Continue: Windows PowerShell turns any stderr line of a native tool (cmake GLOB notes, javac deprecation notes) into a stop;
+# every step checks $LASTEXITCODE instead
+$ErrorActionPreference = 'Continue'
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 function Env-Or([string]$name, [string]$default) { $v = [Environment]::GetEnvironmentVariable($name); if ($v) { $v } else { $default } }
@@ -49,7 +51,13 @@ $jni = (Resolve-Path work/jni).Path -replace '\\', '/'
 # Default Vulkan driver bundled as assets: Turnip (Mesa, MIT) fetched by tools/fetch_turnip.py with a pinned SHA-256;
 # without it the APK simply uses the system driver.
 & $python tools/fetch_turnip.py *> work/logs/fetch-turnip.log
-$drv = if (Test-Path work/driver-assets/drivers) { '-PdmDriverAssets=' + ((Resolve-Path work/driver-assets).Path -replace '\', '/') } else { '-PdmNoDriverAssets=1' }
+# Gamepad themes and the default on-screen layout of the front end (dm/android/front-assets, nx2android themes, MIT) go in beside the driver
+$fa = 'work/front-assets'
+if (Test-Path $fa) { Remove-Item -Recurse -Force $fa }
+New-Item -ItemType Directory -Force $fa | Out-Null
+if (Test-Path work/driver-assets/drivers) { Copy-Item -Recurse work/driver-assets/drivers $fa }
+Copy-Item -Recurse dm/android/front-assets/* $fa
+$drv = '-PdmDriverAssets=' + ((Resolve-Path $fa).Path -replace '\\', '/')
 & $gradle -p dm/android :app:assembleDebug '-PdmGame=doom' '-PdmAppId=org.doom.port' "-PdmPython=$python" "-PdmPrebuiltJni=$jni" --console plain $drv *> work/logs/gradle-apk.log
 if ($LASTEXITCODE) { throw 'APK build failed (work/logs/gradle-apk.log)' }
 if (-not (Test-Path $keystore)) { throw "Keystore not found: $keystore (set DM_KEYSTORE)" }

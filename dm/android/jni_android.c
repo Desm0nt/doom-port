@@ -60,11 +60,12 @@ static pthread_once_t g_lifecycle_once = PTHREAD_ONCE_INIT;
 static int g_lifecycle_error;
 static void lifecycle_graphics(int on) {
     __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "graphics suspend=%d begin", on);
-    dm_gfx_suspend(on);
+    void dm_hold_bg_graphics(int on); dm_hold_bg_graphics(on);   // [front] = dm_gfx_suspend unless the pause menu holds it (hle_hold.c)
     __android_log_print(ANDROID_LOG_INFO, "dm-lifecycle", "graphics suspend=%d complete", on);
 }
 static void lifecycle_init(void) {
-    dm_lifecycle_ops ops = {dm_focus_set, dm_audio_suspend, lifecycle_graphics};
+    void dm_hold_bg_audio(int on);   // [front] the pause menu holds audio / graphics too (hle_hold.c): the effective state is either
+    dm_lifecycle_ops ops = {dm_focus_set, dm_hold_bg_audio, lifecycle_graphics};
     g_lifecycle_error = dm_lifecycle_start(&g_lifecycle, ops);
     if (!g_lifecycle_error) pthread_setname_np(g_lifecycle.thread, "dm-lifecycle");
     if (g_lifecycle_error) __android_log_print(ANDROID_LOG_ERROR, "dm-lifecycle", "worker start failed rc=%d", g_lifecycle_error);
@@ -454,3 +455,17 @@ const char *dm_vk_driver_status(void);
 JNIEXPORT jstring JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeDriverStatus(JNIEnv *env, jclass cls) {
     (void)cls; return (*env)->NewStringUTF(env, dm_vk_driver_status());
 }
+
+// [front] The unified front end (frontend-common, docs/FRONTEND_UNIFIED.md); the same names and signatures as nx2android's front_android.c and DOOM
+// Eternal's branch. nativeHold: the pause menu is open: the game is held as the Switch holds it behind HOME (hle_hold.c: graphics, audio, guest clock);
+// the Java side stops sending input. nativeQuit: the graceful exit (hle_lifecycle.c dm_host_shutdown: audio and graphics stopped, then _exit(0)).
+// nativeOpmode / nativeSetOpmode: the Switch operation mode, 0 handheld / 1 docked, switched live (hle_oe.c dm_set_opmode: notifications 30 / 31).
+void dm_hold_menu(int on); void dm_host_shutdown(const char *why); void dm_haptics_android_foreground(int on);
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeHold(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls;
+    dm_haptics_android_foreground(on ? 0 : 1);   // no rumble left running under the menu
+    dm_hold_menu(on ? 1 : 0);
+}
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeQuit(JNIEnv *env, jclass cls) { (void)env; (void)cls; LOG("[java] the app ends (pause menu)"); dm_host_shutdown("pause menu: quit"); }
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeOpmode(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_opmode(); }
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetOpmode(JNIEnv *env, jclass cls, jint m) { (void)env; (void)cls; dm_set_opmode(m ? 1 : 0); }

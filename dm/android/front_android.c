@@ -61,6 +61,9 @@ uint64_t front_game_res(int docked) {
     }
     return docked ? 900ull << 32 | 1600 : 720ull << 32 | 1280;
 }
+// [DOOM] The game view's size as Java reported it (0 = not known yet): hle_args.c's aspect choice "auto" also follows screens
+// narrower than 16:9 (4:3 handhelds), which front_game_res above reports as 1280x720.
+int front_screen_size(int *w, int *h) { *w = atomic_load(&g_screen_w); *h = atomic_load(&g_screen_h); return *w > 0 && *h > 0; }
 
 #ifdef DM_GAME_DOOM
 // ---------------- [DOOM] game controllers ----------------

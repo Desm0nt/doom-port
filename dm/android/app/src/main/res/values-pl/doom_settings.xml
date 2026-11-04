@@ -23,7 +23,9 @@
     <string name="gear_lang_system">Jak w systemie</string>
     <string name="gear_aa">Wspomaganie celowania</string>
     <string name="gear_aa_switch">Jak na Switchu</string>
-    <string name="gear_wide">Szeroki ekran: szerszy widok zamiast pasów po bokach</string>
+    <string name="gear_aspect">Proporcje obrazu</string>
+    <string name="gear_aspect_auto">Auto (jak ekran)</string>
+    <string name="gear_aspect_note">Auto: na szerokim ekranie szerszy widok, na ekranie 4:3 obraz 4:3. 4:3 na szerokim ekranie dodaje pasy po bokach.</string>
     <string name="gear_rumble">Wibracje</string>
     <string name="gear_fps_counter">Licznik FPS i czasu klatki</string>
     <string name="gear_res">Rozdzielczość 3D (interfejs zostaje w 720p)</string>
@@ -39,8 +41,8 @@
     <string name="gear_large">Duża</string>
     <string name="gear_look">Czułość widoku (przesunięcie i przycisk strzału)</string>
     <string name="gear_deadzone">Gałka ruchu: kompensacja martwej strefy gry</string>
-    <string name="toast_wide_now">Szeroki ekran: zastosowano</string>
-    <string name="toast_wide_next">Szeroki ekran: od następnego uruchomienia</string>
+    <string name="toast_wide_now">Proporcje obrazu: zastosowano</string>
+    <string name="toast_wide_next">Proporcje obrazu: od następnego uruchomienia</string>
     <string name="gear_button">Przycisk ustawień</string>
     <string name="gear_button_normal">Normalny</string>
     <string name="gear_button_faded">Przygaszony</string>

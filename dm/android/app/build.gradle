@@ -42,7 +42,7 @@ android {
         // Product code (first line of dm/PRODUCT): an import pack's pack_info.txt must match it (DmActivity.ensureImported)
         buildConfigField 'String', 'DM_GAME', "\"${project.findProperty('dmGame') ?: 'd2r'}\""
         buildConfigField 'String', 'DM_PRODUCT', "\"${file('../../PRODUCT').readLines()[0].trim()}\""
-        minSdk 31
+        minSdk((project.findProperty('dmMinSdk') ?: '31') as int)
         targetSdk 36
         // 跟发布版本走：versionName = 发布版本号，versionCode = 主 × 10000 + 次 × 100 + 修订（2.0.0 → 20000），只增不减，旧版才能被覆盖升级
         // Follows the release: versionName = release version, versionCode = major × 10000 + minor × 100 + patch (2.0.0 → 20000), only ever increasing so older installs upgrade in place

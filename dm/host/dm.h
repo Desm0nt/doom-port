@@ -76,7 +76,8 @@ uint64_t guest_ns(void);              // 客体时钟（hle_os.c；DM_TICK_HOLD 
 int dm_detclock_enabled(void);
 void dm_guest_clock_advanced(void);
 void guest_clock_freeze(int on);
-void guest_clock_freeze_for(int reason, int on);   // 按原因冻结（1 后台，2 系统键盘）；见 hle_os.c | Freeze by reason (1 background, 2 system keyboard); see hle_os.c
+void guest_clock_freeze_for(int reason, int on);
+void guest_clock_read_wait(void);   // [front] waits while the pause menu holds the game (hle_os.c, hle_hold.c)   // 按原因冻结（1 后台，2 系统键盘）；见 hle_os.c | Freeze by reason (1 background, 2 system keyboard); see hle_os.c
 void dm_guest_frame_tick(void);        // 每次出图调（hle_nvn.c）：DM_DETCLOCK 开时把客体时钟推进一个固定步长 | Called on every present (hle_nvn.c): when DM_DETCLOCK is on, advances the guest clock by one fixed step
 int dm_nvn_ruler_truth(void);         // 视觉尺子真值阶段（DM_NVN_RULER=1 的前两张截图）为 1 | 1 during the ground-truth phase of the visual ruler (the first two screenshots with DM_NVN_RULER=1)
 uint64_t dm_nvn_frame_count(void);
