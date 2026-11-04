@@ -3,6 +3,9 @@
 <!-- Only one permission: all files access (to read the game resources the player puts in Download/S2X/D2R Mobile/data). No network, no other permissions. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- [DOOM] Android 10 (the minSdk 29 build) has no all files access: the old storage permission with requestLegacyExternalStorage reads the same folders -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- [DOOM] rumble (haptics_android.c): without it every vibrate() threw SecurityException -->
     <uses-permission android:name="android.permission.VIBRATE" />
@@ -15,6 +18,7 @@
         android:appCategory="game"
         android:isGame="true"
         android:allowBackup="false"
+        android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen">
         <activity
             android:name=".DmActivity"

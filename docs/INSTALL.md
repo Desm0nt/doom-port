@@ -31,7 +31,7 @@ File names do not matter: setup recognises the files by their content.
 
 **A phone:**
 
-- Android 12 or newer, 64-bit;
+- Android 12 or newer, 64-bit (Android 10 and 11: a separate APK, Step 6);
 - **Snapdragon with an Adreno GPU recommended** (tested on Snapdragon 8 Gen 3 and 8 Gen 2; other GPUs are untested, see
   *Vulkan drivers* / *Other GPUs* in the [README](../README.md));
 - 8 GB of RAM or more (12 GB+ is more comfortable);
@@ -168,6 +168,10 @@ or OpenMTP; on Linux the file manager usually shows the phone directly.
 On the phone, open this link and install the APK:
 
 **<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk>**
+
+Android 10 or 11: install this one instead (the same game, built for older Android; not yet tested on a real Android 10 device):
+
+**<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64-android10.apk>**
 
 (Release notes and older versions: <https://github.com/Desm0nt/doom-port/releases>.) Android asks you to allow
 installing apps from your browser or file manager the first time.

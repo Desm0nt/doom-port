@@ -33,9 +33,14 @@ final class SaveTransfer implements FrontMenu.Saves {
     static SaveTransfer forGame(Context c, String dataFolder) {
         File pub = new File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), dataFolder + "/saves");
         File ext = c.getExternalFilesDir(null);
-        boolean canPub = android.os.Environment.isExternalStorageManager() && (pub.isDirectory() || pub.mkdirs()) && pub.canWrite();
+        boolean canPub = allFilesAccess(c) && (pub.isDirectory() || pub.mkdirs()) && pub.canWrite();
         File dir = canPub || ext == null ? pub : new File(ext, "saves");
         return new SaveTransfer(c, new File(c.getFilesDir(), "save"), dir);
+    }
+    // all files access; Android 10 (a minSdk 29 build) has none: there the storage permission with requestLegacyExternalStorage does the same
+    static boolean allFilesAccess(Context c) {
+        return android.os.Build.VERSION.SDK_INT >= 30 ? android.os.Environment.isExternalStorageManager()
+            : c.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == android.content.pm.PackageManager.PERMISSION_GRANTED;
     }
     @Override public String where() { return exports.getAbsolutePath(); }
 

@@ -112,7 +112,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         inputs = getSystemService(InputManager.class);
         if (inputs != null) inputs.registerInputDeviceListener(this, null);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        getWindow().getAttributes().layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        // [DOOM] Android 10 (the minSdk 29 build) has no ALWAYS: SHORT_EDGES is the same in landscape
+        getWindow().getAttributes().layoutInDisplayCutoutMode = android.os.Build.VERSION.SDK_INT >= 30
+            ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         if (DOOM) applyDisplayMode();   // [DOOM] frame rate limit above 60: ask for a display mode at a multiple of it
         view = new SurfaceView(this);
         view.getHolder().addCallback(this);
@@ -156,19 +158,35 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         return ok;
     }
 
+    @SuppressWarnings("deprecation")
     private void immersiveBars() {
+        if (android.os.Build.VERSION.SDK_INT < 30) {   // [DOOM] Android 10 (the minSdk 29 build): the flags the insets controller replaced
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                | View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            return;
+        }
         WindowInsetsController c = getWindow().getInsetsController();
         if (c != null) { c.hide(WindowInsets.Type.systemBars()); c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE); }
     }
 
     // 资源在玩家放的位置读（缺省 Download/S2X/D2R Mobile/data），要「所有文件访问」权限；没有就引导去系统设置页，回来再启动
     // Resources are read where the player put them (default Download/S2X/D2R Mobile/data), which needs "all files access"; without it, guide the player to the system settings page and start after returning
+    // [DOOM] Android 10 (the minSdk 29 build) has no all files access: the storage permission with requestLegacyExternalStorage reads the same
+    // folders. It is asked for once by itself; a tap asks again, or opens the app's settings page once the player chose "don't ask again"
+    private boolean legacyStorageAsked;
+    private static final String[] LEGACY_STORAGE = {android.Manifest.permission.READ_EXTERNAL_STORAGE, android.Manifest.permission.WRITE_EXTERNAL_STORAGE};
     private boolean ensureFileAccess() {
-        if (Environment.isExternalStorageManager()) return true;
+        if (SaveTransfer.allFilesAccess(this)) return true;
+        boolean legacy = android.os.Build.VERSION.SDK_INT < 30;
+        if (legacy && !legacyStorageAsked) { legacyStorageAsked = true; requestPermissions(LEGACY_STORAGE, 1); }
         TextView t = new TextView(this);
         t.setText(R.string.dmAndroidPermission);
         t.setTextSize(20); t.setPadding(64, 64, 64, 64);
-        t.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + getPackageName()))));
+        t.setOnClickListener(v -> {
+            if (!legacy) startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + getPackageName())));
+            else if (shouldShowRequestPermissionRationale(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)) requestPermissions(LEGACY_STORAGE, 1);
+            else startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+        });
         setContentView(t);
         return false;
     }
@@ -333,7 +351,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
 
     private android.view.Display display() {
         android.view.Display d = null;
-        try { d = getDisplay(); } catch (RuntimeException e) { /* not attached yet */ }
+        if (android.os.Build.VERSION.SDK_INT >= 30) try { d = getDisplay(); } catch (RuntimeException e) { /* not attached yet */ }
         if (d == null && displays != null) d = displays.getDisplay(android.view.Display.DEFAULT_DISPLAY);
         return d;
     }
@@ -476,7 +494,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         return n > 0 ? v : -1;
     }
     static boolean qualcommSoc() {
-        String s = (android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.HARDWARE).toLowerCase(Locale.ROOT);
+        String s = ((android.os.Build.VERSION.SDK_INT >= 31 ? android.os.Build.SOC_MANUFACTURER + " " : "") + android.os.Build.HARDWARE).toLowerCase(Locale.ROOT);
         return s.contains("qti") || s.contains("qualcomm") || s.contains("qcom");
     }
     // The GPU model as the kernel reports it, e.g. "Adreno750v2" (empty when unreadable or not an Adreno).
@@ -843,8 +861,13 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             for (int i = 0; i < navIds.length; i++) navLabels[i] = getString(navIds[i]);
             touchOverlay = new TouchOverlay(this, gameLabels, navLabels);
             touchOverlay.setOnApplyWindowInsetsListener((v, insets) -> {
-                android.graphics.Insets safe = insets.getInsets(WindowInsets.Type.displayCutout());
-                touchOverlay.setSafeInsets(safe.left, safe.right, safe.bottom);
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    android.graphics.Insets safe = insets.getInsets(WindowInsets.Type.displayCutout());
+                    touchOverlay.setSafeInsets(safe.left, safe.right, safe.bottom);
+                } else {   // [DOOM] Android 10 (the minSdk 29 build)
+                    android.view.DisplayCutout c = insets.getDisplayCutout();
+                    if (c == null) touchOverlay.setSafeInsets(0, 0, 0); else touchOverlay.setSafeInsets(c.getSafeInsetLeft(), c.getSafeInsetRight(), c.getSafeInsetBottom());
+                }
                 return insets;
             });
             gameFrame.addView(touchOverlay, new FrameLayout.LayoutParams(-1, -1));

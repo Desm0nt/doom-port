@@ -31,7 +31,7 @@ DOOM Mobile запускает на Android-телефоне **вашу собс
 
 **Телефон:**
 
-- Android 12 или новее, 64-бит;
+- Android 12 или новее, 64-бит (Android 10 и 11 — отдельный APK, шаг 6);
 - **рекомендуется Snapdragon с GPU Adreno** (проверено на Snapdragon 8 Gen 3 и 8 Gen 2; другие GPU не проверялись, см.
   разделы *Vulkan drivers* / *Other GPUs* в [README](../README.md));
 - от 8 ГБ оперативной памяти (с 12 ГБ+ комфортнее);
@@ -168,6 +168,10 @@ doom-port-main/
 Откройте на телефоне ссылку и установите APK:
 
 **<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk>**
+
+Android 10 или 11: ставьте вместо него этот (та же игра, собранная под старый Android; на настоящем Android 10 ещё не проверена):
+
+**<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64-android10.apk>**
 
 (Описание версий и старые сборки: <https://github.com/Desm0nt/doom-port/releases>.) В первый раз Android попросит
 разрешить установку приложений из браузера или файлового менеджера.
