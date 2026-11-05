@@ -17,9 +17,24 @@ and keeps the original copyright line.
 | AMD FidelityFX Super Resolution 1.0 (RCAS) | MIT, Copyright (c) 2021 Advanced Micro Devices, Inc. | https://github.com/GPUOpen-Effects/FidelityFX-FSR — `dm/android/shaders/rcas.comp` |
 | Snapdragon Game Super Resolution 1 (SGSR1, mobile variant) | BSD-3-Clause, Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved. (licence text in the shader header) | https://github.com/quic/snapdragon-gsr — re-written from the published algorithm (nothing fetched) in `dm/android/shaders/gsr.frag` (`DM_GFX_UPSCALE`); the same pass reuses the RCAS math above |
 | nx2android gamepad themes | MIT, Copyright (c) 2026 seedds (`dm/android/front-assets/LICENSE-nx2android-themes.txt`) | https://github.com/shirai91/nx2android — the on-screen gamepad skins (`themes/`) and the default layout (`overlay_default.tsv`) in `dm/android/front-assets`, unmodified |
+| Granite (texture decode shaders) | MIT, Copyright (c) 2017-2026 Hans-Kristian Arntzen (shader headers: 2020-2026) | https://github.com/Themaister/Granite at 69f450c62dc3, `assets/shaders/decode/{bc6.comp,bc7.comp,bitextract.h}` — ported (modified) into `dm/gfx/vulkan/engine/xbg_bc_gpu.glsl` (GPU BC decode, `DM_GFX_BC_DECODE=gpu`); licence and hashes in `dm/gfx/vulkan/engine/third_party/granite_decode/` |
+| bcdec (BC6H decode tables) | MIT or Unlicense, Copyright (c) 2022 Sergii Kudlai | https://github.com/iOrange/bcdec at 80859ed (already in `dm/gfx/vulkan/engine/third_party/bcdec`) — `bcdec_bc6h_half` ported to numpy in `tools/astc_overlay_doom.py` (`bc6h_unsigned_to_half`, bit-exact, `tools/test_astc_overlay_doom.py --bcdec`) |
 
 Only the parts that DOOM uses were ported: its main imports, its SDK 6.4 code paths, its NVN calls, its shaders and its audio
 renderer, on an Adreno 750 target. Everything new is behind `DM_GAME_DOOM`, except where noted.
+
+## Setup-time Python packages (PC only, not in the app; `tools/requirements-astc.txt`, pip-installed by setup into `tools/.runtime`)
+
+Used by `tools/astc_overlay_doom.py` (ASTC / EAC texture overlay for GPUs without BC, docs/doom/BUGS_AND_FIXES.md §2.26). Nothing
+of them is copied into the repository or the APK; the overlay they produce is made on the player's PC from the player's own RomFS.
+
+| Package (pinned) | License / copyright | Source / use |
+|---|---|---|
+| astc-encoder-py 0.1.12 | MIT, Copyright (c) 2024 Rudolf Kolbe; bundles ARM astc-encoder: Apache-2.0, Copyright 2011-2024 Arm Limited | https://github.com/K0lb3/astc-encoder-py (PyPI `astc-encoder-py`), https://github.com/ARM-software/astc-encoder — BC3 / BC7 → ASTC 4x4 LDR, BC6H → ASTC 4x4 HDR |
+| etcpak 0.9.15 | MIT, Copyright (c) 2021 K0lb3; bundles wolfpld/etcpak: BSD-3-Clause, Copyright (c) 2013 Bartosz Taudul | https://github.com/K0lb3/etcpak (PyPI `etcpak`), https://github.com/wolfpld/etcpak — BC4 → EAC R11, BC5 → EAC RG11 (BC1 → ETC2 RGB8 with `--bc1-etc2`) |
+| texture2ddecoder 1.0.6 | MIT, Copyright (c) 2020 K0lb3 | https://github.com/K0lb3/texture2ddecoder (PyPI) — BC1 / BC3 / BC4 / BC5 / BC7 decode; ETC2 / EAC decode for the quality report |
+| numpy 2.2.6 (2.3.5 on Python 3.14+) | BSD-3-Clause, Copyright (c) 2005-2024 NumPy Developers | https://numpy.org (PyPI) — image arrays, the BC6H decoder |
+| archspec 0.2.7 | Apache-2.0 OR MIT, Copyright 2019-2024 Lawrence Livermore National Security, LLC and other Archspec Project Developers | https://github.com/archspec/archspec (PyPI) — CPU detection, a dependency of astc-encoder-py and etcpak |
 
 ## Host (dm/host)
 

@@ -121,6 +121,22 @@ R16G16_SNORM, R32G32_SFLOAT, R16G16B16A16_UNORM — все с VERTEX_BUFFER на
 - `nogs` отдельно: GS-модули unusable (`module_gap`), culling-GS снимается pass-through'ом; при `r_geometryCulling 1` draw с GS
   пропускаются.
 
+### 1.12a BC без BC: заливка пачками, декод на GPU, грязные блоки (issue #6, 05.11, BUGS §2.24)
+- Падение POCO X6 Pro (G615): вся декодированная текстура шла одним staging → abort арены на 256 МБ (357 МБ = BC7 8192² 5 мипов в
+  RGBA8 / BC6H 8192x4096 5 мипов в RGBA16F — физкэши VT). `BcUpload` (`xbg_game.cpp`) режет на пачки ≤ `DM_GFX_BC_BATCH_MB` (32):
+  уровни, полосы строк блоков, грязные GOB-блоки. Не-декодированные текстуры — пачками только если > 256 МБ (Adreno как был).
+- `DM_GFX_BC_DECODE=gpu` (умолч.): сырые блоки → `xbg_bc_decode.comp` (BC6H/BC7 — порт Granite 69f450c62dc3, MIT; BC1–5 — наша
+  целочисленная арифметика) → device-local буфер 32 МБ → `vkCmdCopyBufferToImage`. Те же байты, что CPU (`engine/tests/bc_gpu_decode_test.cpp`,
+  GLSL компилируется как C++ через `tests/glsl_shim.h`; все форматы, все моды BC6H/BC7, 300k блоков на формат). `=cpu` — старый bcdec.
+- Кэши VT меняются **на лету** (WriteTexels, до 32 страниц/кадр): декодированные текстуры теперь тоже идут через `partial_upload`
+  (`DM_GFX_BC_PARTIAL=1`) — декодируются только грязные блоки, раньше — вся текстура на каждое изменение.
+- `DM_GFX_BC6_E5=1`: беззнаковый BC6H → `E5B9G9R9` (4 Б/пикс. вместо 8). VRAM VT-кэшей на Mali по логам Adreno: 27 BC7 357 МБ, 1880
+  BC6H 179 МБ (было бы 357), 94 BC6H куб-массив ≈ 503 МБ (было бы ≈ 1006), 103 BC3 192 МБ; ≈ 1.23 ГБ против ≈ 0.31 ГБ нативного BC.
+  Строка на устройство: `NVN BC decode vram=… native_would_be=…`.
+- ASTC/ETC2 на лету — нет (это повторное сжатие: GPU-энкодер ASTC 4x4 LDR реален, ~1–5 мс/кадр на страницы VT, но двойные потери;
+  BC6H требует ASTC HDR); запланирован дисковый ASTC-кэш: вход `BcUpload::blocks` (тут же хэш сырых блоков), формат — `bc_store`,
+  объём — `NVN BC totals raw= decoded=` / `NVN PERF bcdecode … total … first …`.
+
 ### 1.12 Строка диагностики
 `NVN fallbacks on this device: …` — все включённые фолбэки (BC CPU-декод N/7 форматов, no-geometry-shader, no-depth-bounds,
 rg16/rgba16-unorm-nearest, depth-nearest, d24-as-d32, no-formatless-storage, texel-buffer-clamp, subgroup-lone-lane, cpu-timestamps).
@@ -134,9 +150,7 @@ compute-pipeguard, MUTABLE только по необходимости + `VkIma
 MUTABLE — Arm Best Practices §8.9), BC per-format CPU-декод, BC4/5 в 8 бит без LINEAR у RG16.
 
 ## 3. Не сделано и почему
-- **GPU-декод BC** (CPU и память ×4–8 на VT-страницах): готовых декодеров у Switch-эмуляторов нет (все на CPU); кандидат — шейдеры
-  Granite (MIT, s3tc/rgtc/bc6/bc7, `switch_emu_mali_powervr.md` §4), 2–4 дня с тестом против bcdec, плюс SRGB-storage и VT-атлас.
-  Отложено: CPU-путь работает (Maleoon), сначала нужен лог реального Mali.
+- ~~**GPU-декод BC**~~ — сделан 05.11 (§1.12a): через буфер и копию, поэтому SRGB-storage не нужен; VT-атлас — грязными блоками.
 - **Culling-GS при `r_geometryCulling 1` без GS** — GS пишет компактный индекс-буфер (gs_cull_fix.md), нужна compute-эмуляция; по
   умолчанию culling выключен и GS снимается.
 - **Точная эмуляция 3-компонентных вершин** (w=1) — не нужна Mali/PowerVR по gpuinfo.
@@ -149,7 +163,9 @@ MUTABLE — Arm Best Practices §8.9), BC per-format CPU-декод, BC4/5 в 8 
 ## 4. План проверки на Adreno (Mi 13 / Mi 14), всё через `dm/env`
 1. Базовый прогон без переменных: лог `NVN gpu family=adreno … sim=0`, `NVN gpu policy: pipe_serial=0 pipe_guard=0 ubo_dynamic=1
    noout_mask=0 zero-copy default=1`, `NVN zero-copy guest memory=1`, `NVN fallbacks on this device: subgroup-lone-lane`; fps как в v0.4.x.
-2. `DM_GFX_SIM_GPU=mali`: меню → уровень → 2–3 мин. игры. В логе `bc-cpu-decode(7/7)`, `NVN sampler: format 91/77 … NEAREST` (если
+2. `DM_GFX_SIM_GPU=mali`: меню → уровень → 2–3 мин. игры. В логе `bc-gpu-decode(7/7)`, `NVN BC decode device=… -> decoder=gpu
+   bc6=e5b9g9r9`, `NVN BC decode: pipeline fmt=…`, `NVN chunked texture upload … mode=gpu`, `NVN partial texture upload … decoded=gpu`,
+   `NVN BC decode vram=…` (повтор с `DM_GFX_BC_DECODE=cpu` — та же картинка), `NVN sampler: format 91/77 … NEAREST` (если
    встречаются), `zero-copy guest memory=0`, lone-lane для `cec755c4`, `depth bounds … drawn without it` (если используется). Смотреть:
    нет fatal, текстуры на месте (VT-страницы подгружаются, возможен статтер), RSS процесса (память декода BC), fps.
 3. `DM_GFX_SIM_GPU=powervr`: то же + `pipe_serial=1 ubo_dynamic=0`, `quad shuffles … off`, тени (NEAREST на D24/D32), прогрев дольше.

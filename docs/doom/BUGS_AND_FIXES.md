@@ -49,6 +49,8 @@ Adreno 750), драйвер Qualcomm, если не сказано иное.
 | 37 | Медленное плавное ведение пальцем (обзор) отрабатывается плохо | обзор шёл через правый стик: малые наклоны × dt кадра, проигрыш 0.05 с | `DM_TOUCH_LOOK`=gyro: дельта пальца целиком в канал гиро-прицела за кадр (§4.8) | 🧪 собрано 02.11, на телефоне не проверено |
 | 38 | Экраны 4:3 (Retroid Pocket Classic/Mini, RG405V): 16:9 с полосами сверху/снизу | вывод только 1280×720 или шире | ⚙ «Соотношение сторон» Авто / 16:9 / 4:3, `DM_DOOM_ASPECT`: таблица `r_mode` → 960×720 (Авто — по экрану, не уже 960); FOV по вертикали тот же, HUD ×0.75 по центру | собрано и проверено на Mi 13 Pro 04.11 (§2.20) |
 | 39 | «Force close на Poco X7 Pro» (Dimensity 8400, Mali-G720) с Reddit — без лога; игроку лог не достать без adb | boot.log рос бесконечно и лежал во внутреннем каталоге; нет отчёта о падении; Turnip мог попасть в настройки на не-Adreno | авто-выбор драйвера по железу, `crash.txt` в `Download/DOOM Mobile/logs`, хлебные крошки, `DM_GFX_CRUMBS` (0) | собрано 05.11, на телефоне не проверено (§2.22) |
+| 40 | Issue #3: на POCO X7 Pro (Mali-G720) выбран PanVK, лог пишет `active=libvulkan_panfrost.so reason=ok`, а работает стоковый драйвер ARM | пакет `-EMULATOR` — glibc-сборка (NEEDED `libdrm.so.2`), хук adrenotools молча подставил системный HAL, а мы проверяли только «есть GPU» | проверка подмены (`/proc/self/maps` + `driverID`), фильтр пакетов по семейству GPU / glibc / недостающим либам в Java и нативе, причина в тосте; бандл-Turnip не дефолт без Adreno | собрано 05.11, на телефоне не проверено (§2.25) |
+| 41 | На Mali / PowerVR текстуры BC занимают в 4–8 раз больше VRAM (декод в несжатое, §2.24): атласы и пробы ≈ 2 ГБ вместо ≈ 0.4 | у GPU нет BC, а данные игры — только BC | «вариант A»: setup перекодирует BC файлов в ASTC 4x4 / ASTC 4x4 HDR / EAC того же размера блока (`tools/astc_overlay_doom.py`, оверлей `DOOM Mobile/astc`), движок создаёт образы в этих форматах без декода; `DM_GFX_ASTC_OVERLAY` (auto) | собрано 05.11, хост-тесты зелёные, на телефоне не проверено (§2.26) |
 
 ---
 
@@ -1040,6 +1042,138 @@ Switch (`vt_filter`, пробы) — возможен короткий фриз/
 - **Не сделано:** GPU-декод BC (на CPU, как раньше; кандидат — шейдеры Granite, MIT, 2–4 дня), эмуляция culling-GS без `geometryShader`
   (при `r_geometryCulling 0` GS и так снимается pass-through'ом), пайплайны против прохода с тем же load op для PowerVR, аудит
   occlusion-запросов на тайлерах.
+
+### 2.24 Mali: abort «Invalid or excessive buffer size» на первой сцене (issue #6) → заливка пачками и декод BC на GPU (05.11; собрано, хост-тесты зелёные, на телефоне не проверено)
+
+POCO X6 Pro (Mali-G615, v0.4.10): через ~45 с, на первой настоящей сцене, `Arena::alloc` ← `stream_buffer` ← `get_image_slow`
+abort с размером `0x15500000` (357 МБ). На Mali нет BC → текстура декодируется на CPU в несжатый формат, и **вся** (все уровни и
+слои) шла одним staging-буфером, а арена режет на 256 МБ. 357 МБ = 8192x8192 BC7 c 5 мипами в RGBA8 (serial 27) или 8192x4096
+BC6H c 5 мипами в RGBA16F (1880) — это кэши виртуальных текстур. Кэш 94 (BC6H, куб-массив 128²x5760, 7 мипов) в RGBA16F — ~1 ГБ.
+- **На лету или при загрузке?** На лету. Физкэши VT (103 BC3-sRGB 4096²x3, 1880 и 94 BC6H, 27 BC7) игра пишет постранично через
+  `nvnTextureWriteTexels` прямо во время игры (до `vt_maxPPF`=32 страниц 128² за кадр; в логах Adreno тысячи
+  `NVN partial texture upload serial=103/1880/94`). На Adreno (нативный BC) уходят только грязные GOB-блоки (`partial_upload`), а
+  декодированные текстуры из `partial_eligible` были исключены → на Mali **каждое** изменение страницы = декод и заливка всей
+  текстуры заново (сотни МБ). Теперь грязные блоки декодированных текстур идут той же дорогой, что на Adreno, и декодируются только они.
+- **Заливка пачками (все GPU):** `BcUpload` (`xbg_game.cpp`) берёт текстуру прямоугольниками блоков — целые уровни, полосы строк
+  блоков больших уровней, грязные GOB-блоки — и сбрасывает пачку, когда staging дошёл бы до `DM_GFX_BC_BATCH_MB` (32). Через неё идут
+  все декодированные BC и любая цветная текстура, чей один staging был бы > 256 МБ; остальное — прежним одним буфером (Adreno как был).
+  Пачки уходят в пролог слота (`gfx-upload-prologue`, без разрыва прохода) или в проход, как раньше; в прологе образ с несколькими
+  пачками получает один барьер туда и один обратно.
+- **Декод на GPU (`DM_GFX_BC_DECODE=gpu`, по умолчанию):** в staging только сырые блоки (в 4–8 раз меньше байт, без CPU-декода),
+  compute `xbg_bc_decode.comp` (64 потока, поток = блок 4x4, таблица регионов + бинарный поиск) пишет пиксели в device-local буфер
+  (32 МБ, общий, по очереди с барьерами), оттуда `vkCmdCopyBufferToImage`. Формат буфера = ровно то, что кладёт CPU-путь, поэтому
+  образы те же (RGBA8/sRGB, R16/RG16 или R8/RG8, RG16 SNORM, RGBA16F) и CPU-путь (`=cpu`) остаётся рабочим запасным.
+  BC6H/BC7 портированы из Granite (MIT, 69f450c62dc3, `third_party/granite_decode`), BC1–BC5 — целочисленная арифметика нашего
+  `xbg_texture.c` (у Granite float, байты расходятся). `engine/tests/bc_gpu_decode_test.cpp` компилирует тот же GLSL как C++
+  (`tests/glsl_shim.h`) и сверяет с `xbg_decode_block` все 16 форматов x опции: по 300k случайных блоков (все моды BC6H/BC7) —
+  байт в байт; BC4/5 SNORM допускают ±1 из 32767 (у CPU float-палитра); плюс сквозная проверка нарезки/таблицы/копий.
+- **BC6H → E5B9G9R9 (`DM_GFX_BC6_E5=1`, по умолчанию):** беззнаковый BC6H декодируется в 4-байтовый общий порядок вместо RGBA16F
+  (8 байт): кэши 94 и 1880 вдвое меньше по VRAM и полосе (≈0.5 и 0.18 ГБ вместо 1.0 и 0.36). Округление — по
+  GL_EXT_texture_shared_exponent, целочисленно, одинаково на CPU и GPU (тест: GLSL = C = формула в double на 2.1M троек).
+- **Почему не ASTC/ETC2 на лету:** транскод BC→ASTC — это полноценное сжатие (BC-блоки в ASTC-блоки не переводятся), GPU-энкодер
+  ASTC 4x4 LDR реален (~0.5 Мпикс/кадр VT-страниц ≈ 1–5 мс GPU), но это повторное сжатие с потерями, большой шейдер и отдельный риск;
+  для BC6H нужен ASTC HDR (`textureCompressionASTC_HDR`, есть не везде) и HDR-энкодер. Поэтому сейчас — декод в несжатое; ASTC —
+  следующий шаг как кэш на диске (точка входа `BcUpload::blocks`, решение о формате `bc_store`, байты для оценки места —
+  `NVN BC totals` / `NVN PERF bcdecode … total raw= decoded= first raw= decoded=`).
+- **Логи:** `NVN BC decode device=… -> decoder=gpu bc6=e5b9g9r9 …` (раз), `NVN BC decode: GPU decoder ready`, `NVN BC decode: pipeline fmt=…`,
+  `NVN BC decode vram=… native_would_be=…` (первая декодированная и каждые +64 МБ), `NVN chunked texture upload … mode=gpu batches=…`,
+  `NVN partial texture upload … decoded=gpu`, `NVN PERF bcdecode …`, при выходе `NVN BC totals raw=… decoded=…`.
+- **Проверка на Adreno:** `DM_GFX_SIM_GPU=nobc` (или `mali`) — те же пути; `DM_GFX_BC_DECODE=cpu` против `gpu` должны дать одну картинку.
+- **Не сделано:** `CopyBufferToTexture` в декодированную BC-текстуру (гостевые копии, редкие) декодирует по-прежнему CPU; на устройстве
+  GPU-декод не запускался (только хост-тесты и сборка).
+
+### 2.25 Свой драйвер Vulkan на не-Adreno (issue #3: PanVK «активен», а работал стоковый Mali) → проверка, что драйвер реально подменён (05.11; собрано, на телефоне не проверено)
+
+Повод: issue #3, POCO X7 Pro (Mali-G720, Dimensity 8400, Android 16), выбран пакет `Mesa-PanVK-v26.3.1-795ca7ff-EMULATOR`.
+В логе `[vk] driver choice: … active=libvulkan_panfrost.so reason=ok`, а GPU — `"Mali-G720 MC7" … info "v1.r49p1-…"` (драйвер ARM).
+- **Причина (две):**
+  1. Пакет не тот: `-EMULATOR.zip` у zenithblue-oss/panvk-kbase-android — **glibc-сборка** для Winlator-glibc-контейнеров
+     (`meta.json` `"abi": "linux-aarch64-glibc"`, NEEDED `libdrm.so.2` и т. п.), в Android-приложении не грузится никогда. Для
+     адренотулс-загрузчиков нужен `Mesa-PanVK-Android-<ver>-<sha>-adrenotools.zip` (bionic, та же `.so` во всех лаунчер-zip).
+     В logcat: `hook_impl: … failed to load custom driver: dlopen failed: library "libdrm.so.2" not found … in namespace vulkan.mali.so!`
+     → `falling back!`.
+  2. Наш код этого не видел: хук adrenotools при ошибке загрузки сам подставляет системный HAL (`vulkan.mali.so`), а
+     `adrenotools_open_libvulkan` всё равно возвращает рабочий libvulkan. `driver_has_gpu` проверял только «есть GPU с Vulkan 1.1»,
+     поэтому `reason=ok`. Linker-namespace'ы Android 16 тут ни при чём: хук на этом телефоне отработал (создал namespace
+     `vulkan.mali.so`, искал зависимости в папке пакета).
+- **Как грузят другие:** Winlator / Eden / Strato / GameHub на Mali — тем же adrenotools (`ADRENOTOOLS_DRIVER_CUSTOM`, без GSL/redirect),
+  он не KGSL-специфичен: хукается `android_load_sphal_library` любого `vulkan.*.so`. Прямой `dlopen` ICD + `vk_icdGetInstanceProcAddr`
+  без загрузчика работает только в glibc-контейнерах (там WSI X11 у самого Mesa); на Android `VK_KHR_android_surface`/swapchain делает
+  системный загрузчик поверх `VK_ANDROID_native_buffer` драйвера, у Mesa-Android своего Android WSI нет — поэтому загрузчик должен
+  оставаться сверху, и adrenotools — правильный путь и для Mali/Xclipse.
+- **Исправление (`vk_driver.c`):**
+  - библиотека пакета — по `meta.json` `libraryName` (иначе первая `.so`, `*vulkan*` в приоритете);
+  - семейство GPU пакета по имени папки / `meta.json` name / библиотеке (panvk/panfrost/mali → Mali; radv/radeon/xclipse → Xclipse;
+    powervr → PowerVR; turnip/freedreno/adreno → Adreno; Mali проверяется первым — GameHub-zip PanVK кладёт `libvulkan_freedreno.so`):
+    не своё железо → не грузится (`no-adreno` / `no-mali` / `no-xclipse` / `no-powervr`; `DM_VK_DRIVER_FORCE=1` — всё равно пробовать);
+  - до загрузки — разбор ELF `DT_NEEDED`: `libc.so.6` / `ld-linux` или `abi` glibc в meta.json → `glibc-build`; версионная
+    `name.so.N`, которой нет в папке пакета → `missing-lib`;
+  - после загрузки — **проверка подмены** (`verify_custom`): библиотека пакета должна быть в `/proc/self/maps` (по realpath или
+    `<пакет>/<библиотека>`), а GPU пробного инстанса не должен сообщать проприетарный `driverID` (ARM 9, Qualcomm 8, IMG 7, Samsung 21…;
+    Turnip 18, PanVK 20, RADV 3 — ок). Не прошло → `reason=not-taken-over`, `active=system`: системный HAL уже работает в копии загрузчика adrenotools
+    (так было и до 2.25), её и оставляем, чтобы не открывать HAL второй раз; меняются только имя, статус и тост. Ещё раз — на инстансе самой игры (`[vk] driver verify (game instance)`), при расхождении статус переписывается;
+  - `TU_DEBUG=sysmem` ставится только для Adreno/неизвестных пакетов;
+  - эксперимент `DM_VK_DRIVER_DIRECT=1`: если adrenotools не подменил — `dlopen` ICD напрямую, но только если драйвер сам даёт
+    `VK_KHR_surface` + `VK_KHR_android_surface` (у нынешних Mesa-Android — нет, будет `direct ICD not usable`);
+  - статус для Java: `<requested>\t<active>\t<reason>\tverified=0|1 gpu=… driver=… id=…`.
+- **Java (`DmActivity`):** `driverProblem()` — те же проверки (семейство по `/dev/kgsl-3d0`, `/dev/mali0`, `/dev/pvrsrvkm`; glibc;
+  недостающая библиотека): такие пакеты скрыты в ⚙ со строкой «Скрыты (не подходят этому телефону…)» и причиной, сохранённый выбор
+  сбрасывается при старте с тостом-объяснением. Тост фолбэка и строка «Сейчас используется» показывают причину словами и
+  `verified=… gpu=… driver=…`. `defaultDriver()` без Adreno 6xx+ на KGSL сразу `""` — бандл-Turnip на Mali/Xclipse/PowerVR больше не
+  дефолт. `unzipDriver` теперь сохраняет и вспомогательные `lib*.so.N`, `*.json`, `*.txt` пакета (раньше только `*.so` и `meta.json`).
+- **Что должно работать:** Mali на mali_kbase с Android-сборкой PanVK-kbase (`…-adrenotools.zip` / `…-winlator.zip` / `…-cmod.zip`,
+  а также GameHub-zip; minApi пакета 29, их тестовая база Android 14–16); Xclipse с RADV-Xclipse (Android 14+). PowerVR — пригодных
+  пакетов нет. Ограничения: PanVK/RADV — экспериментальные сборки (hang/DEVICE_LOST возможны, crash-guard §2.22 откатит на системный
+  после двух неудачных стартов); если OEM запретит `linkernsbypass` (Android 16+ с другим линкером) — `load-failed`/`not-taken-over`,
+  игра на системном драйвере, игрок видит причину.
+- **Проверить на Adreno (ничего не изменилось):** `[vk] driver choice: requested=turnip27 active=libvulkan_freedreno.so verified=1
+  reason=ok family=adreno probe="Turnip Adreno (TM) 750" driverID=18 driverName="turnip Mesa driver" …` и
+  `[vk] driver verify (game instance): … driverID=18 … verified=1`; с системным — `requested=system active=system verified=0 reason=ok`.
+- **На Mali с правильным пакетом:** `[vk] custom driver sees "Mali-G720 …" vendor 0x13b5 … driverID 20 "panvk" "Mesa 26.3…"`,
+  `driver choice: … active=libvulkan_panfrost.so verified=1 reason=ok family=mali …`; с `-EMULATOR.zip` — пакет скрыт в ⚙, а из
+  dm/env: `[vk] driver … skipped: a Linux glibc build … reason=glibc-build`; если хук всё же упал — `did NOT take over: the library is
+  not mapped … reason=not-taken-over` и тост.
+
+### 2.26 GPU без BC: текстуры игры заранее в ASTC / EAC на ПК («вариант A», 05.11; собрано, хост-тесты зелёные, на телефоне не проверено)
+
+Повод — §2.24: без BC текстуры декодируются в несжатое, атласы и пробы занимают ≈ 2 ГБ VRAM вместо ≈ 0.4. Исследование и цифры —
+`../research/astc_pretranscode_estimate.md` (§8 — что сделано).
+- **Setup, шаг 7** — `tools/astc_overlay_doom.py` (`--no-astc` пропускает; энкодеры — `tools/requirements-astc.txt`, setup ставит их
+  pip'ом в свой venv). Блоки BC каждой файловой текстуры (BIM v7 в `.resources`/`.patch`) перекодируются в формат **того же размера
+  блока**: BC3/BC7 → ASTC 4x4 (`-medium`, ниже 42 дБ — ещё `-thorough`), BC6H (кубы проб) → ASTC 4x4 HDR, BC4 → EAC R11, BC5 → EAC RG11.
+  Раскладка не меняется, поэтому атласы (декали BC7 8192², transSort BC5, свет BC4) и массив проб игра собирает из уже готовых блоков.
+  **BC1 — нет** (`--bc1-etc2`): ETC2 от etcpak даёт медиану 36 дБ, пиксель-арт классических уровней 17–25 дБ; BC1 только standalone, мало.
+- **Оверлей `Download/DOOM Mobile/astc/`:** `data/base/gameresources_003.patch` (копия оригинала + дописанные записи, raw deflate как у
+  игры), `data/base/gameresources_003.pindex` (те же записи, у перекодированных — новые off/size/zsize, patch 3), `nohdr/base/…pindex`
+  (без BC6H), `manifest.json` (пишется последним), `quality.tsv`. Имена файлов игры те же: ей не нужно знать про патч 4.
+- **Реальная RomFS:** 5 172 текстуры, ≈ 4 мин на Ryzen 5 5600, 0.82 ГБ; медиана PSNR (против декодированного BC) BC7 50.4 / BC3 50.3 /
+  BC5 48.8 / BC4 51.9 дБ, BC6H 0.04 ступени log2. Детерминировано (порядок записи фиксирован), продолжает после обрыва (`.journal`),
+  повторный запуск ничего не делает, пока совпадают SHA-256 скрипта, версии энкодеров, настройки и RomFS.
+- **Выбор при старте** (`android/vulkan_present.cpp astc_overlay_boot`, до `vkCreateDevice` и до монтирования RomFS): `manifest.json`
+  разобран (`xbg_astc_overlay.h`), файлы оверлея нужного размера (недокопированный не берётся), RomFS та же; `DM_GFX_ASTC_OVERLAY=auto` —
+  только без `textureCompressionBC` и с ASTC LDR + ETC2, с ASTC HDR (расширение включается только тогда) — вариант `data`, иначе
+  `nohdr` (BC6H остаётся на GPU-декоде). Ставит `DM_ROMFS_OVERLAY` (впереди) и `DM_GFX_ASTC_FORMATS`.
+- **Движок** (`bc_store` → `BC_SUBST`): образ в заменяющем VkFormat (0x44/0x4d → `ASTC_4x4_UNORM`, 0x48/0x4e → `ASTC_4x4_SRGB`, 0x50 →
+  `ASTC_4x4_SFLOAT`, 0x49 → `EAC_R11_UNORM`, 0x4b → `EAC_R11G11_UNORM`; BC1 → `ETC2_R8G8B8` только с `--bc1-etc2`), блоки — как нативные
+  (deswizzle и частичная дозаливка атласов те же), без декода.
+- **Как отличить подменённое от настоящего BC:** по форме, `xbg_astc_keep_bc` (зеркало `keep_bc` в инструменте): один mip ≥ 4096×4096
+  (кэши VT 103 BC3-sRGB 4096²×3 и 1880 BC6H 8192×4096, их пишет транскодер игры), BC6H не куб, массивы BC3, не-2D → настоящий BC, GPU-декод.
+  Проверено на всех живых BC-текстурах дампов dump3–11 и на всех 6 078 BC-записях файлов: под правило не попадает ни одна файловая,
+  попадают оба кэша. По `WriteTexels` отличать нельзя — атласы и пробы тоже пишутся им. Ошибка даёт только неверную картинку: образ
+  создаётся в любом случае; вид без заменяющего формата → формат образа + лог; копия между подменённой и настоящей BC → пропуск + лог.
+- **Adreno:** в `auto` оверлей не используется вовсе (устройство создаётся как раньше, без лишнего расширения) — побитно как было.
+  `DM_GFX_ASTC_OVERLAY=1` форсирует (Adreno умеет ASTC LDR и ETC2; HDR — если драйвер даёт расширение).
+- **Логи:** `NVN astc overlay: USED variant=data formats=bc3 bc4 bc5 bc6h bc7 (…) dir=… device bc=… astcLdr=… etc2=… astcHdr=…` (или
+  `not used … (причина)`, одна строка на запуск), `NVN astc overlay: engine substitutes …`, `NVN astc overlay: textures substituted=N
+  (bc3=… bc7=… …) kept_bc=M (vt-cache-shape=…) live=…MB …` (на 1-й и при удвоении), `NVN astc overlay: kept on BC serial=…` (до 32),
+  `NVN fallbacks on this device: … astc-overlay(…)`, при выходе `NVN astc overlay totals`.
+- **Тесты:** `tools/test_astc_overlay_doom.py [--bcdec]` (индекс, BIM, каждый формат через энкодер, EAC R11, sync-flush, сквозной прогон
+  на синтетической RomFS: перенос записей, `nohdr`, детерминизм 1 / 2 процесса, актуальность / устаревание; `--bcdec` — 300 тыс. случайных
+  BC6H против bcdec.h побитно); `engine/tests/astc_overlay_test.cpp` (форматы, правило формы на текстурах дампов, разбор manifest,
+  выбор для Adreno / Mali / PowerVR). Старые `bc_gpu_decode_test`, `native_bc_policy_test`, `vendor_policy_test` и др. — зелёные.
+- **Не сделано / риски:** на телефоне не запускалось; BC1 и кэши VT по-прежнему декодируются (§2.24); если игра где-то заполняет
+  BC-текстуру своими, не файловыми блоками и та не похожа по форме на кэш VT, она будет показана как ASTC / EAC — мусор на ней, не краш
+  (в дампах таких нет: свои блоки пишутся только в 103 и 1880). Проверка — пройти уровни на `DM_GFX_ASTC_OVERLAY=1` и сравнить с `=0`.
 
 ### 3.11 Раунд 7 (perf7, 30.10): где на самом деле CPU и GPU
 - **«10 мкс на draw» наполовину — ожидание GPU.** Разбивка `sub=` (p_p0/p_p1): `commands+acquire` 3.9–5.1 мкс/draw — это

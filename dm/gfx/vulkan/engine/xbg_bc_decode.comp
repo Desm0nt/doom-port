@@ -1,0 +1,54 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// [nonadreno] GPU BC decode (DM_GFX_BC_DECODE=gpu, issue #6): one invocation decodes one 4x4 BC block of a batch into the
+// output storage buffer, in the pixel layout the CPU decoder produces (rows padded to whole blocks); vkCmdCopyBufferToImage
+// then moves it into the decoded image (RGBA8 / R16 / RG16 / R8 / RG8 / RGBA16F / E5B9G9R9; sRGB is only the image format).
+// A batch (xbg_bc_gpu.h XbgBcGpuBatch) is many regions: block rectangles of one subresource (whole levels, row bands of big
+// levels, or the dirty GOB blocks of a partial upload). Input words: 8 per region, then the raw blocks.
+// Decoders: xbg_bc_gpu.glsl (BC6H/BC7 ported from Granite, MIT; see that file). Regenerate xbg_bc_decode_spv.h after editing
+// this file or xbg_bc_gpu.glsl (the command is at the top of that header).
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint XBG_FMT = 0x41u;   // NVN format 0x41..0x50
+layout(constant_id = 1) const uint XBG_OPT = 0u;      // bit 0: BC4/BC5 to 8-bit channels; bit 1: unsigned BC6H to E5B9G9R9
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint words[]; } src;
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { uint words[]; } dst;
+// regions: region count; blocks: blocks in the batch; bpp: output bytes per pixel (1, 2, 4, 8); block_words: 2 (8-byte) or 4
+layout(push_constant) uniform Push { uint regions; uint blocks; uint bpp; uint block_words; } pc;
+
+#include "xbg_bc_gpu.glsl"
+
+void main()
+{
+    uint g = gl_GlobalInvocationID.x;
+    if (g >= pc.blocks)
+        return;
+    // Region of block g: the last one whose first block is <= g (first blocks ascend).
+    uint lo = 0u, hi = pc.regions - 1u;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi + 1u) >> 1;
+        if (src.words[mid * 8u] <= g) lo = mid; else hi = mid - 1u;
+    }
+    uint R = lo * 8u;
+    uint local = g - src.words[R];
+    uint bx_n = src.words[R + 1u], per_slice = src.words[R + 2u], by_n = src.words[R + 3u];
+    uint z = local / per_slice, rem = local - z * per_slice, by = rem / bx_n, bx = rem - by * bx_n;
+    uint s = src.words[R + 4u] + local * pc.block_words;
+    uvec4 p = uvec4(src.words[s], src.words[s + 1u], 0u, 0u);
+    if (pc.block_words == 4u)
+    {
+        p.z = src.words[s + 2u];
+        p.w = src.words[s + 3u];
+    }
+    uint row_words = src.words[R + 6u];
+    uint base = src.words[R + 5u] + (z * by_n + by) * 4u * row_words + bx * pc.bpp;
+    XBG_DONT_UNROLL for (int r = 0; r < 4; r++)
+    {
+        uint at = base + uint(r) * row_words;
+        XbgRow q = xbg_bc_row(p, r, pc.bpp);
+        dst.words[at] = q.lo.x;
+        if (pc.bpp >= 2u) dst.words[at + 1u] = q.lo.y;
+        if (pc.bpp >= 4u) { dst.words[at + 2u] = q.lo.z; dst.words[at + 3u] = q.lo.w; }
+        if (pc.bpp == 8u) { dst.words[at + 4u] = q.hi.x; dst.words[at + 5u] = q.hi.y; dst.words[at + 6u] = q.hi.z; dst.words[at + 7u] = q.hi.w; }
+    }
+}

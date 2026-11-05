@@ -48,6 +48,28 @@ final class CrashLog {
     }
     static File report(Context c) { return new File(dir(c), "crash.txt"); }
 
+    // ---- the native logs next to the crash reports (GitHub issue #3: Android/data is out of a file manager's reach on Android 11+):
+    // boot.log and boot.prev.log of <files or external files>/dm are copied to dir() as they are, overwriting the copies; a log above
+    // MIRROR_MAX keeps its head and its last MIRROR_MAX bytes. Called when the app goes to the background and before it quits.
+    static final long MIRROR_MAX = 8L << 20;
+    static void mirrorBootLogs(Context c) {
+        File log = bootLog(c), d = dir(c);
+        copyLog(log, new File(d, "boot.log"));
+        copyLog(new File(log.getParentFile(), "boot.prev.log"), new File(d, "boot.prev.log"));
+    }
+    private static void copyLog(File from, File to) {
+        if (!from.isFile()) return;
+        try (RandomAccessFile in = new RandomAccessFile(from, "r"); OutputStream out = new FileOutputStream(to)) {
+            long n = in.length(); byte[] buf = new byte[1 << 16];
+            if (n > MIRROR_MAX) {   // head (device / driver / GPU lines), a marker, then the tail
+                byte[] head = new byte[HEAD_BYTES]; in.readFully(head); out.write(head);
+                out.write(("\n---- [" + (n - HEAD_BYTES - MIRROR_MAX) + " bytes left out] ----\n").getBytes(StandardCharsets.UTF_8));
+                in.seek(n - MIRROR_MAX);
+            }
+            for (int k; (k = in.read(buf)) > 0; ) out.write(buf, 0, k);
+        } catch (IOException e) { android.util.Log.w("dm", "crash log: copy " + from + ": " + e); }
+    }
+
     // The native log of the last run: the newer of <files>/dm/boot.log and <external files>/dm/boot.log (jni_android.c picks one by the
     // same rule as DmActivity.startHost; both are looked at so a change of that rule does not lose the log).
     static File bootLog(Context c) {

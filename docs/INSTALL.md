@@ -160,6 +160,14 @@ about 22 GB).
 
    Not on an SD card, and not `Download/DOOM Mobile/DOOM Mobile/...`.
 
+> **Phones without a Snapdragon GPU (Mali, PowerVR, Xclipse: Dimensity, Exynos, Tensor, Unisoc).** Setup also makes a
+> copy of the game's textures in formats these GPUs read directly (ASTC / EAC): the folder `DOOM Mobile/astc` (about
+> 0.85 GB and 3–10 extra minutes on the PC; the encoders are downloaded once, about 20 MB). With it the game needs much
+> less graphics memory on these phones, so there are fewer crashes and stutters. If you prepared your files with an
+> older setup, run setup again: it keeps what is already done and only adds the new folder. Then copy the `astc` folder
+> to `Download/DOOM Mobile/astc` on the phone. Snapdragon phones don't use it: skip it with `--no-astc`, or just don't
+> copy the folder.
+
 Copying ~22 GB over USB takes 10–40 minutes. On macOS use [Android File Transfer](https://www.android.com/filetransfer/)
 or OpenMTP; on Linux the file manager usually shows the phone directly.
 

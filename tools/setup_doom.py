@@ -4,13 +4,15 @@
   setup                     (no file arguments, e.g. a double-click on setup.bat)
       Looks for the base game, the update v262144 and prod.keys in put-game-files-here/ (next to the setup scripts) and
       in the current directory, under any file names, and prepares everything.
-  setup FILE_OR_FOLDER... [--work DIR] [--push [SERIAL]] [--dry-run] [--yes] [--keep-nsp] [--skip-shaders]
-        [--steps exefs,patch,romfs,shaders]
+  setup FILE_OR_FOLDER... [--work DIR] [--push [SERIAL]] [--dry-run] [--yes] [--keep-nsp] [--skip-shaders] [--no-astc]
+        [--jobs N] [--steps exefs,patch,romfs,shaders,astc]
       The same with explicit files (or folders to search), in any order. Packages: NSP, NSZ, XCI, XCZ, also split dumps
       (a folder of 00, 01, ... parts, or name.xc0 / name.ns0 with .xc1 ... next to it); one package may hold both the base
       game and the update. Base and update are told apart by the title id in their content meta (CNMT), not by the name.
-      Then: ExeFS -> offline patch (dm/tools/patch_nso.py, DM_TARGET=android) -> RomFS -> shader translation -> the phone
-      folder <work>/DOOM Mobile/{romfs, dm/out, dm/shaders}. Every step is skipped when its output is already complete;
+      Then: ExeFS -> offline patch (dm/tools/patch_nso.py, DM_TARGET=android) -> RomFS -> shader translation -> textures
+      for phones without BC (tools/astc_overlay_doom.py: ASTC / EAC copies of the BC textures for Mali, PowerVR, Xclipse;
+      --no-astc skips it) -> the phone folder <work>/DOOM Mobile/{romfs, dm/out, dm/shaders, astc}. Every step is skipped
+      when its output is already complete (the texture step also when made by another tools/astc_overlay_doom.py);
       delete an output to redo its step. --dry-run identifies the inputs, checks the tools and the free space and prints
       the plan. --yes answers yes to every question (download .NET, copy to the phone).
   setup check [FILE_OR_FOLDER...] [--work DIR]
@@ -26,7 +28,8 @@ memory. Compressed packages (NSZ / XCZ) get their program expanded to plain NSPs
 those are deleted afterwards unless --keep-nsp. Default work directory: $DM_DOOM_WORK or <repository>/work.
 The .NET 10 SDK (shader translator build) is taken from DOTNET, tools/.runtime/dotnet, ~/.dotnet or PATH; when it is
 missing, setup offers to install it into tools/.runtime/dotnet with Microsoft's dotnet-install script (no admin rights,
-nothing system-wide). setup.bat / setup.sh provide Python and its packages the same way (tools/.runtime).
+nothing system-wide). setup.bat / setup.sh provide Python and its packages the same way (tools/.runtime); the texture
+encoders of the last step (tools/requirements-astc.txt, ~20 MB from PyPI) are added to that Python the first time (asked first).
 """
 import argparse, os, re, shutil, struct, subprocess, sys, time
 from pathlib import Path
@@ -47,6 +50,7 @@ PY_PACKAGES = (('cryptography', 'decrypting your packages'), ('zstandard', 'NSZ 
 PKG_RE = re.compile(r'\.(nsp|nsz|xci|xcz|xc0|ns0)$', re.I)
 META_TYPES = {0x80: 'base game', 0x81: 'update', 0x82: 'DLC', 0x83: 'delta update'}
 ROMFS_BYTES = 23 << 30          # the merged RomFS is ~22 GB
+ASTC_BYTES = 1 << 30            # the ASTC / EAC texture overlay is ~0.85 GB
 SMALL_BYTES = 3 << 29           # ExeFS, patched modules, shader jobs, translator build, bundles (~1.5 GB)
 WIN = os.name == 'nt'
 GB = 2**30
@@ -57,7 +61,11 @@ STAGES = [('Finding and checking your game files', 'a few seconds'),
           ('Extracting the game program (ExeFS)', '1-5 min'),
           ('Patching the program for Android', '1-5 min'),
           ('Extracting the game data (RomFS, ~22 GB)', '20-60 min, longest with NSZ / XCZ'),
-          ('Translating the shaders', '5-20 min; the first run also downloads build packages from NuGet')]
+          ('Translating the shaders', '5-20 min; the first run also downloads build packages from NuGet'),
+          ('Converting the textures for phones without BC (ASTC)', '3-10 min; the first run also downloads the encoders')]
+ASTC_TOOL = TOOLS / 'astc_overlay_doom.py'
+ASTC_REQUIREMENTS = TOOLS / 'requirements-astc.txt'
+ASTC_MODULES = (('astc-encoder-py', 'astc_encoder'), ('etcpak', 'etcpak'), ('texture2ddecoder', 'texture2ddecoder'), ('numpy', 'numpy'))
 
 
 class Fail(Exception):
@@ -112,6 +120,7 @@ class Layout:
         self.exefs, self.nsp, self.jobs = self.work / 'exefs-update', self.work / 'nsp', self.work / 'shaders-jobs'
         self.xlate = self.work / 'build' / 'dmsh_xlate_doom'
         self.romfs_manifest = self.work / 'romfs-manifest.json'
+        self.astc = self.phone / 'astc'
 
     def exefs_ok(self):
         return build_id(self.exefs / 'main') == BUILD_ID and (self.exefs / 'sdk').is_file()
@@ -139,6 +148,17 @@ class Layout:
 
     def complete(self):
         return self.out_ok() and self.romfs_ok() and self.shaders_ok()
+
+    def astc_ok(self):
+        # Complete AND made by tools/astc_overlay_doom.py of this checkout (its SHA-256 is in the manifest, which is written last),
+        # like out_ok: a release with a newer tool rebuilds the overlay on the next setup run. The tool itself also checks the
+        # encoder versions, its settings and the source RomFS before it skips.
+        import hashlib, json
+        try: man = json.loads((self.astc / 'manifest.json').read_text())
+        except (OSError, ValueError): return False
+        if man.get('format') != 'doom-astc-overlay' or not ASTC_TOOL.is_file(): return False
+        if man.get('tool_sha256') != hashlib.sha256(ASTC_TOOL.read_bytes()).hexdigest(): return False
+        return all((self.astc / rel).is_file() and (self.astc / rel).stat().st_size == size for rel, size in man.get('files', {}).items())
 
 
 def build_id(nso):
@@ -433,6 +453,66 @@ def step_romfs(L, base, upd, keys, keep_nsp):
               f'  could not remove the temporary NSPs in {L.nsp}; delete them by hand')
 
 
+def astc_requirements():
+    """{package: pinned version} of tools/requirements-astc.txt for this Python (markers: only python_version < / >= 'x.y')."""
+    want, here = {}, sys.version_info[:2]
+    for line in ASTC_REQUIREMENTS.read_text().splitlines():
+        spec = line.split('#')[0].strip()
+        if not spec: continue
+        req, _, marker = spec.partition(';')
+        m = re.fullmatch(r'\s*python_version\s*(<|>=)\s*["\'](\d+)\.(\d+)["\']\s*', marker) if marker.strip() else None
+        if marker.strip() and m is None: raise Fail(f'{ASTC_REQUIREMENTS.name}: unsupported marker {marker.strip()!r}')
+        if m and ((here < (int(m[2]), int(m[3]))) != (m[1] == '<')): continue
+        name, _, ver = req.strip().partition('==')
+        want[name.strip()] = ver.strip()
+    return want
+
+
+def astc_packages_missing():
+    """The pinned encoder packages that are not installed in this Python at their pinned version."""
+    import importlib.util as iu
+    from importlib import metadata
+    miss = []
+    for name, ver in astc_requirements().items():
+        try:
+            if metadata.version(name) != ver: miss.append(f'{name}=={ver}')
+        except metadata.PackageNotFoundError:
+            miss.append(f'{name}=={ver}')
+    for pkg, mod in ASTC_MODULES:
+        if iu.find_spec(mod) is None and not any(m.startswith(pkg + '==') for m in miss): miss.append(pkg)
+    return miss
+
+
+def install_astc_packages(yes):
+    """pip install -r tools/requirements-astc.txt into this Python (the private tools/.runtime venv / Python). False when declined
+    or failed: the texture step is then skipped (the game still runs: phones without BC decode BC textures on the GPU)."""
+    miss = astc_packages_missing()
+    if not miss: return True
+    print(f'  The texture step needs these Python packages from PyPI (~20 MB, pinned in tools/requirements-astc.txt):\n    '
+          + ', '.join(miss) + f'\n  They go into {Path(sys.prefix)} only.')
+    if not ask('  Install them now?', yes):
+        print('  skipped: the texture step needs them (run setup again and answer Y, or use --no-astc)'); return False
+    cmd = [sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check', '--no-warn-script-location', '--only-binary=:all:',
+           '-r', str(ASTC_REQUIREMENTS)]
+    if subprocess.run(cmd).returncode or astc_packages_missing():
+        print('  could not install the texture encoders (see above); the texture step is skipped. Snapdragon phones do not need it; '
+              'other phones still run, with more GPU memory for textures. Run setup again later to retry.')
+        return False
+    return True
+
+
+def step_astc(L, yes, jobs=None):
+    """tools/astc_overlay_doom.py <romfs> <phone>/astc: re-encodes the BC textures for GPUs without BC (it skips itself when up to
+    date and resumes when interrupted). Non-fatal: without it the game still works (BC is decoded on the GPU there)."""
+    if not install_astc_packages(yes): return False
+    cmd = [sys.executable, ASTC_TOOL, L.romfs, L.astc] + (['--jobs', str(jobs)] if jobs else [])
+    r = subprocess.run([str(c) for c in cmd], env=dict(os.environ, PYTHONUTF8='1'))
+    if r.returncode:
+        print(f'  the texture step failed ({r.returncode}); the game still runs without it (run setup again to retry: it resumes)')
+        return False
+    return True
+
+
 def spirv_tool(name):
     env = os.environ.get('SPIRV_OPT' if name == 'spirv-opt' else 'SPIRV_VAL')
     if env: return env
@@ -579,7 +659,7 @@ def push(L, serial):
     adb = [adb, '-s', serial]
     if subprocess.run(adb + ['get-state'], capture_output=True, text=True).stdout.strip() != 'device':
         raise Fail(f'adb device {serial} not reachable')
-    for local in (L.out, L.shaders, L.romfs):
+    for local in (L.out, L.shaders, L.romfs) + ((L.astc,) if (L.astc / 'manifest.json').is_file() else ()):
         rel = local.relative_to(L.phone).as_posix()
         remote = f'{PHONE_DIR}/{rel}'
         listing = subprocess.run(adb + ['shell', f"cd '{remote}' 2>/dev/null && find . -type f -exec stat -c '%s %n' {{}} +"],
@@ -623,7 +703,8 @@ def next_steps(L, offer_push, yes):
     print(f'''
 What to do next:
   1. Copy the whole "DOOM Mobile" folder into the phone's Download folder (internal storage), so that the phone has
-       Download/DOOM Mobile/romfs   and   Download/DOOM Mobile/dm
+       Download/DOOM Mobile/romfs   and   Download/DOOM Mobile/dm   (and Download/DOOM Mobile/astc: textures for phones
+       without a Snapdragon GPU; Snapdragon phones never use it, it may be left out there)
      (USB cable + file manager is fine; the phone needs ~{gb(size + GB)} free).
   2. Install the app on the phone: {APK_URL}
   3. Start DOOM Mobile and allow "All files access" when it asks.
@@ -677,6 +758,8 @@ def check(L, files):
     item(L.out_ok(), 'dm/out: patched main / sdk', RUN_SETUP)
     item(L.romfs_ok(), 'romfs: extracted and verified', RUN_SETUP)
     item(L.shaders_ok(), f'dm/shaders: {L.shader_count()} SPIR-V bundles', RUN_SETUP)
+    print(f"  {'OK ' if L.astc_ok() else '.. '} astc: textures for phones without BC (Mali, PowerVR, Xclipse): " +
+          ('made by this setup' if L.astc_ok() else 'missing or made by another setup (optional: run setup to make it, --no-astc skips it)'))
     if L.nsp.is_dir(): print(f'  ..  temporary NSPs in {L.nsp} (removed after the RomFS step)')
     if nxt:
         say(f'Next: {nxt[0]}')
@@ -689,6 +772,7 @@ def check(L, files):
 def prepare(a, L):
     steps = set(a.steps.split(','))
     shaders_needed = 'shaders' in steps and not a.skip_shaders and not L.shaders_ok()
+    astc_wanted = 'astc' in steps and not a.no_astc
     miss = missing_packages()
     if sys.version_info < (3, 10) or miss:
         raise Fail(f'Python 3.10+ with {", ".join(miss) or "the packages"} is needed; start setup through setup.bat / '
@@ -716,6 +800,7 @@ def prepare(a, L):
         need += max(0, ROMFS_BYTES - folder_bytes(L.romfs))   # a partial RomFS is deleted first
         for role, t in (('base', base), ('update', upd)):
             if t.compressed and not (L.nsp / f'{role}.nsp').is_file(): need += t.program_size
+    if astc_wanted and not L.astc_ok(): need += ASTC_BYTES
     free = free_bytes(L.work)
     print(f'  output: {L.phone}')
     print(f'  disk space: {gb(free)} free, about {gb(need)} needed while preparing (~23 GB stays at the end)')
@@ -730,7 +815,8 @@ def prepare(a, L):
     print(f"  SPIRV-Tools: {spirv_tool('spirv-val') or 'not found (optional)'}")
     plan = [('ExeFS', L.exefs_ok() or 'exefs' not in steps), ('patch', L.out_ok() or 'patch' not in steps),
             ('RomFS' + (' (compressed input is expanded first)' if base.compressed or upd.compressed else ''),
-             L.romfs_ok() or 'romfs' not in steps), ('shaders', not shaders_needed)]
+             L.romfs_ok() or 'romfs' not in steps), ('shaders', not shaders_needed),
+            ('textures for phones without BC', not astc_wanted or L.astc_ok())]
     print('  plan: ' + ', '.join(f"{n} {'(done/skipped)' if d else ''}".strip() for n, d in plan))
     if a.dry_run:
         say('dry run: inputs, tools and space checked; nothing was written'); return 0
@@ -748,6 +834,10 @@ def prepare(a, L):
     if shaders_needed:
         step_shaders(L, dn or find_dotnet() or install_dotnet(a.yes)); print(f'  done in {took(t0)}')
     else: print('  already done' if L.shaders_ok() else '  skipped')
+    t0 = stage(7)
+    if not astc_wanted: print('  skipped (--no-astc)' if a.no_astc else '  skipped (--steps)')
+    elif not L.romfs_ok(): print('  skipped: needs the RomFS (step 5) first')
+    elif step_astc(L, a.yes, a.jobs): print(f'  done in {took(t0)}')
     if not L.complete():
         say(f'finished the requested steps; the folder is not complete yet: {L.phone}'); return 0
     if a.push:
@@ -780,7 +870,10 @@ def main(argv=None):
     ap.add_argument('--yes', '-y', action='store_true')
     ap.add_argument('--keep-nsp', action='store_true')
     ap.add_argument('--skip-shaders', action='store_true')
-    ap.add_argument('--steps', default='exefs,patch,romfs,shaders', help='comma list of steps to run (default: all)')
+    ap.add_argument('--no-astc', action='store_true', help='skip the textures for phones without BC (ASTC / EAC overlay, ~0.85 GB); '
+                                                          'Snapdragon phones do not need them')
+    ap.add_argument('--jobs', type=int, help='worker processes of the texture step (default: all CPU threads)')
+    ap.add_argument('--steps', default='exefs,patch,romfs,shaders,astc', help='comma list of steps to run (default: all)')
     a = ap.parse_args(argv)
     L = Layout(a.work)
     print('DOOM Mobile setup: prepares the game folder for the phone from your own DOOM (Switch) dumps.')

@@ -17,6 +17,26 @@
 _Static_assert((char)-1 < 0,"bcdec signed formats require -fsigned-char");
 
 int xbg_bc_8bit_channels=0;
+int xbg_bc6_e5=0;
+/* [nonadreno] E5B9G9R9 from binary16 (BC6H UF16 output: never negative, at most 0x7bff). value = M*2^-24 with M the half's
+ * integer significand shifted by its exponent; the shared exponent E divides by 2^E with round-half-up, as the extension's
+ * floor(x/2^(E-24)+0.5). Same arithmetic as xbg_e5b9g9r9 in xbg_bc_gpu.glsl (tests/bc_gpu_decode_test.cpp). */
+static uint32_t e5_round(uint32_t h,int e) {
+    uint32_t he=(h>>10)&31u,m=he?(h&1023u)|1024u:h&1023u;int sh=e-(he?(int)he-1:0);
+    if(sh<=0)return m<<(unsigned)(-sh);
+    if(sh>=32)return 0;
+    return (m+(1u<<(unsigned)(sh-1)))>>(unsigned)sh;
+}
+uint32_t xbg_e5b9g9r9_from_half(uint32_t r,uint32_t g,uint32_t b) {
+    /* sharedexp_max = 511/512 * 2^16 = 65408 = half 0x7bfc */
+    if(r>0x7bfcu)r=0x7bfcu;
+    if(g>0x7bfcu)g=0x7bfcu;
+    if(b>0x7bfcu)b=0x7bfcu;
+    uint32_t m=r>g?r:g;if(b>m)m=b;uint32_t me=(m>>10)&31u;int e;
+    if(me)e=(int)me+1;else{int msb=-1;for(uint32_t v=m&1023u;v;v>>=1)msb++;e=msb-8>0?msb-8:0;}
+    if(e5_round(m,e)==512u)e++;
+    return e5_round(r,e)|e5_round(g,e)<<9|e5_round(b,e)<<18|(uint32_t)e<<27;
+}
 int xbg_bc_format_info(uint32_t fmt,xbg_bc_format *out) {
     if(!out || fmt<0x41 || fmt>0x50)return -1;
     out->pixels=XBG_RGBA8_UNORM;out->bytes_per_pixel=4;out->bytes_per_block=16;
@@ -27,6 +47,7 @@ int xbg_bc_format_info(uint32_t fmt,xbg_bc_format *out) {
     if(fmt==0x4b)out->pixels=XBG_RG16_UNORM;
     if(fmt==0x4c)out->pixels=XBG_RG16_SNORM;
     if(fmt==0x4f || fmt==0x50){out->pixels=XBG_RGBA16_SFLOAT;out->bytes_per_pixel=8;}
+    if(fmt==0x50 && xbg_bc6_e5){out->pixels=XBG_RGB9E5_UFLOAT;out->bytes_per_pixel=4;}
     /* 8 位通道回退：设备不能线性过滤 16 位 R/RG（Mali）。SNORM 仍保留 16 位。
      * 8-bit channel fallback: the device cannot filter 16-bit R/RG (Mali). Signed formats keep 16 bits. */
     if(xbg_bc_8bit_channels){
@@ -177,6 +198,7 @@ int xbg_decode_block(uint32_t fmt,const void *block,size_t bn,void *out,size_t o
             uint32_t pixels[16];bcdec_bc7(aligned,pixels,16);memcpy(dst,pixels,64);
         } else {
             uint16_t rgb[48],pixels[64];bcdec_bc6h_half(aligned,rgb,12,fmt==0x4f);
+            if(fmt==0x50 && xbg_bc6_e5){uint32_t packed[16];for(unsigned i=0;i<16;i++)packed[i]=xbg_e5b9g9r9_from_half(rgb[i*3],rgb[i*3+1],rgb[i*3+2]);memcpy(dst,packed,sizeof(packed));return 0;}
             for(unsigned i=0;i<16;i++) {for(unsigned k=0;k<3;k++)pixels[i*4+k]=rgb[i*3+k];pixels[i*4+3]=0x3c00;}
             memcpy(dst,pixels,sizeof(pixels));
         }

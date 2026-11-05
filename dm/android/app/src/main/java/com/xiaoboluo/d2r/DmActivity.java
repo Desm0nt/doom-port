@@ -146,6 +146,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         android.util.Log.i("dm", "[java] quit from the pause menu");
         if (DOOM) CrashLog.sessionEnd(this);   // [DOOM] a clean end: no crash report at the next start
         try { if (libraryLoaded) nativeQuit(); } catch (UnsatisfiedLinkError e) { /* an older library: just end */ }
+        if (DOOM && libraryLoaded) CrashLog.mirrorBootLogs(this);   // [DOOM] boot.log next to crash.txt (System.exit skips onStop)
         finishAndRemoveTask(); System.exit(0);
     }
     @Override public void immersive() { immersiveBars(); }
@@ -506,15 +507,17 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             String lang = p.getString("lang", "");
             if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
             String drv = p.getString("driver", defaultDriver());
-            // [DOOM] hardware check at every start (BUGS_AND_FIXES 2.22): Turnip needs a Qualcomm Adreno 6xx+ (KGSL). Anything else (Mali,
-            // PowerVR, Xclipse, Maleoon, unknown) gets the system driver even when the saved choice says turnip* (settings imported /
-            // restored from another phone); the choice is reset so the dialog and the next starts agree, and the player is told once.
+            // [DOOM] hardware check at every start (BUGS_AND_FIXES 2.22, 2.25): Turnip needs a Qualcomm Adreno 6xx+ (KGSL), PanVK a Mali
+            // (/dev/mali0), RADV-Xclipse a Samsung Xclipse, and a Linux glibc build (the "-EMULATOR" zips) runs nowhere in an Android app
+            // (driverProblem). Such a saved choice (settings imported / restored from another phone, or picked before this check existed)
+            // gets the system driver; the choice is reset so the dialog and the next starts agree, and the player is told once why.
             boolean turnipOk = turnipPossible();
-            if (!drv.isEmpty() && !turnipOk && adrenoOnlyPackage(drv)) {
-                crumb("driver: saved choice " + drv + " needs an Adreno 6xx+ GPU, this phone has " + hardwareSummary() + ": the system driver is used and the choice reset");
+            String problem = drv.isEmpty() ? null : driverProblem(drv);
+            if (problem != null) {
+                crumb("driver: saved choice " + drv + " cannot run here (" + problem + "), this phone has " + hardwareSummary() + ": the system driver is used and the choice reset");
                 p.edit().putString("driver", "").apply();
-                driverNotice = Ui.t(this, "Драйвер Vulkan " + driverLabel(drv) + " работает только на Adreno (Snapdragon); на этом телефоне используется системный драйвер.",
-                    "Vulkan driver " + driverLabel(drv) + " works only on Adreno (Snapdragon) GPUs; this phone uses the system driver.");
+                driverNotice = Ui.t(this, "Драйвер Vulkan " + driverLabel(drv) + " не подходит: " + driverReasonText(problem) + ". Используется системный драйвер.",
+                    "Vulkan driver " + driverLabel(drv) + " cannot run here: " + driverReasonText(problem) + ". The system driver is used.");
                 drv = "";
             }
             crumb("driver: " + (drv.isEmpty() ? "system" : drv) + " (saved " + (p.contains("driver") ? "\"" + p.getString("driver", "") + "\"" : "none, default " + defaultDriver())
@@ -552,6 +555,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // When gpu_model is unreadable on a Qualcomm SoC, turnip27 is tried (vk_driver.c falls back to the system driver without a GPU).
     static final String DEFAULT_DRIVER = "turnip27", DRIVER_A710 = "turnip27-a710", DRIVER_A8XX = "turnip27-a8xx";
     private String defaultDriver() {
+        if (!turnipPossible()) return "";   // [DOOM] 2.25: non-Adreno (Mali / Xclipse / PowerVR / Maleoon): the bundled Turnip is never the default
         File dir = new File(getFilesDir(), "drivers");
         int m = adrenoModel(gpuModel());
         if (m == 0) return qualcommSoc() ? pkgIfPresent(dir, DEFAULT_DRIVER) : "";
@@ -586,15 +590,103 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         return "gpu_model=" + (g.isEmpty() ? "-" : g) + " kgsl=" + kgsl() + " mali=" + new File("/dev/mali0").exists() + " SoC="
             + (android.os.Build.VERSION.SDK_INT >= 31 ? android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.SOC_MODEL : android.os.Build.HARDWARE);
     }
-    // A driver package that can only drive an Adreno (Turnip / freedreno): by its folder name or its meta.json (name, description, libraryName).
-    boolean adrenoOnlyPackage(String name) {
-        if (adrenoWord(name)) return true;
-        File m = new File(new File(new File(getFilesDir(), "drivers"), name), "meta.json");
-        try { org.json.JSONObject o = new org.json.JSONObject(readSmall(m));
-              return adrenoWord(o.optString("name", "")) || adrenoWord(o.optString("description", "")) || adrenoWord(o.optString("libraryName", "")); }
-        catch (Exception e) { return false; }
+    // [DOOM] (BUGS_AND_FIXES 2.25) The GPU family a driver package is for: "mali" (PanVK / panfrost), "xclipse" (RADV), "powervr",
+    // "adreno" (Turnip / freedreno) or "" (unknown: offered everywhere; vk_driver.c verifies what really runs). The folder name and meta.json
+    // "name" decide first, description / libraryName only when they say nothing (the GameHub PanVK zip ships libvulkan_freedreno.so and
+    // says so in its description). vk_driver.c family_of uses the same words.
+    static String familyWord(String s) {
+        s = s.toLowerCase(Locale.ROOT);
+        if (s.contains("panvk") || s.contains("panfrost") || s.contains("mali")) return "mali";
+        if (s.contains("radv") || s.contains("radeon") || s.contains("xclipse")) return "xclipse";
+        if (s.contains("powervr") || s.contains("imagination") || s.contains("mesa-pvr")) return "powervr";
+        if (s.contains("turnip") || s.contains("freedreno") || s.contains("adreno")) return "adreno";
+        return "";
     }
-    private static boolean adrenoWord(String s) { s = s.toLowerCase(Locale.ROOT); return s.contains("turnip") || s.contains("freedreno") || s.contains("adreno"); }
+    private org.json.JSONObject driverMeta(String name) {
+        try { return new org.json.JSONObject(readSmall(new File(new File(new File(getFilesDir(), "drivers"), name), "meta.json"))); }
+        catch (Exception e) { return null; }
+    }
+    String driverFamily(String name) {
+        String f = familyWord(name); if (!f.isEmpty()) return f;
+        org.json.JSONObject o = driverMeta(name); if (o == null) return "";
+        f = familyWord(o.optString("name", "")); if (!f.isEmpty()) return f;
+        f = familyWord(o.optString("description", "")); if (!f.isEmpty()) return f;
+        return familyWord(o.optString("libraryName", ""));
+    }
+    static boolean mali() { return new File("/dev/mali0").exists(); }
+    static boolean powervr() { return new File("/dev/pvrsrvkm").exists(); }
+    // The package's driver library: meta.json libraryName, else its first .so (a *vulkan* one preferred), as vk_driver.c picks it.
+    static File driverLib(File dir, org.json.JSONObject meta) {
+        String ln = meta != null ? meta.optString("libraryName", "") : "";
+        if (!ln.isEmpty() && !ln.contains("/")) { File f = new File(dir, ln); if (f.isFile()) return f; }
+        File[] fs = dir.listFiles(); File pick = null;
+        if (fs != null) for (File f : fs) if (f.getName().endsWith(".so") && (pick == null || (f.getName().contains("vulkan") && !pick.getName().contains("vulkan")))) pick = f;
+        return pick;
+    }
+    // DT_NEEDED of an ELF64 library (empty on any parse problem); vk_driver.c elf_check reads it the same way.
+    static java.util.List<String> elfNeeded(File f) {
+        java.util.ArrayList<String> out = new java.util.ArrayList<>();
+        try (java.io.RandomAccessFile r = new java.io.RandomAccessFile(f, "r")) {
+            byte[] eh = new byte[64]; r.readFully(eh);
+            if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F' || eh[4] != 2) return out;
+            java.nio.ByteBuffer e = java.nio.ByteBuffer.wrap(eh).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            long phoff = e.getLong(32); int phent = e.getShort(54) & 0xffff, phnum = e.getShort(56) & 0xffff;
+            if (phent != 56 || phnum == 0 || phnum > 64) return out;
+            byte[] phb = new byte[phent * phnum]; r.seek(phoff); r.readFully(phb);
+            java.nio.ByteBuffer ph = java.nio.ByteBuffer.wrap(phb).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            long dynOff = -1, dynSz = 0;
+            for (int i = 0; i < phnum; i++) if (ph.getInt(i * 56) == 2) { dynOff = ph.getLong(i * 56 + 8); dynSz = ph.getLong(i * 56 + 32); }   // PT_DYNAMIC
+            if (dynOff < 0) return out;
+            int n = (int) Math.min(dynSz, 512 * 16); byte[] db = new byte[n]; r.seek(dynOff); r.readFully(db);
+            java.nio.ByteBuffer d = java.nio.ByteBuffer.wrap(db).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+            long strtab = 0, strsz = 0; java.util.ArrayList<Long> need = new java.util.ArrayList<>();
+            for (int i = 0; i + 16 <= n; i += 16) { long tag = d.getLong(i), val = d.getLong(i + 8); if (tag == 0) break; if (tag == 5) strtab = val; else if (tag == 10) strsz = val; else if (tag == 1) need.add(val); }
+            long stroff = -1;   // DT_STRTAB is a virtual address: the PT_LOAD that holds it gives its file offset
+            for (int i = 0; i < phnum; i++) { int b = i * 56; if (ph.getInt(b) == 1) { long off = ph.getLong(b + 8), va = ph.getLong(b + 16), fsz = ph.getLong(b + 32); if (strtab >= va && strtab < va + fsz) stroff = strtab - va + off; } }
+            if (stroff < 0) return out;
+            for (long v : need) { if (v >= strsz) continue; r.seek(stroff + v); StringBuilder sb = new StringBuilder(); int c; while ((c = r.read()) > 0 && sb.length() < 128) sb.append((char) c); out.add(sb.toString()); }
+        } catch (Exception ex) { /* not an ELF we can read: no verdict */ }
+        return out;
+    }
+    // [DOOM] Why a driver package cannot run on this phone, or null: a package for another GPU family (no-adreno: Turnip needs an Adreno 6xx+
+    // on KGSL / no-mali / no-xclipse / no-powervr), a Linux glibc build (glibc-build: the "-EMULATOR" PanVK zips are for Winlator-style glibc
+    // containers; issue #3 picked one and it needed libdrm.so.2), or a versioned library it needs and does not ship (missing-lib). vk_driver.c
+    // repeats these checks natively (DM_VK_DRIVER_FORCE=1 skips them there).
+    String driverProblem(String name) {
+        String fam = driverFamily(name);
+        if (fam.equals("adreno") && !turnipPossible()) return "no-adreno";
+        if (fam.equals("mali") && !mali()) return "no-mali";
+        if (fam.equals("xclipse") && (kgsl() || mali() || powervr())) return "no-xclipse";
+        if (fam.equals("powervr") && !powervr()) return "no-powervr";
+        File dir = new File(new File(getFilesDir(), "drivers"), name);
+        org.json.JSONObject meta = driverMeta(name);
+        if (meta != null && meta.optString("abi", "").toLowerCase(Locale.ROOT).contains("glibc")) return "glibc-build";
+        File lib = driverLib(dir, meta);
+        if (lib != null) for (String n : elfNeeded(lib)) {
+            if (n.equals("libc.so.6") || n.equals("libm.so.6") || n.equals("libpthread.so.0") || n.equals("libdl.so.2") || n.contains("ld-linux")) return "glibc-build";
+            if (n.matches(".*\\.so\\.[0-9].*") && !new File(dir, n).exists()) return "missing-lib " + n;
+        }
+        return null;
+    }
+    // The player's words for a driverProblem / vk_driver.c status reason.
+    String driverReasonText(String r) {
+        if (r == null || r.isEmpty()) return "";
+        switch (r) {
+            case "no-adreno": return Ui.t(this, "он только для Adreno 6xx+ (Snapdragon)", "it is for Adreno 6xx+ (Snapdragon) GPUs only");
+            case "no-mali": return Ui.t(this, "он только для Mali", "it is for Mali GPUs only");
+            case "no-xclipse": return Ui.t(this, "он только для Samsung Xclipse", "it is for Samsung Xclipse GPUs only");
+            case "no-powervr": return Ui.t(this, "он только для PowerVR", "it is for PowerVR GPUs only");
+            case "glibc-build": return Ui.t(this, "это сборка для Linux/glibc (эмуляторы вроде Winlator glibc), нужен Android-пакет этого драйвера (например …-adrenotools.zip)",
+                "this is a Linux glibc build (for Winlator-style glibc containers); use the Android package of this driver (e.g. …-adrenotools.zip)");
+            case "not-taken-over": return Ui.t(this, "драйвер не загрузился, вместо него работал системный (подробности в логе)", "the driver did not load and the system driver ran instead (details in the log)");
+            case "no-gpu": return Ui.t(this, "драйвер не видит GPU этого телефона", "the driver sees no GPU on this phone");
+            case "load-failed": return Ui.t(this, "драйвер не открылся", "the driver could not be opened");
+            case "no-library": return Ui.t(this, "в пакете нет библиотеки драйвера", "the package has no driver library");
+            default:
+                if (r.startsWith("missing-lib")) return Ui.t(this, "в пакете не хватает библиотеки", "the package lacks a library") + r.substring(11);
+                return r;
+        }
+    }
     static boolean qualcommSoc() {
         String s = ((android.os.Build.VERSION.SDK_INT >= 31 ? android.os.Build.SOC_MANUFACTURER + " " : "") + android.os.Build.HARDWARE).toLowerCase(Locale.ROOT);
         return s.contains("qti") || s.contains("qualcomm") || s.contains("qcom");
@@ -664,14 +756,16 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         try { byte[] h = java.security.MessageDigest.getInstance("SHA-256").digest(d); StringBuilder sb = new StringBuilder(); for (byte x : h) sb.append(String.format("%02x", x)); return sb.toString(); }
         catch (java.security.NoSuchAlgorithmException e) { return ""; }
     }
-    // Unpack an adrenotools package zip (meta.json + the driver library, at the zip root or in one folder) into out/.
+    // Unpack an adrenotools package zip (meta.json + the driver library and anything it ships, at the zip root or in one folder) into out/.
     static void unzipDriver(java.io.InputStream src, File out) throws java.io.IOException {
         File tmp = new File(out.getPath() + ".tmp"); deleteDriverTree(tmp); tmp.mkdirs();
         try (java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(src)) {
             java.util.zip.ZipEntry e; byte[] buf = new byte[1 << 16];
             while ((e = z.getNextEntry()) != null) {
                 if (e.isDirectory()) continue;
-                String n = new File(e.getName()).getName(); if (!(n.endsWith(".so") || n.equals("meta.json"))) continue;
+                // [DOOM] 2.25: also the helper libraries a driver may ship next to it (versioned lib*.so.N) and its json / text files
+                String n = new File(e.getName()).getName();
+                if (!(n.endsWith(".so") || n.matches(".+\\.so\\.[0-9][0-9.]*") || n.endsWith(".json") || n.endsWith(".txt"))) continue;
                 try (java.io.OutputStream os = new java.io.FileOutputStream(new File(tmp, n))) { int k; while ((k = z.read(buf)) > 0) os.write(buf, 0, k); }
             }
         }
@@ -804,13 +898,13 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             // Vulkan driver: the system one, or any adrenotools package under files/drivers/<name>/ (bundled, downloaded or imported from
             // Download/DOOM Mobile/drivers), labelled with the name from its meta.json; below it, what the running game actually uses.
             heading(box, when(R.string.gear_driver, false));
-            // [DOOM] Turnip packages are not offered on a GPU they cannot drive (turnipPossible); a line says why they are missing
-            final boolean turnipOk = turnipPossible();
-            java.util.ArrayList<String> offered = new java.util.ArrayList<>(); int hidden = 0;
-            for (String n : driverPackages()) if (turnipOk || !adrenoOnlyPackage(n)) offered.add(n); else hidden++;
+            // [DOOM] packages that cannot run here (driverProblem: another GPU family, a glibc build, a missing library) are not offered;
+            // a line lists them with the reason
+            java.util.ArrayList<String> offered = new java.util.ArrayList<>(); StringBuilder hiddenWhy = new StringBuilder();
+            for (String n : driverPackages()) { String why = driverProblem(n); if (why == null) offered.add(n); else hiddenWhy.append("\n- ").append(driverLabel(n)).append(": ").append(driverReasonText(why)); }
             final String[] drvNames = offered.toArray(new String[0]);
-            if (hidden > 0) { TextView hn = new TextView(this); hn.setText(Ui.t(this, "Turnip скрыт: он работает только на Adreno (Snapdragon), здесь " + hardwareSummary(),
-                "Turnip is hidden: it works only on Adreno (Snapdragon) GPUs; this phone: " + hardwareSummary())); box.addView(hn); }
+            if (hiddenWhy.length() > 0) { TextView hn = new TextView(this); hn.setText(Ui.t(this, "Скрыты (не подходят этому телефону, " + hardwareSummary() + "):",
+                "Hidden (cannot run on this phone, " + hardwareSummary() + "):") + hiddenWhy); box.addView(hn); }
             String[] drvLabels = new String[drvNames.length + 1]; drvLabels[0] = getString(R.string.gear_driver_system);
             for (int i = 0; i < drvNames.length; i++) drvLabels[i + 1] = driverLabel(drvNames[i]);
             int drvAt = 0; { String cur = p.getString("driver", defaultDriver()); for (int i = 0; i < drvNames.length; i++) if (drvNames[i].equals(cur)) drvAt = i + 1; }
@@ -822,6 +916,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 a.setText(fell ? getString(R.string.gear_driver_active_fallback, driverLabel(st[0]))
                                : getString(R.string.gear_driver_active, st[0].isEmpty() || "system".equals(st[1]) ? getString(R.string.gear_driver_system_short) : driverLabel(st[0])));
                 box.addView(a);
+                // [DOOM] 2.25: why it fell back, or what the GPU reports for the custom driver (vk_driver.c verified it)
+                if (fell || (st.length > 3 && !st[0].isEmpty())) { TextView w = new TextView(this);
+                    w.setText((fell ? driverReasonText(st[2]) + (st.length > 3 ? "; " : "") : "") + (st.length > 3 ? st[3] : "")); box.addView(w); }
             }
             heading(box, when(R.string.gear_lang, false));
             String[] langLabels = LANG_LABELS.clone(); langLabels[0] = getString(R.string.gear_lang_system);
@@ -928,10 +1025,10 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         String[] st = driverStatus();
         if (!driverStatusDone && st != null) {
             driverStatusDone = true;
-            crumb("Vulkan driver status: requested \"" + st[0] + "\" active " + st[1] + " reason " + st[2]);
+            crumb("Vulkan driver status: requested \"" + st[0] + "\" active " + st[1] + " reason " + st[2] + (st.length > 3 ? " " + st[3] : ""));
             if (!st[0].isEmpty() && "system".equals(st[1])) {
                 android.util.Log.w("dm", "driver " + st[0] + " did not start (" + st[2] + "): system driver");
-                android.widget.Toast.makeText(DmActivity.this, getString(R.string.toast_driver_fallback, driverLabel(st[0]), st[2]), android.widget.Toast.LENGTH_LONG).show();
+                android.widget.Toast.makeText(DmActivity.this, getString(R.string.toast_driver_fallback, driverLabel(st[0]), driverReasonText(st[2])), android.widget.Toast.LENGTH_LONG).show();
                 driverGuard().delete(); driverGuardDone = true;   // not a crash: the native side already chose the system driver
             }
         }
@@ -1216,7 +1313,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override protected void onResume() { super.onResume(); resumed = true; immersiveBars(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); } }
     @Override protected void onPause() { resumed = false; if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
     @Override protected void onStart() { super.onStart(); if (started) { nativeFocus(2); if (DOOM && bootFailure == 0) CrashLog.session(this, "fg"); } }   // [DOOM] session state for CrashLog
-    @Override protected void onStop() { if (started) { nativeFocus(1); if (DOOM && bootFailure == 0) CrashLog.session(this, "bg"); } com.xiaoboluo.d2r.widget.HeroWidgetProvider.requestUpdate(this); super.onStop(); }
+    @Override protected void onStop() { if (started) { nativeFocus(1); if (DOOM && bootFailure == 0) CrashLog.session(this, "bg"); }
+        if (DOOM && libraryLoaded) { android.content.Context app = getApplicationContext(); new Thread(() -> CrashLog.mirrorBootLogs(app), "dm-logcopy").start(); }   // [DOOM] boot.log next to crash.txt
+        com.xiaoboluo.d2r.widget.HeroWidgetProvider.requestUpdate(this); super.onStop(); }
     @Override protected void onDestroy() { if (DOOM && isFinishing()) { crumb("activity finishing"); CrashLog.sessionEnd(this); } if (displays != null) displays.unregisterDisplayListener(this); if (inputs != null) inputs.unregisterInputDeviceListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
     @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersiveBars(); else releaseTouches(); }
 

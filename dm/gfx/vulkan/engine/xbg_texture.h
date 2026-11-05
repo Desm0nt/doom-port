@@ -11,12 +11,22 @@ extern "C" {
 enum xbg_pixels { XBG_RGBA8_UNORM=1, XBG_RGBA8_SRGB=2,
                   XBG_R16_UNORM=3, XBG_RG16_UNORM=4,
                   XBG_R16_SNORM=5, XBG_RG16_SNORM=6, XBG_RGBA16_SFLOAT=7,
-                  XBG_R8_UNORM=8, XBG_R8_SNORM=9, XBG_RG8_UNORM=10, XBG_RG8_SNORM=11 };
+                  XBG_R8_UNORM=8, XBG_R8_SNORM=9, XBG_RG8_UNORM=10, XBG_RG8_SNORM=11,
+                  XBG_RGB9E5_UFLOAT=12 };
 /* 设备不支持 16 位单/双通道格式的线性过滤时置 1（Mali 的 R16G16_UNORM 就是这种）：
  * BC4/BC5 改为解码成 8 位 R8/RG8，牺牲通道精度换取可线性过滤。
  * Set when the device cannot linearly filter 16-bit single/dual channel formats (Mali's R16G16_UNORM):
  * BC4/BC5 then decode to 8-bit R8/RG8, trading channel precision for filterability. */
 extern int xbg_bc_8bit_channels;
+/* [nonadreno] 置 1 时无符号 BC6H（0x50）解码成 E5B9G9R9（每像素 4 字节，原为 RGBA16F 8 字节）：Mali 上 VT 的 BC6H 缓存
+ * （128²x5760 立方体数组 7 级、8192x4096）解码后约 1.4 GB，打包后减半。有符号 BC6H（0x4f）仍为 RGBA16F。由引擎在建第一张解码图前设定
+ * （DM_GFX_BC6_E5，缺省 1）。 | When 1, unsigned BC6H (0x50) decodes to E5B9G9R9 (4 bytes a pixel instead of RGBA16F's 8): the VT's BC6H
+ * caches on Mali (128^2 x5760 cube array with 7 levels, 8192x4096) take ~1.4 GB decoded, half of that packed. Signed BC6H (0x4f) stays
+ * RGBA16F. Set by the engine before its first decoded image (DM_GFX_BC6_E5, default 1). */
+extern int xbg_bc6_e5;
+/* Shared-exponent packing of three non-negative binary16 values (GL_EXT_texture_shared_exponent rounding, integer exact; the GPU
+ * decoder xbg_bc_gpu.glsl uses the same arithmetic). */
+uint32_t xbg_e5b9g9r9_from_half(uint32_t r,uint32_t g,uint32_t b);
 typedef struct xbg_bc_format {
     uint32_t pixels, bytes_per_pixel, bytes_per_block;
 } xbg_bc_format;

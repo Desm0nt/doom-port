@@ -1,0 +1,12 @@
+{
+  "repository": "https://github.com/Themaister/Granite",
+  "commit": "69f450c62dc3",
+  "license": "MIT, Copyright (c) 2017-2026 Hans-Kristian Arntzen (LICENSE; the shader headers say 2020-2026)",
+  "files": {
+    "assets/shaders/decode/bc6.comp": "48774d6322668e8115a7a5867a3255d245732f747b47defa677d7647e1c55c80",
+    "assets/shaders/decode/bc7.comp": "960760d4047a8a6a664b324a95f4e2cf1a6602d4474d6dedd2c177016c15dbab",
+    "assets/shaders/decode/bitextract.h": "30156b157ef2b668d09eb087acf2067657a81d233cbbd2654206ff4ebf62857d"
+  },
+  "ported_to": "dm/gfx/vulkan/engine/xbg_bc_gpu.glsl (modified: per-pixel functions called from a per-block storage-buffer decoder, shared tables, swizzles spelled out, E5B9G9R9 output option)",
+  "retrieved": "2026-11-05T19:45:08+03:00"
+}

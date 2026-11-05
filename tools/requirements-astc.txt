@@ -1,0 +1,9 @@
+# DOOM Mobile setup: texture encoders for the ASTC / ETC2 / EAC overlay (tools/astc_overlay_doom.py), installed by setup into
+# its private Python (tools/.runtime). Pinned: the overlay is rebuilt when an encoder version changes. Wheels exist for Windows,
+# Linux and macOS (x86-64 / arm64), CPython 3.10+.
+astc-encoder-py==0.1.12      # MIT; bundles ARM astc-encoder (Apache-2.0)
+etcpak==0.9.15               # MIT; bundles wolfpld/etcpak (BSD-3-Clause)
+texture2ddecoder==1.0.6      # MIT (BC decoders)
+archspec==0.2.7              # Apache-2.0 / MIT; CPU feature detection used by astc-encoder-py and etcpak
+numpy==2.2.6 ; python_version < "3.14"   # BSD-3-Clause
+numpy==2.3.5 ; python_version >= "3.14"
