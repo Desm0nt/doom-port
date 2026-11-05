@@ -1183,17 +1183,31 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public void onInputDeviceChanged(int id) { updatePadVisibility(); }
     @Override public void onInputDeviceRemoved(int id) { if (libraryLoaded) nativePadRemoved(id); updatePadVisibility(); }
 
-    // [DOOM] A real controller connected (external gamepad / joystick): the on-screen pad hides all but the settings button,
-    // and comes back when the last one is disconnected.
+    // [DOOM] A real controller connected: the on-screen pad hides all but the settings button, and comes back when the last one is
+    // disconnected. Only a device that looks like a game controller counts: an external one (USB / Bluetooth) with face buttons or a
+    // stick, or a built-in one (handheld consoles) with both. HyperOS phones list built-in input devices that call themselves gamepad /
+    // joystick without being one (POCO F6, GitHub issue #5): with the old "any gamepad / joystick source" test the pad never showed there.
     private static boolean physicalController(InputDevice d) {
         if (d == null || d.isVirtual()) return false;
         int s = d.getSources();
-        return (s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK;
+        if ((s & InputDevice.SOURCE_GAMEPAD) != InputDevice.SOURCE_GAMEPAD && (s & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK) return false;
+        boolean[] k = d.hasKeys(KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_Y);
+        boolean buttons = k[0] && k[1] && (k[2] || k[3]);
+        boolean stick = d.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null && d.getMotionRange(MotionEvent.AXIS_Y, InputDevice.SOURCE_JOYSTICK) != null;
+        return d.isExternal() ? buttons || stick : buttons && stick;
     }
+    private String lastInputDevices;
     void updatePadVisibility() {
         if (doomPad == null) return;
-        boolean any = false;
-        for (int id : InputDevice.getDeviceIds()) if (physicalController(InputDevice.getDevice(id))) { any = true; break; }
+        boolean any = false; StringBuilder list = new StringBuilder();
+        for (int id : InputDevice.getDeviceIds()) {
+            InputDevice d = InputDevice.getDevice(id); if (d == null) continue;
+            boolean c = physicalController(d); any |= c;
+            list.append("\n  ").append(id).append(" \"").append(d.getName()).append("\" sources 0x").append(Integer.toHexString(d.getSources()))
+                .append(d.isVirtual() ? " virtual" : "").append(d.isExternal() ? " external" : " built-in").append(c ? " -> controller" : "");
+        }
+        String s = list.toString();   // one log per change: which device hides the on-screen pad is visible in boot.log
+        if (!s.equals(lastInputDevices)) { lastInputDevices = s; android.util.Log.i("dm", "[input] devices (on-screen pad " + (any ? "hidden: controller" : "shown") + "):" + s); }
         doomPad.setControllerMode(any);
     }
     @Override public void onDisplayAdded(int id) { updateRefresh(); }

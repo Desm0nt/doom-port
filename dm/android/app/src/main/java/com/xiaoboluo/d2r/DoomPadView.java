@@ -82,6 +82,9 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     private static boolean hostLook = true;   // false when the native library lacks nativeLookDelta
     private long lookNanos;
     private float opacity = 1, sizeK = 1; private boolean shown = true, lookOn = true;
+    // "split" (doom_controls, the editor's Grouped / Separate button; GitHub issue #9): every button is placed on its own: the A/B/X/Y
+    // diamond is no group and the d-pad becomes four buttons. Off (default) = as before: the diamond and the d-pad move as one.
+    private boolean split;
     private String preset = PRESET_GAME; private int builtFor = -2;   // the layout the controls were built for (-1 game, 0 tablet, 1 phone)
     private final Set<Integer> sent = new HashSet<>();   // keys held down in the game
     private Runnable editDone;
@@ -113,7 +116,10 @@ public class DoomPadView extends View implements FrontMenu.Pad {
             ctls.add(new Ctl("r", "R", B, KeyEvent.KEYCODE_E, 0.84f, 0.09f, 0, 0, 26, 26, false)); ctls.add(new Ctl("zr", "ZR", B, KeyEvent.KEYCODE_CTRL_LEFT, 0.95f, 0.09f, 0, 0, 28, 28, false));
             ctls.add(new Ctl("plus", "+", B, KeyEvent.KEYCODE_TAB, 0.62f, 0.09f, 0, 0, 22, 22, false));
             // left: the d-pad (one control, 8 directions; drawn as DOOM's four buttons), L / ZL, "-", the gear in the middle
-            ctls.add(new Ctl("dpad", "", K_DPAD, 0, DPAD_FX, DPAD_FY, 0, 0, GAP + 24, GAP + 24, false));
+            if (split) {   // "split" (editor toggle): the d-pad's four buttons are separate controls, each placed on its own
+                ctls.add(new Ctl("dpad_up", "↑", B, KeyEvent.KEYCODE_DPAD_UP, DPAD_FX, DPAD_FY, 0, -GAP, 24, 24, false)); ctls.add(new Ctl("dpad_right", "→", B, KeyEvent.KEYCODE_DPAD_RIGHT, DPAD_FX, DPAD_FY, GAP, 0, 24, 24, false));
+                ctls.add(new Ctl("dpad_down", "↓", B, KeyEvent.KEYCODE_DPAD_DOWN, DPAD_FX, DPAD_FY, 0, GAP, 24, 24, false)); ctls.add(new Ctl("dpad_left", "←", B, KeyEvent.KEYCODE_DPAD_LEFT, DPAD_FX, DPAD_FY, -GAP, 0, 24, 24, false));
+            } else ctls.add(new Ctl("dpad", "", K_DPAD, 0, DPAD_FX, DPAD_FY, 0, 0, GAP + 24, GAP + 24, false));
             ctls.add(new Ctl("l", "L", B, KeyEvent.KEYCODE_Q, 0.16f, 0.09f, 0, 0, 26, 26, false)); ctls.add(new Ctl("zl", "ZL", B, KeyEvent.KEYCODE_SHIFT_LEFT, 0.05f, 0.09f, 0, 0, 28, 28, false));
             ctls.add(new Ctl("minus", "-", B, KeyEvent.KEYCODE_M, 0.38f, 0.09f, 0, 0, 22, 22, false));
             ctls.add(new Ctl("menu", "⚙", K_MENU, SETTINGS, 0.50f, 0.09f, 0, 0, 20, 20, false));
@@ -121,12 +127,18 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         } else if (skin.theme != null) {   // nx2android's ergonomic layout
             for (PadTheme.Ctl c : skin.theme.layouts[layout]) {
                 int kind = c.kind == PadTheme.STICK_L || c.kind == PadTheme.STICK_R ? K_STICK : c.kind == PadTheme.DPAD ? K_DPAD : c.kind == PadTheme.MENU ? K_MENU : K_BUTTON;
+                if (kind == K_DPAD && split) {   // the same four separate buttons in the theme's d-pad box (thirds of it)
+                    float t = c.w / 3; String[] n = {"dpad_up", "dpad_right", "dpad_down", "dpad_left"}, lab = {"↑", "→", "↓", "←"};
+                    int[] key = {KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT}; float[][] o = {{0, -t}, {t, 0}, {0, t}, {-t, 0}};
+                    for (int i = 0; i < 4; i++) ctls.add(new Ctl(n[i], lab[i], K_BUTTON, key[i], c.ax, c.y + o[i][1], c.x + o[i][0], 0, t / 2, t / 2, true));
+                    continue;
+                }
                 Ctl k = new Ctl(c.name, c.kind == PadTheme.MENU ? "⚙" : c.label, kind, kind == K_MENU ? SETTINGS : keyOf(c.btn), c.ax, c.y, c.x, 0, c.w / 2, c.h / 2, true);
                 if (kind == K_STICK) { k.right = c.kind == PadTheme.STICK_R; k.clickKey = k.right ? KeyEvent.KEYCODE_BUTTON_THUMBR : KeyEvent.KEYCODE_BUTTON_THUMBL; k.grab = 1.15f; }
                 ctls.add(k);
             }
         }
-        for (Ctl c : ctls) if (c.kind == K_BUTTON && ("a".equals(c.name) || "b".equals(c.name) || "x".equals(c.name) || "y".equals(c.name))) c.group = "abxy";
+        if (!split) for (Ctl c : ctls) if (c.kind == K_BUTTON && ("a".equals(c.name) || "b".equals(c.name) || "x".equals(c.name) || "y".equals(c.name))) c.group = "abxy";
         loadPlaces();
     }
     static int keyOf(int btn) {   // DM_BTN_* -> the keycode front_android.c maps to it
@@ -182,6 +194,7 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         gearMode = p.getInt("gear_mode", GEAR_NORMAL) == GEAR_NORMAL ? GEAR_NORMAL : GEAR_FADED; gearAlpha = Math.max(1, Math.min(100, p.getInt("gear_alpha", GEAR_ALPHA_DEFAULT)));
         opacity = Math.max(5, Math.min(100, p.getInt("opacity", OPACITY_DEFAULT))) / 100f; sizeK = Math.max(60, Math.min(160, p.getInt("size", SIZE_DEFAULT))) / 100f;
         shown = p.getBoolean("shown", true); lookOn = p.getBoolean("look_on", true); tick = p.getBoolean("tick", false);
+        boolean sp = p.getBoolean("split", false); if (sp != split) { split = sp; if (builtFor != -2) { releaseAll(); builtFor = -2; } }
         String pr = p.getString("preset", defPreset); if (!pr.equals(preset)) { preset = pr; builtFor = -2; }
         if (builtFor != -2) loadPlaces();
         skinPack = p.getString("skin", defSkin);
@@ -401,11 +414,19 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         Runnable d = editDone; editDone = null; if (d != null) d.run();
     }
     @Override public void resetLayout() { ensureBuilt(); for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; } savePlaces(); invalidate(); }
-    private RectF edButton(int k) {   // the toolbar at the top middle: - + Reset Cancel Save
-        float H = getHeight(), bw = H * 0.17f, bh = H * 0.085f, gap = H * 0.02f, total = 5 * bw + 4 * gap, x0 = (getWidth() - total) / 2, y0 = H * 0.035f;
+    private static final int ED_BUTTONS = 6;
+    private RectF edButton(int k) {   // the toolbar at the top middle: - + Grouped/Separate Reset Cancel Save
+        float H = getHeight(), bw = H * 0.17f, bh = H * 0.085f, gap = H * 0.02f, total = ED_BUTTONS * bw + (ED_BUTTONS - 1) * gap, x0 = (getWidth() - total) / 2, y0 = H * 0.035f;
         return new RectF(x0 + k * (bw + gap), y0, x0 + k * (bw + gap) + bw, y0 + bh);
     }
-    private int edButtonAt(float x, float y) { for (int k = 0; k < 5; k++) if (edButton(k).contains(x, y)) return k; return -1; }
+    private int edButtonAt(float x, float y) { for (int k = 0; k < ED_BUTTONS; k++) if (edButton(k).contains(x, y)) return k; return -1; }
+    // Grouped / Separate in the editor: the places so far are saved, the controls rebuilt, and Cancel goes back to the new set as it is now
+    private void edToggleSplit() {
+        savePlaces(); split = !split; prefs().edit().putBoolean("split", split).apply();
+        android.util.Log.i("dm", "[java] layout editor: " + (split ? "every button on its own" : "ABXY and d-pad grouped"));
+        build(builtFor); edSel = null; edGroup.clear();
+        edSaved = new float[ctls.size()][]; for (int i = 0; i < ctls.size(); i++) { Ctl c = ctls.get(i); edSaved[i] = new float[] {c.px, c.py, c.ps}; }
+    }
     private void edResize(Ctl c, float s) { c.ps = Math.max(0.5f, Math.min(2.5f, s)); }
     private void edPlace(Ctl c, float cx, float cy) { c.px = Math.max(0, Math.min(1, cx / getWidth())); c.py = Math.max(0, Math.min(1, cy / getHeight())); }
     // A group (c.group) is edited as one: the members' centres and sizes when the finger went down, moved by the same offset or scaled about their centre
@@ -449,8 +470,9 @@ public class DoomPadView extends View implements FrontMenu.Pad {
             int bt = edBtnDown; edPtr = edPtr2 = -1; edBtnDown = -1;
             if (bt >= 0 && a != MotionEvent.ACTION_CANCEL && bt == edButtonAt(e.getX(ai), e.getY(ai))) {
                 if (bt == 0 || bt == 1) { float f = bt == 1 ? 1.1f : 1 / 1.1f; if (edSel != null) { edGrab(edSel); edScaleGroup(f); } else for (Ctl c : ctls) edResize(c, c.ps * f); }
-                else if (bt == 2) { for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; } edSel = null; }
-                else if (bt == 3) { endEdit(false); return; }
+                else if (bt == 2) edToggleSplit();
+                else if (bt == 3) { for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; } edSel = null; }
+                else if (bt == 4) { endEdit(false); return; }
                 else { endEdit(true); return; }
             }
             invalidate();
@@ -513,10 +535,11 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         c.drawText(k.label, x, y + text.getTextSize() * 0.35f, text);
     }
     private void drawEditor(Canvas c) {
-        boolean ru = Ui.ru(getContext()); String[] names = ru ? new String[] {"−", "+", "Сброс", "Отмена", "Сохранить"} : new String[] {"−", "+", "Reset", "Cancel", "Save"};
+        boolean ru = Ui.ru(getContext());
+        String[] names = ru ? new String[] {"−", "+", split ? "Раздельно" : "Группами", "Сброс", "Отмена", "Сохранить"} : new String[] {"−", "+", split ? "Separate" : "Grouped", "Reset", "Cancel", "Save"};
         text.setTextSize(getHeight() * 0.04f); text.setColor(0xffffffff);
-        for (int k = 0; k < 5; k++) {
-            RectF r = edButton(k); fill.setColor(k == edBtnDown ? 0xff1fb6c9 : k == 4 ? 0xe0157c8a : 0xd0202833); line.setColor(0xff7fe3f0); line.setStrokeWidth(1.5f * dp);
+        for (int k = 0; k < ED_BUTTONS; k++) {
+            RectF r = edButton(k); fill.setColor(k == edBtnDown ? 0xff1fb6c9 : k == ED_BUTTONS - 1 ? 0xe0157c8a : 0xd0202833); line.setColor(0xff7fe3f0); line.setStrokeWidth(1.5f * dp);
             float rad = r.height() / 2; c.drawRoundRect(r, rad, rad, fill); c.drawRoundRect(r, rad, rad, line);
             c.drawText(names[k], r.centerX(), r.centerY() + text.getTextSize() * 0.35f, text);
         }
@@ -527,8 +550,8 @@ public class DoomPadView extends View implements FrontMenu.Pad {
             c.drawRoundRect(new RectF(l - 4 * dp, t - 4 * dp, r + 4 * dp, bt + 4 * dp), 12 * dp, 12 * dp, line); }
         line.setStrokeWidth(2 * dp);
         text.setTextSize(getHeight() * 0.032f); text.setAlpha(220);
-        c.drawText(ru ? "Тяните контрол пальцем (ромб ABXY — целиком), второй палец — размер; −/+ без выбора меняют все"
-                      : "Drag a control (the ABXY diamond moves as one); a second finger resizes it; − / + with none chosen resize all",
+        c.drawText(ru ? (split ? "Тяните контрол пальцем (каждая кнопка отдельно)" : "Тяните контрол пальцем (ромб ABXY и крестовина — целиком)") + ", второй палец — размер; −/+ без выбора меняют все"
+                      : (split ? "Drag a control (every button on its own)" : "Drag a control (the ABXY diamond and the d-pad move as one)") + "; a second finger resizes it; − / + with none chosen resize all",
             getWidth() / 2f, getHeight() * 0.18f, text);
     }
 }
