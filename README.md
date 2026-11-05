@@ -9,7 +9,7 @@ You bring the game: this repository contains no game content.
 **Install:** step-by-step guide for players — [docs/INSTALL.md](docs/INSTALL.md) (English) ·
 [docs/INSTALL.ru.md](docs/INSTALL.ru.md) (по-русски). In short: dump your own game + update v262144 and `prod.keys`,
 put them into `put-game-files-here/`, double-click `setup.bat` (or `bash setup.sh`), copy `work/DOOM Mobile` to the
-phone's `Download` folder and install the [APK](https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk).
+phone's `Download` folder and install the APK from the [latest release](https://github.com/Desm0nt/doom-port/releases/latest).
 
 > **Tested so far on Adreno 750 (Snapdragon 8 Gen 3, Xiaomi 14 Ultra) and Adreno 740 (Snapdragon 8 Gen 2).** Other GPUs
 > are untested. Adreno 6xx/7xx use the bundled Mesa **Turnip** Vulkan driver by default; other Adreno generations get
@@ -180,7 +180,7 @@ Full guide: **[docs/INSTALL.md](docs/INSTALL.md)** (English) / **[docs/INSTALL.r
    checks the inputs and the free space (~50 GB while preparing), then extracts, patches and translates everything into
    `work/DOOM Mobile` (~22 GB). Technical details: [docs/doom/GAME_FILES.md](docs/doom/GAME_FILES.md).
 3. Copy `work/DOOM Mobile` to the phone's `Download` folder (USB cable, *File transfer* mode) and install the APK
-   ([latest](https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk), or build it yourself,
+   ([latest release](https://github.com/Desm0nt/doom-port/releases/latest), `DOOM-Mobile-v<version>-arm64.apk`, or build it yourself,
    see *Building*).
 4. Start *DOOM Mobile* and allow *All files access* when asked.
 

@@ -165,13 +165,12 @@ or OpenMTP; on Linux the file manager usually shows the phone directly.
 
 ## Step 6. Install the app
 
-On the phone, open this link and install the APK:
+On the phone, open the latest release and install its APK from *Assets*:
 
-**<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk>**
+**<https://github.com/Desm0nt/doom-port/releases/latest>**
 
-Android 10 or 11: install this one instead (the same game, built for older Android; not yet tested on a real Android 10 device):
-
-**<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64-android10.apk>**
+- Android 12 or newer: `DOOM-Mobile-v<version>-arm64.apk`;
+- Android 10 or 11: `DOOM-Mobile-v<version>-arm64-android10.apk` (the same game, built for older Android; not yet tested on a real Android 10 device).
 
 (Release notes and older versions: <https://github.com/Desm0nt/doom-port/releases>.) Android asks you to allow
 installing apps from your browser or file manager the first time.

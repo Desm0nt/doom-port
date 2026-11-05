@@ -165,13 +165,12 @@ doom-port-main/
 
 ## Шаг 6. Установите приложение
 
-Откройте на телефоне ссылку и установите APK:
+Откройте на телефоне последний релиз и установите APK из раздела *Assets*:
 
-**<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk>**
+**<https://github.com/Desm0nt/doom-port/releases/latest>**
 
-Android 10 или 11: ставьте вместо него этот (та же игра, собранная под старый Android; на настоящем Android 10 ещё не проверена):
-
-**<https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64-android10.apk>**
+- Android 12 и новее: `DOOM-Mobile-v<версия>-arm64.apk`;
+- Android 10 или 11: `DOOM-Mobile-v<версия>-arm64-android10.apk` (та же игра, собранная под старый Android; на настоящем Android 10 ещё не проверена).
 
 (Описание версий и старые сборки: <https://github.com/Desm0nt/doom-port/releases>.) В первый раз Android попросит
 разрешить установку приложений из браузера или файлового менеджера.
