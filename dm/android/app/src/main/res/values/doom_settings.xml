@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">Game files were not found in Download/DOOM Mobile. On a PC, run setup with your own game files, then copy the \"DOOM Mobile\" folder it makes to the phone\'s Download folder.</string>
     <string name="doom_start_missing_modules">The patched game modules are missing (Download/DOOM Mobile/dm/out). Run setup on the PC again and copy the whole \"DOOM Mobile\" folder to the phone\'s Download folder again.</string>
     <string name="doom_start_missing_shaders">The shaders are missing (Download/DOOM Mobile/dm/shaders). Run setup on the PC again and copy the whole \"DOOM Mobile\" folder to the phone\'s Download folder again.</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">Game folder</string>
+    <string name="folder_auto_fmt">%1$s (found automatically)</string>
+    <string name="folder_custom_fmt">%1$s (your choice)</string>
+    <string name="folder_next_fmt">From the next launch: %1$s</string>
+    <string name="folder_next_auto">automatic search</string>
+    <string name="folder_none">No game folder found</string>
+    <string name="folder_choose">Choose…</string>
+    <string name="folder_choose_start">Choose the game folder…</string>
+    <string name="folder_title">Game folder</string>
+    <string name="folder_help">Choose the \"DOOM Mobile\" folder (the one with romfs and dm inside) or the folder that holds it. Without a choice the game looks for Download/DOOM Mobile on the phone\'s storage, SD cards and USB drives.</string>
+    <string name="folder_sd_warning">An SD card or USB drive is slower than the phone\'s own storage: expect longer loading and possible stutter.</string>
+    <string name="folder_browse">Browse… (system folder picker)</string>
+    <string name="folder_path_hint">Path, e.g. /storage/XXXX-XXXX/Download/DOOM Mobile</string>
+    <string name="folder_use_path">Use this path</string>
+    <string name="folder_reset">Reset to automatic</string>
+    <string name="folder_bad">This folder cannot be used:\n%1$s\n%2$s</string>
+    <string name="folder_not_path">This is not a folder on the phone\'s storage, an SD card or a USB drive. Choose a folder there, or type its path.</string>
+    <string name="folder_no_picker">This phone has no system folder picker: type the path instead.</string>
+    <string name="folder_set_next">Game folder saved: %1$s. It is used from the next launch.</string>
+    <string name="folder_set_now">Game folder: %1$s</string>
+    <string name="folder_unavailable">The chosen game folder %1$s cannot be used (%2$s). Found automatically and used instead: %3$s</string>
+    <string name="folder_searched">Searched:</string>
+    <string name="folder_why_ok">complete</string>
+    <string name="folder_why_missing">not found</string>
+    <string name="folder_why_unreadable">cannot be read (Android 10 may keep SD cards and USB drives closed to apps)</string>
+    <string name="folder_why_romfs">no romfs folder</string>
+    <string name="folder_why_modules">patched game modules missing (dm/out)</string>
+    <string name="folder_why_shaders">shaders missing (dm/shaders)</string>
 </resources>

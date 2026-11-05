@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">Download/DOOM Mobile にゲームファイルが見つかりません。PC で自分のゲームファイルを使って setup を実行し、作成された「DOOM Mobile」フォルダをスマートフォンの Download フォルダにコピーしてください。</string>
     <string name="doom_start_missing_modules">パッチ済みのゲームモジュールがありません（Download/DOOM Mobile/dm/out）。PC で setup をもう一度実行し、「DOOM Mobile」フォルダ全体をスマートフォンの Download フォルダにコピーし直してください。</string>
     <string name="doom_start_missing_shaders">シェーダーがありません（Download/DOOM Mobile/dm/shaders）。PC で setup をもう一度実行し、「DOOM Mobile」フォルダ全体をスマートフォンの Download フォルダにコピーし直してください。</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">ゲームフォルダ</string>
+    <string name="folder_auto_fmt">%1$s（自動検出）</string>
+    <string name="folder_custom_fmt">%1$s（手動で選択）</string>
+    <string name="folder_next_fmt">次回起動から: %1$s</string>
+    <string name="folder_next_auto">自動検索</string>
+    <string name="folder_none">ゲームフォルダが見つかりません</string>
+    <string name="folder_choose">選択…</string>
+    <string name="folder_choose_start">ゲームフォルダを選択…</string>
+    <string name="folder_title">ゲームフォルダ</string>
+    <string name="folder_help">「DOOM Mobile」フォルダ（romfs と dm が入っているフォルダ）か、それを含むフォルダを選んでください。選ばない場合は、本体ストレージ、SD カード、USB ドライブの Download/DOOM Mobile を探します。</string>
+    <string name="folder_sd_warning">SD カードや USB ドライブは本体ストレージより遅いため、読み込みが長くなり、カクつくことがあります。</string>
+    <string name="folder_browse">参照…（システムのフォルダ選択）</string>
+    <string name="folder_path_hint">パス（例: /storage/XXXX-XXXX/Download/DOOM Mobile）</string>
+    <string name="folder_use_path">このパスを使う</string>
+    <string name="folder_reset">自動に戻す</string>
+    <string name="folder_bad">このフォルダは使えません:\n%1$s\n%2$s</string>
+    <string name="folder_not_path">これは本体ストレージ、SD カード、USB ドライブ上のフォルダではありません。そこでフォルダを選ぶか、パスを入力してください。</string>
+    <string name="folder_no_picker">この端末にはシステムのフォルダ選択がありません。パスを入力してください。</string>
+    <string name="folder_set_next">ゲームフォルダを保存しました: %1$s。次回起動から使われます。</string>
+    <string name="folder_set_now">ゲームフォルダ: %1$s</string>
+    <string name="folder_unavailable">選択したゲームフォルダ %1$s は使えません（%2$s）。代わりに自動検出したフォルダを使います: %3$s</string>
+    <string name="folder_searched">検索した場所:</string>
+    <string name="folder_why_ok">揃っています</string>
+    <string name="folder_why_missing">見つかりません</string>
+    <string name="folder_why_unreadable">読み取れません（Android 10 では SD カードや USB ドライブにアプリがアクセスできない場合があります）</string>
+    <string name="folder_why_romfs">romfs フォルダがありません</string>
+    <string name="folder_why_modules">パッチ済みのゲームモジュールがありません（dm/out）</string>
+    <string name="folder_why_shaders">シェーダーがありません（dm/shaders）</string>
 </resources>

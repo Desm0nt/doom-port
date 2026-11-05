@@ -46,8 +46,12 @@ android {
         targetSdk 36
         // 跟发布版本走：versionName = 发布版本号，versionCode = 主 × 10000 + 次 × 100 + 修订（2.0.0 → 20000），只增不减，旧版才能被覆盖升级
         // Follows the release: versionName = release version, versionCode = major × 10000 + minor × 100 + patch (2.0.0 → 20000), only ever increasing so older installs upgrade in place
-        versionCode 20001
-        versionName '2.0.1'
+        // [DOOM] the DOOM release version (doom/VERSION, e.g. 0.4.14) instead of d2r-mobile's 2.0.1: versionCode = 100000 + major x 10000 +
+        // minor x 100 + patch (0.4.14 -> 100414), above d2r's 20001 that every DOOM APK up to v0.4.13 carried, so they upgrade in place
+        def doomVer = project.findProperty('dmGame') == 'doom' ? file('../doom/VERSION').text.trim() : null
+        def doomNum = doomVer ? doomVer.tokenize('.').collect { it as int } : null
+        versionCode doomNum ? 100000 + doomNum[0] * 10000 + doomNum[1] * 100 + doomNum[2] : 20001
+        versionName doomVer ?: '2.0.1'
         ndk { abiFilters 'arm64-v8a' }
         if (!prebuilt) externalNativeBuild { cmake {
             arguments "-DDM_GEN_DIR=${project.findProperty('dmGenDir') ?: ''}"

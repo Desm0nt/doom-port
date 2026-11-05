@@ -20,7 +20,7 @@ import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
 // [DOOM] Crash reports the player can open with a file manager (BUGS_AND_FIXES 2.22), no button, nothing per frame.
-//   where: Download/DOOM Mobile/logs/crash.txt when the app can write there (all files access; the storage permission on the Android 10
+//   where: <game folder>/logs/crash.txt (Download/DOOM Mobile by default, GameFolder.java) when the app can write there (all files access; the storage permission on the Android 10
 //     build), else Android/data/<package>/files/logs/crash.txt. Overwritten each time; the one before is kept as crash.prev.txt.
 //   when: (1) a Java exception (DmActivity's uncaught exception handler: written at once); (2) a start / boot failure that shows an error
 //     screen (written at once, the screen names the file); (3) at the next start, when the last run did not end cleanly: the native crash
@@ -36,10 +36,11 @@ final class CrashLog {
 
     private CrashLog() {}
 
-    // Download/DOOM Mobile/logs (writable), else <external files>/logs, else <files>/logs.
+    // <game folder>/logs (GameFolder: Download/DOOM Mobile or the player's folder, e.g. on an SD card; issue #11), else Download/DOOM Mobile/logs
+    // (writable), else <external files>/logs, else <files>/logs.
     static File dir(Context c) {
-        File pub = new File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), DmActivity.FRONT_DATA_DIR + "/logs");
-        try { if (SaveTransfer.allFilesAccess(c) && (pub.isDirectory() || pub.mkdirs()) && pub.canWrite()) return pub; } catch (RuntimeException e) { /* storage not ready */ }
+        File pub = GameFolder.writable(c, "logs");
+        if (pub != null) return pub;
         File ext = c.getExternalFilesDir(null);
         File d = ext != null ? new File(ext, "logs") : new File(c.getFilesDir(), "logs");
         if (!d.isDirectory() && !d.mkdirs()) d = new File(c.getFilesDir(), "logs");

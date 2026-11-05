@@ -6,7 +6,7 @@ Android-обёрткой (`jni_android.c`, `setenv(..., 0)` — не перек�
 
 ## Как задать переключатель
 
-- **`dm/env`** — файл `/sdcard/Download/DOOM Mobile/dm/env`, строки `KEY=VALUE`, `#` — комментарий. Читается при старте
+- **`dm/env`** — файл `/sdcard/Download/DOOM Mobile/dm/env` (точнее `<папка игры>/dm/env`: папка может быть на SD/USB или выбрана в ⚙, BUGS_AND_FIXES 2.28), строки `KEY=VALUE`, `#` — комментарий. Читается при старте
   (`load_env_file` в `jni_android.c`) до умолчаний APK. Все серии (`play_series.sh`, `diag_run.sh`, `ab_run.sh`) пишут его
   сами и в конце удаляют. **Если хозяин играет сам — проверить, что старого `dm/env` не осталось.**
 - **Маркер-файлы** в `dm/` (`gfx-dump-now`, `gfx-capture-now`, `gfx-pipe-skip`, `gfx-lone-lane`, `gfx-noload`, `gfx-tex-dirty`

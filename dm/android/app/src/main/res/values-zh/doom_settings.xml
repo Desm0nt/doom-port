@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">在 Download/DOOM Mobile 里没有找到游戏文件。请在电脑上用你自己的游戏文件运行 setup，再把它生成的「DOOM Mobile」文件夹拷到手机的 Download 文件夹。</string>
     <string name="doom_start_missing_modules">缺少打过补丁的游戏模块（Download/DOOM Mobile/dm/out）。请在电脑上重新运行 setup，再把整个「DOOM Mobile」文件夹重新拷到手机的 Download 文件夹。</string>
     <string name="doom_start_missing_shaders">缺少着色器（Download/DOOM Mobile/dm/shaders）。请在电脑上重新运行 setup，再把整个「DOOM Mobile」文件夹重新拷到手机的 Download 文件夹。</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">游戏文件夹</string>
+    <string name="folder_auto_fmt">%1$s（自动找到）</string>
+    <string name="folder_custom_fmt">%1$s（你选择的）</string>
+    <string name="folder_next_fmt">下次启动起：%1$s</string>
+    <string name="folder_next_auto">自动查找</string>
+    <string name="folder_none">没有找到游戏文件夹</string>
+    <string name="folder_choose">选择…</string>
+    <string name="folder_choose_start">选择游戏文件夹…</string>
+    <string name="folder_title">游戏文件夹</string>
+    <string name="folder_help">选择「DOOM Mobile」文件夹（里面有 romfs 和 dm），或包含它的文件夹。不选择时，游戏会在手机存储、SD 卡和 U 盘里查找 Download/DOOM Mobile。</string>
+    <string name="folder_sd_warning">SD 卡或 U 盘比手机自身存储慢：加载会更久，可能出现卡顿。</string>
+    <string name="folder_browse">浏览…（系统文件夹选择器）</string>
+    <string name="folder_path_hint">路径，例如 /storage/XXXX-XXXX/Download/DOOM Mobile</string>
+    <string name="folder_use_path">使用这个路径</string>
+    <string name="folder_reset">恢复自动查找</string>
+    <string name="folder_bad">这个文件夹不能使用：\n%1$s\n%2$s</string>
+    <string name="folder_not_path">这不是手机存储、SD 卡或 U 盘上的文件夹。请在那里选择文件夹，或输入它的路径。</string>
+    <string name="folder_no_picker">这台手机没有系统文件夹选择器：请直接输入路径。</string>
+    <string name="folder_set_next">已保存游戏文件夹：%1$s。下次启动起生效。</string>
+    <string name="folder_set_now">游戏文件夹：%1$s</string>
+    <string name="folder_unavailable">选择的游戏文件夹 %1$s 不能使用（%2$s）。改用自动找到的：%3$s</string>
+    <string name="folder_searched">查找过的位置：</string>
+    <string name="folder_why_ok">完整</string>
+    <string name="folder_why_missing">未找到</string>
+    <string name="folder_why_unreadable">无法读取（Android 10 可能不让应用访问 SD 卡和 U 盘）</string>
+    <string name="folder_why_romfs">没有 romfs 文件夹</string>
+    <string name="folder_why_modules">缺少打过补丁的游戏模块（dm/out）</string>
+    <string name="folder_why_shaders">缺少着色器（dm/shaders）</string>
 </resources>

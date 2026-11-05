@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">Файли гри не знайдено в Download/DOOM Mobile. Запустіть на ПК setup зі своїми файлами гри й скопіюйте створену ним теку «DOOM Mobile» до теки Download на телефоні.</string>
     <string name="doom_start_missing_modules">Немає пропатчених модулів гри (Download/DOOM Mobile/dm/out). Запустіть setup на ПК ще раз і знову скопіюйте всю теку «DOOM Mobile» до Download на телефоні.</string>
     <string name="doom_start_missing_shaders">Немає шейдерів (Download/DOOM Mobile/dm/shaders). Запустіть setup на ПК ще раз і знову скопіюйте всю теку «DOOM Mobile» до Download на телефоні.</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">Тека гри</string>
+    <string name="folder_auto_fmt">%1$s (знайдена автоматично)</string>
+    <string name="folder_custom_fmt">%1$s (обрана вами)</string>
+    <string name="folder_next_fmt">З наступного запуску: %1$s</string>
+    <string name="folder_next_auto">автоматичний пошук</string>
+    <string name="folder_none">Теку гри не знайдено</string>
+    <string name="folder_choose">Обрати…</string>
+    <string name="folder_choose_start">Обрати теку гри…</string>
+    <string name="folder_title">Тека гри</string>
+    <string name="folder_help">Оберіть теку «DOOM Mobile» (у ній romfs і dm) або теку, у якій вона лежить. Без вибору гра шукає Download/DOOM Mobile у пам\'яті телефона, на SD-картках і USB-накопичувачах.</string>
+    <string name="folder_sd_warning">SD-картка або USB-накопичувач повільніші за пам\'ять телефона: завантаження триватимуть довше, можливі підгальмовування.</string>
+    <string name="folder_browse">Огляд… (системний вибір теки)</string>
+    <string name="folder_path_hint">Шлях, наприклад /storage/XXXX-XXXX/Download/DOOM Mobile</string>
+    <string name="folder_use_path">Використати цей шлях</string>
+    <string name="folder_reset">Скинути на автоматичний</string>
+    <string name="folder_bad">Цю теку не можна використати:\n%1$s\n%2$s</string>
+    <string name="folder_not_path">Це не тека в пам\'яті телефона, на SD-картці чи USB-накопичувачі. Оберіть теку там або введіть її шлях.</string>
+    <string name="folder_no_picker">На цьому телефоні немає системного вибору теки: введіть шлях вручну.</string>
+    <string name="folder_set_next">Теку гри збережено: %1$s. Вона використовуватиметься з наступного запуску.</string>
+    <string name="folder_set_now">Тека гри: %1$s</string>
+    <string name="folder_unavailable">Обрану теку гри %1$s не можна використати (%2$s). Замість неї знайдено автоматично: %3$s</string>
+    <string name="folder_searched">Де шукали:</string>
+    <string name="folder_why_ok">усе на місці</string>
+    <string name="folder_why_missing">не знайдено</string>
+    <string name="folder_why_unreadable">не читається (Android 10 може закривати SD-картки й USB-накопичувачі від застосунків)</string>
+    <string name="folder_why_romfs">немає теки romfs</string>
+    <string name="folder_why_modules">немає пропатчених модулів гри (dm/out)</string>
+    <string name="folder_why_shaders">немає шейдерів (dm/shaders)</string>
 </resources>

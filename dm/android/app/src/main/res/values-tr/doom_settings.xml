@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">Oyun dosyaları Download/DOOM Mobile içinde bulunamadı. Bilgisayarda kendi oyun dosyalarınızla setup\'ı çalıştırın ve oluşturduğu \"DOOM Mobile\" klasörünü telefonun Download klasörüne kopyalayın.</string>
     <string name="doom_start_missing_modules">Yamalı oyun modülleri eksik (Download/DOOM Mobile/dm/out). Bilgisayarda setup\'ı yeniden çalıştırın ve \"DOOM Mobile\" klasörünün tamamını telefonun Download klasörüne yeniden kopyalayın.</string>
     <string name="doom_start_missing_shaders">Gölgelendiriciler eksik (Download/DOOM Mobile/dm/shaders). Bilgisayarda setup\'ı yeniden çalıştırın ve \"DOOM Mobile\" klasörünün tamamını telefonun Download klasörüne yeniden kopyalayın.</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">Oyun klasörü</string>
+    <string name="folder_auto_fmt">%1$s (otomatik bulundu)</string>
+    <string name="folder_custom_fmt">%1$s (sizin seçiminiz)</string>
+    <string name="folder_next_fmt">Sonraki açılıştan itibaren: %1$s</string>
+    <string name="folder_next_auto">otomatik arama</string>
+    <string name="folder_none">Oyun klasörü bulunamadı</string>
+    <string name="folder_choose">Seç…</string>
+    <string name="folder_choose_start">Oyun klasörünü seç…</string>
+    <string name="folder_title">Oyun klasörü</string>
+    <string name="folder_help">\"DOOM Mobile\" klasörünü (içinde romfs ve dm olanı) ya da onu içeren klasörü seçin. Seçim yapılmazsa oyun Download/DOOM Mobile klasörünü telefon belleğinde, SD kartlarda ve USB sürücülerde arar.</string>
+    <string name="folder_sd_warning">SD kart veya USB sürücü telefonun kendi belleğinden yavaştır: yüklemeler uzar, takılmalar olabilir.</string>
+    <string name="folder_browse">Gözat… (sistem klasör seçici)</string>
+    <string name="folder_path_hint">Yol, örn. /storage/XXXX-XXXX/Download/DOOM Mobile</string>
+    <string name="folder_use_path">Bu yolu kullan</string>
+    <string name="folder_reset">Otomatiğe sıfırla</string>
+    <string name="folder_bad">Bu klasör kullanılamaz:\n%1$s\n%2$s</string>
+    <string name="folder_not_path">Bu, telefon belleğinde, SD kartta veya USB sürücüde bir klasör değil. Oradan bir klasör seçin ya da yolunu yazın.</string>
+    <string name="folder_no_picker">Bu telefonda sistem klasör seçici yok: yolu elle yazın.</string>
+    <string name="folder_set_next">Oyun klasörü kaydedildi: %1$s. Sonraki açılıştan itibaren kullanılacak.</string>
+    <string name="folder_set_now">Oyun klasörü: %1$s</string>
+    <string name="folder_unavailable">Seçilen oyun klasörü %1$s kullanılamıyor (%2$s). Yerine otomatik bulunan kullanılıyor: %3$s</string>
+    <string name="folder_searched">Aranan yerler:</string>
+    <string name="folder_why_ok">eksiksiz</string>
+    <string name="folder_why_missing">bulunamadı</string>
+    <string name="folder_why_unreadable">okunamıyor (Android 10, SD kartları ve USB sürücüleri uygulamalara kapatabilir)</string>
+    <string name="folder_why_romfs">romfs klasörü yok</string>
+    <string name="folder_why_modules">yamalı oyun modülleri eksik (dm/out)</string>
+    <string name="folder_why_shaders">gölgelendiriciler eksik (dm/shaders)</string>
 </resources>

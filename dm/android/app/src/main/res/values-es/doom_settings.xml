@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">No se encontraron los archivos del juego en Download/DOOM Mobile. En un PC, ejecuta setup con tus propios archivos del juego y copia la carpeta «DOOM Mobile» que crea a la carpeta Download del teléfono.</string>
     <string name="doom_start_missing_modules">Faltan los módulos parcheados del juego (Download/DOOM Mobile/dm/out). Ejecuta setup en el PC de nuevo y vuelve a copiar toda la carpeta «DOOM Mobile» a la carpeta Download del teléfono.</string>
     <string name="doom_start_missing_shaders">Faltan los shaders (Download/DOOM Mobile/dm/shaders). Ejecuta setup en el PC de nuevo y vuelve a copiar toda la carpeta «DOOM Mobile» a la carpeta Download del teléfono.</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">Carpeta del juego</string>
+    <string name="folder_auto_fmt">%1$s (encontrada automáticamente)</string>
+    <string name="folder_custom_fmt">%1$s (elegida por ti)</string>
+    <string name="folder_next_fmt">Desde el próximo inicio: %1$s</string>
+    <string name="folder_next_auto">búsqueda automática</string>
+    <string name="folder_none">No se encontró la carpeta del juego</string>
+    <string name="folder_choose">Elegir…</string>
+    <string name="folder_choose_start">Elegir la carpeta del juego…</string>
+    <string name="folder_title">Carpeta del juego</string>
+    <string name="folder_help">Elige la carpeta «DOOM Mobile» (la que contiene romfs y dm) o la carpeta que la contiene. Sin elección, el juego busca Download/DOOM Mobile en la memoria del teléfono, en tarjetas SD y en unidades USB.</string>
+    <string name="folder_sd_warning">Una tarjeta SD o una unidad USB es más lenta que la memoria del teléfono: las cargas tardarán más y puede haber tirones.</string>
+    <string name="folder_browse">Examinar… (selector de carpetas del sistema)</string>
+    <string name="folder_path_hint">Ruta, p. ej. /storage/XXXX-XXXX/Download/DOOM Mobile</string>
+    <string name="folder_use_path">Usar esta ruta</string>
+    <string name="folder_reset">Volver a automático</string>
+    <string name="folder_bad">Esta carpeta no se puede usar:\n%1$s\n%2$s</string>
+    <string name="folder_not_path">Esto no es una carpeta de la memoria del teléfono, de una tarjeta SD ni de una unidad USB. Elige una carpeta allí o escribe su ruta.</string>
+    <string name="folder_no_picker">Este teléfono no tiene selector de carpetas del sistema: escribe la ruta.</string>
+    <string name="folder_set_next">Carpeta del juego guardada: %1$s. Se usará desde el próximo inicio.</string>
+    <string name="folder_set_now">Carpeta del juego: %1$s</string>
+    <string name="folder_unavailable">La carpeta del juego elegida %1$s no se puede usar (%2$s). Se usa en su lugar la encontrada automáticamente: %3$s</string>
+    <string name="folder_searched">Dónde se buscó:</string>
+    <string name="folder_why_ok">completa</string>
+    <string name="folder_why_missing">no encontrada</string>
+    <string name="folder_why_unreadable">no se puede leer (Android 10 puede cerrar las tarjetas SD y unidades USB a las apps)</string>
+    <string name="folder_why_romfs">no hay carpeta romfs</string>
+    <string name="folder_why_modules">faltan los módulos del juego parcheados (dm/out)</string>
+    <string name="folder_why_shaders">faltan los shaders (dm/shaders)</string>
 </resources>

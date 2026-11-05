@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">Файлы игры не найдены в Download/DOOM Mobile. Запустите на ПК setup со своими файлами игры и скопируйте созданную им папку «DOOM Mobile» в папку Download на телефоне.</string>
     <string name="doom_start_missing_modules">Нет пропатченных модулей игры (Download/DOOM Mobile/dm/out). Запустите setup на ПК ещё раз и заново скопируйте всю папку «DOOM Mobile» в Download на телефоне.</string>
     <string name="doom_start_missing_shaders">Нет шейдеров (Download/DOOM Mobile/dm/shaders). Запустите setup на ПК ещё раз и заново скопируйте всю папку «DOOM Mobile» в Download на телефоне.</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">Папка игры</string>
+    <string name="folder_auto_fmt">%1$s (найдена автоматически)</string>
+    <string name="folder_custom_fmt">%1$s (выбрана вами)</string>
+    <string name="folder_next_fmt">Со следующего запуска: %1$s</string>
+    <string name="folder_next_auto">автоматический поиск</string>
+    <string name="folder_none">Папка игры не найдена</string>
+    <string name="folder_choose">Выбрать…</string>
+    <string name="folder_choose_start">Выбрать папку игры…</string>
+    <string name="folder_title">Папка игры</string>
+    <string name="folder_help">Выберите папку «DOOM Mobile» (в ней romfs и dm) или папку, в которой она лежит. Без выбора игра ищет Download/DOOM Mobile в памяти телефона, на SD-картах и USB-накопителях.</string>
+    <string name="folder_sd_warning">SD-карта или USB-накопитель медленнее памяти телефона: загрузки будут дольше, возможны подтормаживания.</string>
+    <string name="folder_browse">Обзор… (системный выбор папки)</string>
+    <string name="folder_path_hint">Путь, например /storage/XXXX-XXXX/Download/DOOM Mobile</string>
+    <string name="folder_use_path">Использовать этот путь</string>
+    <string name="folder_reset">Сбросить на автоматический</string>
+    <string name="folder_bad">Эту папку нельзя использовать:\n%1$s\n%2$s</string>
+    <string name="folder_not_path">Это не папка в памяти телефона, на SD-карте или USB-накопителе. Выберите папку там или введите её путь.</string>
+    <string name="folder_no_picker">На этом телефоне нет системного выбора папки: введите путь вручную.</string>
+    <string name="folder_set_next">Папка игры сохранена: %1$s. Она будет использоваться со следующего запуска.</string>
+    <string name="folder_set_now">Папка игры: %1$s</string>
+    <string name="folder_unavailable">Выбранную папку игры %1$s нельзя использовать (%2$s). Вместо неё найдена автоматически: %3$s</string>
+    <string name="folder_searched">Где искали:</string>
+    <string name="folder_why_ok">всё на месте</string>
+    <string name="folder_why_missing">не найдена</string>
+    <string name="folder_why_unreadable">не читается (Android 10 может закрывать SD-карты и USB-накопители от приложений)</string>
+    <string name="folder_why_romfs">нет папки romfs</string>
+    <string name="folder_why_modules">нет пропатченных модулей игры (dm/out)</string>
+    <string name="folder_why_shaders">нет шейдеров (dm/shaders)</string>
 </resources>

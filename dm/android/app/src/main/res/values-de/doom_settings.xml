@@ -56,4 +56,33 @@
     <string name="doom_start_missing_data">Keine Spieldateien in Download/DOOM Mobile gefunden. Führe auf dem PC setup mit deinen eigenen Spieldateien aus und kopiere den erzeugten Ordner „DOOM Mobile“ in den Download-Ordner des Telefons.</string>
     <string name="doom_start_missing_modules">Die gepatchten Spielmodule fehlen (Download/DOOM Mobile/dm/out). Führe setup auf dem PC erneut aus und kopiere den ganzen Ordner „DOOM Mobile“ noch einmal in den Download-Ordner des Telefons.</string>
     <string name="doom_start_missing_shaders">Die Shader fehlen (Download/DOOM Mobile/dm/shaders). Führe setup auf dem PC erneut aus und kopiere den ganzen Ordner „DOOM Mobile“ noch einmal in den Download-Ordner des Telefons.</string>
+    <!-- [DOOM] the game folder (GameFolder.java, issue #11): gear row, start error button, chooser -->
+    <string name="gear_folder">Spielordner</string>
+    <string name="folder_auto_fmt">%1$s (automatisch gefunden)</string>
+    <string name="folder_custom_fmt">%1$s (von dir gewählt)</string>
+    <string name="folder_next_fmt">Ab dem nächsten Start: %1$s</string>
+    <string name="folder_next_auto">automatische Suche</string>
+    <string name="folder_none">Kein Spielordner gefunden</string>
+    <string name="folder_choose">Wählen…</string>
+    <string name="folder_choose_start">Spielordner wählen…</string>
+    <string name="folder_title">Spielordner</string>
+    <string name="folder_help">Wähle den Ordner „DOOM Mobile“ (darin liegen romfs und dm) oder den Ordner, der ihn enthält. Ohne Auswahl sucht das Spiel Download/DOOM Mobile im Telefonspeicher, auf SD-Karten und USB-Laufwerken.</string>
+    <string name="folder_sd_warning">Eine SD-Karte oder ein USB-Laufwerk ist langsamer als der Telefonspeicher: Ladezeiten werden länger, Ruckler sind möglich.</string>
+    <string name="folder_browse">Durchsuchen… (System-Ordnerauswahl)</string>
+    <string name="folder_path_hint">Pfad, z. B. /storage/XXXX-XXXX/Download/DOOM Mobile</string>
+    <string name="folder_use_path">Diesen Pfad verwenden</string>
+    <string name="folder_reset">Auf automatisch zurücksetzen</string>
+    <string name="folder_bad">Dieser Ordner kann nicht verwendet werden:\n%1$s\n%2$s</string>
+    <string name="folder_not_path">Das ist kein Ordner im Telefonspeicher, auf einer SD-Karte oder einem USB-Laufwerk. Wähle dort einen Ordner oder gib seinen Pfad ein.</string>
+    <string name="folder_no_picker">Dieses Telefon hat keine System-Ordnerauswahl: gib den Pfad stattdessen ein.</string>
+    <string name="folder_set_next">Spielordner gespeichert: %1$s. Er wird ab dem nächsten Start verwendet.</string>
+    <string name="folder_set_now">Spielordner: %1$s</string>
+    <string name="folder_unavailable">Der gewählte Spielordner %1$s kann nicht verwendet werden (%2$s). Stattdessen automatisch gefunden: %3$s</string>
+    <string name="folder_searched">Durchsucht:</string>
+    <string name="folder_why_ok">vollständig</string>
+    <string name="folder_why_missing">nicht gefunden</string>
+    <string name="folder_why_unreadable">nicht lesbar (Android 10 kann SD-Karten und USB-Laufwerke für Apps sperren)</string>
+    <string name="folder_why_romfs">kein Ordner romfs</string>
+    <string name="folder_why_modules">gepatchte Spielmodule fehlen (dm/out)</string>
+    <string name="folder_why_shaders">Shader fehlen (dm/shaders)</string>
 </resources>

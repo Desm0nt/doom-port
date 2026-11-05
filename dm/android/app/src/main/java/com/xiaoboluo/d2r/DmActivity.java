@@ -68,7 +68,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native void nativeQuit();
     static native int nativeOpmode();
     static native void nativeSetOpmode(int mode);
-    static final String FRONT_DATA_DIR = "DOOM Mobile";   // Download/<this>: the player's data folder; save exports go to its saves/
+    static final String FRONT_DATA_DIR = "DOOM Mobile";   // Download/<this>: the player's data folder; save exports go to its saves/ ([DOOM] found on any volume or chosen: GameFolder.java)
     private FrontMenu front;
     private SaveTransfer saves;
     static native void nativeContext(Object context);
@@ -141,7 +141,14 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public boolean ready() { return started; }
     @Override public void hold(boolean on) { if (!libraryLoaded) return; try { nativeHold(on); } catch (UnsatisfiedLinkError e) { android.util.Log.e("dm", "nativeHold missing: the game is not paused (" + e.getMessage() + ")"); } }
     @Override public void gameSettings() { showDoomSettings(); }
-    @Override public FrontMenu.Saves saves() { if (saves == null) saves = SaveTransfer.forGame(this, FRONT_DATA_DIR); return saves; }
+    @Override public FrontMenu.Saves saves() {
+        if (saves == null && DOOM) {   // [DOOM] issue #11: exports go to <game folder>/saves (GameFolder), with SaveTransfer.forGame's fallback
+            File pub = GameFolder.writable(this, "saves"), ext = getExternalFilesDir(null);
+            saves = new SaveTransfer(this, new File(getFilesDir(), "save"), pub != null ? pub : ext != null ? new File(ext, "saves") : new File(GameFolder.defaultDir(), "saves"));
+        }
+        if (saves == null) saves = SaveTransfer.forGame(this, FRONT_DATA_DIR);
+        return saves;
+    }
     @Override public void quit() {
         android.util.Log.i("dm", "[java] quit from the pause menu");
         if (DOOM) CrashLog.sessionEnd(this);   // [DOOM] a clean end: no crash report at the next start
@@ -491,7 +498,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             File drivers = new File(getFilesDir(), "drivers");
             Os.setenv("DM_DRIVERS_DIR", drivers.getAbsolutePath(), true);
             extractBundledDrivers(drivers);   // the APK's default driver (Turnip, assets/drivers/<name>/)
-            importDrivers(new File(Environment.getExternalStorageDirectory(), "Download/DOOM Mobile/drivers"), drivers);
+            importDrivers(new File(GameFolder.dir(this), "drivers"), drivers);   // [DOOM] <game folder>/drivers (issue #11)
             updateDriversInBackground(drivers);   // other packages from the repository's drivers/manifest.json when online
             // Game language (DOOM takes it from the system like on the Switch: hle_oe.c GetDesiredLanguage reads DM_LANG; jni sets
             // DM_LANG from the phone locale only when it is unset). "" = follow the phone.
@@ -793,7 +800,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         } catch (java.io.IOException e) { android.util.Log.e("dm", "bundled drivers: " + e); }
     }
 
-    // Driver packages in private storage (imported at launch from Download/DOOM Mobile/drivers), sorted by folder name.
+    // Driver packages in private storage (imported at launch from <game folder>/drivers, by default Download/DOOM Mobile/drivers), sorted by folder name.
     private String[] driverPackages() {
         File[] dirs = new File(getFilesDir(), "drivers").listFiles(); java.util.ArrayList<String> out = new java.util.ArrayList<>();
         if (dirs != null) for (File d : dirs) { File[] fs = d.isDirectory() ? d.listFiles() : null; if (fs == null) continue;
@@ -958,6 +965,11 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             android.widget.Button editB = new android.widget.Button(this); editB.setText(Ui.t(this, "Изменить раскладку…", "Edit the layout…")); box.addView(editB);
             android.widget.Button resetB = new android.widget.Button(this); resetB.setText(Ui.t(this, "Сбросить раскладку", "Reset the layout")); box.addView(resetB);
             resetB.setOnClickListener(v -> { if (doomPad != null) { doomPad.resetLayout(); android.widget.Toast.makeText(this, Ui.t(this, "Раскладка сброшена", "Layout reset"), android.widget.Toast.LENGTH_SHORT).show(); } });
+            // [DOOM] issue #11: the game folder this run uses, and "Choose…" (the chooser saves at once; the running game keeps its folder)
+            heading(box, when(R.string.gear_folder, false));
+            TextView folderT = new TextView(this); folderT.setText(folderLine()); box.addView(folderT);
+            android.widget.Button folderB = new android.widget.Button(this); folderB.setText(R.string.folder_choose); box.addView(folderB);
+            folderB.setOnClickListener(v -> showFolderDialog(() -> folderT.setText(folderLine())));
             android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
             final AlertDialog[] gearDlg = new AlertDialog[1];
             editB.setOnClickListener(v -> { if (gearDlg[0] != null) gearDlg[0].dismiss(); if (front != null) front.edit(); else if (doomPad != null) doomPad.startEdit(null); });
@@ -1046,6 +1058,18 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (started || importing || !resumed || !ensureFileAccess()) return;
         File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
         if (!DOOM && !libraryLoaded && !ensureImported(new File(downloads, "S2X/D2R Mobile/android"))) return;
+        // [DOOM] issue #11: find the game folder (GameFolder: internal storage, SD cards, USB drives, the player's choice) before anything
+        // of this launch is set up; none complete = the start error with the searched paths and "Choose the game folder…", the library is
+        // not loaded, so a folder chosen there simply runs this again.
+        if (DOOM && !libraryLoaded) {
+            GameFolder.Result r = GameFolder.resolve(this);
+            logFolder(r);
+            if (r.dir == null) { showFolderError(r.best() == GameFolder.NO_SHADERS ? -4 : r.best() == GameFolder.NO_MODULES ? -3 : -2, r); return; }
+            if (!r.saved.isEmpty() && r.savedState != GameFolder.OK && !folderNoticeShown) {
+                folderNoticeShown = true;
+                android.widget.Toast.makeText(this, getString(R.string.folder_unavailable, r.saved, folderWhy(r.savedState), r.dir.getAbsolutePath()), android.widget.Toast.LENGTH_LONG).show();
+            }
+        }
         if (gameFrame.getParent() == null) setContentView(gameFrame);
         if (!libraryLoaded) {
             // 与 jni_android.c 选运行目录同一条规则：内部目录有主程序就用内部目录，否则用外部私有目录
@@ -1098,7 +1122,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         // not .build.config: the imported overlay can provide that file, and then the resource directory has none.
         File data = new File(downloads, "S2X/D2R Mobile/data"), earlier = new File(downloads, "data");
         if (!data.isDirectory() && earlier.isDirectory()) data = earlier;
-        String src = DOOM ? new File(downloads, "DOOM Mobile").getAbsolutePath() : data.getAbsolutePath();   // [DOOM] Download/DOOM Mobile/{romfs,dm}
+        String src = DOOM ? GameFolder.dir(this).getAbsolutePath() : data.getAbsolutePath();   // [DOOM] <game folder>/{romfs,dm} (GameFolder, issue #11)
         if (DOOM) CrashLog.session(this, "fg");   // [DOOM] the game runs from here: a leftover marker at the next start = it did not end cleanly
         int result = nativeStart(getFilesDir().getAbsolutePath(), ext.getAbsolutePath(), src, Locale.getDefault().toLanguageTag());
         if (DOOM) { nativeLogReady = true; gameStartedAt = android.os.SystemClock.uptimeMillis(); flushCrumbs(); crumb("nativeStart " + result); }
@@ -1113,6 +1137,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 case -10 -> R.string.dmAndroidInvalidOverlay;
                 default -> 0;
             };
+            // [DOOM] the Java check passed but the native one did not: the same screen with the searched paths and the folder button
+            if (DOOM && result >= -4 && result <= -2) { showFolderError(result, GameFolder.resolve(this)); return; }
             showStartError(resource == 0 ? getString(R.string.dmAndroidStartFailed, result) : getString(resource)); return;
         }
         started = true;
@@ -1124,12 +1150,145 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         nativeFocus(3);
     }
 
-    private void showStartError(String message) {
+    private void showStartError(String message) { showStartError(message, false); }
+    private void showStartError(String message, boolean folderButton) {
         // [DOOM] every error screen writes a report at once and names it (CrashLog.java)
         if (DOOM) message += "\n\n" + Ui.t(this, "Журнал для отчёта об ошибке: ", "Log for a bug report: ") + startErrorReport(message).getAbsolutePath();
         TextView t = new TextView(this);
         t.setText(message); t.setTextSize(20); t.setPadding(64, 64, 64, 64);
-        setContentView(t);
+        if (!folderButton) { setContentView(t); return; }
+        // [DOOM] issue #11: the game files are missing or incomplete: "Choose the game folder…" under the text
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.addView(t);
+        android.widget.Button b = new android.widget.Button(this); b.setText(R.string.folder_choose_start); b.setOnClickListener(v -> showFolderDialog(null));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2); lp.setMargins(64, 0, 64, 64); box.addView(b, lp);
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
+        setContentView(scroll);
+    }
+
+    // ---- [DOOM] the game folder (GameFolder.java, GitHub issue #11, BUGS_AND_FIXES 2.28)
+    private static final int REQ_FOLDER = 4711;
+    private static String folderLogged;      // the last resolution written to the log (once per change, startHost runs often)
+    private boolean folderNoticeShown;
+    private AlertDialog folderDialog;
+    private Runnable folderRowUpdate;         // the gear dialog's "Game folder" line, refreshed after a choice
+    private void logFolder(GameFolder.Result r) {
+        String s = r.log();
+        if (s.equals(folderLogged)) return;
+        folderLogged = s;
+        for (String l : s.split("\n")) crumb(l);
+    }
+    String folderWhy(int state) {
+        switch (state) {
+            case GameFolder.OK: return getString(R.string.folder_why_ok);
+            case GameFolder.MISSING: return getString(R.string.folder_why_missing);
+            case GameFolder.UNREADABLE: return getString(R.string.folder_why_unreadable);
+            case GameFolder.NO_ROMFS: return getString(R.string.folder_why_romfs);
+            case GameFolder.NO_MODULES: return getString(R.string.folder_why_modules);
+            default: return getString(R.string.folder_why_shaders);
+        }
+    }
+    // The start error for -2 / -3 / -4 with the folders that were searched and what each lacks
+    private void showFolderError(int code, GameFolder.Result r) {
+        StringBuilder sb = new StringBuilder(getString(code == -4 ? R.string.doom_start_missing_shaders : code == -3 ? R.string.doom_start_missing_modules : R.string.doom_start_missing_data));
+        sb.append("\n\n").append(getString(R.string.folder_searched));
+        for (GameFolder.Candidate c : r.all) sb.append("\n• ").append(c.dir.getAbsolutePath()).append(" — ").append(folderWhy(c.state));
+        showStartError(sb.toString(), true);
+    }
+    // "<path> (found automatically / your choice)" and, when another folder was chosen for the next launch, a second line
+    private String folderLine() {
+        GameFolder.Result r = GameFolder.last(); String saved = GameFolder.saved(this);
+        String line = r == null || r.dir == null ? getString(R.string.folder_none)
+            : getString(r.how.equals("saved choice") ? R.string.folder_custom_fmt : R.string.folder_auto_fmt, r.dir.getAbsolutePath());
+        String used = r == null ? "" : r.saved;
+        if (started && !saved.equals(used)) line += "\n" + getString(R.string.folder_next_fmt, saved.isEmpty() ? getString(R.string.folder_next_auto) : saved);
+        return line;
+    }
+    // The chooser: the system folder picker, a typed path, or back to the automatic search. onDone refreshes the gear row (or null).
+    void showFolderDialog(Runnable onDone) {
+        folderRowUpdate = onDone;
+        LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(48, 24, 48, 0);
+        TextView info = new TextView(this);
+        info.setText(folderLine() + "\n\n" + getString(R.string.folder_help) + "\n\n" + getString(R.string.folder_sd_warning));
+        box.addView(info);
+        android.widget.Button browse = new android.widget.Button(this); browse.setText(R.string.folder_browse); box.addView(browse);
+        EditText path = new EditText(this); path.setSingleLine(true); path.setHint(R.string.folder_path_hint);
+        path.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS | InputType.TYPE_TEXT_VARIATION_URI);
+        String saved = GameFolder.saved(this); GameFolder.Result r = GameFolder.last();
+        path.setText(!saved.isEmpty() ? saved : r != null && r.dir != null ? r.dir.getAbsolutePath() : GameFolder.defaultDir().getAbsolutePath());
+        box.addView(path);
+        android.widget.Button use = new android.widget.Button(this); use.setText(R.string.folder_use_path); box.addView(use);
+        android.widget.Button reset = new android.widget.Button(this); reset.setText(R.string.folder_reset); box.addView(reset);
+        reset.setEnabled(!saved.isEmpty());
+        android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
+        AlertDialog d = new AlertDialog.Builder(this).setTitle(R.string.folder_title).setView(scroll).setNegativeButton(R.string.gear_cancel, null).create();
+        folderDialog = d;
+        d.setOnDismissListener(x -> { if (folderDialog == d) folderDialog = null; if (resumed) immersiveBars(); });
+        browse.setOnClickListener(v -> openFolderPicker());
+        use.setOnClickListener(v -> {
+            String p = path.getText().toString().trim();
+            if (p.isEmpty()) return;
+            if (!p.startsWith("/")) p = new File(android.os.Environment.getExternalStorageDirectory(), p).getAbsolutePath();   // "Download/DOOM Mobile"
+            applyFolderChoice(new File(p));
+        });
+        reset.setOnClickListener(v -> {
+            crumb("game folder: reset to the automatic search (was " + GameFolder.saved(this) + ")");
+            GameFolder.prefs(this).edit().remove(GameFolder.PREF).apply();
+            folderApplied(null);
+        });
+        d.show();
+    }
+    private void openFolderPicker() {
+        Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        i.putExtra(android.provider.DocumentsContract.EXTRA_INITIAL_URI,
+            android.provider.DocumentsContract.buildDocumentUri("com.android.externalstorage.documents", "primary:" + Environment.DIRECTORY_DOWNLOADS));
+        try { startActivityForResult(i, REQ_FOLDER); }
+        catch (android.content.ActivityNotFoundException e) { crumb("game folder picker: none on this phone"); android.widget.Toast.makeText(this, R.string.folder_no_picker, android.widget.Toast.LENGTH_LONG).show(); }
+    }
+    @SuppressWarnings("deprecation")
+    @Override protected void onActivityResult(int request, int result, Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != REQ_FOLDER) return;
+        Uri u = result == RESULT_OK && data != null ? data.getData() : null;
+        if (u == null) { crumb("game folder picker: cancelled"); return; }
+        File f = GameFolder.fromTreeUri(this, u);
+        crumb("game folder picker: " + u + " -> " + (f != null ? f.getAbsolutePath() : "not a storage path"));
+        if (f == null) { new AlertDialog.Builder(this).setTitle(R.string.folder_title).setMessage(R.string.folder_not_path).setPositiveButton(android.R.string.ok, null).show(); return; }
+        applyFolderChoice(f);
+    }
+    // A chosen folder (or the folder that holds "DOOM Mobile"): saved only when complete; otherwise the player is told what is missing
+    private void applyFolderChoice(File picked) {
+        File d = GameFolder.normalize(picked);
+        int s = GameFolder.check(this, d);
+        crumb("game folder: the player chose " + picked.getAbsolutePath() + (d.equals(picked) ? "" : " -> " + d.getAbsolutePath()) + ": " + GameFolder.stateName(s));
+        if (s != GameFolder.OK) {
+            new AlertDialog.Builder(this).setTitle(R.string.folder_title).setMessage(getString(R.string.folder_bad, d.getAbsolutePath(), folderWhy(s))
+                + (GameFolder.removable(d) ? "\n\n" + getString(R.string.folder_sd_warning) : "")).setPositiveButton(android.R.string.ok, null).show();
+            return;
+        }
+        GameFolder.prefs(this).edit().putString(GameFolder.PREF, d.getAbsolutePath()).apply();
+        if (GameFolder.removable(d)) android.widget.Toast.makeText(this, R.string.folder_sd_warning, android.widget.Toast.LENGTH_LONG).show();
+        folderApplied(d);
+    }
+    // After a change (d = the new folder, null = automatic): the running game keeps its folder until the next launch; before the library
+    // loads the start simply runs again; after a failed nativeStart (native paths already set) the app restarts in a new process.
+    private void folderApplied(File d) {
+        if (folderDialog != null) folderDialog.dismiss();
+        String what = d != null ? d.getAbsolutePath() : getString(R.string.folder_next_auto);
+        if (started) {
+            android.widget.Toast.makeText(this, getString(R.string.folder_set_next, what), android.widget.Toast.LENGTH_LONG).show();
+            if (folderRowUpdate != null) folderRowUpdate.run();
+            return;
+        }
+        android.widget.Toast.makeText(this, getString(R.string.folder_set_now, what), android.widget.Toast.LENGTH_SHORT).show();
+        if (libraryLoaded) { restartApp(); return; }
+        GameFolder.forget(); lastStartError = null;
+        startHost();   // not resumed yet (back from the picker): onResume runs it
+    }
+    private void restartApp() {
+        crumb("restart in a new process for the new game folder");
+        CrashLog.sessionEnd(this);   // not a crash
+        if (libraryLoaded) CrashLog.mirrorBootLogs(this);
+        startActivity(new Intent(this, DmRestart.class).putExtra("pid", android.os.Process.myPid()));
     }
 
     // 原生线程只投递主线程工作，不持有 Activity，也不直接操作视图。
