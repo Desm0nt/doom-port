@@ -52,4 +52,8 @@
     <string name="gear_res_drs_note">동적 해상도가 켜져 있으면 3D 해상도를 스스로 고릅니다. 이 값은 꺼져 있을 때 적용됩니다.</string>
     <string name="gear_light" formatted="false">가벼운 모드: Switch 휴대 모드 화질(앰비언트 오클루전과 반사 프로브 없음, 더 단순한 그림자와 필터링, 3D 최대 80% x 90%), 성능이 낮은 기기용</string>
     <string name="toast_light_failed">이 게임 빌드에서는 가벼운 모드를 사용할 수 없습니다: main.patched.bin을 업데이트하세요</string>
+    <string name="doom_start_permission">게임이 Download/DOOM Mobile 안의 파일을 읽을 수 있도록 파일 접근을 허용하세요. 여기를 눌러 접근을 허용한 뒤 돌아오세요.</string>
+    <string name="doom_start_missing_data">Download/DOOM Mobile에서 게임 파일을 찾지 못했습니다. PC에서 자신의 게임 파일로 setup을 실행한 뒤 만들어진 \"DOOM Mobile\" 폴더를 휴대폰의 Download 폴더에 복사하세요.</string>
+    <string name="doom_start_missing_modules">패치된 게임 모듈이 없습니다(Download/DOOM Mobile/dm/out). PC에서 setup을 다시 실행하고 \"DOOM Mobile\" 폴더 전체를 휴대폰의 Download 폴더에 다시 복사하세요.</string>
+    <string name="doom_start_missing_shaders">셰이더가 없습니다(Download/DOOM Mobile/dm/shaders). PC에서 setup을 다시 실행하고 \"DOOM Mobile\" 폴더 전체를 휴대폰의 Download 폴더에 다시 복사하세요.</string>
 </resources>

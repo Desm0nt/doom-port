@@ -52,4 +52,8 @@
     <string name="gear_res_drs_note">Gdy dynamiczna rozdzielczość jest włączona, sama wybiera rozdzielczość 3D; ta wartość działa, gdy jest wyłączona.</string>
     <string name="gear_light" formatted="false">Tryb lekki: jakość Switcha w trybie przenośnym (bez okluzji otoczenia i sond odbić, prostsze cienie i filtrowanie, 3D najwyżej 80 % x 90 %) dla słabszych urządzeń</string>
     <string name="toast_light_failed">Tryb lekki jest niedostępny w tej wersji gry: zaktualizuj main.patched.bin</string>
+    <string name="doom_start_permission">Zezwól na dostęp do plików, aby gra mogła odczytać swoje pliki w Download/DOOM Mobile. Stuknij tutaj, zezwól na dostęp i wróć.</string>
+    <string name="doom_start_missing_data">Nie znaleziono plików gry w Download/DOOM Mobile. Na komputerze uruchom setup z własnymi plikami gry i skopiuj utworzony folder „DOOM Mobile” do folderu Download w telefonie.</string>
+    <string name="doom_start_missing_modules">Brak spatchowanych modułów gry (Download/DOOM Mobile/dm/out). Uruchom ponownie setup na komputerze i skopiuj jeszcze raz cały folder „DOOM Mobile” do folderu Download w telefonie.</string>
+    <string name="doom_start_missing_shaders">Brak shaderów (Download/DOOM Mobile/dm/shaders). Uruchom ponownie setup na komputerze i skopiuj jeszcze raz cały folder „DOOM Mobile” do folderu Download w telefonie.</string>
 </resources>

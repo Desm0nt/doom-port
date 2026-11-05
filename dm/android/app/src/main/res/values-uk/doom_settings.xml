@@ -52,4 +52,8 @@
     <string name="gear_res_drs_note">Коли ввімкнено динамічну роздільність, вона сама обирає роздільність 3D; це значення діє, коли її вимкнено.</string>
     <string name="gear_light" formatted="false">Легкий режим: якість портативної Switch (без затінення оточення та проб відбиттів, простіші тіні й фільтрація, 3D не вище 80 % x 90 %) для слабких пристроїв</string>
     <string name="toast_light_failed">Легкий режим недоступний із цією збіркою гри: оновіть main.patched.bin</string>
+    <string name="doom_start_permission">Дозвольте доступ до файлів, щоб гра могла прочитати свої файли в Download/DOOM Mobile. Натисніть сюди, дозвольте доступ і поверніться.</string>
+    <string name="doom_start_missing_data">Файли гри не знайдено в Download/DOOM Mobile. Запустіть на ПК setup зі своїми файлами гри й скопіюйте створену ним теку «DOOM Mobile» до теки Download на телефоні.</string>
+    <string name="doom_start_missing_modules">Немає пропатчених модулів гри (Download/DOOM Mobile/dm/out). Запустіть setup на ПК ще раз і знову скопіюйте всю теку «DOOM Mobile» до Download на телефоні.</string>
+    <string name="doom_start_missing_shaders">Немає шейдерів (Download/DOOM Mobile/dm/shaders). Запустіть setup на ПК ще раз і знову скопіюйте всю теку «DOOM Mobile» до Download на телефоні.</string>
 </resources>

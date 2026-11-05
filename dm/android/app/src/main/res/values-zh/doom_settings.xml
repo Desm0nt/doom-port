@@ -52,4 +52,8 @@
     <string name="gear_res_drs_note">开启动态分辨率时由它自行选择 3D 分辨率；关闭时使用此处的值。</string>
     <string name="gear_light" formatted="false">轻量模式：Switch 掌机画质（无环境光遮蔽和反射探针，阴影与过滤更简单，3D 最高 80% x 90%），适合性能较弱的设备</string>
     <string name="toast_light_failed">当前游戏补丁不支持轻量模式：请更新 main.patched.bin</string>
+    <string name="doom_start_permission">请允许文件访问，游戏才能读取 Download/DOOM Mobile 里的文件。点这里，允许访问后返回。</string>
+    <string name="doom_start_missing_data">在 Download/DOOM Mobile 里没有找到游戏文件。请在电脑上用你自己的游戏文件运行 setup，再把它生成的「DOOM Mobile」文件夹拷到手机的 Download 文件夹。</string>
+    <string name="doom_start_missing_modules">缺少打过补丁的游戏模块（Download/DOOM Mobile/dm/out）。请在电脑上重新运行 setup，再把整个「DOOM Mobile」文件夹重新拷到手机的 Download 文件夹。</string>
+    <string name="doom_start_missing_shaders">缺少着色器（Download/DOOM Mobile/dm/shaders）。请在电脑上重新运行 setup，再把整个「DOOM Mobile」文件夹重新拷到手机的 Download 文件夹。</string>
 </resources>

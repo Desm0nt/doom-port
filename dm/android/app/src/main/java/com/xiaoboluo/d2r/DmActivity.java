@@ -245,7 +245,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         boolean legacy = android.os.Build.VERSION.SDK_INT < 30;
         if (legacy && !legacyStorageAsked) { legacyStorageAsked = true; requestPermissions(LEGACY_STORAGE, 1); }
         TextView t = new TextView(this);
-        t.setText(R.string.dmAndroidPermission);
+        t.setText(DOOM ? R.string.doom_start_permission : R.string.dmAndroidPermission);   // [DOOM] the shared text names d2r's Download/S2X/D2R Mobile
         t.setTextSize(20); t.setPadding(64, 64, 64, 64);
         t.setOnClickListener(v -> {
             if (!legacy) startActivity(new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:" + getPackageName())));
@@ -1007,9 +1007,10 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (DOOM) { nativeLogReady = true; gameStartedAt = android.os.SystemClock.uptimeMillis(); flushCrumbs(); crumb("nativeStart " + result); }
         if (result < 0) {
             int resource = switch (result) {
-                case -2 -> R.string.dmAndroidMissingData;
-                case -3 -> R.string.dmAndroidMissingModules;
-                case -4 -> R.string.dmAndroidMissingShaders;
+                // [DOOM] its own texts: the shared ones name d2r's Download/S2X/D2R Mobile and d2rm_android.py
+                case -2 -> DOOM ? R.string.doom_start_missing_data : R.string.dmAndroidMissingData;
+                case -3 -> DOOM ? R.string.doom_start_missing_modules : R.string.dmAndroidMissingModules;
+                case -4 -> DOOM ? R.string.doom_start_missing_shaders : R.string.dmAndroidMissingShaders;
                 case -5 -> R.string.dmAndroidMissingConfig;
                 case -9 -> R.string.dmAndroidMissingOverlay;
                 case -10 -> R.string.dmAndroidInvalidOverlay;

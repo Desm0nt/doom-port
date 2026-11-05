@@ -52,4 +52,8 @@
     <string name="gear_res_drs_note">Con la resolución dinámica activada, ella elige la resolución 3D; este valor se usa cuando está desactivada.</string>
     <string name="gear_light" formatted="false">Modo ligero: calidad de Switch en modo portátil (sin oclusión ambiental ni sondas de reflejos, sombras y filtrado más simples, 3D como máximo 80 % x 90 %) para dispositivos modestos</string>
     <string name="toast_light_failed">El modo ligero no está disponible con esta versión del juego: actualiza main.patched.bin</string>
+    <string name="doom_start_permission">Permite el acceso a archivos para que el juego pueda leer sus archivos en Download/DOOM Mobile. Toca aquí, permite el acceso y vuelve.</string>
+    <string name="doom_start_missing_data">No se encontraron los archivos del juego en Download/DOOM Mobile. En un PC, ejecuta setup con tus propios archivos del juego y copia la carpeta «DOOM Mobile» que crea a la carpeta Download del teléfono.</string>
+    <string name="doom_start_missing_modules">Faltan los módulos parcheados del juego (Download/DOOM Mobile/dm/out). Ejecuta setup en el PC de nuevo y vuelve a copiar toda la carpeta «DOOM Mobile» a la carpeta Download del teléfono.</string>
+    <string name="doom_start_missing_shaders">Faltan los shaders (Download/DOOM Mobile/dm/shaders). Ejecuta setup en el PC de nuevo y vuelve a copiar toda la carpeta «DOOM Mobile» a la carpeta Download del teléfono.</string>
 </resources>

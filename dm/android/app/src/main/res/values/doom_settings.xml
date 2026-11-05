@@ -52,4 +52,8 @@
     <string name="gear_res_drs_note">With dynamic resolution on, it picks the 3D resolution itself; this value is used when it is off.</string>
     <string name="gear_light" formatted="false">Light mode: Switch handheld quality (no ambient occlusion and reflection probes, simpler shadows and filtering, 3D at most 80 % x 90 %) for weak devices</string>
     <string name="toast_light_failed">Light mode is not available with this game build: update main.patched.bin</string>
+    <string name="doom_start_permission">Allow access to files so the game can read its files in Download/DOOM Mobile. Tap here, allow access, then return.</string>
+    <string name="doom_start_missing_data">Game files were not found in Download/DOOM Mobile. On a PC, run setup with your own game files, then copy the \"DOOM Mobile\" folder it makes to the phone\'s Download folder.</string>
+    <string name="doom_start_missing_modules">The patched game modules are missing (Download/DOOM Mobile/dm/out). Run setup on the PC again and copy the whole \"DOOM Mobile\" folder to the phone\'s Download folder again.</string>
+    <string name="doom_start_missing_shaders">The shaders are missing (Download/DOOM Mobile/dm/shaders). Run setup on the PC again and copy the whole \"DOOM Mobile\" folder to the phone\'s Download folder again.</string>
 </resources>
