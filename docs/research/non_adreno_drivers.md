@@ -1,7 +1,7 @@
 # Не-Adreno GPU: драйверы, детект вендора, что сломается в DOOM (30.10)
 
 Исследование без правок кода. Источники: веб (ссылки в конце), upstream d2r-mobile (`doom-port-repo/docs`),
-наш код `dm` (android/vk_driver.c, DmActivity.java, gfx/vulkan/engine/xbg_game.cpp, xbg_texture.c, harmony/native/napi_ohos.c)
+наш код `src/dm` (android/vk_driver.c, DmActivity.java, gfx/vulkan/engine/xbg_game.cpp, xbg_texture.c, harmony/native/napi_ohos.c)
 и статистика всех 863 шейдер-бандлов DOOM (`work/shaders-vk/*.xgs`, скрипт в scratchpad: стадии/capabilities/форматы).
 
 ## TL;DR
@@ -247,4 +247,4 @@ else                                                              // не Qualco
   https://docs.mesa3d.org/drivers/panfrost.html
 - Maleoon: https://www.notebookcheck.net/HiSilicon-Maleoon-910-Benchmarks-and-Specs.803657.0.html ; upstream README-d2r-mobile (HarmonyOS, Maleoon 955)
 - Наш код/доки: `doom-port-repo/docs/research/d2r_nx2android_history.md` (Mali-G925 17b4baa), `docs/BUGS_AND_FIXES.md` п.8,
-  `docs/research/gs_cull_fix.md`, d2r-mobile `docs/android-notes/2026-10-25-adreno-740-750-rewrites.md`.
+  `docs/research/gs_cull_fix.md`, `doom-port-repo/docs/android-notes/2026-10-25-adreno-740-750-rewrites.md`.

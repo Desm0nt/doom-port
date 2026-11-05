@@ -48,6 +48,7 @@ Adreno 750), драйвер Qualcomm, если не сказано иное.
 | 36 | Игра на 4–5 % медленнее реального времени (`[tick] … speed 0.95x/0.96x`) | множитель 0.96 в адаптивном тике самой игры (`0x1ecf940`) — все часы игры идут от него | `DM_DOOM_TICK_SCALE`=1.0: хост докладывает 0.04·d в перенос `S+0xa0` | собрано 02.11, **на телефоне не проверено** (§4.7) |
 | 37 | Медленное плавное ведение пальцем (обзор) отрабатывается плохо | обзор шёл через правый стик: малые наклоны × dt кадра, проигрыш 0.05 с | `DM_TOUCH_LOOK`=gyro: дельта пальца целиком в канал гиро-прицела за кадр (§4.8) | 🧪 собрано 02.11, на телефоне не проверено |
 | 38 | Экраны 4:3 (Retroid Pocket Classic/Mini, RG405V): 16:9 с полосами сверху/снизу | вывод только 1280×720 или шире | ⚙ «Соотношение сторон» Авто / 16:9 / 4:3, `DM_DOOM_ASPECT`: таблица `r_mode` → 960×720 (Авто — по экрану, не уже 960); FOV по вертикали тот же, HUD ×0.75 по центру | собрано и проверено на Mi 13 Pro 04.11 (§2.20) |
+| 39 | «Force close на Poco X7 Pro» (Dimensity 8400, Mali-G720) с Reddit — без лога; игроку лог не достать без adb | boot.log рос бесконечно и лежал во внутреннем каталоге; нет отчёта о падении; Turnip мог попасть в настройки на не-Adreno | авто-выбор драйвера по железу, `crash.txt` в `Download/DOOM Mobile/logs`, хлебные крошки, `DM_GFX_CRUMBS` (0) | собрано 05.11, на телефоне не проверено (§2.22) |
 
 ---
 
@@ -967,6 +968,78 @@ Switch (`vt_filter`, пробы) — возможен короткий фриз/
   ещё раз или страница настроек приложения).
 - Проверено: APK minSdk 29 на Mi 13 Pro (Android 14) запускается, Turnip / zero-copy как у основной сборки. Риски на настоящем
   Android 10: Turnip на старых ядрах KGSL, производительность устройств того времени (SD 845–865).
+
+### 2.22 Автовыбор драйвера по железу, crash-логи для игроков, хлебные крошки (05.11; собрано, на телефоне не проверено)
+
+Повод: на Reddit «force close на Poco X7 Pro» (Dimensity 8400, Mali-G720), лога нет. Игрок до `boot.log` без adb не доберётся,
+а сам `boot.log` открывался на дозапись и рос бесконечно.
+- **Драйвер по железу на каждом старте** (`DmActivity.applyDoomSettings`, `turnipPossible`): Turnip возможен только при KGSL
+  (`/dev/kgsl-3d0` или `/sys/class/kgsl/kgsl-3d0`) и Adreno ≥ 600 (при нечитаемом `gpu_model` — SoC Qualcomm, как раньше в
+  `defaultDriver`). Иначе (Mali, PowerVR, Xclipse, Maleoon, неизвестное) сохранённый `turnip*` (настройки перенесены / восстановлены
+  с другого телефона) сбрасывается на системный, один тост, в ⚙ Turnip-пакеты скрыты строкой «Turnip скрыт: …». Adreno-only пакет —
+  по имени папки или `meta.json` (turnip / freedreno / adreno), PanVK и подобные остаются. Нативная защита в `vk_driver.c`: без
+  KGSL такой пакет не грузится вовсе (`reason=no-adreno`; `DM_VK_DRIVER_FORCE=1` — всё же попробовать). На Adreno поведение прежнее.
+- **Лог одного запуска** (`jni_android.c`): при старте `boot.log` → `boot.prev.log` (один предыдущий), новый пишется с нуля; за
+  `DM_LOG_MAX_MB` (32) обрезается до первых 4 МБ и пишется дальше. Шапка: `boot: log … pid … app …`, `boot: device … SoC … Android …
+  build …`, `boot: gpu kgsl= gpu_model= mali=, memory …`. Все `__android_log_print` библиотеки (dm-vulkan: лог движка, swapchain,
+  FATAL; dm-lifecycle; dm-input) теперь тоже в файле: линковка `-Wl,--wrap=__android_log_print`.
+- **Падение → отчёт** (`CrashLog.java`): `Download/DOOM Mobile/logs/crash.txt` (есть доступ ко всем файлам / разрешение на Android 10),
+  иначе `Android/data/org.doom.port/files/logs/crash.txt`; перезаписывается, предыдущий — `crash.prev.txt`. Внутри: шапка (устройство,
+  SoC, GPU, настройка драйвера, Android, версия APK, память), причина, начало (48 КБ) и хвост (512 КБ) boot.log упавшего запуска,
+  logcat своего процесса (`logcat -d -b main -b crash --pid`, без разрешений). Когда пишется:
+  - сигнал в нативном коде (`crash.c`: SIGSEGV/BUS/ILL/TRAP, на Android теперь и SIGABRT/SIGFPE — то есть `abort()`, `die()`,
+    `xbg_fatalf`): обработчик сразу пишет метку `files/dm-crash.txt` (сигнал, addr, pc, последняя строка FATAL; async-signal-safe),
+    в конце ждёт, пока насос stderr допишет дамп, и делает `fsync` лога; отчёт собирается при следующем старте;
+  - Java-исключение — сразу (default uncaught handler), потом системный обработчик;
+  - экран ошибки старта/загрузки — сразу, путь к файлу написан на экране;
+  - приложение умерло во время игры: маркер `files/dm-session.txt` (pid, `fg`/`bg`) остался. Android 11+: причина из
+    `ApplicationExitInfo` (CRASH, CRASH_NATIVE, ANR + трасса, LOW_MEMORY/SIGNALED на переднем плане…; убийство в фоне и
+    USER_REQUESTED — не отчёт); Android 10: отчёт, только если игра была на переднем плане. Выход из меню паузы маркер снимает.
+  При отчёте с прошлого запуска — тост с путём и строка `[java] crash report of the last run written: …`.
+- **Хлебные крошки** (одна строка, ничего на кадр): `boot: patched modules present / shader bundles found / Vulkan initialization /
+  Vulkan initialized in N ms / host thread started`, `[vk] vkCreateInstance …`, `[vk] gpu N: "<имя>" vendor … driver … id … info …`,
+  `[vk] gpu N limits: …`, `[vk] gpu N features: …`, `[vk] gpu N memory: …`, `[vk] driver choice: …`, `[life] unfocused / background /
+  foreground / active`, `[java] driver: …`, `[java] Vulkan driver status: …`, `[java] first frames presented N s after …`,
+  `[java] trim memory level N`, `[java] nativeStart N`, `[res] first open <архив>.resources (t, MB)` (что игра грузила: загрузочный
+  набор, потом пакеты уровня). Swapchain (`[dm-vulkan] Swapchain: …`), hold/меню, термал уже были и теперь все в файле.
+- **`crash.c` из Eternal:** `dladdr` с именем библиотеки для static-функций, детектор «петли фолтов» (20000 одинаковых фолтов за 2 с —
+  хук отвечает «обработано», а страница не открывается: раньше поток крутился в обработчике вечно), сохранение `errno` вокруг хуков,
+  `stack scan` — адреса кода гостя на стеке. Порт `G_LOCK`-трекинга из `hle_thread.c` Eternal и его `diag.c` не делал: в DOOM
+  `diag.c` не собирается, а `hle_thread.c` здесь чужая зона риска.
+- **GPU-крошки `DM_GFX_CRUMBS`** (по умолчанию 0) — см. SWITCHES; при `xbg_fatalf` и простое GPU (`DM_GFX_CRUMBS_STALL_MS`) строки
+  `NVN crumbs …` попадают в boot.log → в отчёт. Через record-поток идёт новый пакет `K_FILL_BUF` (`t_vkrec` PASS в WSL).
+- **Проверить на Adreno:** `grep -E "boot: log|boot: device|boot: gpu|\[vk\] driver choice|\[vk\] gpu 0|\[java\] driver:|first frames|\[life\]|\[res\] first open"`
+  в `files/dm/boot.log`; `boot.prev.log` после второго запуска; `NVN crumbs switches: crumbs=0`. Тест падения: `DM_TEST_KILL_AT` или
+  `kill -SEGV <pid>` → при следующем старте тост и `Download/DOOM Mobile/logs/crash.txt` с `reason: native crash (signal=11 …)`.
+
+### 2.23 Mali / PowerVR на системном драйвере: фатальные пути → фолбэки, политики по семейству, симуляция на Adreno (05.11; собрано, на телефоне не проверено)
+
+Повод — тот же force close на Poco X7 Pro (Mali-G720, r49p1; профиль gpuinfo 44439 — ровно этот телефон). Сверка профилей Mali
+(G720, G57 r32/r54), PowerVR (BXM-8-256 старый/новый, DXT) с нашими `need()`/`xbg_fatalf` нашла несколько путей, которые на Mali
+убивают процесс, хотя на Adreno никогда не срабатывали. Подробно (источники, риски, план проверки) —
+`../research/mali_powervr_impl.md`; эмуляторы — `../research/switch_emu_mali_powervr.md`.
+- **Сэмплер без линейной фильтрации формата** (Mali: `R16G16_UNORM`, `R16G16B16A16_UNORM`; PowerVR: D24/D32/R32F) был fatal —
+  теперь NEAREST (min/mag/mip, без анизотропии), лог раз на формат (как d2r-mobile 0733eb4/c386573). `DM_GFX_SAMPLER_STRICT=1` — старое.
+- **`depthBounds`=0 на всех Mali/PowerVR** — draw с depth bounds был fatal, теперь тест снимается (лог раз). Так же `fillModeNonSolid`
+  (FILL) и `depthBiasClamp`.
+- **Пайплайны:** ошибка `vkCreateGraphicsPipelines` больше не fatal (draw пропускается), `VK_INCOMPLETE` с хэндлом — успех (Mali, Eden #3383);
+  на не-Adreno — защита от крашей компилятора по образцу compute-pipeguard (`DM_GFX_PIPE_GUARD`, `gfx-gpipe-skip`), на PowerVR —
+  сборка по одному (`DM_GFX_PIPE_SERIAL`).
+- **`vkWaitForFences` → `VK_ERROR_INITIALIZATION_FAILED`** на Mali при прерванном сигналом ожидании (Skyline) — повтор (движок и презентер).
+- **Null storage image / storage texel buffer** без `nullDescriptor` (у G720 r49 нет robustness2) был fatal — заглушка 1×1 / scratch-буфер.
+- **Usage образа**, отвергнутое `vkGetPhysicalDeviceImageFormatProperties` целиком, — повтор без STORAGE, затем без attachment.
+- **Texel-буферы** режутся до `maxTexelBufferElements` (PowerVR 65536); вершинный формат без VERTEX_BUFFER → 4 компоненты (по gpuinfo у
+  Mali/PowerVR все наши форматы есть, путь для AMD-подобных).
+- **Политики по семейству** (`xbg_vendor_policy.h`): zero-copy только на Adreno (на остальных когерентность dma-buf не проверена);
+  PowerVR без dynamic UBO (overrun таблицы, PPSSPP); на не-Adreno `colorWriteMask=0` для FS без выходов (Mali пишет 0, d2r #179);
+  quad-рерайт выключается, если в FS нет quad-операций / subgroup < 4.
+- **Одна строка `NVN fallbacks on this device: …`** — все фолбэки устройства; первым делом смотреть её и `NVN caps` в логе с Mali.
+- **Симуляция:** `DM_GFX_SIM_GPU=mali|powervr|xclipse|<токены>` сужает фичи/subgroup/форматы/лимиты, которые видит движок, и включает
+  умолчания семейства — так все пути выше проверяются на Mi 13/14. Без переменной на Adreno всё как было: новые ветки срабатывают только
+  там, где раньше был fatal, или по семейству ≠ Adreno (проверено чтением каждой ветки; `vendor_policy_test` фиксирует умолчания Adreno).
+- **Не сделано:** GPU-декод BC (на CPU, как раньше; кандидат — шейдеры Granite, MIT, 2–4 дня), эмуляция culling-GS без `geometryShader`
+  (при `r_geometryCulling 0` GS и так снимается pass-through'ом), пайплайны против прохода с тем же load op для PowerVR, аудит
+  occlusion-запросов на тайлерах.
 
 ### 3.11 Раунд 7 (perf7, 30.10): где на самом деле CPU и GPU
 - **«10 мкс на draw» наполовину — ожидание GPU.** Разбивка `sub=` (p_p0/p_p1): `commands+acquire` 3.9–5.1 мкс/draw — это

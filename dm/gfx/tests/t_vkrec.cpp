@@ -78,6 +78,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer c,uint32_t a,uint32_
 VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer c,uint32_t a,uint32_t b,uint32_t d,uint32_t e){tag("d");put(c);put(a);put(b);put(d);put(e);}
 VKAPI_ATTR void VKAPI_CALL vkCmdDispatch(VkCommandBuffer c,uint32_t x,uint32_t y,uint32_t z){tag("disp");put(c);put(x);put(y);put(z);}
 VKAPI_ATTR void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer c,VkBuffer b,VkDeviceSize o){tag("dispi");put(c);put(b);put(o);}
+VKAPI_ATTR void VKAPI_CALL vkCmdFillBuffer(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkDeviceSize n,uint32_t d){tag("fill");put(c);put(b);put(o);put(n);put(d);}   // [DOOM] DM_GFX_CRUMBS markers
 VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer c,VkPipelineLayout l,VkShaderStageFlags s,uint32_t o,uint32_t n,const void *v){tag("pc");put(c);put(l);put(s);put(o);putn(static_cast<const uint8_t*>(v),n);}
 }
 void VKAPI_CALL mock_dicnt(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkBuffer cb,VkDeviceSize co,uint32_t n,uint32_t s){tag("dicnt");put(c);put(b);put(o);put(cb);put(co);put(n);put(s);}
@@ -119,7 +120,7 @@ void slot(VkCommandBuffer c,VkFence fence,int k,bool big){
         case 19:CmdBindIndexBuffer(c,hd<VkBuffer>(rnd()),rnd(),VkIndexType(rnd()%2));CmdDrawIndexed(c,rnd(),1+rnd()%3,rnd(),int32_t(rnd())-100,rnd()%4);break;
         case 20:CmdDraw(c,rnd(),1,rnd(),0);break;
         case 21:CmdDrawIndexedIndirect(c,hd<VkBuffer>(rnd()),rnd(),1,20);CmdDrawIndirect(c,hd<VkBuffer>(rnd()),rnd(),1,16);break;
-        case 22:CmdDispatch(c,rnd()%64,rnd()%64,1);CmdDispatchIndirect(c,hd<VkBuffer>(rnd()),rnd());break;
+        case 22:CmdDispatch(c,rnd()%64,rnd()%64,1);CmdDispatchIndirect(c,hd<VkBuffer>(rnd()),rnd());CmdFillBuffer(c,hd<VkBuffer>(rnd()),0,4,rnd());break;   // + [DOOM] crumbs marker fill
         case 23:{uint8_t pc[16];for(auto &x:pc)x=uint8_t(rnd());CmdPushConstants(c,hd<VkPipelineLayout>(rnd()),VK_SHADER_STAGE_FRAGMENT_BIT,0,4*(1+rnd()%4),pc);break;}
         case 24:{VkBuffer a=hd<VkBuffer>(rnd()),b=hd<VkBuffer>(rnd());VkDeviceSize o=rnd(),co=rnd();uint32_t n=rnd()%9;
             if(vkrec::on)vkrec::CmdDrawIndirectCount(vkrec::K_DRAW_IDX_IND_CNT,reinterpret_cast<void*>(&mock_dicnt),c,a,o,b,co,n,20);else mock_dicnt(c,a,o,b,co,n,20);

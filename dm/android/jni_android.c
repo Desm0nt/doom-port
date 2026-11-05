@@ -29,6 +29,12 @@
 #endif
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdatomic.h>
+#include <time.h>
+#include <sys/ioctl.h>
+#include <sys/system_properties.h>
 
 void front_android_set_window(void *win, int w, int h);
 void front_android_set_refresh(float hz);
@@ -74,22 +80,105 @@ static int lifecycle_ready(void) { pthread_once(&g_lifecycle_once, lifecycle_ini
 
 // stderr → 管道 → 本线程：逐行写日志文件（adb pull 取）并转 logcat（标签 dm）
 // stderr → pipe → this thread: write line by line to the log file (fetched with adb pull) and forward to logcat (tag dm)
+// [DOOM] (BUGS_AND_FIXES 2.22) The log no longer grows forever: every launch moves boot.log to boot.prev.log (one previous run kept) and
+// starts a new one; within a run, past DM_LOG_MAX_MB (default 32) the file is cut back to its first 4 MB (the boot: device, driver, GPU)
+// and goes on from there, so the head and the latest lines both survive. The app's own __android_log_print lines (dm-vulkan: the
+// engine's xbg_logf, swapchain, FATAL; dm-lifecycle; dm-input) are copied into the file too (__wrap___android_log_print below; the
+// link uses -Wl,--wrap). A crash (crash.c report hook) marks <files>/dm-crash.txt and fsyncs the log; DmActivity / CrashLog.java then
+// writes Download/DOOM Mobile/logs/crash.txt from it at the next start.
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_log_fd = -1;
+static char g_log_path[1200], g_crash_flag[1200];
+static _Atomic int g_pump_busy;
+static char g_crash_note[384];   // the last FATAL line: copied into the crash marker (read in the signal handler, racy by design)
+static long g_log_head = -1, g_log_max = 32l << 20;
+#define LOG_HEAD_KEEP (4l << 20)
+static void log_file_line(const char *tag, const char *s) {
+    if (!g_logf) return;
+    pthread_mutex_lock(&g_log_mu);
+    if (tag) fprintf(g_logf, "[%s] %s\n", tag, s); else { fputs(s, g_logf); fputc('\n', g_logf); }
+    fflush(g_logf);
+    long at = ftell(g_logf);
+    if (g_log_head < 0 && at >= LOG_HEAD_KEEP) g_log_head = at;   // the boot head ends at this line
+    if (g_log_head > 0 && at > g_log_max) {
+        if (!ftruncate(g_log_fd, g_log_head)) { fseek(g_logf, 0, SEEK_END);
+            fprintf(g_logf, "[dm] [log] boot.log passed %ld MB: cut back to its first %ld MB (DM_LOG_MAX_MB), later lines follow\n", g_log_max >> 20, g_log_head >> 20); fflush(g_logf); }
+    }
+    pthread_mutex_unlock(&g_log_mu);
+}
+static void note_fatal(const char *s) { if (strstr(s, "FATAL")) snprintf(g_crash_note, sizeof g_crash_note, "%s", s); }
 static void *log_pump(void *arg) {
     int fd = (int)(intptr_t)arg; char buf[4096]; size_t have = 0; ssize_t k;
     while ((k = read(fd, buf + have, sizeof buf - 1 - have)) > 0) {
+        atomic_store(&g_pump_busy, 1);
         have += (size_t)k; buf[have] = 0; char *s = buf, *nl;
-        while ((nl = strchr(s, '\n'))) { *nl = 0; __android_log_write(ANDROID_LOG_INFO, "dm", s); if (g_logf) { fputs(s, g_logf); fputc('\n', g_logf); fflush(g_logf); } s = nl + 1; }
+        while ((nl = strchr(s, '\n'))) { *nl = 0; __android_log_write(ANDROID_LOG_INFO, "dm", s); note_fatal(s); log_file_line(NULL, s); s = nl + 1; }
         have = strlen(s); memmove(buf, s, have);
-        if (have == sizeof buf - 1) { __android_log_write(ANDROID_LOG_INFO, "dm", buf); if (g_logf) { fputs(buf, g_logf); fflush(g_logf); } have = 0; }
+        if (have == sizeof buf - 1) { __android_log_write(ANDROID_LOG_INFO, "dm", buf); log_file_line(NULL, buf); have = 0; }
+        atomic_store(&g_pump_busy, 0);
     }
     return NULL;
 }
+// Every __android_log_print of libdm.so (vulkan_present.cpp dm-vulkan incl. the engine's log and FATAL callback, dm-lifecycle,
+// dm-input, dm-vvl) comes here (CMakeLists.txt: -Wl,--wrap=__android_log_print): to logcat as before, and into boot.log.
+int __wrap___android_log_print(int prio, const char *tag, const char *fmt, ...) {
+    char text[1024]; va_list a; va_start(a, fmt); vsnprintf(text, sizeof text, fmt, a); va_end(a);
+    int r = __android_log_write(prio, tag, text);
+    if (prio >= ANDROID_LOG_FATAL) snprintf(g_crash_note, sizeof g_crash_note, "[%s] FATAL: %s", tag ? tag : "?", text);
+    log_file_line(tag ? tag : "?", text);
+    return r;
+}
+// Async-signal-safe helpers for the crash hook (no stdio, no locks).
+static size_t s_hex(char *o, uint64_t v) { char t[17]; int n = 0; do { t[n++] = "0123456789abcdef"[v & 15]; v >>= 4; } while (v); o[0] = '0'; o[1] = 'x'; for (int i = 0; i < n; i++) o[2 + i] = t[n - 1 - i]; return (size_t)n + 2; }
+static size_t s_dec(char *o, int v) { char t[12]; int n = 0; unsigned u = v < 0 ? 0u - (unsigned)v : (unsigned)v; do { t[n++] = (char)('0' + u % 10); u /= 10; } while (u); size_t k = 0; if (v < 0) o[k++] = '-'; while (n) o[k++] = t[--n]; return k; }
+static size_t s_cat(char *o, const char *s) { size_t n = 0; while (s[n]) { o[n] = s[n]; n++; } return n; }
+static void crash_report_hook(int phase, int sig, uint64_t addr, uint64_t pc) {
+    if (phase == 0) {   // the marker first: <files>/dm-crash.txt "signal=<n> addr=<hex> pc=<hex>\n<last FATAL line>\n"
+        int fd = g_crash_flag[0] ? open(g_crash_flag, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
+        if (fd < 0) return;
+        char b[640]; size_t n = 0;
+        n += s_cat(b + n, "signal="); n += s_dec(b + n, sig); n += s_cat(b + n, " addr="); n += s_hex(b + n, addr); n += s_cat(b + n, " pc="); n += s_hex(b + n, pc); b[n++] = '\n';
+        for (size_t i = 0; g_crash_note[i] && n < sizeof b - 2; i++) b[n++] = g_crash_note[i];
+        b[n++] = '\n';
+        if (write(fd, b, n) < 0) {} fsync(fd); close(fd);
+        return;
+    }
+    // phase 1: let the pump put the dump into boot.log (the pipe empty and the pump idle twice in a row), then fsync it; at most 1.5 s
+    int quiet = 0;
+    for (int i = 0; i < 300 && quiet < 2; i++) {
+        int n = 0; quiet = !ioctl(2, FIONREAD, &n) && n == 0 && !atomic_load(&g_pump_busy) ? quiet + 1 : 0;
+        struct timespec ts = {0, 5000000}; nanosleep(&ts, NULL);
+    }
+    if (g_log_fd >= 0) fsync(g_log_fd);
+}
+void crash_set_report_hook(void (*fn)(int phase, int sig, uint64_t addr, uint64_t pc));   // crash.c
+static void prop(const char *name, char *out) { out[0] = 0; __system_property_get(name, out); if (!out[0]) snprintf(out, PROP_VALUE_MAX, "-"); }
+static void log_header(void) {
+    char mf[PROP_VALUE_MAX], md[PROP_VALUE_MAX], dv[PROP_VALUE_MAX], sm[PROP_VALUE_MAX], so[PROP_VALUE_MAX], hw[PROP_VALUE_MAX], bp[PROP_VALUE_MAX], rel[PROP_VALUE_MAX], sdk[PROP_VALUE_MAX], fp[PROP_VALUE_MAX];
+    prop("ro.product.manufacturer", mf); prop("ro.product.model", md); prop("ro.product.device", dv); prop("ro.soc.manufacturer", sm); prop("ro.soc.model", so);
+    prop("ro.hardware", hw); prop("ro.board.platform", bp); prop("ro.build.version.release", rel); prop("ro.build.version.sdk", sdk); prop("ro.build.fingerprint", fp);
+    time_t now = time(NULL); struct tm tm; char when[64]; localtime_r(&now, &tm); strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S %z", &tm);
+    LOG("boot: log %s (the previous run: boot.prev.log), pid %d, %s, app %s", g_log_path, (int)getpid(), when, getenv("DM_APP_VERSION") ? getenv("DM_APP_VERSION") : "?");
+    LOG("boot: device %s %s (%s), SoC %s %s, hardware %s, platform %s, Android %s (SDK %s), build %s", mf, md, dv, sm, so, hw, bp, rel, sdk, fp);
+    char model[96] = ""; FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r"); if (f) { if (fgets(model, sizeof model, f)) model[strcspn(model, "\r\n")] = 0; fclose(f); }
+    long total = 0, avail = 0; f = fopen("/proc/meminfo", "r");
+    if (f) { char l[128]; while (fgets(l, sizeof l, f)) { sscanf(l, "MemTotal: %ld", &total); sscanf(l, "MemAvailable: %ld", &avail); } fclose(f); }
+    LOG("boot: gpu kgsl=%d gpu_model=%s mali=%d, memory %ld MB (available %ld MB), Vulkan driver asked: %s", !access("/dev/kgsl-3d0", F_OK) || !access("/sys/class/kgsl/kgsl-3d0", F_OK),
+        model[0] ? model : "-", !access("/dev/mali0", F_OK), total >> 10, avail >> 10, getenv("DM_VK_DRIVER") && *getenv("DM_VK_DRIVER") ? getenv("DM_VK_DRIVER") : "system");
+}
+static void log_limit(void) { const char *e = getenv("DM_LOG_MAX_MB"); if (e && atol(e) >= 8) g_log_max = atol(e) << 20; }   // again after dm/env
 static void log_init(void) {
     static int initialized; if (initialized) return; initialized = 1;
-    char p[1200]; snprintf(p, sizeof p, "%s/boot.log", g_runtime); g_logf = fopen(p, "a");
+    char prev[1220]; snprintf(g_log_path, sizeof g_log_path, "%s/boot.log", g_runtime); snprintf(prev, sizeof prev, "%s/boot.prev.log", g_runtime);
+    if (rename(g_log_path, prev) && errno != ENOENT) unlink(g_log_path);   // [DOOM] one previous run kept; never append forever
+    g_logf = fopen(g_log_path, "w"); g_log_fd = g_logf ? fileno(g_logf) : -1;
+    log_limit();
+    snprintf(g_crash_flag, sizeof g_crash_flag, "%s/dm-crash.txt", g_files);
+    crash_set_report_hook(crash_report_hook);
     int fds[2]; if (pipe(fds)) return;
     dup2(fds[1], 2); close(fds[1]); setvbuf(stderr, NULL, _IOLBF, 0);
-    pthread_t th; if (!pthread_create(&th, NULL, log_pump, (void *)(intptr_t)fds[0])) pthread_detach(th);
+    pthread_t th; if (!pthread_create(&th, NULL, log_pump, (void *)(intptr_t)fds[0])) { pthread_setname_np(th, "dm-log"); pthread_detach(th); }
+    log_header();
 }
 
 static void mkdirs(const char *p) {
@@ -125,8 +214,10 @@ static void *host_thread(void *arg) {
     // Initialize graphics on the host thread; shaders stay external, and failure stops startup.
     char shaders[1200], error[512] = {0};
     snprintf(shaders, sizeof shaders, "%s/shaders", g_runtime);
+    uint64_t t0 = now_ns(); LOG("boot: Vulkan initialization (shaders %s)", shaders);
     int graphics_rc = dm_android_vk_initialize(shaders, error, sizeof error);
     if (graphics_rc) { LOG("boot: Vulkan initialization failed %d: %s", graphics_rc, error); front_android_boot_failed(-6); return NULL; }
+    LOG("boot: Vulkan initialized in %.0f ms", (now_ns() - t0) / 1e6);   // [DOOM] breadcrumb
     char *argv[] = {"dmhost", out, "main", "sdk", NULL};
     LOG("boot: dm_main %s", out);
     int rc = dm_main(4, argv);
@@ -176,6 +267,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     snprintf(romfs, sizeof romfs, "%s/romfs", g_src);
     snprintf(p, sizeof p, "%s/out/main.patched.bin", g_runtime);
     if (access(p, R_OK)) { snprintf(g_runtime, sizeof g_runtime, "%s/dm", g_src); LOG("boot: runtime %s", g_runtime); load_env_file(g_runtime); }
+    log_limit();
     // [DOOM] DM_STDOUT_FILE=1: send this process's stdout (Android drops it) to <runtime>/stdout.txt, e.g. for the shader
     // disassembly of Turnip/ir3 (IR3_SHADER_DEBUG=disasm) or other driver debug output that is not written to logcat.
     { const char *e = getenv("DM_STDOUT_FILE");
@@ -306,6 +398,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
         snprintf(required, sizeof required, "%s/out/%s", g_runtime, modules[i]);
         if (access(required, R_OK)) { LOG("boot: missing %s", required); return -3; }
     }
+    LOG("boot: patched modules present in %s/out (main / sdk: patched.bin, fixups, gates)", g_runtime);   // [DOOM] breadcrumb
 #ifndef DM_GAME_DOOM   // [DOOM] .build.config is D2R CASC
     snprintf(required, sizeof required, "%s/data/.build.config", romfs);
     if (access(required, R_OK)) { LOG("boot: missing build configuration"); return -5; }
@@ -317,6 +410,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
         if (len > 4 && !strcmp(entry->d_name + len - 4, ".xgs")) { have_shader = 1; break; }
     } closedir(shaders); }
     if (!have_shader) { LOG("boot: no shader bundles in %s", required); return -4; }
+    LOG("boot: shader bundles found in %s", required);
 #ifndef DM_GAME_DOOM   // [DOOM] no D2R touch overlay / overlay contract
     snprintf(required, sizeof required, "%s/overlay", g_runtime);
     // 启动前核必需覆盖层；旧资源不能自动补指纹，也不能带着错误资源进入游戏。
@@ -337,6 +431,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
     pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);
     if (!rc) { started = 1; pthread_detach(th); }
+    LOG("boot: host thread %s", rc ? "NOT started" : "started");
     return rc ? -1 : n;
 }
 
@@ -370,6 +465,8 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeTouch(JNIEnv *env
 // UI posts only: 0 unfocused, 1 background, 2 foreground, 3 active; active also declares foreground so merging 2/3 cannot lose resume.
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeFocus(JNIEnv *env, jclass cls, jint ev) {
     (void)env; (void)cls;
+    { static const char *const names[] = {"unfocused (onPause)", "background (onStop)", "foreground (onStart)", "active (onResume)"};
+      LOG("[life] %s", ev >= 0 && ev <= 3 ? names[ev] : "?"); }   // [DOOM] breadcrumb
     dm_android_touch_focus(ev == 2 || ev == 3);
     front_android_sensors(ev == 2 || ev == 3);          // motion sensors only while in front
     dm_haptics_android_foreground(ev == 2 || ev == 3);  // no rumble left running in the background
@@ -466,6 +563,14 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeHold(JNIEnv *env,
     dm_haptics_android_foreground(on ? 0 : 1);   // no rumble left running under the menu
     dm_hold_menu(on ? 1 : 0);
 }
+// [DOOM] Java breadcrumbs into boot.log (DmActivity.crumb: trim memory, driver decision, first frame, crash report written) and the log
+// file's path for CrashLog.java (the same rule as here; "" before nativeStart).
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeLog(JNIEnv *env, jclass cls, jstring text) {
+    (void)cls; if (!text) return;
+    const char *t = (*env)->GetStringUTFChars(env, text, NULL); if (!t) return;
+    LOG("[java] %s", t); (*env)->ReleaseStringUTFChars(env, text, t);
+}
+JNIEXPORT jstring JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeLogPath(JNIEnv *env, jclass cls) { (void)cls; return (*env)->NewStringUTF(env, g_log_path); }
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeQuit(JNIEnv *env, jclass cls) { (void)env; (void)cls; LOG("[java] the app ends (pause menu)"); dm_host_shutdown("pause menu: quit"); }
 JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeOpmode(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_opmode(); }
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetOpmode(JNIEnv *env, jclass cls, jint m) { (void)env; (void)cls; dm_set_opmode(m ? 1 : 0); }

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
+#include <unistd.h>
 #include "vk_tramp_names.h"
 #ifdef DM_ADRENOTOOLS
 #include <adrenotools/driver.h>
@@ -29,9 +30,29 @@ static char g_driver_name[160] = "system";
 const char *dm_vk_driver_name(void) { return g_driver_name; }
 // For the app (jni_android.c nativeDriverStatus -> DmActivity toast / settings line): "<requested>\t<active>\t<reason>" once the driver
 // is loaded, "" before. requested = DM_VK_DRIVER ("" = system), active = "system" or the loaded library, reason = ok | no-library
-// (package folder without a .so) | load-failed (adrenotools could not open it) | no-gpu (it loaded but offers no Vulkan 1.1 GPU here).
+// (package folder without a .so) | load-failed (adrenotools could not open it) | no-gpu (it loaded but offers no Vulkan 1.1 GPU here)
+// | no-adreno ([DOOM] an Adreno-only package such as Turnip on a phone without the Qualcomm KGSL GPU device: not even loaded).
 static char g_status[512];
 const char *dm_vk_driver_status(void) { return g_status; }
+
+// [DOOM] Hardware facts for the driver choice (BUGS_AND_FIXES 2.22). Turnip (Mesa freedreno) drives the Adreno through the Qualcomm
+// kernel driver KGSL: without /dev/kgsl-3d0 (Mali, PowerVR, Xclipse, Maleoon...) it cannot work at all, and loading it there only
+// risks a crash inside the driver. The Java side (DmActivity.turnipPossible) makes the same decision before the library loads; this
+// is the native guard for a DM_VK_DRIVER that still asks for it (dm/env, settings restored from another phone).
+static int kgsl_present(void) { return !access("/dev/kgsl-3d0", F_OK) || !access("/sys/class/kgsl/kgsl-3d0", F_OK); }
+static void gpu_model(char *out, size_t n) {
+    out[0] = 0; FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r");
+    if (f) { if (fgets(out, (int)n, f)) out[strcspn(out, "\r\n")] = 0; fclose(f); }
+    if (!out[0]) snprintf(out, n, "%s", !access("/dev/mali0", F_OK) ? "(mali0 device, no kgsl)" : "(unreadable)");
+}
+// A package that can only drive an Adreno: Turnip / freedreno (by its folder or library name).
+static int has_word(const char *s, const char *w) {   // case-insensitive substring (w in lower case)
+    for (; *s; s++) { size_t i = 0; while (w[i] && s[i] && (s[i] | 0x20) == w[i]) i++; if (!w[i]) return 1; }
+    return 0;
+}
+static int adreno_only(const char *name) {
+    return name && (has_word(name, "turnip") || has_word(name, "freedreno") || has_word(name, "adreno"));
+}
 
 #ifdef DM_ADRENOTOOLS
 // Does this driver offer a Vulkan 1.1+ GPU? (A Turnip build for another Adreno generation loads but finds no device.)
@@ -63,9 +84,15 @@ static int driver_has_gpu(PFN_vkGetInstanceProcAddr gipa) {
 
 static void load_driver(void) {
     void *lib = NULL; const char *reason = "ok", *req = getenv("DM_VK_DRIVER");
+    const int kgsl = kgsl_present(); char model[96]; gpu_model(model, sizeof model);
 #ifdef DM_ADRENOTOOLS
-    const char *drv = req, *hooks = getenv("DM_NATIVE_LIB_DIR"), *pkgs = getenv("DM_DRIVERS_DIR");
+    const char *drv = req, *hooks = getenv("DM_NATIVE_LIB_DIR"), *pkgs = getenv("DM_DRIVERS_DIR"), *force = getenv("DM_VK_DRIVER_FORCE");
     char path[1024];
+    if (drv && *drv && !kgsl && adreno_only(drv) && !(force && *force == '1')) {
+        LOG("[vk] driver %s skipped: no Adreno here (no /dev/kgsl-3d0, gpu %s), Turnip cannot run on this GPU; using the system driver"
+            " (DM_VK_DRIVER_FORCE=1 tries it anyway)", drv, model);
+        drv = NULL; reason = "no-adreno";
+    }
     if (drv && *drv && !strchr(drv, '/') && pkgs) {   // a package name: DM_DRIVERS_DIR/<name>/<its .so> (DmActivity copies it there)
         char d[768]; snprintf(d, sizeof d, "%s/%s", pkgs, drv);
         DIR *dir = opendir(d); struct dirent *e; path[0] = 0;
@@ -98,12 +125,81 @@ static void load_driver(void) {
     if (!g_gipa) { LOG("[vk] the Vulkan driver has no vkGetInstanceProcAddr"); abort(); }
     g_create_instance = (PFN_vkCreateInstance)g_gipa(NULL, "vkCreateInstance");
     LOG("[vk] Vulkan driver: %s", g_driver_name);
+    // [DOOM] one line with the choice and why (grep "[vk] driver choice")
+    LOG("[vk] driver choice: requested=%s active=%s reason=%s kgsl=%d gpu_model=%s", req && *req ? req : "system", g_driver_name, reason, kgsl, model);
     snprintf(g_status, sizeof g_status, "%s\t%s\t%s", req ? req : "", g_driver_name, reason);
+}
+
+// [DOOM] Breadcrumbs for the crash log: what the created instance sees (once per run, on the game's own instance): every GPU with its
+// vendor, driver identity and version, and the limits / features the translated Switch shaders lean on most. grep "[vk] gpu".
+static const char *vendor_name(uint32_t v) {
+    switch (v) { case 0x5143: return "Qualcomm"; case 0x13B5: return "ARM"; case 0x1010: return "ImgTec"; case 0x144D: return "Samsung";
+                 case 0x1002: return "AMD"; case 0x10DE: return "NVIDIA"; case 0x8086: return "Intel"; case 0x19E5: return "Huawei";
+                 case 0x10005: return "Mesa"; default: return "?"; }
+}
+static void log_gpus(VkInstance inst) {
+    PFN_vkEnumeratePhysicalDevices en = (PFN_vkEnumeratePhysicalDevices)g_gipa(inst, "vkEnumeratePhysicalDevices");
+    PFN_vkGetPhysicalDeviceProperties2 props2 = (PFN_vkGetPhysicalDeviceProperties2)g_gipa(inst, "vkGetPhysicalDeviceProperties2");
+    PFN_vkGetPhysicalDeviceFeatures feats = (PFN_vkGetPhysicalDeviceFeatures)g_gipa(inst, "vkGetPhysicalDeviceFeatures");
+    PFN_vkGetPhysicalDeviceMemoryProperties memp = (PFN_vkGetPhysicalDeviceMemoryProperties)g_gipa(inst, "vkGetPhysicalDeviceMemoryProperties");
+    PFN_vkEnumerateDeviceExtensionProperties exts = (PFN_vkEnumerateDeviceExtensionProperties)g_gipa(inst, "vkEnumerateDeviceExtensionProperties");
+    uint32_t n = 0; VkPhysicalDevice pd[4];
+    if (!en || !props2 || en(inst, &n, NULL) != VK_SUCCESS || !n) { LOG("[vk] gpu: none enumerated"); return; }
+    if (n > 4) n = 4;
+    if (en(inst, &n, pd) < 0) return;
+    for (uint32_t i = 0; i < n; i++) {
+        int has_drvprops = 0; uint32_t ne = 0;
+        if (exts && exts(pd[i], NULL, &ne, NULL) == VK_SUCCESS && ne) {
+            VkExtensionProperties *e = calloc(ne, sizeof *e);
+            if (e && exts(pd[i], NULL, &ne, e) >= 0) for (uint32_t k = 0; k < ne; k++) if (!strcmp(e[k].extensionName, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) has_drvprops = 1;
+            free(e);
+        }
+        VkPhysicalDeviceDriverPropertiesKHR dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES_KHR};
+        VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES, .pNext = has_drvprops ? &dp : NULL};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
+        props2(pd[i], &p2);
+        const VkPhysicalDeviceProperties *p = &p2.properties; const VkPhysicalDeviceLimits *l = &p->limits;
+        LOG("[vk] gpu %u: \"%s\" vendor %#x (%s) device %#x type %d Vulkan %u.%u.%u driver %#x (%u.%u.%u) id \"%s\" info \"%s\"", i, p->deviceName,
+            p->vendorID, vendor_name(p->vendorID), p->deviceID, (int)p->deviceType, VK_VERSION_MAJOR(p->apiVersion), VK_VERSION_MINOR(p->apiVersion),
+            VK_VERSION_PATCH(p->apiVersion), p->driverVersion, VK_VERSION_MAJOR(p->driverVersion), VK_VERSION_MINOR(p->driverVersion),
+            VK_VERSION_PATCH(p->driverVersion), has_drvprops ? dp.driverName : "-", has_drvprops ? dp.driverInfo : "-");
+        LOG("[vk] gpu %u limits: image2D %u storageRange %u uniformRange %u perStage samplers %u sampled %u storageBuf %u storageImg %u resources %u"
+            " sets %u push %u cs shared %u cs invocations %u vertexAttribs %u colorAtt %u align ubo %llu ssbo %llu atom %llu aniso %.0f ts %.2f ns"
+            " subgroup %u stages %#x ops %#x", i, l->maxImageDimension2D, l->maxStorageBufferRange, l->maxUniformBufferRange,
+            l->maxPerStageDescriptorSamplers, l->maxPerStageDescriptorSampledImages, l->maxPerStageDescriptorStorageBuffers,
+            l->maxPerStageDescriptorStorageImages, l->maxPerStageResources, l->maxBoundDescriptorSets, l->maxPushConstantsSize,
+            l->maxComputeSharedMemorySize, l->maxComputeWorkGroupInvocations, l->maxVertexInputAttributes, l->maxColorAttachments,
+            (unsigned long long)l->minUniformBufferOffsetAlignment, (unsigned long long)l->minStorageBufferOffsetAlignment,
+            (unsigned long long)l->nonCoherentAtomSize, (double)l->maxSamplerAnisotropy, (double)l->timestampPeriod,
+            sg.subgroupSize, (unsigned)sg.supportedStages, (unsigned)sg.supportedOperations);
+        if (feats) {
+            VkPhysicalDeviceFeatures f; memset(&f, 0, sizeof f); feats(pd[i], &f);
+            LOG("[vk] gpu %u features: geometry %u tess %u bc %u astc %u etc2 %u int64 %u int16 %u float64 %u imgReadNoFmt %u imgWriteNoFmt %u"
+                " imgExtFmt %u fragStores %u vtxStores %u multiDrawInd %u firstInstance %u depthClamp %u depthBiasClamp %u dualSrc %u logicOp %u"
+                " sampleRate %u clip %u cull %u cubeArray %u gatherExt %u robust %u", i, f.geometryShader, f.tessellationShader,
+                f.textureCompressionBC, f.textureCompressionASTC_LDR, f.textureCompressionETC2, f.shaderInt64, f.shaderInt16, f.shaderFloat64,
+                f.shaderStorageImageReadWithoutFormat, f.shaderStorageImageWriteWithoutFormat, f.shaderStorageImageExtendedFormats,
+                f.fragmentStoresAndAtomics, f.vertexPipelineStoresAndAtomics, f.multiDrawIndirect, f.drawIndirectFirstInstance, f.depthClamp,
+                f.depthBiasClamp, f.dualSrcBlend, f.logicOp, f.sampleRateShading, f.shaderClipDistance, f.shaderCullDistance, f.imageCubeArray,
+                f.shaderImageGatherExtended, f.robustBufferAccess);
+        }
+        if (memp) {
+            VkPhysicalDeviceMemoryProperties m; memp(pd[i], &m); char line[512]; int at = 0;
+            for (uint32_t h = 0; h < m.memoryHeapCount && at < (int)sizeof line - 48; h++)
+                at += snprintf(line + at, sizeof line - at, " heap%u %llu MB%s", h, (unsigned long long)(m.memoryHeaps[h].size >> 20), m.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " local" : "");
+            for (uint32_t t = 0; t < m.memoryTypeCount && at < (int)sizeof line - 24; t++)
+                at += snprintf(line + at, sizeof line - at, " t%u=h%u/%#x", t, m.memoryTypes[t].heapIndex, (unsigned)m.memoryTypes[t].propertyFlags);
+            LOG("[vk] gpu %u memory:%s", i, line);
+        }
+    }
 }
 
 // vkCreateInstance goes through here so the instance-level functions can be resolved against the instance (one instance).
 static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *a, VkInstance *out) {
     VkResult r = g_create_instance(ci, a, out);
+    const VkApplicationInfo *ai = ci ? ci->pApplicationInfo : NULL;
+    LOG("[vk] vkCreateInstance (api %u.%u, %u layers, %u extensions, driver %s): %d", ai ? VK_VERSION_MAJOR(ai->apiVersion) : 1, ai ? VK_VERSION_MINOR(ai->apiVersion) : 0,
+        ci ? ci->enabledLayerCount : 0, ci ? ci->enabledExtensionCount : 0, g_driver_name, (int)r);
     if (r == VK_SUCCESS) {
         pthread_mutex_lock(&g_lock);
         g_instance = *out;
@@ -112,6 +208,7 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
                 strncmp(dm_vk_names[i], "vkEnumerateInstance", 19))
                 dm_vk_table[i] = NULL;
         pthread_mutex_unlock(&g_lock);
+        static int logged; if (!logged) { logged = 1; log_gpus(*out); }   // [DOOM] breadcrumbs: once per run
     }
     return r;
 }

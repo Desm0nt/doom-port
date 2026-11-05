@@ -31,6 +31,13 @@ extern "C" void dm_aperf_frame_tid(int);   // [mt 2a] perf_android.c: the ADPF s
 #include <thread>
 #include <unistd.h>
 #include <time.h>
+// [nonadreno] Mali: vkWaitForFences returns VK_ERROR_INITIALIZATION_FAILED when its ppoll() is interrupted by a signal (Skyline
+// fence_cycle.h cbc896c8f8, idea only); retried. Other results unchanged, so Adreno sees the same calls.
+static VkResult dm_present_wait_fences(VkDevice d,uint32_t n,const VkFence *f,VkBool32 all,uint64_t timeout){
+    VkResult r=vkWaitForFences(d,n,f,all,timeout);
+    for(unsigned tries=0;r==VK_ERROR_INITIALIZATION_FAILED && tries<1000;++tries)r=vkWaitForFences(d,n,f,all,timeout);
+    return r;}
+#define vkWaitForFences dm_present_wait_fences
 extern "C" double dm_present_period(void);
 // 错过上屏节拍的帧数（晚于「上次期望时刻 + 周期」2 ms 以上）；自适应出图档按它降档 / 试升
 // Frames that missed their display slot (more than 2 ms later than "previous desired time + period"); the adaptive present tier steps down / probes up by it

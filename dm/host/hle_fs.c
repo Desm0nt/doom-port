@@ -686,6 +686,19 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     // [DOOM] every save-storage file opened for writing (e.g. savedir:/PROFILE/save.dat when the profile is saved, BUGS_AND_FIXES 2.14);
     // the commit that follows logs "存档提交 #n"
     else if (g_fsave[fd] && (mode & (MODE_WRITE | MODE_APPEND))) LOG("[save] open for writing %s (mode %d, size %lld)", path, mode, (long long)st.st_size);
+    // [DOOM] breadcrumb for crash logs (BUGS_AND_FIXES 2.22): the first open of each *.resources archive, i.e. what the game was
+    // loading (the boot set, then a level's own packs), one line per archive per run
+    { size_t pl = strlen(path);
+      if (pl > 10 && !strcmp(path + pl - 10, ".resources") && !(mode & (MODE_WRITE | MODE_APPEND))) {
+          static _Atomic uint64_t seen[512]; uint64_t h = 1469598103934665603ull;
+          for (const char *c = path; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+          if (!h) h = 1;
+          for (unsigned i = 0, k = (unsigned)h & 511; i < 512; i++, k = (k + 1) & 511) {
+              uint64_t z = 0;
+              if (atomic_load(&seen[k]) == h) break;
+              if (atomic_compare_exchange_strong(&seen[k], &z, h)) { LOG("[res] first open %s (%.1f s, %lld MB)", path, (now_ns() - g_t0_ns) / 1e9, (long long)(st.st_size >> 20)); break; }
+              if (z == h) break;
+          } } }
 #endif
     return RES_OK;
 }
