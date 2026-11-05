@@ -1175,6 +1175,48 @@ BC6H c 5 мипами в RGBA16F (1880) — это кэши виртуальны
   BC-текстуру своими, не файловыми блоками и та не похожа по форме на кэш VT, она будет показана как ASTC / EAC — мусор на ней, не краш
   (в дампах таких нет: свои блоки пишутся только в 103 и 1880). Проверка — пройти уровни на `DM_GFX_ASTC_OVERLAY=1` и сравнить с `=0`.
 
+### 2.27 SIGILL на ARMv8.0 (issue #10, Redmi 10C / Snapdragon 680) → выбор LSE / v8.0 по CPU при запуске (05.11, v0.4.13; собрано, эмулятор A53 зелёный, на телефоне не проверено)
+
+Redmi 10C (SM6225 = Snapdragon 680, Kryo 265 = Cortex-A73 + A53, **ARMv8.0-A без LSE**): через 9 с после старта `signal 4`,
+`pc=libdm.so+0xf3a04` = `stadd x17, [x16]` в `nvnth_6`. Счётчик вызовов в NVN-переходниках (`gfx/nvn/nvn_thunks.S`, генератор
+`gfx/tools/gen_protos.py`) был написан LSE-инструкцией `stadd` (ARMv8.1) с `.arch_extension lse` — на v8.0-ядрах это
+недопустимая инструкция. Под удар попадают все телефоны на A53/A57/A72/A73 (Snapdragon 4xx/6xx/660/665/680, Helio G35–G85 и т. п.).
+- **Аудит всего, что мы сами выпускаем в машинный код** (`llvm-objdump -d` + сканер классов v8.1+: LSE, RCpc, LOR, RDM, dotprod,
+  fp16, crc32, crypto, PAuth не-hint, jscvt, fhm, frint, flagm, bf16/i8mm, MTE, SVE; патч-зоны модулей — capstone):
+  - `nvn_thunks.S`: 523 × `stadd` — **причина падения**;
+  - `nvn_entry.S`, `_nvn_prof_entry` (только `DM_NVN_PROF=1`): 1 × `stadd`;
+  - `host/hle_count.c` (только `DM_HLECOUNT`): стаб пишется в память во время работы, слово `stadd` — objdump его не видит;
+  - флаги сборки: нигде нет `-march`/`-mcpu`/`+lse`/`+rcpc`/`+dotprod`; `-mtune=cortex-x3` ISA не меняет; zlib-ng собирает
+    `+crc` только для `crc32_armv8*`, выбор по `HWCAP_CRC32` в рантайме; `armv8-a+simd` = базовый NEON;
+  - C/C++ атомики — outline atomics NDK (`__aarch64_ldadd8_acq_rel` и т. п.: `cbz` по `__aarch64_have_lse_atomics`, иначе
+    `ldaxr/stlxr`); `stg` в libunwind — только для MTE-кадров; PAC/BTI — hint-пространство, на v8.0 это NOP;
+  - hook-библиотеки adrenotools: чисто (только те же outline-хелперы); Turnip 27 (все 4 сборки) — LSE только в outline-хелперах;
+  - `patch_nso.py`: эмиттер пишет только v8.0-кодировки (B/BL/ADRP/ADD/SUB/LDR/STR/STP/LDP/STUR/LDUR/MRS/BR/BLR/CBZ/NOP/BRK/MOVZ),
+    остальное — копии инструкций самой игры (Switch = A57, v8.0). Скан патч-зон `main.patched.bin` (0x73c0000+, 202k слов) и
+    `sdk.patched.bin` (0xc80000+, 120k слов) — 0 инструкций v8.1+. **Патчи игры не меняются, повторный setup не нужен.**
+  - сама игра: `main` — чисто; `sdk` (nnSdk) содержит AES/SHA/CRC32 — их имеет A57 Switch и практически все Android-SoC
+    (в v8.0 они формально опциональны); теперь это видно в boot-логе (`aes=`, `crc32=`), если когда-то встретится SoC без них.
+- **Исправление: выбор по CPU при запуске, на LSE-телефонах код тот же байт в байт.** `host/dm_cpu.h`:
+  `dm_cpu_lse()` = `getauxval(AT_HWCAP) & HWCAP_ATOMICS` (на Apple всегда 1). Адрес выбирается один раз в месте, где он выдаётся:
+  - переходники: генератор пишет второй набор `_nvnth80_<i>` и таблицу `_nvn_thunk_v80`; `nvn_lookup` отдаёт игре
+    `nvn_thunk[i]` (LSE, как раньше) или `nvn_thunk_v80[i]`. v8.0-счётчик — обычный `ldr/add/str`: это диагностика
+    (`DM_NVN_COUNT`, кадровый лог, tsv), редкая потеря инкремента при одновременном вызове одной функции из двух потоков не важна,
+    а LL/SC нужен третий регистр под статус `stxr` (в переходнике свободны только x16/x17, иначе — в стек игры);
+  - `DM_NVN_PROF`: тело `_nvn_prof_entry` вынесено в макросы, `_nvn_prof_entry` собирается в те же инструкции со `stadd`,
+    `_nvn_prof_entry_v80` — с точным циклом `ldxr/add/stxr` (x11/x12 там свободны); выбор в `nvn_nops_register`;
+  - `DM_HLECOUNT`: при отсутствии LSE стаб пишет `ldr x17,[x16]; add; str` в те же 6 слов (литералы на тех же 0x18/0x20).
+- **Скорость:** на телефонах с LSE (всё от Cortex-A55/A75, т. е. Snapdragon 845+/7xx/8xx, Dimensity, Tensor) выполняется тот же
+  код, что раньше; добавлен один `getenv` + выбор таблицы на каждый из 523 `nvnBootstrapLoader`-запросов при загрузке —
+  микросекунды, вне игрового цикла. На v8.0 переходник на 1 инструкцию длиннее и без атомика — не медленнее `stadd`.
+- **Лог:** в boot.log строка `boot: cpu hwcap=… hwcap2=… atomics(LSE)=… lrcpc=… ilrcpc=… dotprod=… crc32=… aes=… pmull=… sha2=…
+  fphp=… asimdhp=… rdm=… jscvt=… fhm=… sve=… sve2=… i8mm=… bf16=… bti=… mte=…; cores (пример) 6x 0x51:0x801 (Kryo-silver/A53) + 2x 0x51:0x800
+  (Kryo-gold/A73); our asm: LSE (ARMv8.1+) | ARMv8.0 fallback (no LSE)` и при первом NVN-запросе `[nvn] thunks: …`.
+- **Проверка без v8.0-телефона:** `DM_CPU_NOLSE=1` в `files/dm/env` принудительно включает v8.0-варианты на любом телефоне
+  (в логе `ARMv8.0 fallback, forced by DM_CPU_NOLSE`). Эмулятор unicorn с моделью Cortex-A53 на собранном libdm.so: старый
+  `nvnth_6` падает на `stadd` (воспроизводит issue #10), `nvnth80_6` ×1000 → счётчик 1000 и x16 = слот; `nvn_prof_entry_v80` —
+  тики точные, x0 возвращается; стаб `DM_HLECOUNT` v8.0 ×5 → 5. На модели `max` (LSE) работают оба набора.
+- **Не сделано:** проверка на реальном v8.0-телефоне (Redmi 10C от автора issue).
+
 ### 3.11 Раунд 7 (perf7, 30.10): где на самом деле CPU и GPU
 - **«10 мкс на draw» наполовину — ожидание GPU.** Разбивка `sub=` (p_p0/p_p1): `commands+acquire` 3.9–5.1 мкс/draw — это
   не создание `Commands`, а старт слота кольца из **двух** слотов при chunked submit (2.5–3 Vulkan-submit на кадр):

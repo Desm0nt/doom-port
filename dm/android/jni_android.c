@@ -35,6 +35,7 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/system_properties.h>
+#include "../host/dm_cpu.h"   // [DOOM] getauxval + dm_cpu_lse() for the boot cpu line
 
 void front_android_set_window(void *win, int w, int h);
 void front_android_set_refresh(float hz);
@@ -167,6 +168,47 @@ static void log_header(void) {
         model[0] ? model : "-", !access("/dev/mali0", F_OK), total >> 10, avail >> 10, getenv("DM_VK_DRIVER") && *getenv("DM_VK_DRIVER") ? getenv("DM_VK_DRIVER") : "system");
 }
 static void log_limit(void) { const char *e = getenv("DM_LOG_MAX_MB"); if (e && atol(e) >= 8) g_log_max = atol(e) << 20; }   // again after dm/env
+// [DOOM] One boot line with the CPU features that matter for the machine code we ship (GitHub issue #10: SIGILL on the NVN thunks'
+// stadd on a Snapdragon 680 = Cortex-A73/A53, ARMv8.0 without LSE): AT_HWCAP / AT_HWCAP2 bits, the cores' implementer:part and the
+// variant our hand-written code runs (host/dm_cpu.h). Called after the env files, so a forced DM_CPU_NOLSE=1 shows here too.
+static const char *cpu_part_name(unsigned impl, unsigned part) {
+    static const struct { unsigned short impl, part; const char *name; } t[] = {
+        {0x41, 0xd03, "A53"}, {0x41, 0xd04, "A35"}, {0x41, 0xd05, "A55"}, {0x41, 0xd07, "A57"}, {0x41, 0xd08, "A72"}, {0x41, 0xd09, "A73"},
+        {0x41, 0xd0a, "A75"}, {0x41, 0xd0b, "A76"}, {0x41, 0xd0d, "A77"}, {0x41, 0xd41, "A78"}, {0x41, 0xd44, "X1"}, {0x41, 0xd46, "A510"},
+        {0x41, 0xd47, "A710"}, {0x41, 0xd48, "X2"}, {0x41, 0xd4d, "A715"}, {0x41, 0xd4e, "X3"}, {0x41, 0xd80, "A520"}, {0x41, 0xd81, "A720"},
+        {0x41, 0xd82, "X4"}, {0x41, 0xd85, "X925"}, {0x41, 0xd87, "A725"}, {0x51, 0x800, "Kryo-gold/A73"}, {0x51, 0x801, "Kryo-silver/A53"},
+        {0x51, 0x802, "Kryo-gold/A75"}, {0x51, 0x803, "Kryo-silver/A55"}, {0x51, 0x804, "Kryo-gold/A76"}, {0x51, 0x805, "Kryo-silver/A55"},
+        {0x51, 0x001, "Oryon"}};
+    for (size_t i = 0; i < sizeof t / sizeof *t; i++) if (t[i].impl == impl && t[i].part == part) return t[i].name;
+    return "?";
+}
+static void log_cpu(void) {
+    unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
+    // cores: "N x impl:part (name)" per distinct pair, from /proc/cpuinfo (CPU implementer comes before CPU part in each block)
+    struct { unsigned impl, part, n; } k[8]; unsigned nk = 0, impl = 0;
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    if (f) {
+        char l[256]; unsigned v;
+        while (fgets(l, sizeof l, f)) {
+            if (sscanf(l, "CPU implementer : %x", &v) == 1) impl = v;
+            else if (sscanf(l, "CPU part : %x", &v) == 1) {
+                unsigned j = 0; while (j < nk && !(k[j].impl == impl && k[j].part == v)) j++;
+                if (j < nk) k[j].n++; else if (nk < 8) { k[nk].impl = impl; k[nk].part = v; k[nk].n = 1; nk++; }
+            }
+        }
+        fclose(f);
+    }
+    char cores[320] = ""; size_t o = 0;
+    for (unsigned j = 0; j < nk && o < sizeof cores - 48; j++)
+        o += (size_t)snprintf(cores + o, sizeof cores - o, "%s%ux 0x%02x:0x%03x (%s)", j ? " + " : "", k[j].n, k[j].impl, k[j].part, cpu_part_name(k[j].impl, k[j].part));
+#define B(w, n) (int)(((w) >> (n)) & 1)
+    LOG("boot: cpu hwcap=%#lx hwcap2=%#lx atomics(LSE)=%d lrcpc=%d ilrcpc=%d dotprod=%d crc32=%d aes=%d pmull=%d sha2=%d fphp=%d asimdhp=%d "
+        "rdm=%d jscvt=%d fhm=%d sve=%d sve2=%d i8mm=%d bf16=%d bti=%d mte=%d; cores %s; our asm: %s",
+        hw, hw2, B(hw, 8), B(hw, 15), B(hw, 26), B(hw, 20), B(hw, 7), B(hw, 3), B(hw, 4), B(hw, 6), B(hw, 9), B(hw, 10),
+        B(hw, 12), B(hw, 13), B(hw, 23), B(hw, 22), B(hw2, 1), B(hw2, 13), B(hw2, 14), B(hw2, 17), B(hw2, 18), nk ? cores : "?",
+        dm_cpu_lse() ? "LSE (ARMv8.1+)" : dm_cpu_hw_lse() ? "ARMv8.0 fallback, forced by DM_CPU_NOLSE" : "ARMv8.0 fallback (no LSE)");
+#undef B
+}
 static void log_init(void) {
     static int initialized; if (initialized) return; initialized = 1;
     char prev[1220]; snprintf(g_log_path, sizeof g_log_path, "%s/boot.log", g_runtime); snprintf(prev, sizeof prev, "%s/boot.prev.log", g_runtime);
@@ -279,6 +321,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     int n = link_romfs(romfs);
     LOG("boot: 资源链接 %d 个文件", n);
 #endif
+    log_cpu();                                // [DOOM] after the env files (DM_CPU_NOLSE), before any NVN thunk is handed out
     setenv("DM_RUNTIME_DIR", g_runtime, 1);   // [DOOM] hle_nvn.c polls <it>/dump for an on-demand thread dump
     setenv("DM_FILES_DIR", g_files, 0);       // [r5] internal storage (not FUSE): DM_GFX_SHADER_RAWCACHE=2|3 mirrors the shader bundles there
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);

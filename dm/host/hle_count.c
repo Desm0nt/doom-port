@@ -9,6 +9,7 @@
 // Touches only x16 / x17, which may be clobbered between calls; arguments and return values pass through unchanged. Stubs are written in a writable page and sealed read-only executable when loading ends (hlecount_seal).
 // svc is counted separately by number (the hle_svc.c dispatch entry calls hlecount_svc). Unavailable on iOS (code written at runtime cannot execute).
 #include "dm.h"
+#include "dm_cpu.h"   // [DOOM] LSE or ARMv8.0 stub (GitHub issue #10)
 #include <stdatomic.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -36,11 +37,21 @@ void *hlecount_wrap(const char *kind, const char *name, void *fn) {
     unsigned i = g_nhc++; g_hc[i].kind = kind; g_hc[i].name = name; g_hc[i].fn = fn;
     uint32_t *w = g_hcode + 12 * i;                                  // 48 字节：5 条指令 + 1 空 + 两个 8 字节字面量（偏移 0x18 / 0x20） | 48 bytes: 5 instructions + 1 empty + two 8-byte literals (offsets 0x18 / 0x20)
     w[0] = 0x58000000 | ((0x18 / 4) << 5) | 16;                      // ldr x16, [pc+0x18]   → &计数 | ldr x16, [pc+0x18]   → &count
+    if (dm_cpu_lse()) {
     w[1] = 0xD2800031;                                                // movz x17, #1
     w[2] = 0xF8200000 | (17u << 16) | (16u << 5) | 31;               // stadd x17, [x16]（ldadd 目标 xzr） | stadd x17, [x16] (ldadd with destination xzr)
     w[3] = 0x58000000 | (((0x20 - 0xc) / 4) << 5) | 16;              // ldr x16, [pc+0x14]   → 实现 | ldr x16, [pc+0x14]   → implementation
     w[4] = 0xD61F0200;                                                // br x16
     w[5] = 0xD503201F;                                                // nop
+    } else {
+    // [DOOM] ARMv8.0 core without LSE (stadd = SIGILL): plain ldr/add/str in the same 6 words. A diagnostic count; a rare lost
+    // increment between two threads is fine (LL/SC would need a third register for the stxr status; only x16/x17 are free).
+    w[1] = 0xF9400211;                                                // ldr x17, [x16]
+    w[2] = 0x91000631;                                                // add x17, x17, #1
+    w[3] = 0xF9000211;                                                // str x17, [x16]
+    w[4] = 0x58000000 | (((0x20 - 0x10) / 4) << 5) | 16;             // ldr x16, [pc+0x10]   -> implementation
+    w[5] = 0xD61F0200;                                                // br x16
+    }
     uint64_t a = (uint64_t)&g_hc[i].n, b = (uint64_t)fn; memcpy(w + 6, &a, 8); memcpy(w + 8, &b, 8);
     return w;
 }

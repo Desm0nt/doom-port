@@ -25,9 +25,11 @@ _nvn_unimpl_entry:
 // Save x0-x7 / q0-q7 (NVN functions pass no arguments on the stack, verified by the generator), take mach_absolute_time -> call the real implementation (nvn_real[i]) -> take it again,
 // atomically add the difference to nvn_prof_ticks[i] (mach timebase units); return values x0/x1, q0-q3 are passed back unchanged.
 // cntvct_el0 is not used: measured on this machine it is not in a fixed ratio to the system timebase (cntfrq reports 1 GHz, increment ratio over the same interval 98.9), so it cannot be converted to time.
-    .globl _nvn_prof_entry
-    .p2align 2
-_nvn_prof_entry:
+// [DOOM] Two entries with the same body (assembler macros, so the LSE entry assembles to exactly the instructions it had):
+// _nvn_prof_entry adds with the LSE stadd (ARMv8.1); _nvn_prof_entry_v80 adds with an LL/SC loop for ARMv8.0 cores without LSE
+// (Cortex-A53/A57/A72/A73: stadd raises SIGILL, GitHub issue #10). hle_nvn.c picks one per run (dm_cpu_lse(), host/dm_cpu.h).
+// Here x11 / x12 are free (caller-saved, the return values are already on the stack), so the fallback can be exact.
+    .macro NVN_PROF_HEAD
     sub sp, sp, #240
     stp x29, x30, [sp]
     mov x29, sp
@@ -70,10 +72,29 @@ _nvn_prof_entry:
     adrp x10, _nvn_prof_ticks@PAGE
     add x10, x10, _nvn_prof_ticks@PAGEOFF
     add x10, x10, x16, lsl #3
-    stadd x9, [x10]
+    .endm
+    .macro NVN_PROF_TAIL
     ldp x0, x1, [sp, #16]
     ldp q0, q1, [sp, #96]
     ldp q2, q3, [sp, #128]
     ldp x29, x30, [sp]
     add sp, sp, #240
     ret
+    .endm
+
+    .globl _nvn_prof_entry
+    .p2align 2
+_nvn_prof_entry:
+    NVN_PROF_HEAD
+    stadd x9, [x10]
+    NVN_PROF_TAIL
+
+    .globl _nvn_prof_entry_v80
+    .p2align 2
+_nvn_prof_entry_v80:
+    NVN_PROF_HEAD
+1:  ldxr x11, [x10]
+    add x11, x11, x9
+    stxr w12, x11, [x10]
+    cbnz w12, 1b
+    NVN_PROF_TAIL

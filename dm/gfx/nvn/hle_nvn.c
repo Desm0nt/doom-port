@@ -32,6 +32,7 @@
 #include "../../host/front.h"
 #include "nvn_dirty.h"
 #include "../tex/nvn_deswizzle.h"
+#include "../../host/dm_cpu.h"   // [DOOM] LSE or ARMv8.0 thunks (GitHub issue #10)
 #ifdef DM_GAME_DOOM
 #include "../vulkan/engine/xbg_draw_plan.h"   // xbg_draw_call record (OP_X_DRAW_CALL)
 #endif
@@ -59,9 +60,12 @@ typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
 nvn_slot_t nvn_slot[NVN_NFUNC];                 // 跳板按 i*16 访问，布局不可改 | The thunk accesses it by i*16; the layout must not change
 _Static_assert(sizeof(nvn_slot_t) == 16, "跳板按 16 字节步长寻址");
 extern void *nvn_thunk[NVN_NFUNC];
+// [DOOM] The same thunks without LSE (plain counter) for ARMv8.0 cores; nvn_lookup picks the table (dm_cpu_lse(), host/dm_cpu.h)
+extern void *nvn_thunk_v80[NVN_NFUNC];
 extern const char *nvn_names[NVN_NFUNC];
 extern void nvn_unimpl_entry(void);
 extern void nvn_prof_entry(void);
+extern void nvn_prof_entry_v80(void);    // [DOOM] DM_NVN_PROF wrapper with an LL/SC add instead of stadd (nvn_entry.S)
 void *nvn_real[NVN_NFUNC];               // DM_NVN_PROF：计时包装调用的真实现 | DM_NVN_PROF: the real implementation called by the timing wrapper
 _Atomic uint64_t nvn_prof_ticks[NVN_NFUNC]; // DM_NVN_PROF：各函数累计耗时（cntvct 计数） | DM_NVN_PROF: cumulative time of each function (cntvct counts)
 static uint8_t g_unimpl_seen[NVN_NFUNC];
@@ -156,8 +160,11 @@ static void *nvn_lookup(const char *name) {
 #ifdef DM_GAME_DOOM
     nvn_count_start();
 #endif
+    // [DOOM] LSE phones get the same thunk addresses as before; ARMv8.0 cores (no HWCAP_ATOMICS) the stadd-free set
+    void *const *tab = dm_cpu_lse() ? nvn_thunk : nvn_thunk_v80;
+    { static int said; if (!said++) LOG("[nvn] thunks: %s", tab == nvn_thunk ? "LSE stadd (ARMv8.1+)" : "ARMv8.0 (no LSE: plain counter)"); }
     for (unsigned i = 0; i < NVN_NFUNC; i++)
-        if (!strcmp(nvn_names[i], name)) return nvn_thunk[i];
+        if (!strcmp(nvn_names[i], name)) return tab[i];
     LOG("【红】NVN 取址未知名字：%s", name ? name : "(null)");
     return NULL;
 }
@@ -1270,9 +1277,11 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
     unsigned nnop = sizeof g_nops / sizeof *g_nops;
     // DM_NVN_PROF=1：已实现的函数（未实现桩与出图除外：出图含节拍等待，单独计）套计时包装，用于拆「翻译层录制期」耗时
     // DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to break down the time spent in the "translation layer recording phase"
-    if (getenv("DM_NVN_PROF"))
+    if (getenv("DM_NVN_PROF")) {
+        void *prof = dm_cpu_lse() ? (void *)nvn_prof_entry : (void *)nvn_prof_entry_v80;   // [DOOM] no stadd on ARMv8.0 cores
         for (unsigned i = 0; i < NVN_NFUNC; i++)
-            if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; }
+            if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = prof; }
+    }
     LOG("[nvn] 空设备：名字 %u，已实现 %u（语义 %u + 空实现 %u），其余 %u 个接报红桩",
         NVN_NFUNC, g_nsem + nnop, g_nsem, nnop, NVN_NFUNC - g_nsem - nnop);
 }
