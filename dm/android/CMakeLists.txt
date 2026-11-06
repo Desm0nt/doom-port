@@ -118,6 +118,7 @@ set(ANDROID_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/touch_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/haptics_android.c
   ${CMAKE_CURRENT_SOURCE_DIR}/perf_android.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpu_topo.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vulkan_present.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vk_driver.c
   ${CMAKE_CURRENT_SOURCE_DIR}/vk_tramp.S

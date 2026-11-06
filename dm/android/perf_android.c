@@ -18,6 +18,9 @@
 //   busy % where readable. The guest threads get host names (hle_thread.c thr_host_name) so these lines and top can tell them apart.
 // - [r2] DM_GUEST_BIGCORE=<hex mask>: the busiest guest thread (the game's main thread) is kept on that host CPU mask (sched_setaffinity,
 //   re-checked every 2 s because HyperOS rewrites masks) and always belongs to the ADPF session.
+// - [DOOM] Guest threads by the CPU plan (cpu_topo.c): on one-big-cluster SoCs (SD680 4+4, Helio G99 2+6) every guest thread is kept off
+//   the translator's core (plan guest mask), checked every 2 s like the bigcore thread (which keeps its own mask). Flagships: no guest
+//   mask (as before). Only while the translation pin is the planned one; DM_GUEST_CPUS=<hex> sets the mask by hand (0 = none).
 // Switches (env file): DM_ADPF=0 or DM_NO_ADPF=1 (one meaning since r2: no hint session; the thermal frame-rate vote stays);
 // DM_THERMAL_VOTE=0 keep the marker vote whatever the temperature; [r2] DM_ADPF_NOCLIP=1, DM_ADPF_WORK=wall, DM_ADPF_TARGET_MS=<ms>,
 // DM_ADPF_HYST=1, DM_ADPF_GPU=0, DM_GUEST_BIGCORE=<hex>, DM_GUEST_BIGCORE_PICK=present (docs/SWITCHES.md).
@@ -28,6 +31,7 @@
 // Copyright (c) 2026 seedds, MIT License.
 #include "../host/dm.h"
 #include "touch_android.h"
+#include "cpu_topo.h"
 #include <android/native_window.h>
 #include <dirent.h>
 #include <dlfcn.h>
@@ -51,6 +55,8 @@ __attribute__((weak)) uint64_t dm_nvn_pace_sleep_ns(void);         // gfx/nvn/hl
 __attribute__((weak)) int dm_nvn_present_menu_capped(void);         // gfx/nvn/hle_nvn.c [r6b]: 1 = presents capped at DM_PRESENT_MENU_HZ (menu / loading)
 __attribute__((weak)) int thr_guest_tids(int32_t *out, int max);    // host/hle_thread.c: live guest threads' host tids
 __attribute__((weak)) void thr_refresh_host_names(void);           // host/hle_thread.c: re-read the guest names into the host names
+__attribute__((weak)) unsigned dm_present_pin_mask(void);           // android/vulkan_present.cpp: the translation thread's pin (0 = none)
+__attribute__((weak)) int dm_present_pin_tid(void);                 // android/vulkan_present.cpp: the thread that pin is applied to
 
 static int64_t perf_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 
@@ -342,6 +348,34 @@ static void big_check(void) {
     int r = aff_set(want, &g_big_set), err = r ? errno : 0; if (r) ++g_big_fail;
     if (g_big_resets <= 4 || (r && g_big_fail <= 4)) LOG("[perf] bigcore: tid %d mask found reset, re-pinned (result %d, resets %u)", want, err, g_big_resets);
 }
+// [DOOM] Guest threads on the CPU plan's guest mask (see the header). Raw affinity calls as big_check; new guest threads and masks
+// the system reset are (re)pinned at the next check; if the pin stops being the planned one the guests get every CPU back.
+static unsigned g_gm_mask, g_gm_threads, g_gm_new, g_gm_resets, g_gm_fail; static int g_gm_told;
+static int32_t g_gm_tids[256]; static int g_gm_n;
+static void guest_mask_check(void) {
+    const dm_cpu_plan_t *pl = dm_cpu_plan();
+    const char *e = getenv("DM_GUEST_CPUS"); const unsigned pin = dm_present_pin_mask ? dm_present_pin_mask() : 0;
+    const unsigned want = pl->guest && ((e && *e) || (pin && pin == pl->translate)) ? pl->guest : 0;
+    if (!want && !g_gm_mask) return;
+    int32_t gt[256]; int ng = thr_guest_tids ? thr_guest_tids(gt, 256) : 0; const int big = C.big_mask ? atomic_load(&g_big_tid) : 0;
+    const int pinned = dm_present_pin_tid ? dm_present_pin_tid() : 0;   // DM_NVN_SYNC=1: the presenting guest thread carries the translation pin
+    cpumask_t set; memset(&set, 0, sizeof set); set.b[0] = want; if (!want) set = g_all_set;
+    unsigned on = 0;
+    for (int i = 0; i < ng; i++) {
+        if (gt[i] == big || gt[i] == pinned) continue;
+        int seen = 0; for (int j = 0; j < g_gm_n && !seen; j++) seen = g_gm_tids[j] == gt[i];
+        cpumask_t cur; if (!aff_get(gt[i], &cur) && !memcmp(&cur, &set, sizeof cur)) { on++; continue; }
+        if (aff_set(gt[i], &set)) { ++g_gm_fail; continue; }
+        on++; if (seen && want == g_gm_mask) ++g_gm_resets; else ++g_gm_new;
+    }
+    memcpy(g_gm_tids, gt, sizeof(int32_t) * (size_t)ng); g_gm_n = ng; g_gm_threads = on;
+    if (want != g_gm_mask || !g_gm_told) {
+        LOG("[cpu] guest threads: %u kept on cpus %x (%s; translation pin %x, bigcore thread %d left alone)", on, want ? want : (unsigned)g_all_set.b[0],
+            !want ? "released, the pin is no longer the planned one" : e && *e ? "DM_GUEST_CPUS" : "cpu plan", pin, big);
+        g_gm_told = 1;
+    }
+    g_gm_mask = want;
+}
 static void monitor_scan(int64_t now) {
     static struct { int tid; uint64_t ticks; } prev[512]; static int np; static int64_t last; static int scans;
     static struct { int tid; uint64_t used, u; int cpu; char comm[16]; } cur[512]; int nc = 0;
@@ -389,6 +423,7 @@ static void monitor_scan(int64_t now) {
     }
     LOG("%s", l);
     clocks_log();
+    if (g_gm_mask) { LOG("[cpu] guests 10s: %u threads on cpus %x, newly pinned %u, mask found reset %u, failures %u", g_gm_threads, g_gm_mask, g_gm_new, g_gm_resets, g_gm_fail); g_gm_new = g_gm_resets = 0; }
     if (C.big_mask) {
         tstat_t ts; task_stat(big, &ts);
         LOG("[perf] bigcore 10s: tid %d (%s) mask %x last cpu %d, mask found reset %u times (total %u), failures %u", big, big ? ts.comm : "-", C.big_mask, big ? ts.cpu : -1, g_big_resets_w, g_big_resets, g_big_fail);
@@ -407,7 +442,7 @@ static void *perf_monitor(void *arg) {
         struct timespec s = {1, 0}; nanosleep(&s, NULL);
         int64_t now = perf_now();
         clocks_sample();
-        if (C.big_mask && now >= next_big) { big_check(); next_big = now + 2000000000ll; }
+        if (now >= next_big) { if (C.big_mask) big_check(); guest_mask_check(); next_big = now + 2000000000ll; }
         if (now >= next_scan) { monitor_scan(now); next_scan = now + 10000000000ll; }
     }
     return NULL;

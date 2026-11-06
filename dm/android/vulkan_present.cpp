@@ -29,6 +29,7 @@ extern "C" void dm_aperf_frame_tid(int);   // [mt 2a] perf_android.c: the ADPF s
 #include <pthread.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include "cpu_topo.h"   // [DOOM] thread placement by core capacity (DM_CPU_TOPO)
 #include "../gfx/vulkan/engine/xbg_astc_overlay.h"   // [nonadreno] ASTC / ETC2 / EAC overlay (variant A): the boot choice below
 #include <thread>
 #include <unistd.h>
@@ -84,12 +85,12 @@ bool present_timing=false;VkQueryPool present_queries=VK_NULL_HANDLE;bool presen
 // Marker gfx-no-pin turns it off and gfx-pin-cpu = hex mask picks the cores; gfx-ab-toggle = N with gfx-ab-target = pin
 // alternates pinned and released every N seconds, in phase with the engine's A/B (its PERF lines carry ab=).
 unsigned pin_mask=0;int pin_ab=0;int pin_state=-1;unsigned pin_presents=0,pin_drifts=0,pin_failures=0;cpu_set_t pin_original;bool pin_have_original=false;
-unsigned fastest_cores(){
-    unsigned best=0,mask=0,present=0;
-    for(int c=0;c<32;c++){char path[96];snprintf(path,sizeof path,"/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",c);FILE *f=fopen(path,"rb");if(!f)continue;
-        unsigned v=0;if(fscanf(f,"%u",&v)==1 && v){present|=1u<<c;if(v>best){best=v;mask=0;}if(v==best)mask|=1u<<c;}fclose(f);}
-    return mask==present?0:mask;   // one core class: nothing to pick
-}
+// [DOOM] The default pin comes from cpu_topo.c (dm_cpu_plan()->translate): on SoCs with a second strong cluster (flagships) it is the
+// old fastest_cores() result (the CPUs with the highest cpuinfo_max_freq, none when all share it); on one-big-cluster SoCs (SD680 4+4,
+// Helio G99 2+6) it is the fastest core alone, so the record thread gets the next big core instead of the little ones.
+// DM_CPU_TOPO=index gives the old rule. pin_planned: the pin is the plan's (no marker / DM_GFX_PIN_CPU changed it), so the record and
+// present threads may take the plan's masks; with a hand-set pin they keep the old "every core but the pin".
+bool pin_planned=false;
 // [r2] Where the present (translation) thread really runs: sched_getcpu() once per present, and every 30 s one line
 // "NVN pin cpus 30s: ..." with the share of presents seen on each CPU, the mask checks of that window and how many found the
 // mask reset (HyperOS rewrites it). Always on, pin or not (one getcpu per present).
@@ -105,8 +106,9 @@ void pin_hist_tick(){
     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","%s",line);
     memset(pin_hist,0,sizeof pin_hist);pin_hist_n=pin_checks_w=pin_drifts_w=0;pin_hist_t0=now;
 }
+std::atomic<int> pin_tid{0};   // [DOOM] the thread pin_update pins (the caller of present; a guest thread with DM_NVN_SYNC=1): perf_android.c skips it
 void pin_update(){
-    pin_hist_tick();
+    pin_hist_tick();{const int t=int(gettid());if(pin_tid.load(std::memory_order_relaxed)!=t)pin_tid.store(t,std::memory_order_relaxed);}
     if(!pin_mask)return;bool want=true;
     if(pin_ab>0){timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);want=((ts.tv_sec/pin_ab)&1)==0;}
     bool changed=int(want)!=pin_state;if(!changed && ++pin_presents%120)return;
@@ -613,9 +615,15 @@ void pt::loop(){
     // [mtb] DM_GFX_PRESENT_UNPIN=1: start from every core, not from the creator's affinity. The thread is created by the pinned translation
     // thread and inherits its pin, so clearing the pin left an empty set and it stayed on the translation thread's core (affinity=1 in the log).
     const char *unpin_e=getenv("DM_GFX_PRESENT_UNPIN");const bool unpin=!(unpin_e && *unpin_e=='0');   // on by default since 02.11 (the present thread inherited the translator pin)
-    int ar=1;if(pin_mask){cpu_set_t set;CPU_ZERO(&set);if(unpin){long n=sysconf(_SC_NPROCESSORS_CONF);if(n<1 || n>32)n=n<1?8:32;for(long c=0;c<n;c++)CPU_SET(int(c),&set);}
+    // [DOOM] With the planned pin (cpu_topo.c) the plan's present mask: on flagships every core but the pin, as before; on one-big-cluster
+    // SoCs the little cluster (the present thread is light: one blit and vkQueuePresentKHR per frame). DM_GFX_PRESENT_CPUS=<hex> sets it.
+    const dm_cpu_plan_t *plan=dm_cpu_plan();unsigned planned=0;
+    int ar=1;if(pin_mask && unpin && (pin_planned || getenv("DM_GFX_PRESENT_CPUS")) && plan->present){cpu_set_t set;CPU_ZERO(&set);for(int c=0;c<32;c++)if(plan->present>>c&1)CPU_SET(c,&set);ar=sched_setaffinity(0,sizeof set,&set);planned=plan->present;}
+    else if(pin_mask){cpu_set_t set;CPU_ZERO(&set);if(unpin){long n=sysconf(_SC_NPROCESSORS_CONF);if(n<1 || n>32)n=n<1?8:32;for(long c=0;c<n;c++)CPU_SET(int(c),&set);}
      if(unpin || !sched_getaffinity(0,sizeof set,&set)){for(int c=0;c<32;c++)if(pin_mask>>c&1)CPU_CLR(c,&set);if(CPU_COUNT(&set))ar=sched_setaffinity(0,sizeof set,&set);}}
-    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present thread started tid=%d nice=%d (setpriority %d) off-pin-mask=%x affinity=%d",int(gettid()),getpriority(PRIO_PROCESS,0),pr,pin_mask,ar);
+    unsigned now_mask=0;{cpu_set_t cur;CPU_ZERO(&cur);if(!sched_getaffinity(0,sizeof cur,&cur))for(int c=0;c<32;c++)if(CPU_ISSET(c,&cur))now_mask|=1u<<c;}
+    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present thread started tid=%d nice=%d (setpriority %d) off-pin-mask=%x affinity=%d cpus=%x (%s)",int(gettid()),getpriority(PRIO_PROCESS,0),pr,pin_mask,ar,now_mask,
+        planned?"cpu plan":pin_mask?"all but the pin":"inherited");
     for(;;){Job j;{std::unique_lock<std::mutex> l(mu);cv.wait(l,[]{return done<enq;});j=ring[(done+1)%depth];cur=j.ticket;}
         const int64_t t0=now_ns();int r;{std::lock_guard<std::mutex> rl(render_mutex);r=present_body(j.src,j.fmt,j.w,j.h,j.has_crop?j.crop:nullptr,j.mirror);}
         busy_ns+=uint64_t(now_ns()-t0);++jobs;
@@ -662,6 +670,9 @@ extern "C" int dm_present_async_m(VkImage source,VkFormat format,uint32_t width,
 }
 // [mtb] The translation thread's core pin (0 = none): the record thread keeps off it.
 extern "C" unsigned dm_present_pin_mask(void){return pin_mask;}
+extern "C" int dm_present_pin_tid(void){return pin_tid.load(std::memory_order_relaxed);}
+// [DOOM] The record thread's mask from the CPU plan (cpu_topo.c) while the pin is the planned one; 0 = the old "every core but the pin".
+extern "C" unsigned dm_present_record_mask(void){const unsigned p=pin_mask;return p && pin_planned && p==dm_cpu_plan()->translate?dm_cpu_plan()->record:0u;}
 // Nanoseconds waited until every handed present has its blit submitted / has finished (0 = nothing pending).
 extern "C" uint64_t dm_present_wait_submitted(void){std::unique_lock<std::mutex> l(pt::mu);if(pt::sub>=pt::enq)return 0;const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::sub>=pt::enq;});return uint64_t(pt::now_ns()-t0);}
 extern "C" uint64_t dm_present_drain(void){std::unique_lock<std::mutex> l(pt::mu);if(pt::done>=pt::enq)return 0;const int64_t t0=pt::now_ns();pt::cv.wait(l,[]{return pt::done>=pt::enq;});return uint64_t(pt::now_ns()-t0);}
@@ -805,14 +816,15 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};if((r=vkCreateSemaphore(device,&sc,nullptr,&acquired)))return fail("Acquire semaphore",r);VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};if((r=vkCreateFence(device,&fc,nullptr,&fence)))return fail("Present fence",r);
     {std::string dir=path;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-overlap").c_str(),"rb");overlap=true;if(m){overlap=fgetc(m)!='0';fclose(m);}
      auto open_marker=[&](const char *name){return fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+name).c_str(),"rb");};
-     pin_mask=fastest_cores();pin_ab=0;pin_state=-1;pin_have_original=false;pin_presents=pin_drifts=0;
+     pin_mask=dm_cpu_plan()->translate;pin_ab=0;pin_state=-1;pin_have_original=false;pin_presents=pin_drifts=0;
      if(FILE *p=open_marker("/gfx-pin-cpu")){if(fscanf(p,"%x",&pin_mask)!=1)pin_mask=0;fclose(p);}
      if(FILE *n=open_marker("/gfx-no-pin")){pin_mask=0;fclose(n);}
      // [perf4] DM_GFX_PIN_CPU=<hex mask> (env; 0 = no pin): same as the gfx-pin-cpu marker, e.g. f0 = X4 + all A720 instead of
      // the X4 alone (the present thread is also the translation thread with DM_NVN_SYNC=1).
      if(const char *e=getenv("DM_GFX_PIN_CPU");e && *e){unsigned v=0;if(sscanf(e,"%x",&v)==1)pin_mask=v;}
+     pin_planned=pin_mask==dm_cpu_plan()->translate;
      if(FILE *t=open_marker("/gfx-ab-target")){char target[16]={0};if(fscanf(t,"%15s",target)==1 && !strcmp(target,"pin"))if(FILE *a=open_marker("/gfx-ab-toggle")){if(fscanf(a,"%d",&pin_ab)!=1)pin_ab=0;fclose(a);}fclose(t);}
-     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN pin mask=%x ab=%d (markers gfx-no-pin, gfx-pin-cpu, gfx-ab-target=pin)",pin_mask,pin_ab);
+     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN pin mask=%x ab=%d %s (markers gfx-no-pin, gfx-pin-cpu, gfx-ab-target=pin)",pin_mask,pin_ab,pin_planned?"cpu plan":"set by hand");
      if(FILE *b=open_marker("/gfx-membench")){fclose(b);membench();}}
     if(overlap){if((r=vkCreateCommandPool(device,&cp,nullptr,&overlap_pool)))return fail("Present command pool",r);ca.commandPool=overlap_pool;if((r=vkAllocateCommandBuffers(device,&ca,&overlap_command)))return fail("Present command",r);
         if((r=vkCreateSemaphore(device,&sc,nullptr,&overlap_acquired)))return fail("Acquire semaphore",r);if((r=vkCreateFence(device,&fc,nullptr,&overlap_fence)))return fail("Present fence",r);}

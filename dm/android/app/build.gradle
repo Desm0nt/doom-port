@@ -51,7 +51,13 @@ android {
         def doomVer = project.findProperty('dmGame') == 'doom' ? file('../doom/VERSION').text.trim() : null
         def doomNum = doomVer ? doomVer.tokenize('.').collect { it as int } : null
         versionCode doomNum ? 100000 + doomNum[0] * 10000 + doomNum[1] * 100 + doomNum[2] : 20001
-        versionName doomVer ?: '2.0.1'
+        versionName((doomVer ?: '2.0.1') + (project.findProperty('dmDiag') == '1' ? '-diag' : ''))
+        // [DOOM] -PdmDiag=1: the diagnostics APK (DmActivity: per-pass GPU profile on, boot.log copied to the game folder every minute)
+        buildConfigField 'boolean', 'DM_DIAG', project.findProperty('dmDiag') == '1' ? 'true' : 'false'
+        // -PdmDiagDriver=<package>: the diagnostics APK forces this bundled driver package (assets/drivers/<package>) on Adreno 6xx+
+        buildConfigField 'String', 'DM_DIAG_DRIVER', "\"${project.findProperty('dmDiagDriver') ?: ''}\""
+        // -PdmDiagTuDebug=<flags>: the diagnostics APK sets TU_DEBUG to these Turnip debug flags (e.g. sysmem,noubwc)
+        buildConfigField 'String', 'DM_DIAG_TU_DEBUG', "\"${project.findProperty('dmDiagTuDebug') ?: ''}\""
         ndk { abiFilters 'arm64-v8a' }
         if (!prebuilt) externalNativeBuild { cmake {
             arguments "-DDM_GEN_DIR=${project.findProperty('dmGenDir') ?: ''}"

@@ -3,6 +3,7 @@
 //   g++ -std=c++17 -Wall -idirafter <ndk>/toolchains/llvm/prebuilt/<host>/sysroot/usr/include -o vendor_policy_test vendor_policy_test.cpp
 #include "../xbg_vendor_policy.h"
 #include <stdio.h>
+#include <initializer_list>
 
 static int failures;
 #define CHECK(expression) do { if(!(expression)){printf("FAIL line %d: %s\n",__LINE__,#expression);++failures;} } while(0)
@@ -108,6 +109,32 @@ int main(){
     p={all,all,all};xbg_sim_format_features(XBG_SIM_PROFILE_XCLIPSE,VK_FORMAT_R32G32B32_SFLOAT,&p);CHECK(p.bufferFeatures==all);
     p={all,all,all};xbg_sim_format_features(XBG_SIM_PROFILE_MALI,VK_FORMAT_R16G16B16_SNORM,&p);CHECK(p.bufferFeatures==all);
     CHECK(xbg_sim_parse("novertex3")==XBG_SIM_NOVERTEX3);
+
+    // [tile] Tiler defaults: Adreno (and Xclipse / other) keep the old behaviour, Mali / PowerVR get the tile-friendly paths;
+    // the render-area cut is Mali only (PowerVR's Mesa driver reloads depth for a partial area).
+    for(XbgGpuFamily fam:{XBG_GPU_ADRENO,XBG_GPU_XCLIPSE,XBG_GPU_OTHER,XBG_GPU_MALEOON}){
+        CHECK(!xbg_noload_default(fam));CHECK(!xbg_tile_area_default(fam));CHECK(!xbg_tile_barrier_default(fam));CHECK(xbg_chunk_mid_split_default(fam));}
+    CHECK(!xbg_noload_default(XBG_GPU_MALI) && xbg_tile_area_default(XBG_GPU_MALI) && xbg_tile_barrier_default(XBG_GPU_MALI) && !xbg_chunk_mid_split_default(XBG_GPU_MALI));
+    CHECK(!xbg_noload_default(XBG_GPU_POWERVR) && !xbg_tile_area_default(XBG_GPU_POWERVR) && xbg_tile_barrier_default(XBG_GPU_POWERVR) && !xbg_chunk_mid_split_default(XBG_GPU_POWERVR));
+    CHECK(xbg_tile_area_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("mali"))));
+    CHECK(!xbg_tile_area_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("nobc,subgroup16"))));   // capability tokens alone keep Adreno's defaults
+
+    // [tile] Draw rectangles: scissor exact; triangles narrowed to the (possibly flipped) viewport with a pixel of margin; points /
+    // lines scissor only; clamped to the framebuffer; empty when nothing is left.
+    {XbgRect r=xbg_draw_rect(0,0,4096,4096,1024,2048,512,512,true,4096,4096);CHECK(r.x0==1023 && r.y0==2047 && r.x1==1538 && r.y1==2562);
+     r=xbg_draw_rect(0,0,4096,4096,1024,2560,512,-512,true,4096,4096);CHECK(r.x0==1023 && r.y0==2047 && r.x1==1538 && r.y1==2562);   // flipped viewport, same rows
+     r=xbg_draw_rect(0,0,4096,4096,1024,2048,512,512,false,4096,4096);CHECK(r.x0==0 && r.y0==0 && r.x1==4096 && r.y1==4096);
+     r=xbg_draw_rect(100,200,50,60,0,0,4096,4096,true,4096,4096);CHECK(r.x0==100 && r.y0==200 && r.x1==150 && r.y1==260);
+     r=xbg_draw_rect(0,0,1600,720,-0.5f,-3.25f,1601.5f,724.f,true,1600,720);CHECK(r.x0==0 && r.y0==0 && r.x1==1600 && r.y1==720);
+     r=xbg_draw_rect(0,0,100,100,500,500,10,10,true,100,100);CHECK(xbg_rect_empty(r));
+     r=xbg_draw_rect(0,0,100,100,10,10,0,10,true,100,100);CHECK(r.x1==100 && r.y1==100);   // degenerate viewport: scissor only
+     CHECK(xbg_rect_inside(XbgRect{10,10,20,20},XbgRect{0,0,32,32}) && !xbg_rect_inside(XbgRect{10,10,40,20},XbgRect{0,0,32,32}) && xbg_rect_inside(XbgRect{0,0,0,0},XbgRect{5,5,6,6}));
+     XbgRect u=xbg_rect_union(XbgRect{0,0,0,0},XbgRect{5,6,7,8});CHECK(u.x0==5 && u.y0==6 && u.x1==7 && u.y1==8);
+     u=xbg_rect_union(XbgRect{5,6,7,8},XbgRect{1,9,3,12});CHECK(u.x0==1 && u.y0==6 && u.x1==7 && u.y1==12);
+     XbgRect a=xbg_area_align(XbgRect{1023,2047,1538,2562},32,32,4096,4096,0.9f);CHECK(a.x0==992 && a.y0==2016 && a.x1==1568 && a.y1==2592);
+     a=xbg_area_align(XbgRect{0,0,1590,700},32,32,1600,720,0.9f);CHECK(a.x0==0 && a.y0==0 && a.x1==1600 && a.y1==720);   // >= 90 %: whole framebuffer
+     a=xbg_area_align(XbgRect{0,0,0,0},16,16,64,64,0.9f);CHECK(a.x1==64 && a.y1==64);
+     a=xbg_area_align(XbgRect{3,3,5,5},1,1,64,64,0.9f);CHECK(a.x0==3 && a.y0==3 && a.x1==5 && a.y1==5);}
 
     if(failures){printf("%d failure(s)\n",failures);return 1;}
     printf("vendor_policy_test: all checks passed\n");return 0;

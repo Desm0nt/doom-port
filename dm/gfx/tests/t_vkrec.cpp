@@ -43,6 +43,7 @@ void dm_present_queue_lock(void){}
 void dm_present_queue_unlock(void){}
 __attribute__((weak)) unsigned dm_present_pin_mask(void);   // weak, as in the engine
 unsigned dm_present_pin_mask(void){return 0;}
+__attribute__((weak)) unsigned dm_present_record_mask(void);   // [DOOM] weak and undefined: the block falls back to "every core but the pin"
 VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer c,const VkCommandBufferBeginInfo *b){tag("begin");put(c);put(b->flags);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer c){tag("end");put(c);return VK_SUCCESS;}
 std::atomic<uint64_t> queue_submits{0};

@@ -36,6 +36,7 @@
 #include <sys/ioctl.h>
 #include <sys/system_properties.h>
 #include "../host/dm_cpu.h"   // [DOOM] getauxval + dm_cpu_lse() for the boot cpu line
+#include "cpu_topo.h"          // [DOOM] thread placement by core capacity: the [cpu] topology / plan lines at boot
 
 void front_android_set_window(void *win, int w, int h);
 void front_android_set_refresh(float hz);
@@ -94,9 +95,17 @@ static _Atomic int g_pump_busy;
 static char g_crash_note[384];   // the last FATAL line: copied into the crash marker (read in the signal handler, racy by design)
 static long g_log_head = -1, g_log_max = 32l << 20;
 #define LOG_HEAD_KEEP (4l << 20)
+// [DOOM] DM_LOG_TIME=1 (the diagnostics APK sets it): every boot.log line starts with the local wall-clock time it was written,
+// "HH:MM:SS.mmm ", so a report shows when each step happened and how long the run lasted (logcat has its own stamps anyway)
+static int g_log_time = -1;
 static void log_file_line(const char *tag, const char *s) {
     if (!g_logf) return;
     pthread_mutex_lock(&g_log_mu);
+    if (g_log_time < 0) { const char *e = getenv("DM_LOG_TIME"); g_log_time = e && *e && strcmp(e, "0") ? 1 : 0; }
+    if (g_log_time) {
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); struct tm tm; time_t sec = ts.tv_sec; localtime_r(&sec, &tm);
+        fprintf(g_logf, "%02d:%02d:%02d.%03ld ", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000);
+    }
     if (tag) fprintf(g_logf, "[%s] %s\n", tag, s); else { fputs(s, g_logf); fputc('\n', g_logf); }
     fflush(g_logf);
     long at = ftell(g_logf);
@@ -322,6 +331,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     LOG("boot: 资源链接 %d 个文件", n);
 #endif
     log_cpu();                                // [DOOM] after the env files (DM_CPU_NOLSE), before any NVN thunk is handed out
+    (void)dm_cpu_plan();                      // [DOOM] after the env files (DM_CPU_TOPO): reads the topology once, logs "[cpu] topology" / "[cpu] plan"
     setenv("DM_RUNTIME_DIR", g_runtime, 1);   // [DOOM] hle_nvn.c polls <it>/dump for an on-demand thread dump
     setenv("DM_FILES_DIR", g_files, 0);       // [r5] internal storage (not FUSE): DM_GFX_SHADER_RAWCACHE=2|3 mirrors the shader bundles there
     setenv("DM_ROMFS", romfs, 0); setenv("DM_SAVE", save, 0); setenv("DM_TEMP", temp, 0);

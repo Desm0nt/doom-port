@@ -49,6 +49,43 @@ final class CrashLog {
     }
     static File report(Context c) { return new File(dir(c), "crash.txt"); }
 
+    // ---- the diagnostics APK: a logcat child process writes every line of this app (an app sees only its own uid's lines: Java, native,
+    // the driver, the crash buffer) to <logs>/logcat.txt from the first moment of the process, the buffer's earlier lines of this start
+    // included. It writes as the lines come, so whatever kills the game silently (SIGSEGV outside our handler, a kernel kill), the file
+    // keeps everything up to that moment. The last start's file becomes logcat.prev.txt; 8 MB per file, one rotation (logcat.txt.1).
+    private static Process logcat;
+    static synchronized void startLogcatCapture(Context c) {
+        if (logcat != null) return;
+        try {
+            File d = dir(c), now = new File(d, "logcat.txt"), prev = new File(d, "logcat.prev.txt");
+            wipeForDiag(c);   // first, so a fresh install does not keep the old file as "previous"
+            if (now.isFile()) { prev.delete(); now.renameTo(prev); }
+            new File(d, "logcat.txt.1").delete();
+            logcat = new ProcessBuilder("logcat", "-v", "threadtime", "-b", "main,system,crash", "-f", now.getAbsolutePath(), "-r", "8192", "-n", "1")
+                .redirectErrorStream(true).start();
+            android.util.Log.i("dm", "[diag] logcat capture to " + now + " (pid " + android.os.Process.myPid() + ")");
+        } catch (Exception e) { android.util.Log.w("dm", "[diag] logcat capture failed: " + e); }
+    }
+
+    // ---- the diagnostics APK (BuildConfig.DM_DIAG): once per install / update (files/diag-wiped holds the package's lastUpdateTime), the
+    // logs and crash markers left by earlier versions are deleted, so every report the tester sends comes from this build. Later starts
+    // keep them: a crash of this build is still reported at the next start.
+    static void wipeForDiag(Context c) {
+        long stamp = 0;
+        try { stamp = c.getPackageManager().getPackageInfo(c.getPackageName(), 0).lastUpdateTime; } catch (Exception e) { /* keep 0 */ }
+        File mark = new File(c.getFilesDir(), "diag-wiped");
+        if (String.valueOf(stamp).equals(readSmall(mark))) return;
+        File d = dir(c), ext = c.getExternalFilesDir(null); int n = 0;
+        List<File> gone = new ArrayList<>();
+        for (String f : new String[] {"crash.txt", "crash.prev.txt", "boot.log", "boot.prev.log", "logcat.txt", "logcat.txt.1", "logcat.prev.txt"}) gone.add(new File(d, f));
+        for (File root : new File[] {c.getFilesDir(), ext}) if (root != null) {
+            gone.add(new File(root, "dm/boot.log")); gone.add(new File(root, "dm/boot.prev.log")); gone.add(new File(root, "logs/crash.txt")); gone.add(new File(root, "logs/crash.prev.txt")); }
+        gone.add(new File(c.getFilesDir(), NATIVE_MARK)); gone.add(new File(c.getFilesDir(), SESSION));
+        for (File f : gone) if (f.delete()) n++;
+        try (OutputStream os = new FileOutputStream(mark)) { os.write(String.valueOf(stamp).getBytes(StandardCharsets.UTF_8)); } catch (IOException e) { /* wipes again next time */ }
+        android.util.Log.i("dm", "[diag] old logs and crash markers deleted: " + n + " files");
+    }
+
     // ---- the native logs next to the crash reports (GitHub issue #3: Android/data is out of a file manager's reach on Android 11+):
     // boot.log and boot.prev.log of <files or external files>/dm are copied to dir() as they are, overwriting the copies; a log above
     // MIRROR_MAX keeps its head and its last MIRROR_MAX bytes. Called when the app goes to the background and before it quits.

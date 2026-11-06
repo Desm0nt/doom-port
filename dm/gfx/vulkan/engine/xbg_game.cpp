@@ -165,6 +165,7 @@ extern "C" __attribute__((weak)) void dm_present_thread_stats(uint64_t out[4]);
 extern "C" __attribute__((weak)) int dm_present_handoff_prepare(void);
 extern "C" __attribute__((weak)) int dm_present_async_m(VkImage source,VkFormat format,uint32_t width,uint32_t height,const int32_t crop[4],int32_t interval,int mirror);
 extern "C" __attribute__((weak)) unsigned dm_present_pin_mask(void);
+extern "C" __attribute__((weak)) unsigned dm_present_record_mask(void);   // [DOOM] android/vulkan_present.cpp: the CPU plan's dm-record mask (0 = none)
 static void (*g_ui_rect_fn)(double *y,double *h);
 static double g_ui_moff;static uint64_t g_ui_moff_addr;
 extern "C" void xbg_set_ui_rect_fn(void (*fn)(double *y,double *h)){g_ui_rect_fn=fn;}
@@ -865,13 +866,17 @@ void run_avail(){
 }
 void run_inline(){const uint64_t t0=timing_clock();run_avail();busy_ns.fetch_add(timing_clock()-t0,std::memory_order_relaxed);}
 // dm-record: off the translation thread's pinned cores (it inherits that pin from its creator), or DM_GFX_RECORD_CPUS=<hex mask>.
+// [DOOM] Or the CPU plan's record mask (android/cpu_topo.c) while the pin is the planned one: on one-big-cluster SoCs (SD680 4+4,
+// Helio G99 2+6) the next big core after the translator's instead of "every core but the pin" (= the little cores there).
+// On flagships the plan's mask is the old one (every core but the pin).
 void apply_affinity(bool first){
     const unsigned pin=dm_present_pin_mask?dm_present_pin_mask():0u;if(!first && pin==last_pin)return;last_pin=pin;
+    const unsigned plan=!cpus_mask && pin && dm_present_record_mask?dm_present_record_mask():0u;
     cpu_set_t set;CPU_ZERO(&set);long n=sysconf(_SC_NPROCESSORS_CONF);if(n<1 || n>32)n=n<1?8:32;
-    for(long c=0;c<n;c++)if(cpus_mask?(cpus_mask>>c&1):!(pin>>c&1))CPU_SET(int(c),&set);
+    for(long c=0;c<n;c++)if(cpus_mask?(cpus_mask>>c&1):plan?(plan>>c&1):!(pin>>c&1))CPU_SET(int(c),&set);
     if(!CPU_COUNT(&set))for(long c=0;c<n;c++)CPU_SET(int(c),&set);
     const int r=sched_setaffinity(0,sizeof set,&set);unsigned m=0;for(long c=0;c<n;c++)if(CPU_ISSET(int(c),&set))m|=1u<<c;
-    rlog("NVN rec thread tid=%d affinity=%#x (translation pin %#x%s) result=%d nice=%d",int(gettid()),m,pin,cpus_mask?", DM_GFX_RECORD_CPUS":"",r,getpriority(PRIO_PROCESS,0));
+    rlog("NVN rec thread tid=%d affinity=%#x (translation pin %#x%s) result=%d nice=%d",int(gettid()),m,pin,cpus_mask?", DM_GFX_RECORD_CPUS":plan?", cpu plan":"",r,getpriority(PRIO_PROCESS,0));
 }
 void loop(){
     pthread_setname_np(pthread_self(),"dm-record");if(setpriority(PRIO_PROCESS,0,-8))setpriority(PRIO_PROCESS,0,-4);
@@ -1096,6 +1101,7 @@ struct Slot {
     std::unordered_map<VkDescriptorSetLayout,std::vector<VkDescriptorSet>> spare_sets; // batch-allocated, reset with the pools
     struct PassRec {
         uint32_t q0=0,q1=0,w=0,h=0,att=0,fmt=0,draws0=0,draws1=0,x=0,y=0,z=0;uint64_t verts0=0,verts1=0;int end_line=0;   // end_line: end_open_pass call site (perf4)
+        XbgRect area{};char ld='L';   // [tile] render area begun and colour load (L load, N DONT_CARE, P poison clear, C lazy-clear twin, A clear-attachments flush)
         bool compute=false,complete=false,mixed=false,dz=false;std::string first,last;
     };
     bool prof=false;VkQueryPool prof_pool{};uint32_t prof_used=0,prof_slot=0,prof_skipped=0;uint64_t prof_frame=0;
@@ -1123,7 +1129,7 @@ long long us=-1;unsigned mid=0;bool diag=false;   // us: DM_GFX_SUBMIT_CHUNK_US;
 // acc_ns: translation since the last submission, up to t0 (start of this guest submit, or the last mid check that restarted
 // the budget); seen_*: perf.submits / draws+dispatches at the last check; was_open: a render pass was open at the last boundary.
 uint64_t acc_ns=0,seen_submits=0,t0=0,seen_draws=0;bool was_open=false;
-uint64_t mid_cuts=0,end_cuts=0,not_ready=0,checks=0;   // NVN PERF chunk, per window
+uint64_t mid_cuts=0,end_cuts=0,not_ready=0,checks=0,kept_open=0;   // NVN PERF chunk, per window (kept_open: [tile] checks that kept an open pass, DM_GFX_CHUNK_MID_SPLIT=0)
 // Overlap-free GPU busy time. A slot's timestamps (top of pipe .. bottom of pipe) start when the command processor reaches
 // it, so a submission queued behind a running one (3 slots; present) starts its span before that one ends and gpu_ms counts
 // the overlap twice. Spans are folded in submission order (Slot::serial; slots may retire out of order) and each counts
@@ -1205,6 +1211,15 @@ void fold_completion_wait_stats(){
 }
 struct SiteScope{int old;explicit SiteScope(int site,bool force=false):old(sync_site){if(force || sync_site==SITE_OTHER)sync_site=site;}~SiteScope(){sync_site=old;}};
 uint64_t write_seq=1,barrier_seq=0; // image writes vs. last full barrier (render-pass merging)
+// [nonadreno][tile] Tile-based GPU paths (xbg_vendor_policy.h, docs/research/tile_gpu_impl.md), fixed at initialization; all off on
+// Adreno unless a DM_GFX_* switch says otherwise. frag_seq: image writes made visible to the fragment stages only (a narrowed
+// read barrier, DM_GFX_TILE_BARRIER); always >= barrier_seq. passes_since_full: render passes ended since the last full barrier
+// (their narrowed dependencies order nothing before later pre-fragment stages).
+bool tile_area_on=false,tile_barrier_on=false,tile_poison=false,chunk_mid_split=true;VkExtent2D area_gran{1,1};PFN_vkGetRenderAreaGranularity area_gran_fn=nullptr;extern bool noload_enabled;
+// Look-ahead context of DM_GFX_TILE_AREA (tile_scan): the op execute() runs, its CALL depth and the return points of the CALLs
+// around it, and the handles of the guest submission being executed.
+const uint8_t *exec_pc=nullptr;unsigned exec_depth=0;const uint8_t *exec_ret[64]{};const uint64_t *exec_handles=nullptr;int exec_nhandles=0,exec_handle=0;
+uint64_t frag_seq=0,passes_since_full=0,tile_area_passes=0,tile_area_px=0,tile_full_px=0,tile_area_splits=0,tile_scan_ops=0,tile_scan_cut=0,tile_frag_barriers=0,tile_war_barriers=0,tile_poisoned=0;
 // Render-pass merging: consecutive draws into the same framebuffer share one
 // render pass. Any non-draw operation, a texture read of something written
 // since the last barrier, or a layout change ends the open pass first.
@@ -1215,7 +1230,8 @@ struct ImageList{Image *v[9];uint32_t n=0;void push_back(Image *i){if(n<9)v[n++]
     size_t size()const{return n;}bool empty()const{return !n;}Image *operator[](size_t i)const{return v[i];}};
 // depth_attached / depth_used (NVN PERF pass_ends depth_idle, NVN GPASS dz=1): a pass that carries a depth attachment no
 // draw tests and no clear touches; a tiler loads and stores that attachment for nothing.
-struct OpenPass {VkRenderPass pass{};VkFramebuffer framebuffer{};VkCommandBuffer cmd{};ImageList images;bool depth_attached=false,depth_used=false,depth_written=false,color_targets=false,depth_cleared=false,dirty_begin=false;} open_pass;
+struct OpenPass {VkRenderPass pass{};VkFramebuffer framebuffer{};VkCommandBuffer cmd{};ImageList images;bool depth_attached=false,depth_used=false,depth_written=false,color_targets=false,depth_cleared=false,dirty_begin=false;
+    bool dirty_begin_f=false,area_part=false;XbgRect area{};} open_pass;   // [tile] dirty_begin_f: dirty_begin against frag_seq; area: the begun renderArea when area_part (DM_GFX_TILE_AREA)
 // Framebuffers of cached render passes, kept across frames (creating and destroying one per pass per frame was ~5% of the
 // render thread on Adreno 730). Each attachment Image lists the keys of the framebuffers that use its views; the first of
 // them to be destroyed (all GPU work that used it is complete by then) takes the framebuffer along. gfx-no-persistent-fb
@@ -1358,8 +1374,15 @@ void report(const char *why){
 }
 void report_perf(double f){if(!active)return;xbg_logf("NVN PERF crumbs mode=%d marks=%.1f draws_noted=%.1f reports=%llu gpu_marker=%u submitted=%u",mode,marks/f,notes/f,(unsigned long long)reports.load(),unsigned(*word),sub_seq.load());marks=notes=0;}
 }
-void end_open_pass(int line){if(open_pass.cmd){++mt_hz_gen;if(lazy_pending)lazy_clear_flush();++pass_end_lines[line];end_occlusion_query();vkrec::CmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd,line);crumbs::mark(open_pass.cmd,crumbs::PASS);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];}}
-void full_barrier(VkCommandBuffer cmd){++mt_hz_gen;storage_unbarriered=false;storage_dirty.clear();VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkrec::CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++barrier_by[cur_op<64?cur_op:63];}
+void end_open_pass(int line){if(open_pass.cmd){++mt_hz_gen;if(lazy_pending)lazy_clear_flush();++pass_end_lines[line];end_occlusion_query();vkrec::CmdEndRenderPass(open_pass.cmd);if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd,line);crumbs::mark(open_pass.cmd,crumbs::PASS);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];if(tile_barrier_on)++passes_since_full;}}
+void full_barrier(VkCommandBuffer cmd){++mt_hz_gen;storage_unbarriered=false;storage_dirty.clear();VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkrec::CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;frag_seq=write_seq;passes_since_full=0;++barrier_by[cur_op<64?cur_op:63];}
+// [nonadreno][tile] DM_GFX_TILE_BARRIER: the read barrier of a draw whose images are read by the fragment shader only. Everything
+// before it (any stage) is made visible to the fragment stages (and attachment access) after it, so the vertex / tiling work that
+// follows need not wait for the fragment work before it (Arm GPU Best Practices 101897 §3.9). It orders nothing for later
+// pre-fragment stages: barrier_seq, the storage bookkeeping and passes_since_full stay as they are, so those reads still get
+// full_barrier. Outside a render pass (the caller ended it).
+constexpr VkPipelineStageFlags tile_frag_stages=VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT|VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+void frag_barrier(VkCommandBuffer cmd){++mt_hz_gen;VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkrec::CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,tile_frag_stages,0,1,&b,0,nullptr,0,nullptr);frag_seq=write_seq;++tile_frag_barriers;++barrier_by[cur_op<64?cur_op:63];}
 struct PerfCounts{size_t pipelines,layouts,samplers,passes,images,host_segments,host_bytes;};
 PerfCounts perf_counts();
 struct Perf {
@@ -1453,7 +1476,8 @@ void retire_slot(Slot &s){
             double us=double((t[r.q1].value-t[r.q0].value)&mask)*per;
             if(!complete)first=t[r.q0].value;last=t[r.q1].value;++complete;
             if(r.compute){compute_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=compute us=%.0f cs=%s groups=%u,%u,%u",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.first.c_str(),r.x,r.y,r.z);}
-            else{pass_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=pass us=%.0f %ux%u att=%u fmt=%u draws=%u verts=%llu first=%s last=%s mixed=%u dz=%u end=L%d",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.w,r.h,r.att,r.fmt,r.draws1-r.draws0,(unsigned long long)(r.verts1-r.verts0),r.first.empty()?"builtin-clear/no-game-draw":r.first.c_str(),r.last.empty()?"builtin-clear/no-game-draw":r.last.c_str(),unsigned(r.mixed),unsigned(r.dz),r.end_line);}
+            else{pass_us+=us;xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u i=%zu kind=pass us=%.0f %ux%u att=%u fmt=%u draws=%u verts=%llu first=%s last=%s mixed=%u dz=%u end=L%d area=%d,%d:%dx%d ld=%c",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),i,us,r.w,r.h,r.att,r.fmt,r.draws1-r.draws0,(unsigned long long)(r.verts1-r.verts0),r.first.empty()?"builtin-clear/no-game-draw":r.first.c_str(),r.last.empty()?"builtin-clear/no-game-draw":r.last.c_str(),unsigned(r.mixed),unsigned(r.dz),r.end_line,
+                r.area.x0,r.area.y0,r.area.x1-r.area.x0,r.area.y1-r.area.y0,r.ld);}
         }
         if(complete)span_us=double((last-first)&mask)*per;
         xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u summary recorded=%zu complete=%zu skipped=%u queries=%u result=%d pass_us=%.0f compute_us=%.0f span_us=%.0f",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),s.prof_recs.size(),complete,s.prof_skipped,s.prof_used,int(status),pass_us,compute_us,span_us);
@@ -1556,7 +1580,7 @@ Slot &recording_slot(){
             }
         }
         // Order against work of earlier submissions on this queue.
-        {VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkrec::CmdPipelineBarrier(s.cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;++mt_hz_gen;}
+        {VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkrec::CmdPipelineBarrier(s.cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;frag_seq=write_seq;passes_since_full=0;++mt_hz_gen;}
         for(auto q:s.occlusion_pools)vkrec::CmdResetQueryPool(s.cmd,q,0,256);
         for(auto q:s.timestamp_pools)vkrec::CmdResetQueryPool(s.cmd,q,0,64);
     }
@@ -1572,7 +1596,7 @@ void pt_drain(){pt_drain_ns+=dm_present_drain();pt_check();}
 void submit_slots(bool wait){
     Slot &s=slots[slot_index];
     if(s.recording){
-        if(open_pass.cmd==s.cmd){unsigned saved=cur_op;cur_op=60;end_open_pass();cur_op=saved;}barrier_seq=0;++mt_hz_gen;
+        if(open_pass.cmd==s.cmd){unsigned saved=cur_op;cur_op=60;end_open_pass();cur_op=saved;}barrier_seq=0;frag_seq=0;++mt_hz_gen;
         // Occlusion results: GPU copies them into mapped memory (vkGetQueryPoolResults is slow on this driver).
         s.query_copied=0;if(s.occlusion_used){size_t used=s.occlusion_used;s.query_results=s.readback.alloc(used*8);
             for(size_t i=0;i*256<used;i++){uint32_t n=uint32_t(std::min<size_t>(256,used-i*256));vkrec::CmdCopyQueryPoolResults(s.cmd,s.occlusion_pools[i],0,n,s.query_results.buffer,s.query_results.offset+i*256*8,8,VK_QUERY_RESULT_64_BIT);}
@@ -1747,7 +1771,14 @@ void perf_frame(){
     perf_vlogf("NVN PERF binds_skipped_per_frame=%.1f xmemo_hits=%.1f drops=%llu bumps=%llu/%llu/%llu/%llu/%llu pinned=%zu/%zu",binds_skipped/f,xmemo_hits/f,(unsigned long long)xmemo_drops,(unsigned long long)memo_bump[0],(unsigned long long)memo_bump[1],(unsigned long long)memo_bump[2],(unsigned long long)memo_bump[3],(unsigned long long)memo_bump[4],memo_pinned[0].size(),memo_pinned[1].size());binds_skipped=0;{char top[160]="";int at=0;bool used[32]={};
      for(int r=0;r<4;r++){int best=-1;for(int k=0;k<32;k++)if(!used[k] && offset_changed_at[k] && (best<0 || offset_changed_at[k]>offset_changed_at[best]))best=k;if(best<0)break;used[best]=true;at+=snprintf(top+at,sizeof(top)-size_t(at),"%s%d:%.1f",r?",":"",best,offset_changed_at[best]/f);}
      perf_vlogf("NVN PERF binds set_binds=%.1f offsets_per_bind=%.1f offsets_only=%.1f changed n1=%.1f n2=%.1f n3=%.1f n4+=%.1f at=%s",set_binds/f,set_binds?double(set_bind_offsets)/double(set_binds):0.0,set_binds_offsets_only/f,offset_changes[1]/f,offset_changes[2]/f,offset_changes[3]/f,(offset_changes[4]+offset_changes[5]+offset_changes[6]+offset_changes[7]+offset_changes[8]+offset_changes[9])/f,top);}
-    set_binds=set_bind_offsets=set_binds_offsets_only=0;for(auto &x:offset_changes)x=0;for(auto &x:offset_changed_at)x=0;xmemo_hits=0;perf_vlogf("NVN PERF noload_passes_per_frame=%.2f img_cache_hits=%.1f misses=%.1f why=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f",noload_passes/f,img_cache_hits/f,img_cache_misses/f,noload_why[0]/f,noload_why[1]/f,noload_why[2]/f,noload_why[3]/f,noload_why[4]/f,noload_why[5]/f,noload_why[6]/f,noload_why[7]/f);for(auto &w:noload_why)w=0;noload_passes=0;img_cache_hits=img_cache_misses=0;perf_vlogf("NVN PERF desc_ns_per_frame memo_key=%.2f tmpl_update=%.2f alloc=%.2f setkey=%.2f build=%.2f hit_total=%.2f",desc_ns[0]/1e6/tf,desc_ns[1]/1e6/tf,desc_ns[2]/1e6/tf,desc_ns[3]/1e6/tf,desc_ns[4]/1e6/tf,desc_ns[5]/1e6/tf);for(auto &x:desc_ns)x=0;template_updates=plain_updates=0;set_cache_hits=set_cache_misses=0;
+    set_binds=set_bind_offsets=set_binds_offsets_only=0;for(auto &x:offset_changes)x=0;for(auto &x:offset_changed_at)x=0;xmemo_hits=0;
+    // [tile] DM_GFX_TILE_* / NOLOAD / CHUNK_MID_SPLIT counters (printed when any is on): passes begun over a smaller render area and the
+    // share of framebuffer pixels their areas keep, area splits, look-ahead ops / budget cuts, fragment-only read barriers, write-after-read
+    // full barriers, poisoned noload passes, chunk checks that kept a pass open, and the last render-area granularity.
+    if(tile_area_on || tile_barrier_on || noload_enabled || tile_poison || !chunk_mid_split)perf_vlogf("NVN PERF tile area_passes=%.1f area_px=%.1f%% splits=%.2f scan_ops=%.0f scan_cut=%.2f frag_barriers=%.1f war_barriers=%.2f poisoned=%.1f chunk_kept_open=%.1f gran=%ux%u",
+        tile_area_passes/f,tile_full_px?100.0*double(tile_area_px)/double(tile_full_px):100.0,tile_area_splits/f,tile_scan_ops/f,tile_scan_cut/f,tile_frag_barriers/f,tile_war_barriers/f,tile_poisoned/f,chunk::kept_open/f,area_gran.width,area_gran.height);
+    tile_area_passes=tile_area_px=tile_full_px=tile_area_splits=tile_scan_ops=tile_scan_cut=tile_frag_barriers=tile_war_barriers=tile_poisoned=0;chunk::kept_open=0;
+    perf_vlogf("NVN PERF noload_passes_per_frame=%.2f img_cache_hits=%.1f misses=%.1f why=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f/%.1f",noload_passes/f,img_cache_hits/f,img_cache_misses/f,noload_why[0]/f,noload_why[1]/f,noload_why[2]/f,noload_why[3]/f,noload_why[4]/f,noload_why[5]/f,noload_why[6]/f,noload_why[7]/f);for(auto &w:noload_why)w=0;noload_passes=0;img_cache_hits=img_cache_misses=0;perf_vlogf("NVN PERF desc_ns_per_frame memo_key=%.2f tmpl_update=%.2f alloc=%.2f setkey=%.2f build=%.2f hit_total=%.2f",desc_ns[0]/1e6/tf,desc_ns[1]/1e6/tf,desc_ns[2]/1e6/tf,desc_ns[3]/1e6/tf,desc_ns[4]/1e6/tf,desc_ns[5]/1e6/tf);for(auto &x:desc_ns)x=0;template_updates=plain_updates=0;set_cache_hits=set_cache_misses=0;
     perf_vlogf("NVN PERF async=%d drains=%.2f drain_ms=%.2f pace_ms=%.2f waits=%.2f",int(gfx_async),gfx_drain_calls.exchange(0)/f,gfx_drain_ns.exchange(0)/1e6/f,gfx_pace_ns.exchange(0)/1e6/f,gfx_wait_calls.exchange(0)/f);perf_vlogf("NVN PERF events defer=%d deferred=%.2f cpu_reads_pending=%llu epochs=%zu reports=%zu",int(defer_events),events_deferred/f,(unsigned long long)event_reads,epochs.size(),pending_reports.size());if(evguard::enabled){Dl_info di{};uintptr_t pc=evguard::last_pc.load();const char *mod=pc && dladdr(reinterpret_cast<void*>(pc),&di) && di.dli_fname?di.dli_fname:"?";perf_vlogf("NVN PERF evguard guards=%llu exact=%llu other=%llu writes=%llu last_addr=%#llx last_pc=%#llx in %s",(unsigned long long)evguard::guards.load(),(unsigned long long)evguard::exact.load(),(unsigned long long)evguard::other.load(),(unsigned long long)evguard::writes.load(),(unsigned long long)evguard::last_addr.load(),(unsigned long long)pc,mod);
      perf_vlogf("NVN PERF evguard engine_opens=%llu recloses=%llu",(unsigned long long)evguard::engine_opens.load(),(unsigned long long)evguard::recloses.load());
      perf_vlogf("NVN PERF evguard last word=%#llx x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx",(unsigned long long)evguard::last_word.load(),(unsigned long long)evguard::last_x[0].load(),(unsigned long long)evguard::last_x[1].load(),(unsigned long long)evguard::last_x[2].load(),(unsigned long long)evguard::last_x[3].load(),(unsigned long long)evguard::last_x[4].load(),(unsigned long long)evguard::last_x[5].load());
@@ -2365,16 +2396,20 @@ bool depth_feedback(){return depth_feedback_mode()>0;}
 void read_break_log(unsigned why,Image &im,bool in_open);
 // storage: 1 = bound as a storage image (unordered with earlier storage writes, like NVN without a barrier), 0 = sampled,
 // -1 = unknown (memo replay: an image never sampled is taken as storage-only).
+// [tile] read_frag_only: set by descriptors() for a draw whose shaders bind images in the fragment stage only (DM_GFX_TILE_BARRIER);
+// its reads then need the writes visible to the fragment stages only (frag_seq, frag_barrier). Always false with the switch off.
+bool read_frag_only=false;
 void prepare_read(Image &im,VkCommandBuffer cmd,int storage=-1){
     bool in_open=open_pass.cmd && std::find(open_pass.images.begin(),open_pass.images.end(),&im)!=open_pass.images.end();
     const bool as_storage=storage<0?!im.sampled_ever:storage!=0;
-    const bool written=im.last_write>barrier_seq || (!as_storage && im.storage_write>barrier_seq);
+    const uint64_t seen=read_frag_only?frag_seq:barrier_seq;const bool dirty_begin=read_frag_only?open_pass.dirty_begin_f:open_pass.dirty_begin;
+    const bool written=im.last_write>seen || (!as_storage && im.storage_write>seen);
     // [DOOM] Depth attachment of the open pass read by a shader (GS occlusion culling in the depth pre-pass, depth reads in
     // later passes): memory holds the depth as of the pass start. That is exact while the pass has neither written nor cleared
     // it, and for a depth-only pass only farther than the truth (culling stays conservative) as long as no clear was folded
     // into it. Writes of earlier passes must already be behind a barrier. ~120 pass splits a frame; DM_GFX_DEPTH_FEEDBACK=0 off.
     if(in_open && im.layout==VK_IMAGE_LAYOUT_GENERAL && (im.aspects&VK_IMAGE_ASPECT_DEPTH_BIT) && depth_feedback() && !open_pass.depth_cleared
-       && (!open_pass.depth_written || !open_pass.color_targets) && !open_pass.dirty_begin && im.storage_write<=barrier_seq){
+       && (!open_pass.depth_written || !open_pass.color_targets) && !dirty_begin && im.storage_write<=seen){
         // "Only farther than the truth" fails when the read texels are not the ones being written (atlas tile -> atlas tile copy):
         // mode 2 falls through to the pass break once this pass has written depth (see depth_feedback_mode).
         if(!(open_pass.depth_written && depth_feedback_mode()==2)){++depth_feedback_reads;return;}
@@ -2382,7 +2417,7 @@ void prepare_read(Image &im,VkCommandBuffer cmd,int storage=-1){
     if(im.layout!=VK_IMAGE_LAYOUT_GENERAL || written || in_open){
         if(open_pass.cmd){unsigned why=(im.layout!=VK_IMAGE_LAYOUT_GENERAL)|written<<1|in_open<<2;++read_break_why[why&7];
             read_break_log(why,im,in_open);}
-        end_open_pass();if(im.layout!=VK_IMAGE_LAYOUT_GENERAL)im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);full_barrier(cmd);
+        end_open_pass();if(im.layout!=VK_IMAGE_LAYOUT_GENERAL)im.transition(cmd,VK_IMAGE_LAYOUT_GENERAL);if(read_frag_only)frag_barrier(cmd);else full_barrier(cmd);
     }
 }
 void mark_storage_images(){for(Image *im:storage_images_bound){im->storage_write=++write_seq;im->storage_dirty=true;if(im->sampled_ever)++mt_hz_gen;}storage_images_bound.clear();}
@@ -4568,6 +4603,11 @@ bool storage_gpu_merge(uint64_t base,uint64_t bytes,Descriptors &out,Buffer *&b,
     b=out.keep(dst);return true;
 }
 void descriptors(Descriptors &out,Commands &commands,bool compute){storage_images_bound.clear();
+    // [tile] DM_GFX_TILE_BARRIER: a draw with no image / texture binding before the fragment stage reads every image in the fragment
+    // shader, so its read barriers may be fragment-only (prepare_read). Reset on every return.
+    struct FragRead{explicit FragRead(bool v){read_frag_only=v;}~FragRead(){read_frag_only=false;}} frag_read(tile_barrier_on && !compute && [](){
+        for(unsigned st=0;st<4;st++)if(const Shader *sh=state.shader[st])for(const auto &b:sh->bindings)if(b.source==XBG_SOURCE_TEXTURE || b.source==XBG_SOURCE_IMAGE)return false;
+        return true;}());
     need(!read_preflight || (pending_writebacks.empty() && pending_reports.empty()),"Unresolved CPU reads at descriptor entry");
     uint64_t tm0=perf_clock();struct MemoClock{uint64_t t0;~MemoClock(){}} mc{tm0};
     // ktag (which part of the key each word is) only feeds the keydiff census, so it is filled on timed frames only (one in
@@ -4971,13 +5011,20 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     }
     p.color_slots=colors.size();VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=colors.size();sub.pColorAttachments=colors.data();sub.pDepthStencilAttachment=depth.attachment!=VK_ATTACHMENT_UNUSED?&depth:nullptr;
     VkSubpassDependency dep[2]{};dep[0]={VK_SUBPASS_EXTERNAL,0,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_ACCESS_MEMORY_WRITE_BIT,VK_ACCESS_COLOR_ATTACHMENT_READ_BIT|VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,0};dep[1]={0,VK_SUBPASS_EXTERNAL,VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT|VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT,0};
+    // [tile] DM_GFX_TILE_BARRIER: the pass's attachment accesses wait for everything before (wide source), but nothing of the pass
+    // before its fragment stages waits, and after the pass only fragment stages / transfers wait for it. Pre-fragment reads of
+    // earlier results all have an explicit full barrier (prepare_read of pre-fragment images, pending_view, Commands), and draws
+    // whose pre-fragment stages write storage get one when a pass ended since the last (draw()).
+    if(tile_barrier_on){dep[0].dstStageMask=tile_frag_stages;dep[1].dstStageMask=tile_frag_stages|VK_PIPELINE_STAGE_TRANSFER_BIT;}
     VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};rp.attachmentCount=descriptions.size();rp.pAttachments=descriptions.data();rp.subpassCount=1;rp.pSubpasses=&sub;rp.dependencyCount=2;rp.pDependencies=dep;
     {XbgPipelineKey key;bool valid=xbg_renderpass_key(key,rp);
         if(valid && key.valid){static std::vector<uint32_t> words;words.assign(key.words,key.words+key.count);auto it=render_pass_cache.find(words);
             if(it==render_pass_cache.end()){RenderPassEntry e;VK(vkCreateRenderPass(cfg.device,&rp,nullptr,&e.pass));e.definition.assign(key,true);
                 if(lazy_clear_on){LazyInfo &li=lazy_info[e.pass];li.desc.assign(descriptions.begin(),descriptions.end());li.colors.assign(colors.begin(),colors.end());li.depth=depth;li.dep[0]=dep[0];li.dep[1]=dep[1];}   // [r3] lazy_twin
                 if(noload_enabled && p.samples==VK_SAMPLE_COUNT_1_BIT){std::vector<VkAttachmentDescription> nl(descriptions.begin(),descriptions.end());bool any=false;
-                    for(size_t k=0;k<nl.size() && k<p.images.size();k++)if(p.images[k]->aspects==VK_IMAGE_ASPECT_COLOR_BIT){nl[k].loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;any=true;}
+                    // [tile] DM_GFX_TILE_POISON: the twin clears to magenta instead, so a wrong coverage proof shows on any GPU (on Adreno sysmem
+                    // DONT_CARE keeps the old contents and would hide it).
+                    for(size_t k=0;k<nl.size() && k<p.images.size();k++)if(p.images[k]->aspects==VK_IMAGE_ASPECT_COLOR_BIT){nl[k].loadOp=tile_poison?VK_ATTACHMENT_LOAD_OP_CLEAR:VK_ATTACHMENT_LOAD_OP_DONT_CARE;any=true;}
                     if(any){VkRenderPassCreateInfo r2=rp;r2.pAttachments=nl.data();VK(vkCreateRenderPass(cfg.device,&r2,nullptr,&e.noload));}}
                 it=render_pass_cache.emplace(words,std::move(e)).first;}
             p.pass=it->second.pass;p.pass_noload=it->second.noload;p.definition=&it->second.definition;
@@ -5010,8 +5057,9 @@ void pass_prof_complete(VkCommandBuffer cmd,int index){Slot &s=slots[slot_index]
 }
 void pass_prof_end(VkCommandBuffer cmd,int line){Slot &s=slots[slot_index];if(!s.prof || cmd!=s.cmd)return;if(s.prof_open>=0 && size_t(s.prof_open)<s.prof_recs.size())s.prof_recs[size_t(s.prof_open)].end_line=line;pass_prof_complete(cmd,s.prof_open);s.prof_open=-1;}
 void pass_prof_depth_idle(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof || cmd!=s.cmd || s.prof_open<0 || size_t(s.prof_open)>=s.prof_recs.size())return;s.prof_recs[size_t(s.prof_open)].dz=true;}
-void pass_prof_begin(const Pass &p,VkCommandBuffer cmd){Slot &s=slots[slot_index];s.prof_open=pass_prof_reserve(cmd);if(s.prof_open<0)return;
+void pass_prof_begin(const Pass &p,VkCommandBuffer cmd,const XbgRect *area=nullptr,char ld='L'){Slot &s=slots[slot_index];s.prof_open=pass_prof_reserve(cmd);if(s.prof_open<0)return;
     auto &r=s.prof_recs[s.prof_open];r.w=p.width;r.h=p.height;r.att=uint32_t(p.images.size());r.fmt=p.images.empty()?0u:uint32_t(p.images[0]->fmt);
+    r.area=area?*area:XbgRect{0,0,int32_t(p.width),int32_t(p.height)};r.ld=ld;
 }
 void pass_prof_draw(VkCommandBuffer cmd){Slot &s=slots[slot_index];if(!s.prof || cmd!=s.cmd || s.prof_open<0)return;
     std::string keys;for(unsigned st=0;st<5;++st)if(state.shader[st]){if(!keys.empty())keys+=';';keys+=std::to_string(st)+":"+state.shader[st]->key;}
@@ -5037,7 +5085,12 @@ void lrz_touch_before(const Pass &p,VkCommandBuffer cmd){
                 vkrec::CmdCopyBufferToImage(cmd,b.buffer,pi.image,VK_IMAGE_LAYOUT_GENERAL,1,&c);full_barrier(cmd);++lrz_touches;}}}
     lrz_prev_serial=dim->source.serial;
 }
-void begin_pass(Pass &p,Commands &c){++mt_hz_gen;lrz_touch_before(p,c.command);pass_prof_begin(p,c.command);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};vkrec::CmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
+// [tile] area: a render area smaller than the framebuffer (DM_GFX_TILE_AREA; the caller guarantees every recording of the pass stays
+// inside it), clears: begin clear values (DM_GFX_TILE_POISON's CLEAR twin). Without them the begin is exactly the former one.
+void begin_pass(Pass &p,Commands &c,const XbgRect *area=nullptr,const VkClearValue *clears=nullptr,uint32_t nclear=0,char ld='L'){++mt_hz_gen;lrz_touch_before(p,c.command);pass_prof_begin(p,c.command,area,ld);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=p.pass;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};
+    if(area){b.renderArea.offset={area->x0,area->y0};b.renderArea.extent={uint32_t(area->x1-area->x0),uint32_t(area->y1-area->y0)};}
+    if(clears && nclear){b.clearValueCount=nclear;b.pClearValues=clears;}
+    vkrec::CmdBeginRenderPass(c.command,&b,VK_SUBPASS_CONTENTS_INLINE);}
 // [r3] DM_GFX_LAZY_CLEAR (pipeline_audit.md 3.12). lazy_clear_open records the pass instead of beginning it; the clears of the
 // whole framebuffer that follow collect in lazy (later ones of the same aspect replace earlier ones, as they would overwrite them).
 // The next draw in that pass (draw() matched open_pass, so nothing read or wrote the attachments in between: every other use
@@ -5058,7 +5111,7 @@ void lazy_clear_add(const VkClearAttachment &a){
     lazy.clears.push_back(a);if(lazy.clears.size()>1)++r3_lazy_appended;}
 void lazy_clear_flush(){   // the former recording: begin the pass with its load ops, then the clears
     lazy_pending=false;++mt_hz_gen;VkCommandBuffer cmd=open_pass.cmd;
-    lrz_touch_before(lazy.pass,cmd);pass_prof_begin(lazy.pass,cmd);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=lazy.pass.pass;b.framebuffer=lazy.pass.framebuffer;b.renderArea.extent={lazy.pass.width,lazy.pass.height};vkrec::CmdBeginRenderPass(cmd,&b,VK_SUBPASS_CONTENTS_INLINE);
+    lrz_touch_before(lazy.pass,cmd);pass_prof_begin(lazy.pass,cmd,nullptr,'A');VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=lazy.pass.pass;b.framebuffer=lazy.pass.framebuffer;b.renderArea.extent={lazy.pass.width,lazy.pass.height};vkrec::CmdBeginRenderPass(cmd,&b,VK_SUBPASS_CONTENTS_INLINE);
     VkClearRect r{{{0,0},{lazy.pass.width,lazy.pass.height}},0,1};if(r.rect.extent.width && r.rect.extent.height)for(auto &a:lazy.clears)vkrec::CmdClearAttachments(cmd,1,&a,1,&r);
     ++r3_lazy_flushed;}
 VkRenderPass lazy_twin(VkRenderPass base,uint32_t mask){
@@ -5081,7 +5134,7 @@ void lazy_clear_begin(Pass &p,VkCommandBuffer cmd){
         else{if(a.aspectMask&VK_IMAGE_ASPECT_DEPTH_BIT)values[k].depthStencil.depth=a.clearValue.depthStencil.depth;if(a.aspectMask&VK_IMAGE_ASPECT_STENCIL_BIT)values[k].depthStencil.stencil=a.clearValue.depthStencil.stencil;}}
     VkRenderPass twin=ok?lazy_twin(lazy.pass.pass,mask):VK_NULL_HANDLE;
     if(!twin){lazy_clear_flush();return;}
-    lazy_pending=false;++mt_hz_gen;lrz_touch_before(p,cmd);pass_prof_begin(p,cmd);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=twin;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};b.clearValueCount=n;b.pClearValues=values;
+    lazy_pending=false;++mt_hz_gen;lrz_touch_before(p,cmd);pass_prof_begin(p,cmd,nullptr,'C');VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=twin;b.framebuffer=p.framebuffer;b.renderArea.extent={p.width,p.height};b.clearValueCount=n;b.pClearValues=values;
     vkrec::CmdBeginRenderPass(cmd,&b,VK_SUBPASS_CONTENTS_INLINE);++r3_lazy_folded;}
 void capture_pass(Pass &pass){
     if(!capture.active)return;
@@ -5225,7 +5278,11 @@ VkImage flip(VkCommandBuffer cmd,Image &im){
 uint64_t noload_why[8]={};
 bool first_draw_covers(const Pass &p,int prim,int first,int count,const p_draw_idx *indexed,const std::vector<std::pair<uint32_t,Buffer*>> &vbufs,const Buffer *ib,VkIndexType itype){
     const Shader *vs=state.shader[0],*fs=state.shader[4];
-    if(taafix::lower_left()){++noload_why[3];return false;}   // nvn_cover reads winding / rows in the mirrored (UPPER_LEFT) convention
+    // [tile] DM_GFX_TAA_FIX 2 (NVN lower-left origin, DOOM's default) used to opt out here. nvn_cover works in NDC: the full
+    // viewport maps NDC [-1,1]^2 onto the whole framebuffer in either origin, so coverage does not depend on it; only the facing
+    // could. With culling on, the lower-left mode now requires coverage under both windings (below), so no convention question
+    // remains (DOOM's full-screen passes draw unculled).
+    const bool ll=taafix::lower_left();
     if(!vs || !fs || state.shader[1] || state.shader[2] || state.shader[3] || vs->raster.pos_input<0 || vs->raster.pos_input>=16 || fs->discards || fs->raster.sample_mask){++noload_why[0];return false;}
     for(int i=0;i<state.rt.n;i++)if(state.rt.color[i]){
         if(!(fs->raster.outputs>>i&1) || (state.color.blend_en>>i&1) || ((state.mask.mask>>(4*i))&15)!=15 || state.rt.color[i]->d.target==2){++noload_why[1];return false;}}
@@ -5257,7 +5314,73 @@ bool first_draw_covers(const Pass &p,int prim,int first,int count,const p_draw_i
     // A failure that culling alone causes counts under raster state (3), the rest under geometry (7).
     if(!nvn_cover(P,count,prim,int(state.poly.cull),state.poly.front==1,1,vp,1,sc,long(p.width),long(p.height))){
         ++noload_why[state.poly.cull && nvn_cover(P,count,prim,NVN_COVER_CULL_NONE,1,1,vp,1,sc,long(p.width),long(p.height))?3:7];return false;}
+    if(ll && state.poly.cull && !nvn_cover(P,count,prim,int(state.poly.cull),state.poly.front!=1,1,vp,1,sc,long(p.width),long(p.height))){++noload_why[3];return false;}
     return true;
+}
+// [nonadreno][tile] DM_GFX_TILE_AREA (docs/research/tile_gpu_impl.md). A tiler loads and stores only the tiles of the render area
+// (PanVK derives the fragment job's tile bounds from renderArea; Arm 101897 §7.3), but the engine always began passes over the
+// whole framebuffer: a shadow-atlas tile update loaded and stored the whole 4096x4096 D16 atlas (32 MB each way). The pass now
+// begins over the bounding box of the draws it is predicted to hold (tile_scan reads ahead in the guest command stream), and
+// every draw / clear recorded into it is checked against that box (tile_draw_rect): one outside ends the pass and begins a new
+// one, so a wrong prediction costs a split, never pixels. The lazy-clear, noload and poison begins stay full-size (their loadOp
+// must cover the whole image).
+// The pixels a draw with these scissor / viewport values can touch (xbg_draw_rect: the scissor, narrowed to the viewport for
+// triangles without tessellation / geometry stages, which are clipped to it).
+XbgRect tile_rect(const Pass &p,int prim,bool plain,int32_t sx,int32_t sy,uint32_t sw,uint32_t sh,const float vpx[6]){
+    VkRect2D sc{};if(xbg_clear_rectangle(p.width,p.height,sx,sy,sw,sh,&sc)!=0)sc={{0,0},{p.width,p.height}};
+    VkViewport v{};const bool ok=xbg_nvn_viewport(&v,vpx[0],vpx[1],vpx[2],vpx[3],vpx[4],vpx[5])==0;
+    if(ok && taafix::lower_left()){v.y+=v.height;v.height=-v.height;}   // as draw() sets it
+    const bool tri=ok && plain && (prim==4 || prim==5 || prim==6 || prim==12 || prim==13);
+    return xbg_draw_rect(sc.offset.x,sc.offset.y,sc.extent.width,sc.extent.height,v.x,v.y,v.width,v.height,tri,p.width,p.height);}
+XbgRect tile_draw_rect(const Pass &p,int prim){   // this draw, from the bound state (exact: the check that keeps the area valid)
+    const float v[6]={state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height,state.viewport.minDepth,state.viewport.maxDepth};
+    return tile_rect(p,prim,!state.shader[1] && !state.shader[2] && !state.shader[3],state.scissor.offset.x,state.scissor.offset.y,state.scissor.extent.width,state.scissor.extent.height,v);}
+size_t command_avail_soft(const uint8_t *p);
+// Union of `u` and the rectangles of the draws and clears that follow the current op into the same render targets, up to the first
+// op that ends the pass for sure (a draw / clear into other targets, a dispatch, a copy), the end of the guest submission, or the
+// scan budget. A prediction only: tile_draw_rect checks each draw when it runs.
+XbgRect tile_scan(const Pass &p,const p_set_rt &rt,XbgRect u){
+    if(!exec_pc)return u;
+    const uint8_t *pc=exec_pc;unsigned depth=exec_depth<64?exec_depth:0;int handle=exec_handle;const uint8_t *stack[16];int sd=0;
+    op_hdr h;{const size_t av=command_avail_soft(pc);if(av<8)return u;memcpy(&h,pc,8);if(h.size<8 || (h.size&7) || h.size>av)return u;pc+=h.size;}   // past the current draw
+    int32_t sx=state.scissor.offset.x,sy=state.scissor.offset.y;uint32_t sw=state.scissor.extent.width,sh=state.scissor.extent.height;
+    float v[6]={state.viewport.x,state.viewport.y,state.viewport.width,state.viewport.height,state.viewport.minDepth,state.viewport.maxDepth};
+    bool same=true;unsigned ops=0,draws=0;
+    for(;;){
+        if(++ops>4096 || draws>=512){++tile_scan_cut;break;}
+        const size_t av=command_avail_soft(pc);if(av<8)break;memcpy(&h,pc,8);if(h.size<8 || (h.size&7) || h.size>av)break;
+        const uint8_t *q=pc+8;const size_t n=h.size-8;const uint8_t *next=pc+h.size;
+        auto rd=[&](void *o,size_t bytes){if(n<bytes)return false;memcpy(o,q,bytes);return true;};
+        int prim=-1;bool clear=false,stop=false;
+        switch(h.op){
+        case OP_END:
+            if(sd>0){pc=stack[--sd];continue;}
+            if(depth>0){--depth;pc=exec_ret[depth];if(!pc)stop=true;else continue;break;}
+            if(exec_handles && handle+1<exec_nhandles){pc=reinterpret_cast<const uint8_t*>(uintptr_t(exec_handles[++handle]));continue;}
+            stop=true;break;
+        case OP_JUMP:{uint64_t t;if(!rd(&t,8)){stop=true;break;}pc=reinterpret_cast<const uint8_t*>(uintptr_t(t));continue;}
+        case OP_CALL:{uint64_t t;if(sd>=16 || !rd(&t,8)){stop=true;break;}stack[sd++]=next;pc=reinterpret_cast<const uint8_t*>(uintptr_t(t));continue;}
+        case OP_SET_RT:same=n>=sizeof(p_set_rt) && !memcmp(q,&rt,sizeof(p_set_rt));break;
+        case OP_SCISSOR:{p_scissor a;if(rd(&a,sizeof a) && a.w>=0 && a.h>=0){sx=a.x;sy=a.y;sw=uint32_t(a.w);sh=uint32_t(a.h);}break;}
+        case OP_VIEWPORTS:{p_viewports a;if(rd(&a,sizeof a) && a.first==0 && a.n>=1){v[0]=a.v[0][0];v[1]=a.v[0][1];v[2]=a.v[0][2];v[3]=a.v[0][3];}break;}
+        case OP_DEPTH_RANGE:{p_depth_range a;if(rd(&a,sizeof a)){v[4]=a.n;v[5]=a.f;}break;}
+        case OP_DRAW:{p_draw a;prim=rd(&a,sizeof a)?a.prim:0;break;}
+        case OP_DRAW_IDX:{p_draw_idx a;prim=rd(&a,sizeof a)?a.prim:0;break;}
+        case OP_X_DRAW_CALL:{xbg_draw_call a;prim=rd(&a,sizeof a)?a.primitive:0;break;}
+        case OP_X_DRAW_INDIRECT:case OP_X_MULTI_DRAW_INDIRECT:{xbg_indirect a;prim=rd(&a,sizeof a)?a.primitive:0;break;}
+        case OP_CLEAR_COLOR:case OP_CLEAR_DS:case OP_X_TYPED_CLEAR:clear=true;break;
+        case OP_DISPATCH:case OP_X_DISPATCH_INDIRECT:case OP_COPY_B2T:case OP_COPY_T2B:case OP_COPY_T2T:case OP_CLEAR_TEX:case OP_X_RESOLVE:stop=true;break;
+        default:break;
+        }
+        if(stop)break;
+        if(prim>=0 || clear){
+            if(!same)break;   // into other targets: the engine ends the pass there
+            const XbgRect r=clear?tile_rect(p,0,false,sx,sy,sw,sh,v):tile_rect(p,prim,true,sx,sy,sw,sh,v);
+            u=xbg_rect_union(u,r);++draws;
+            if(double(u.x1-u.x0)*double(u.y1-u.y0)>=0.9*double(p.width)*double(p.height))break;}   // the area will be the whole framebuffer anyway
+        pc=next;
+    }
+    tile_scan_ops+=ops;return u;
 }
 // gfx-async-pipelines: may this draw be skipped while its pipeline builds? Only when losing it for a few frames loses a
 // translucent effect: every written color target blends with the destination (a destination factor other than ZERO, so
@@ -5305,6 +5428,12 @@ bool skip_unusable(const char *what){   // [nonadreno] a bound module lacks a de
         if(sh && !sh->unusable.empty()){static std::unordered_set<std::string> told;if(told.insert(sh->key).second)xbg_logf("NVN %s skipped: shader %s stage %u needs %s",what,sh->key.c_str(),st,sh->unusable.c_str());return true;}}
     return false;}
 void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0,const GpuIndirect *gi=nullptr){DRAW_MARK(0);GsPassthru gs_passthru;if(skip_unusable("draw"))return;preflight_cpu_reads();
+    // [tile] DM_GFX_TILE_BARRIER: the narrowed pass dependencies no longer order a vertex / geometry stage storage write after the
+    // reads of earlier passes (write-after-read). Such a draw (DOOM: the culling GS with r_geometryCulling 1) gets the full barrier
+    // the old dependencies implied, once per run of passes.
+    if(tile_barrier_on && passes_since_full){bool pre_write=false;
+        for(unsigned st=0;st<4 && !pre_write;st++)if(const Shader *sh=state.shader[st]){if(!sh->storage_writes.empty())pre_write=true;else for(const auto &b:sh->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || b.type==VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER){pre_write=true;break;}}
+        if(pre_write){end_open_pass();full_barrier(recording_slot().cmd);++tile_war_barriers;}}
     if(taafix::probe_on())taafix::probe();
     if(draw_log_fp){fprintf(draw_log_fp,"DRAW %u ind=%d vs=%s ps=%s gs=%s count=%d inst=%u rt=",draw_log_n++,gi?(gi->count?2:1):0,state.shader[0]?state.shader[0]->key.c_str():"-",state.shader[4]?state.shader[4]->key.c_str():"-",state.shader[3]?state.shader[3]->key.c_str():"-",count,instances);
         for(int i=0;i<state.rt.n;i++)fprintf(draw_log_fp,"%llu:%#x ",state.rt.color[i]?(unsigned long long)state.rt.color[i]->serial:0ull,state.rt.color[i]?state.rt.color[i]->d.format:0);
@@ -5483,13 +5612,29 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     if(capture.active){for(auto &v:vertex_buffers){char label[40];snprintf(label,sizeof(label),"vertex-stream%u",v.first);capture_log("VERTEX label=%s guest=%#llx bytes=%zu",label,(unsigned long long)state.vb[v.first].address,v.second->size);capture_data(label,v.second->mapped,v.second->size);}if(ib){capture_log("INDEX guest=%#llx vkType=%u bytes=%zu",(unsigned long long)indexed->ibuf,unsigned(index_type),ib->size);capture_data("index",ib->mapped,ib->size);}for(auto &input:d.capture_inputs)for(auto *output:p.images)if(input.image==output)capture_log("FEEDBACK input=%s serial=%llu",input.label.c_str(),(unsigned long long)output->source.serial);}
     DRAW_MARK(5);   // [perf4] section boundary (DM_GFX_DRAW_PROFILE): time since the previous mark goes to section 5-1
     VkQueryPool occlusion{};uint32_t occlusion_index=0;const bool counting=state.count_samples && !no_occlusion_queries && !ab_off("occ");
-    const bool new_run=counting && (!occlusion_batch_enabled || ab_off("query") || !open_occlusion.cmd || open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer);
+    // [tile] DM_GFX_TILE_AREA: a draw outside the open pass's render area needs a new pass (and so a new occlusion run).
+    XbgRect tile_dr{};if(tile_area_on)tile_dr=tile_draw_rect(p,prim);
+    auto area_split=[&]{return tile_area_on && open_pass.area_part && open_pass.cmd==c.command && open_pass.pass==p.pass && open_pass.framebuffer==p.framebuffer && (ui_uy!=0 || ui_vs!=1 || !xbg_rect_inside(tile_dr,open_pass.area));};   // (a host UI shift moves the scissor: full pass)
+    const bool new_run=counting && (!occlusion_batch_enabled || ab_off("query") || !open_occlusion.cmd || open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer || area_split());
     if(new_run){need(cfg.enabled_core.occlusionQueryPrecise,"Precise samples-passed query disabled");occlusion_query(occlusion,occlusion_index);}   // a new pool ends the pass first
-    if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();
+    const bool split=area_split();
+    if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer || split){end_open_pass();if(split)++tile_area_splits;
+        XbgRect area{0,0,int32_t(p.width),int32_t(p.height)};bool area_part=false;
         // Proven full overwrite: begin with the color-DONT_CARE twin; open_pass keeps p.pass, so later draws continue this pass.
-        if(!gi && p.pass_noload && quad_indices.empty() && !ab_off("noload") && ui_uy==0 && ui_vs==1 && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;begin_pass(p,c);p.pass=keep;++noload_passes;}
+        if(!gi && p.pass_noload && quad_indices.empty() && !ab_off("noload") && ui_uy==0 && ui_vs==1 && first_draw_covers(p,prim,first,count,indexed,vertex_buffers,ib,index_type)){VkRenderPass keep=p.pass;p.pass=p.pass_noload;
+            if(tile_poison){VkClearValue cv[9]{};const uint32_t nc=uint32_t(std::min<size_t>(p.images.size(),9));for(uint32_t k=0;k<nc;k++){cv[k].color.float32[0]=1;cv[k].color.float32[2]=1;cv[k].color.float32[3]=1;}   // [tile] magenta
+                begin_pass(p,c,nullptr,cv,nc,'P');++tile_poisoned;}
+            else begin_pass(p,c,nullptr,nullptr,0,noload_enabled?'N':'L');
+            p.pass=keep;++noload_passes;}
+        else if(tile_area_on && ui_uy==0 && ui_vs==1){   // [tile] render area = predicted bounding box of the pass's draws
+            VkExtent2D g{1,1};if(area_gran_fn)area_gran_fn(cfg.device,p.pass,&g);if(!g.width || !g.height)g={1,1};area_gran=g;
+            area=xbg_area_align(tile_scan(p,state.rt,tile_dr),g.width,g.height,p.width,p.height,0.9f);
+            area_part=area.x0!=0 || area.y0!=0 || area.x1!=int32_t(p.width) || area.y1!=int32_t(p.height);
+            begin_pass(p,c,area_part?&area:nullptr);
+            tile_full_px+=uint64_t(p.width)*p.height;if(area_part){++tile_area_passes;tile_area_px+=uint64_t(area.x1-area.x0)*uint64_t(area.y1-area.y0);}else tile_area_px+=uint64_t(p.width)*p.height;}
         else begin_pass(p,c);
-        ++mt_hz_gen;open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;for(auto *pi:p.images)if(pi->prior_write>barrier_seq)open_pass.dirty_begin=true;++perf.passes;}
+        ++mt_hz_gen;open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;for(auto *pi:p.images){if(pi->prior_write>barrier_seq)open_pass.dirty_begin=true;if(pi->prior_write>frag_seq)open_pass.dirty_begin_f=true;}++perf.passes;
+        open_pass.area_part=area_part;open_pass.area=area;}
     if(lazy_pending)lazy_clear_begin(p,c.command);   // [r3] the pending pass of a lazy clear (same pass and framebuffer): begin it, clears as load ops
     if(state.ds.dt || state.ds.st || state.bounds.enable)open_pass.depth_used=true;
     if(state.rt.depth && (state.ds.dw || state.ds.st))open_pass.depth_written=true;if(active_colors)open_pass.color_targets=true;
@@ -5756,7 +5901,11 @@ void clear_attachment(const p_clear_color *color,const p_clear_ds *depth,int sca
                 // [r3] DM_GFX_LAZY_CLEAR: a clear of the whole framebuffer that would begin its own pass keeps it pending (see lazy_pending)
                 VkClearRect r{scissor(p),0,1};const bool whole=r.rect.offset.x==0 && r.rect.offset.y==0 && r.rect.extent.width==p.width && r.rect.extent.height==p.height;
                 const bool lazy=lazy_clear_on && whole && !r3_off("lazyclear") && lazy_clear_known(p);
-                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer){end_open_pass();if(lazy)lazy_clear_open(p);else begin_pass(p,c);++mt_hz_gen;open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
+                // [tile] DM_GFX_TILE_AREA: a clear outside the open pass's render area begins a new (full) pass
+                const bool split=open_pass.area_part && open_pass.cmd==c.command && open_pass.pass==p.pass && open_pass.framebuffer==p.framebuffer &&
+                    !xbg_rect_inside(XbgRect{r.rect.offset.x,r.rect.offset.y,int32_t(r.rect.offset.x+int32_t(r.rect.extent.width)),int32_t(r.rect.offset.y+int32_t(r.rect.extent.height))},open_pass.area);
+                if(split)++tile_area_splits;
+                if(open_pass.cmd!=c.command || open_pass.pass!=p.pass || open_pass.framebuffer!=p.framebuffer || split){end_open_pass();if(lazy)lazy_clear_open(p);else begin_pass(p,c);++mt_hz_gen;open_pass.cmd=c.command;open_pass.pass=p.pass;open_pass.framebuffer=p.framebuffer;open_pass.images=p.images;open_pass.depth_attached=state.rt.depth!=nullptr;++perf.passes;}
                 // [r3] with DM_GFX_LAZY_CLEAR a stencil-only clear no longer counts as a depth clear for the depth-feedback shortcut
                 // (prepare_read): the depth aspect keeps its contents; a packed D24S8 counts it as a depth/stencil write instead.
                 if(depth){open_pass.depth_used=true;if(!lazy_clear_on || (a.aspectMask&VK_IMAGE_ASPECT_DEPTH_BIT))open_pass.depth_cleared=true;else if(ti.fmt==VK_FORMAT_D24_UNORM_S8_UINT)open_pass.depth_written=true;}
@@ -6109,6 +6258,11 @@ void resolve_texture(const p_copy_t2t &p){preflight_cpu_reads();
 // Consecutive commands nearly always sit in one range: remember the last one (pools change only under the mutex,
 // and clear it; host segments are freed only at shutdown).
 uintptr_t cmd_range_lo=0;size_t cmd_range_bytes=0;
+// [tile] command_available without the fatal error: tile_scan only predicts, an address outside the pools ends its scan.
+size_t command_avail_soft(const uint8_t *p){uintptr_t address=uintptr_t(p);if(address-cmd_range_lo<cmd_range_bytes)return cmd_range_bytes-(address-cmd_range_lo);
+    auto it=pools.upper_bound(address);if(it!=pools.begin()){--it;if(address>=it->first && address-it->first<it->second)return it->second-(address-it->first);}
+    auto h=host_ranges.upper_bound(address);if(h!=host_ranges.begin()){--h;if(address>=h->first && address-h->first<h->second)return h->second-(address-h->first);}
+    return 0;}
 size_t command_available(const uint8_t *p){uintptr_t address=uintptr_t(p);if(address-cmd_range_lo<cmd_range_bytes)return cmd_range_bytes-(address-cmd_range_lo);auto it=pools.upper_bound(address);if(it!=pools.begin()){--it;if(address>=it->first && address-it->first<it->second){cmd_range_lo=it->first;cmd_range_bytes=it->second;return it->second-(address-it->first);}}{auto h=host_ranges.upper_bound(address);if(h!=host_ranges.begin()){--h;if(address>=h->first && address-h->first<h->second){cmd_range_lo=h->first;cmd_range_bytes=h->second;return h->second-(address-h->first);}}}xbg_fatalf("NVN command address %#llx is outside registered command pools",(unsigned long long)address);}
 void execute_draw_call(const xbg_draw_call &p){
     need(p.index_type>=-1 && p.index_type<=2 && p.first>=0 && p.count>=0 && p.instances>=0 && p.base_instance>=0,"Invalid recorded draw plan");
@@ -6275,6 +6429,9 @@ void chunk_mid_check(){
     const bool open=open_pass.cmd!=VK_NULL_HANDLE,ended=chunk::was_open && !open;chunk::was_open=open;
     const uint64_t d=perf.draws+perf.dispatches;   // perf resets per window: the wrap then only checks once early
     if(!ended && d-chunk::seen_draws<chunk::mid)return;
+    // [tile] DM_GFX_CHUNK_MID_SPLIT=0 (Mali / PowerVR default): the every-N-draws cut does not end an open pass (on a tiler a split
+    // stores and reloads every attachment); it waits for an op boundary with no pass open. Cuts at pass ends are unchanged.
+    if(!ended && open && !chunk_mid_split){++chunk::kept_open;return;}
     chunk::seen_draws=d;Slot &cur=slots[slot_index];if(!cur.recording || !cur.ops || failed)return;
     ++chunk::checks;const uint64_t now=timing_clock();
     if(perf.submits!=chunk::seen_submits){chunk::seen_submits=perf.submits;chunk::acc_ns=0;chunk::t0=now;}   // another submission (arena, event, wait) restarted the budget
@@ -6289,13 +6446,13 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         // Bound host arena use per frame slot; only at command boundaries.
         {Slot &cur=slots[slot_index];if(cur.recording && cur.stream.used_total+cur.readback.used_total>arena_flush_bytes){SiteScope site(SITE_ARENA);submit_slots(false);}}
         if(chunk::mid)chunk_mid_check();   // [DOOM] DM_GFX_CHUNK_MID: same boundary, after the previous command is fully recorded
-        size_t available=command_available(pc);need(available>=8,"Truncated command header");op_hdr h;memcpy(&h,pc,8);need(h.size>=8 && !(h.size&7) && h.size<=available,"NVN command size outside pool");const uint8_t *p=pc+8;size_t n=h.size-8;cur_op=h.op;
+        size_t available=command_available(pc);need(available>=8,"Truncated command header");op_hdr h;memcpy(&h,pc,8);need(h.size>=8 && !(h.size&7) && h.size<=available,"NVN command size outside pool");const uint8_t *p=pc+8;size_t n=h.size-8;cur_op=h.op;exec_pc=pc;exec_depth=depth;
         if(stategen){const unsigned o=unsigned(h.op);if(o>=256 || !sg::quiet_desc[o])++sg::desc_gen;if(o>=256 || !sg::quiet_pso[o])++sg::pso_gen;}   // [r4] DM_GFX_STATEGEN
         switch(h.op){
         case OP_END:return;
         case OP_BEGIN:break;
         case OP_JUMP:pc=reinterpret_cast<const uint8_t*>(payload<uint64_t>(p,n));continue;
-        case OP_CALL:execute(reinterpret_cast<const uint8_t*>(payload<uint64_t>(p,n)),depth+1,budget);break;
+        case OP_CALL:exec_ret[depth]=pc+h.size;execute(reinterpret_cast<const uint8_t*>(payload<uint64_t>(p,n)),depth+1,budget);break;   // [tile] exec_ret: tile_scan's way back
         case OP_SIGNAL_EVENT:{need(n>=16,"Truncated event");uint64_t addr;uint32_t mode,v;memcpy(&addr,p,8);memcpy(&mode,p+8,4);memcpy(&v,p+12,4);need(addr,"Null event address");SiteScope site(SITE_EVENT);
             if(defer_events){   // hand the work so far to the GPU without waiting; publish when that submission retires
                 Slot &cur=slots[slot_index];
@@ -6468,7 +6625,14 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      gpguard::careful=false;gpguard::loaded=false;gpguard::skip.clear();gpguard::told.clear();gpguard::proven.clear();gpguard::any=false;gpguard::load();
      ubo_dynamic_on=xbg_env_or(getenv("DM_GFX_UBO_DYNAMIC"),xbg_ubo_dynamic_default(gpu_policy));noout_mask_on=xbg_env_or(getenv("DM_GFX_NOOUT_MASK"),xbg_noout_mask_default(gpu_policy));
      xbg_logf("NVN gpu policy: pipe_serial=%d pipe_guard=%d ubo_dynamic=%d noout_mask=%d zero-copy default=%d (DM_GFX_PIPE_SERIAL / PIPE_GUARD / UBO_DYNAMIC / NOOUT_MASK / ZEROCOPY)",
-              int(gpguard::serial),int(gpguard::guard),int(ubo_dynamic_on),int(noout_mask_on),int(xbg_zero_copy_default(gpu_policy)));}
+              int(gpguard::serial),int(gpguard::guard),int(ubo_dynamic_on),int(noout_mask_on),int(xbg_zero_copy_default(gpu_policy)));
+     // [tile] tile-based GPU paths (xbg_vendor_policy.h, docs/research/tile_gpu_impl.md); DM_GFX_NOLOAD is read with its marker below.
+     tile_area_on=xbg_env_or(getenv("DM_GFX_TILE_AREA"),xbg_tile_area_default(gpu_policy));tile_barrier_on=xbg_env_or(getenv("DM_GFX_TILE_BARRIER"),xbg_tile_barrier_default(gpu_policy));
+     chunk_mid_split=xbg_env_or(getenv("DM_GFX_CHUNK_MID_SPLIT"),xbg_chunk_mid_split_default(gpu_policy));tile_poison=xbg_env_or(getenv("DM_GFX_TILE_POISON"),false);
+     frag_seq=passes_since_full=0;area_gran={1,1};read_frag_only=false;   // (no vk_tramp entry for vkGetRenderAreaGranularity: through the device)
+     area_gran_fn=tile_area_on?reinterpret_cast<PFN_vkGetRenderAreaGranularity>(vkGetDeviceProcAddr(cfg.device,"vkGetRenderAreaGranularity")):nullptr;
+     xbg_logf("NVN tile policy: area=%d barrier=%d chunk_mid_split=%d poison=%d noload default=%d (DM_GFX_TILE_AREA / TILE_BARRIER / CHUNK_MID_SPLIT / TILE_POISON / NOLOAD)",
+              int(tile_area_on),int(tile_barrier_on),int(chunk_mid_split),int(tile_poison),int(xbg_noload_default(gpu_policy)));}
     {const auto &l=properties.limits;VkDeviceSize a=256;for(VkDeviceSize x:{l.minUniformBufferOffsetAlignment,l.minStorageBufferOffsetAlignment,l.minTexelBufferOffsetAlignment,l.optimalBufferCopyOffsetAlignment,l.nonCoherentAtomSize,VkDeviceSize(16)})while(a<x)a<<=1;arena_alignment=a;}
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-mode";FILE *m=fopen(marker.c_str(),"rb");sync_mode=false;if(m){sync_mode=fgetc(m)=='1';fclose(m);}}
      {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}else if(const char *e=getenv("DM_GFX_DEFER_EVENTS")){int v=atoi(e);defer_events=v==1?1:v==2?2:0;}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *eg=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-event-guard").c_str(),"rb");evguard::enabled=eg!=nullptr;if(eg)fclose(eg);if(evguard::enabled)xbg_logf("NVN event guard on (marker gfx-event-guard)");}{FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-vcache").c_str(),"rb");vcache::enabled=false;if(v){vcache::enabled=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_VCACHE"))vcache::enabled=atoi(e)!=0;xbg_logf("NVN vertex/index cross-frame cache=%d tracker=%d (marker gfx-vcache)",int(vcache::enabled),int(nvn_dirty_since!=nullptr));}
@@ -6476,7 +6640,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
       xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}
      {astc_ov_mask=xbg_astc_formats_mask(getenv("DM_GFX_ASTC_FORMATS"));   // [nonadreno] ASTC overlay: set by the boot choice (vulkan_present.cpp) only when mounted
       if(astc_ov_mask){char fm[64];xbg_astc_formats_str(astc_ov_mask,fm,sizeof fm);xbg_logf("NVN astc overlay: engine substitutes %s (DM_GFX_ASTC_FORMATS; rom overlay %s)",fm,getenv("DM_ROMFS_OVERLAY")?getenv("DM_ROMFS_OVERLAY"):"-");}}
-     {FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-noload").c_str(),"rb");noload_enabled=false;if(b){noload_enabled=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NOLOAD"))noload_enabled=atoi(e)!=0;xbg_logf("NVN proven full-overwrite first draws skip the color load=%d (marker gfx-noload; A/B target noload)",int(noload_enabled));}{FILE *q=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-bright").c_str(),"rb");bright::enabled=true;if(q){bright::enabled=fgetc(q)!='0';fclose(q);}else if(const char *e=getenv("DM_GFX_BRIGHT"))bright::enabled=atoi(e)!=0;xbg_logf("NVN 3D brightening=%d (marker gfx-bright; A/B target bright)",int(bright::enabled));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
+     {FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-noload").c_str(),"rb");noload_enabled=false;if(b){noload_enabled=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NOLOAD"))noload_enabled=atoi(e)!=0;else noload_enabled=xbg_noload_default(gpu_policy);xbg_logf("NVN proven full-overwrite first draws skip the color load=%d (marker gfx-noload; A/B target noload; default on Mali / PowerVR)",int(noload_enabled));}{FILE *q=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-bright").c_str(),"rb");bright::enabled=true;if(q){bright::enabled=fgetc(q)!='0';fclose(q);}else if(const char *e=getenv("DM_GFX_BRIGHT"))bright::enabled=atoi(e)!=0;xbg_logf("NVN 3D brightening=%d (marker gfx-bright; A/B target bright)",int(bright::enabled));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
     // [DOOM] Chunked submit and ring depth (submit_chunk, chunk_mid_check, ring_slot). DM_GFX_SLOTS: 3 = 3-slot ring, else 2;
     // DM_GFX_CHUNK_MID: 1 = mid-submit cuts with forced checks every 32 draws, N > 1 = every N, unset / 0 = off (also off
     // without chunks). Read here, before any slot is used, and fixed for the session. Defaults since 31.10 (round 1 A/B on the
@@ -6768,7 +6932,7 @@ void submit_chunk(uint64_t spent_ns){
 }
 static void xbg_submit_now(int n,const uint64_t *handles){std::lock_guard<std::recursive_mutex> lock(mutex);
     if(deferred_live_profile && !timing.top){uint64_t current=stats.presents.load();timing=XbgCpuTiming(timing_clock);timing_first=current+2;timing_last=timing_first+deferred_live_profile-1;deferred_live_profile=0;}
-   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();chunk::t0=begin;zcubo::check();snapshot_reset();uint64_t budget=0;for(int i=0;i<n;i++)execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);if(vt_fix_mask()&1)cpu_visible_flush();++stats.submissions;++submitted;if(sync_mode)complete_all();const uint64_t spent=timing_clock()-begin;perf.submit_cpu_ns+=spent;submit_chunk(spent);}
+   TimingRoot timing_root;CPU_SCOPE(Other);need(initialized && !failed,"Game Vulkan backend not initialized/healthy");uint64_t begin=timing_clock();chunk::t0=begin;zcubo::check();snapshot_reset();uint64_t budget=0;exec_handles=handles;exec_nhandles=n;for(int i=0;i<n;i++){exec_handle=i;execute(reinterpret_cast<const uint8_t*>(handles[i]),0,budget);}exec_handles=nullptr;exec_nhandles=0;exec_pc=nullptr;if(vt_fix_mask()&1)cpu_visible_flush();++stats.submissions;++submitted;if(sync_mode)complete_all();const uint64_t spent=timing_clock()-begin;perf.submit_cpu_ns+=spent;submit_chunk(spent);}
 extern "C" uint64_t xbg_legacy_last_fence(){return gfx_async?gfx_enqueued.load():[]{std::lock_guard<std::recursive_mutex> lock(mutex);return submitted;}();}
 extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     // 不取锁的提前返回只用于新写法；旧写法（非鸿蒙缺省）先判 failed，与原来逐条相同

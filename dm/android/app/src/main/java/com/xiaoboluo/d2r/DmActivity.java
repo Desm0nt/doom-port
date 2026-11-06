@@ -107,6 +107,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
+        if (BuildConfig.DM_DIAG) CrashLog.startLogcatCapture(getApplicationContext());   // [DOOM] diagnostics APK: logcat to a file from the first moment
         // 调试包：am start … --ez dmArtDump true 只把触屏控件底图写到 files/dm/artdump/ 就退出（dm/android/tools/art_compare.sh 用）
         // Debug builds: am start … --ez dmArtDump true only writes the touch control art to files/dm/artdump/ and exits (used by dm/android/tools/art_compare.sh)
         if (BuildConfig.DEBUG && getIntent().getBooleanExtra("dmArtDump", false)) {
@@ -202,6 +203,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 } catch (Throwable x) { android.util.Log.e("dm", "crash log: " + x); }
                 if (prev != null) prev.uncaughtException(t, e); else { android.os.Process.killProcess(android.os.Process.myPid()); System.exit(10); }
             });
+            if (BuildConfig.DM_DIAG && !diagWiped) { diagWiped = true; CrashLog.wipeForDiag(app); }   // [DOOM] diagnostics APK: a clean slate
             String last = CrashLog.checkPrevious(app, (f, why) -> runOnUiThread(() -> {
                 if (f == null) return;
                 crumb("crash report of the last run written: " + f.getAbsolutePath());
@@ -511,9 +513,20 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             int asp = aspectPref(p);
             Os.setenv("DM_DOOM_ASPECT", ASPECT_ENV[asp], true);
             Os.setenv("DM_DOOM_WIDE", asp == 0 ? "1" : "0", true);
+            // [DOOM] the diagnostics APK (-PdmDiag=1, for testers who cannot edit dm/env): per-pass GPU timestamps (NVN GPASS) and the
+            // whole NVN PERF block in boot.log; dm/env still wins (not overwritten)
+            // DM_LOG_TIME=1: every boot.log line starts with the wall-clock time it was written (jni_android.c log_file_line);
+            // DM_GFX_PERF_SAMPLE=4: the NVN PERF parts timed every frame (windows of 60)
+            if (BuildConfig.DM_DIAG) { Os.setenv("DM_GFX_PASS_PROF", "1", false); Os.setenv("DM_GFX_PERF_VERBOSE", "1", false);
+                Os.setenv("DM_LOG_TIME", "1", false); Os.setenv("DM_GFX_PERF_SAMPLE", "4", false);
+                if (!BuildConfig.DM_DIAG_TU_DEBUG.isEmpty()) Os.setenv("TU_DEBUG", BuildConfig.DM_DIAG_TU_DEBUG, true); }   // vk_driver.c keeps a set TU_DEBUG
             String lang = p.getString("lang", "");
             if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
-            String drv = p.getString("driver", defaultDriver());
+            // [DOOM] diagnostics APK: always the hardware's default driver (Turnip on an Adreno 6xx+), whatever was saved or the crash guard
+            // decided before, so a report shows the default setup; the guard file is dropped so its strikes cannot switch it back
+            String drv = BuildConfig.DM_DIAG ? (!BuildConfig.DM_DIAG_DRIVER.isEmpty() && turnipPossible() ? BuildConfig.DM_DIAG_DRIVER : defaultDriver())
+                : p.getString("driver", defaultDriver());
+            if (BuildConfig.DM_DIAG) driverGuard().delete();
             // [DOOM] hardware check at every start (BUGS_AND_FIXES 2.22, 2.25): Turnip needs a Qualcomm Adreno 6xx+ (KGSL), PanVK a Mali
             // (/dev/mali0), RADV-Xclipse a Samsung Xclipse, and a Linux glibc build (the "-EMULATOR" zips) runs nowhere in an Android app
             // (driverProblem). Such a saved choice (settings imported / restored from another phone, or picked before this check existed)
@@ -1029,9 +1042,17 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // [DOOM] After the game starts: removes the driver crash guard once a frame was presented, and tells the player once when the
     // chosen driver did not start and the native side fell back to the system driver (vk_driver.c status). Polls every second until
     // both are settled.
+    private static boolean diagWiped;   // [DOOM] diagnostics APK: CrashLog.wipeForDiag looked at this process already
     private boolean driverGuardDone, driverStatusDone, firstFrameDone;   // firstFrameDone: [DOOM] breadcrumb "first frames presented"
     private long gameStartedAt;
     private final float[] guardStats = new float[4];
+    // [DOOM] the diagnostics APK: boot.log copied to <game folder>/logs every minute while the game runs (a hard kill or a hang keeps the
+    // last minute of the log reachable without adb), on a background thread
+    private final Runnable diagMirror = new Runnable() { @Override public void run() {
+        if (!started || isFinishing()) return;
+        android.content.Context app = getApplicationContext(); new Thread(() -> CrashLog.mirrorBootLogs(app), "dm-logcopy").start();
+        view.postDelayed(this, 60_000);
+    } };
     private final Runnable driverWatch = new Runnable() { @Override public void run() {
         if (!started || isDestroyed()) return;
         String[] st = driverStatus();
@@ -1146,6 +1167,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (DOOM) {   // [DOOM] driver crash guard / fallback message (driverWatch), and the notice from the guard at this launch
             if (driverNotice != null) { android.widget.Toast.makeText(this, driverNotice, android.widget.Toast.LENGTH_LONG).show(); driverNotice = null; }
             view.postDelayed(driverWatch, 1000);
+            if (BuildConfig.DM_DIAG) view.postDelayed(diagMirror, 60_000);
         }
         nativeFocus(3);
     }

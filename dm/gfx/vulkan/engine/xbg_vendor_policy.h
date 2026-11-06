@@ -128,6 +128,67 @@ inline bool xbg_ubo_dynamic_default(XbgGpuFamily f){return f!=XBG_GPU_POWERVR;}
 // but Adreno (whose pipelines stay as they were). DM_GFX_NOOUT_MASK.
 inline bool xbg_noout_mask_default(XbgGpuFamily f){return f!=XBG_GPU_ADRENO;}
 
+// [nonadreno][tile] Tile-based GPUs (Mali, PowerVR) read every LOAD attachment into the tile memory and write every STORE one back
+// at each render pass instance, over the render area (docs/research/tile_gpu_impl.md; Arm GPU Best Practices 101897 §7.3, PowerVR
+// "Using Render Passes and Sub-passes"). On Adreno with TU_DEBUG=sysmem none of this costs anything, so Adreno keeps the old
+// behaviour; every default below is "off" on vendor 0x5143.
+inline bool xbg_tile_family(XbgGpuFamily f){return f==XBG_GPU_MALI || f==XBG_GPU_POWERVR;}
+// DM_GFX_NOLOAD: a pass whose first draw provably overwrites every colour pixel (first_draw_covers) begins with colour loadOp
+// DONT_CARE instead of LOAD (DOOM's ~40 full-screen post-process passes a frame).
+// Off by default on every family since 06.11: with DM_GFX_TILE_POISON=1 under DM_GFX_SIM_GPU=mali the scene flashed magenta now and then,
+// i.e. first_draw_covers sometimes accepts a pass whose old contents are still read. =1 forces it for testing.
+inline bool xbg_noload_default(XbgGpuFamily){return false;}
+// DM_GFX_TILE_AREA: renderArea = the bounding box of the draws the pass will hold (look-ahead over the guest command stream,
+// enforced per draw), so a tiler loads / stores only those tiles (4096x4096 shadow atlas updates). Mali only: Mesa's PowerVR
+// driver turns a renderArea that is not the whole image into an extra depth/stencil load (pvr_is_render_area_tile_aligned).
+inline bool xbg_tile_area_default(XbgGpuFamily f){return f==XBG_GPU_MALI;}
+// DM_GFX_TILE_BARRIER: dependencies between passes wait in the fragment stages only (Arm 101897 §3.9: ALL_COMMANDS ->
+// ALL_COMMANDS drains the pipeline; between render passes use ... -> FRAGMENT_SHADER), so the vertex / tiling work of the next
+// pass overlaps the fragment work of the previous one. Image reads from pre-fragment stages keep the full barrier.
+inline bool xbg_tile_barrier_default(XbgGpuFamily f){return xbg_tile_family(f);}
+// DM_GFX_CHUNK_MID_SPLIT: a mid-submit chunk cut every N draws may end an open render pass (a store + reload of every attachment
+// on a tiler); off, the every-N-draws cut waits until no pass is open (cuts at pass ends are unchanged).
+inline bool xbg_chunk_mid_split_default(XbgGpuFamily f){return !xbg_tile_family(f);}
+
+// [tile] Render-area geometry (DM_GFX_TILE_AREA), pure so tests/vendor_policy_test.cpp checks it. A rectangle as x0,y0 (inclusive)
+// .. x1,y1 (exclusive) in framebuffer pixels.
+struct XbgRect{int32_t x0,y0,x1,y1;};
+inline bool xbg_rect_empty(const XbgRect &r){return r.x1<=r.x0 || r.y1<=r.y0;}
+inline XbgRect xbg_rect_union(const XbgRect &a,const XbgRect &b){
+    if(xbg_rect_empty(a))return b;
+    if(xbg_rect_empty(b))return a;
+    return {a.x0<b.x0?a.x0:b.x0,a.y0<b.y0?a.y0:b.y0,a.x1>b.x1?a.x1:b.x1,a.y1>b.y1?a.y1:b.y1};}
+inline XbgRect xbg_rect_clamp(XbgRect r,uint32_t fw,uint32_t fh){
+    r.x0=r.x0<0?0:r.x0;r.y0=r.y0<0?0:r.y0;r.x1=r.x1>int32_t(fw)?int32_t(fw):r.x1;r.y1=r.y1>int32_t(fh)?int32_t(fh):r.y1;return r;}
+inline bool xbg_rect_inside(const XbgRect &in,const XbgRect &out){return xbg_rect_empty(in) || (in.x0>=out.x0 && in.y0>=out.y0 && in.x1<=out.x1 && in.y1<=out.y1);}
+// The pixels a draw can touch: its scissor (exact in Vulkan), narrowed to its viewport for triangles (clipped to the view volume;
+// one pixel of margin for rounding). Points and lines may leave the viewport, so they keep the scissor only. Clamped to the
+// framebuffer. Viewport height may be negative (flipped).
+inline XbgRect xbg_draw_rect(int32_t sx,int32_t sy,uint32_t sw,uint32_t sh,float vx,float vy,float vw,float vh,bool triangles,uint32_t fw,uint32_t fh){
+    XbgRect r{sx,sy,int32_t(int64_t(sx)+sw),int32_t(int64_t(sy)+sh)};
+    if(triangles && vw>0 && vw==vw && vh==vh){
+        float y0=vh<0?vy+vh:vy,y1=vh<0?vy:vy+vh,x1=vx+vw;
+        const float lim=float(1<<30);
+        if(vx>-lim && x1<lim && y0>-lim && y1<lim){
+            const int32_t px0=int32_t(vx)-1,px1=int32_t(x1)+2,py0=int32_t(y0)-1,py1=int32_t(y1)+2;   // truncation toward zero, then a pixel of margin
+            r.x0=px0>r.x0?px0:r.x0;r.y0=py0>r.y0?py0:r.y0;r.x1=px1<r.x1?px1:r.x1;r.y1=py1<r.y1?py1:r.y1;}}
+    r=xbg_rect_clamp(r,fw,fh);
+    if(xbg_rect_empty(r))r={0,0,0,0};
+    return r;
+}
+// Grow a render area to the driver's granularity (vkGetRenderAreaGranularity; PanVK 32x32, PowerVR the tile size) and fall back to
+// the whole framebuffer when the saving is small (fraction of the framebuffer's pixels the area still covers >= full_fraction).
+inline XbgRect xbg_area_align(XbgRect r,uint32_t gw,uint32_t gh,uint32_t fw,uint32_t fh,float full_fraction){
+    const XbgRect full{0,0,int32_t(fw),int32_t(fh)};
+    if(xbg_rect_empty(r))return full;
+    if(gw>1){r.x0-=r.x0%int32_t(gw);r.x1=int32_t((int64_t(r.x1)+gw-1)/gw*gw);}
+    if(gh>1){r.y0-=r.y0%int32_t(gh);r.y1=int32_t((int64_t(r.y1)+gh-1)/gh*gh);}
+    r=xbg_rect_clamp(r,fw,fh);
+    const double a=double(r.x1-r.x0)*double(r.y1-r.y0),f=double(fw)*double(fh);
+    if(f<=0 || a>=f*double(full_fraction))return full;
+    return r;
+}
+
 inline bool xbg_sim_format_in(VkFormat f,VkFormat lo,VkFormat hi){return int(f)>=int(lo) && int(f)<=int(hi);}
 // Narrow the format features the driver reported to what the simulated device reports.
 inline void xbg_sim_format_features(uint32_t sim,VkFormat f,VkFormatProperties *p){

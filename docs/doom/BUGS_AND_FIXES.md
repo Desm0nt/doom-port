@@ -1263,6 +1263,77 @@ Redmi 10C (SM6225 = Snapdragon 680, Kryo 265 = Cortex-A73 + A53, **ARMv8.0-A б�
   запуска», после перезапуска `saved choice`; crash/boot-логи в `<SD>/…/logs`, экспорт сохранений в `<SD>/…/saves`; (5)
   «Сбросить на автоматический»; (6) Android 10-сборка: SD-кандидат в логе `cannot be listed, skipped` или `complete`.
 
+### 2.29 Тайловые GPU (issue #7: POCO M6 Pro, Mali-G57 MC2, 1–2 fps, `GPU 388 ms`) → проходы, барьеры и render area под TBDR (06.11; собрано, хост-тесты зелёные, на телефоне не проверено)
+- **06.11, проверка на Mi 14 (`DM_GFX_SIM_GPU=mali`):** с `DM_GFX_TILE_POISON=1` сцена изредка вспыхивала пурпуром — `first_draw_covers` иногда принимает проход, старое содержимое которого ещё читается. `DM_GFX_NOLOAD` выключен по умолчанию на всех GPU (=1 включает для проверки); `TILE_AREA` / `TILE_BARRIER` оставлены. Отдельно в режиме Mali видны чёрные прямоугольники на поверхностях (и с выключенными тайловыми правками, и с `DM_GFX_BC_PARTIAL=0`) — путь распаковки BC на GPU (§2.24), разбор продолжается.
+
+Лога с устройства нет. Разбор по коду и по `NVN GPASS` с Adreno (`work/logs/play/r4_ab`, 1600x720): ~80 проходов на кадр,
+~50 из них закрыты чтением своего же вложения (цепочка пост-обработки, 1 полноэкранный треугольник), 5 проходов по атласу теней
+4096² D16, 2.5 M вершин на кадр, 15 мс GPU на Adreno. Подробно — `../research/tile_gpu_impl.md`.
+- **Главная цена — не тайлер, а сам GPU:** G57 MC2 по FP32 в ~20 раз слабее Adreno 750, по полосе ~4 раза; 15 мс × 20 ≈ 300 мс —
+  388 мс лишь ~1.3x хуже простой пропорции. Главный рычаг — «лёгкий режим» (handheld-пресет) и разрешение; правки ниже снимают
+  TBDR-надбавку (по оценке 10–25 %).
+- **Сделано (всё по семейству, на Adreno выключено; переключатели в SWITCHES.md, раздел «Не-Adreno GPU»):**
+  `DM_GFX_NOLOAD` (DONT_CARE вместо LOAD для доказанно полноэкранных первых draw; проверка больше не отказывает в lower-left),
+  `DM_GFX_TILE_AREA` (renderArea = габарит draw прохода по просмотру вперёд + проверка каждого draw, вылет → новый проход),
+  `DM_GFX_TILE_BARRIER` (зависимости проходов и барьеры чтения только во фрагментных стадиях, Arm §3.9), `DM_GFX_CHUNK_MID_SPLIT=0`
+  (разрез чанка не рвёт открытый проход), отладочный `DM_GFX_TILE_POISON` (noload чистит в пурпурный).
+- **Проверено без устройства:** `vendor_policy_test` (умолчания по семействам, геометрия прямоугольников), `t_vkrec`, `t_cover`,
+  сборка `work/build-android-tile`. Остальные питон-тесты движка с `--compiler` и `pipeline_memo_source_test` /
+  `test_read_preflight_order` падали и до правки (устаревшие шаблоны исходника).
+- **Не сделано:** `storeOp DONT_CARE` (в Vulkan решается при begin, а конец прохода движок узнаёт позже; DOOM потом читает почти
+  все цели; `nvnCommandBufferDiscardColor/DiscardDepthStencil` в `hle_nvn.c` — пустышки, вызывает ли их игра — смотреть
+  `DM_NVN_FRAMES=<N>`), transient/lazily allocated (все цели — гостевая память, читаются), эмуляция subgroup 32 на 16 (lone-lane не
+  даёт циклов: каждая инвокация — «варп из одной дорожки»; затронуты GS, которые и так сняты pass-through, и `cec755c4`),
+  geometry shader (на DOOM уже `gs_passthru kept=0`).
+- **Риск:** ни один путь не исполнялся на Mali. Ошибка в барьерах = мерцание/гонки (видно и на Adreno с `DM_GFX_TILE_BARRIER=1`),
+  в габарите = пропавшие пиксели в GMEM (`TU_DEBUG=gmem`), в покрытии noload = пурпур с `DM_GFX_TILE_POISON=1`.
+
+### 2.30 Ядра по ёмкости, а не по номеру: слабые big.LITTLE (issue #10 дальше, 06.11; собрано, хост-тест зелёный, на телефоне не проверено)
+
+Redmi 10C (Snapdragon 680: cpu0–3 A53 1.9 ГГц, cpu4–7 A73 2.4 ГГц), `boot3.log`: `NVN pin mask=f0`, `NVN rec thread … affinity=0xf
+(translation pin 0xf0)`, `NVN present thread … off-pin-mask=f0`. Правило «пин транслятора = ядра с максимальной `cpuinfo_max_freq`,
+всем остальным нашим потокам — все ядра, кроме пина» на флагмане (1 prime + 4–5 средних + 2–3 малых) оставляет потоку записи средние
+ядра, а на 4+4 / 2+6 пин забирает **все** большие ядра, и `dm-record` (≈4–6 мс CPU на кадр) уезжает на A53. Helio G99 (2× A76
+cpu6–7 + 6× A55): пин `c0`, запись и present — на A55.
+
+Исправление: `dm/android/cpu_topo.c` (+ `cpu_topo.h`). При старте (после env-файлов) читается топология: `cpuN/cpu_capacity`,
+иначе `cpuinfo_max_freq` × класс ядра по MIDR, иначе только MIDR (`regs/identification/midr_el1`, запасной путь `/proc/cpuinfo`);
+источник годен, только если есть у всех CPU и значения не все равны (ядро без capacity даёт 1024 везде). Равные — один кластер,
+кластеры по убыванию. Малый кластер — самый медленный, если он ≤ 60 % самого быстрого **или** это in-order ядра (A53 / A55 / A510 /
+A520), а самый быстрый — нет (по частоте A53 1.9 / A73 2.4 = 79 %, без MIDR не отличить). Роли:
+- есть второй сильный кластер с ≥ 2 ядрами вне самого быстрого (8 Gen 3, 8 Gen 2, Dimensity 8300 / 9300, 8 Elite, SD439) — **ровно
+  старые маски**: транслятор = быстрейший кластер, запись = present = остальные ядра, гостевые потоки — планировщику;
+- иначе (один сильный кластер: 4+4, 2+6, 6+2; prime + один большой: 1+1+6) — транслятор один на лучшем ядре (`nvn-translate`, при
+  `DM_NVN_SYNC=1` — поток игры, вызывающий present), `dm-record` — на следующем сильном ядре (на 2+6 делит второй A76 с игрой),
+  все гостевые потоки — на всех ядрах, кроме ядра транслятора (`dm-perfmon`, раз в 2 с, как `DM_GUEST_BIGCORE`; поток bigcore и
+  поток, на котором стоит пин present, не трогаются), `dm-present` — на малом кластере.
+
+| SoC | транслятор | запись | present | гости | было (`DM_CPU_TOPO=index`) |
+|---|---|---|---|---|---|
+| 8 Gen 3 (Mi 14) | `80` | `7f` | `7f` | свободно | то же |
+| 8 Gen 2 (Mi 13 Pro) | `80` | `7f` | `7f` | свободно | то же |
+| Dimensity 8300 (1+3+4) | `80` | `7f` | `7f` | свободно | то же |
+| SD680 (4+4) | `80` | `40` | `0f` | `7f` | `f0` / `0f` / `0f` / свободно |
+| Helio G99 (2+6) | `80` | `40` | `3f` | `7f` | `c0` / `3f` / `3f` / свободно |
+| 6+2 (6 больших cpu2–7) | `80` | `40` | `03` | `7f` | `fc` / `03` / `03` / свободно |
+
+Маски флагманов проверены хост-тестом на capacity из mainline-DT (sm8650: A520 1024 / A720 1792 / X4 1894 dmips-mhz; sm8550: A510
+1024 / A715·A710 1792 / X3 1894; нормировка ×частота → 1024), на «плоских» capacity (только частота), на частоте + MIDR и на одном
+MIDR: `dm/android/tests/t_cpu_topo.c` (WSL: `cc -O1 -Wall -o t_cpu_topo t_cpu_topo.c ../cpu_topo.c -lpthread && ./t_cpu_topo`,
+41 проверка). Ручная маска (`DM_GFX_PIN_CPU`, маркеры `gfx-pin-cpu` / `gfx-no-pin`) — запись и present как раньше («все, кроме
+пина»), гости не пинятся. Переключатели: `DM_CPU_TOPO=index`, `DM_GFX_PRESENT_CPUS`, `DM_GUEST_CPUS` (SWITCHES.md, раздел 4).
+
+**Проверить на телефоне.** Mi 14: `[cpu] topology: 8 cpus, ranked by capacity: cpu7 1x X4 … | … (little)`, `[cpu] plan:
+rule=capacity translate=80 record=7f present=7f guest=free (index rule: translate=80 record=7f present=7f …)`, `NVN pin mask=80 ab=0
+cpu plan`, `NVN rec thread … affinity=0x7f (translation pin 0x80, cpu plan)`, `NVN present thread started … cpus=7f (cpu plan)`, строк
+`[cpu] guest threads` нет; fps как до правки. SD680: `translate=80 record=40 present=f guest=7f`, `NVN rec thread … affinity=0x40`,
+`[cpu] guest threads: N kept on cpus 7f`, раз в 10 с `[cpu] guests 10s: …`; ждём ниже `submit_cpu_ms` и `subwait_ms` (`NVN PERF
+rec`), `NVN pin cpus 30s: … c7=100%`. A/B: `DM_CPU_TOPO=index`.
+Не тронуты: HarmonyOS (`front_ohos.c`, `DM_PIN_FAST` — только явная маска), ADPF-сессия (не про ядра), аудио (потоки AAudio —
+системные), `dm-hold` / `dm-log` / `dm-perfmon` (создаются до пина, без маски). Потоки, которые создаёт уже запиненный транслятор
+(кэш пайплайнов `std::thread`, async-сборка пайплайнов), наследуют его пин — как и раньше на флагманах; `dm-present` и `dm-record`
+ставят свои маски.
+
 ### 3.11 Раунд 7 (perf7, 30.10): где на самом деле CPU и GPU
 - **«10 мкс на draw» наполовину — ожидание GPU.** Разбивка `sub=` (p_p0/p_p1): `commands+acquire` 3.9–5.1 мкс/draw — это
   не создание `Commands`, а старт слота кольца из **двух** слотов при chunked submit (2.5–3 Vulkan-submit на кадр):
