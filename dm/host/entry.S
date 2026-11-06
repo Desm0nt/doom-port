@@ -142,3 +142,18 @@ _dm_thread_enter:
     br x16
 1:  bl _dm_thread_returned
     brk #0
+
+// 4) dm_call_on_stack(sp, fn, arg): [DOOM] issues #12/#20. Switch to stack sp (16-byte aligned down) and run fn(arg) there; fn
+//    must not return. hle_thread.c thread_exit uses it to leave the guest thread's small stack for the saved host pthread stack
+//    before pthread_exit. x29 = x30 = 0 end the frame chain there (dm_backtrace stops); x16 is the branch register as in
+//    dm_thread_enter (BTI-compatible with a "bti c" landing pad). x18 and the other registers are left as they are.
+    .globl _dm_call_on_stack
+    .p2align 2
+_dm_call_on_stack:
+    and x0, x0, #0xfffffffffffffff0
+    mov sp, x0
+    mov x29, #0
+    mov x30, #0
+    mov x16, x1
+    mov x0, x2
+    br x16

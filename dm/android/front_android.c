@@ -54,6 +54,7 @@ uint64_t front_game_res(int docked) {
     unsigned w, h; const char *e = getenv("DM_GAME_RES");
     if (e && sscanf(e, "%ux%u", &w, &h) == 2) return docked ? (uint64_t)h << 32 | w : (uint64_t)(h * 4 / 5) << 32 | (w * 4 / 5 + 3) / 4 * 4;
     int dm = atomic_load(&g_screen_w), sh = atomic_load(&g_screen_h);
+    if (dm < sh) { int t = dm; dm = sh; sh = t; }   // [DOOM] the game is landscape only: a view still portrait at start (Mi 13, 06.11) gave 16:9 bars
     unsigned bh = docked ? 900 : 720;
     if (dm > 0 && sh > 0 && dm * 9 > sh * 16) {
         unsigned bw = (unsigned)(llround((double)bh * dm / sh / 8) * 8); if (bw > 4096) bw = 4096;
@@ -63,7 +64,8 @@ uint64_t front_game_res(int docked) {
 }
 // [DOOM] The game view's size as Java reported it (0 = not known yet): hle_args.c's aspect choice "auto" also follows screens
 // narrower than 16:9 (4:3 handhelds), which front_game_res above reports as 1280x720.
-int front_screen_size(int *w, int *h) { *w = atomic_load(&g_screen_w); *h = atomic_load(&g_screen_h); return *w > 0 && *h > 0; }
+int front_screen_size(int *w, int *h) {   // landscape, as front_game_res
+    *w = atomic_load(&g_screen_w); *h = atomic_load(&g_screen_h); if (*w < *h) { int t = *w; *w = *h; *h = t; } return *w > 0 && *h > 0; }
 
 #ifdef DM_GAME_DOOM
 // ---------------- [DOOM] game controllers ----------------

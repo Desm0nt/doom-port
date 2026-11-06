@@ -6,6 +6,7 @@ uint64_t g_t0_ns;
 void crash_thread_init(void) {}
 void guest_thread_init(void) {}
 void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp) { (void)entry; (void)arg; (void)sp; abort(); }
+void dm_call_on_stack(uint64_t sp, void (*fn)(void *), void *arg) { (void)sp; (void)fn; (void)arg; abort(); }
 void *guest_sym(const char *name) { (void)name; return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 void dm_prof_add(int id, uint64_t ns, uint64_t bytes) { (void)id; (void)ns; (void)bytes; }

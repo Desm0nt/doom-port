@@ -522,11 +522,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 if (!BuildConfig.DM_DIAG_TU_DEBUG.isEmpty()) Os.setenv("TU_DEBUG", BuildConfig.DM_DIAG_TU_DEBUG, true); }   // vk_driver.c keeps a set TU_DEBUG
             String lang = p.getString("lang", "");
             if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
-            // [DOOM] diagnostics APK: always the hardware's default driver (Turnip on an Adreno 6xx+), whatever was saved or the crash guard
-            // decided before, so a report shows the default setup; the guard file is dropped so its strikes cannot switch it back
-            String drv = BuildConfig.DM_DIAG ? (!BuildConfig.DM_DIAG_DRIVER.isEmpty() && turnipPossible() ? BuildConfig.DM_DIAG_DRIVER : defaultDriver())
-                : p.getString("driver", defaultDriver());
-            if (BuildConfig.DM_DIAG) driverGuard().delete();
+            // [DOOM] diagnostics APK with -PdmDiagDriver=<pkg> (diag3/4): always that driver on an Adreno 6xx+, whatever was saved or the
+            // crash guard decided before; the guard file is dropped so its strikes cannot switch it back. Without it (diag6, owner 06.11:
+            // "не надо принудительно, пусть фоллбэкается на сток") the saved choice and the crash guard work as in a release build.
+            final boolean diagForced = BuildConfig.DM_DIAG && !BuildConfig.DM_DIAG_DRIVER.isEmpty() && turnipPossible();
+            String drv = diagForced ? BuildConfig.DM_DIAG_DRIVER : p.getString("driver", defaultDriver());
+            if (diagForced) driverGuard().delete();
             // [DOOM] hardware check at every start (BUGS_AND_FIXES 2.22, 2.25): Turnip needs a Qualcomm Adreno 6xx+ (KGSL), PanVK a Mali
             // (/dev/mali0), RADV-Xclipse a Samsung Xclipse, and a Linux glibc build (the "-EMULATOR" zips) runs nowhere in an Android app
             // (driverProblem). Such a saved choice (settings imported / restored from another phone, or picked before this check existed)

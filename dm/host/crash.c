@@ -15,6 +15,11 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <errno.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#include <sys/uio.h>       // struct iovec
+#include <sys/syscall.h>   // __NR_process_vm_readv (bionic declares the wrapper only under _GNU_SOURCE)
+#endif
 
 static _Atomic uint64_t g_watch_last_ns;
 static _Atomic uint64_t g_watch_count;
@@ -88,12 +93,25 @@ void crash_off(const char *tag, uint64_t a) {   // diag.c 也用 | Also used by 
     }
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
+// [DOOM] issues #12/#20: return addresses saved by PAC-enabled code (Android 17 bionic on Samsung: paciasp) carry the pointer
+// authentication code in their top bits, so lr / frame records printed as raw 0x601c... values instead of libc.so+off.
+// xpaclri (hint #7) strips it from x30 and is a NOP on CPUs without pointer authentication. Only for code addresses: data
+// pointers keep their tag byte (fault address, sp)
+static uint64_t strip_pac(uint64_t a) {
+#if defined(__aarch64__)
+    uint64_t r;
+    __asm__("mov x30, %1\n\thint #7\n\tmov %0, x30" : "=r"(r) : "r"(a) : "x30");
+    return r;
+#else
+    return a;
+#endif
+}
 // 帧指针回溯：x29 链 [fp]=上一帧 fp、[fp+8]=返回地址；只走 8 字节对齐、单调上升的帧
 // Frame pointer backtrace: x29 chain [fp]=previous frame's fp, [fp+8]=return address; only 8-byte aligned, monotonically increasing frames are walked
 void dm_backtrace(uint64_t fp) {
     fprintf(stderr, "[dm] bt:");
     for (int i = 0; i < 32 && fp && !(fp & 7); i++) {
-        uint64_t nfp = ((uint64_t *)fp)[0], ra = ((uint64_t *)fp)[1];
+        uint64_t nfp = ((uint64_t *)fp)[0], ra = strip_pac(((uint64_t *)fp)[1]);
         off("", ra);
         if (nfp <= fp) break;
         fp = nfp;
@@ -157,6 +175,29 @@ static int fault_loop(const void *addr, uint64_t pc) {
     }
     return atomic_fetch_add(&g_floop[i].n, 1) + 1 >= FAULT_LOOP_MAX;
 }
+// [DOOM] issues #12/#20: the stack scan reads 4 KiB upward from sp, which crosses the top of a guest stack that sits right below
+// an unmapped page (S23+ report: a second SIGSEGV at the page boundary inside this handler cut the report short). On Linux the
+// words come through process_vm_readv on the own process, which stops with EFAULT at the first unreadable page instead of
+// faulting; page by page, so everything up to that page is still read. Returns the number of words read. Signal-safe (syscalls)
+#ifdef DM_GAME_DOOM
+static int crash_read_words(const uint64_t *src, uint64_t *dst, int n) {
+#if defined(__linux__)
+    uint64_t pg = (uint64_t)getpagesize(); int got = 0; pid_t me = getpid();
+    while (got < n) {
+        uintptr_t p = (uintptr_t)(src + got); size_t len = (size_t)(pg - (p & (pg - 1)));
+        if (len > (size_t)(n - got) * 8) len = (size_t)(n - got) * 8;
+        struct iovec l = {dst + got, len}, r = {(void *)p, len};
+        ssize_t rd = (ssize_t)syscall(__NR_process_vm_readv, me, &l, 1, &r, 1, 0);
+        if (rd < 0 && got == 0 && errno != EFAULT) break;   // syscall refused (not a bad address): read directly as before
+        if (rd != (ssize_t)len) return got;
+        got += (int)(len / 8);
+    }
+    if (got == n) return n;
+#endif
+    for (int i = 0; i < n; i++) dst[i] = src[i];
+    return n;
+}
+#endif
 // [DOOM] Crash report hook (jni_android.c on Android), called in the signal handler, so async-signal-safe: phase 0 right after the
 // CRASH line marks the crash for the app's next start (files/dm-crash.txt; first, so a fault in the riskier dumps below still leaves
 // it), phase 1 last before _exit waits for the log pump to put the lines into boot.log and fsyncs it (the Java side builds
@@ -176,22 +217,44 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         errno = saved_errno;
     }
     fprintf(stderr, "[dm] CRASH sig=%d%s", sig, sig == SIGABRT ? " (abort: see the FATAL / [vk] line above)" : "");
-    off("addr", (uint64_t)si->si_addr); off("pc", UC_PC(uc)); off("lr", UC_LR(uc));
+    off("addr", (uint64_t)si->si_addr); off("pc", UC_PC(uc)); off("lr", strip_pac(UC_LR(uc)));
     fprintf(stderr, " sp=%#llx\n", UC_SP(uc));
     if (g_report_hook) g_report_hook(0, sig, (uint64_t)(uintptr_t)si->si_addr, UC_PC(uc));
+    // [DOOM] issues #12/#20: a fault in the page of sp or up to 64 KiB below it is the thread running off its stack into the guard
+    // page (sp itself may already point there). Said plainly, and the stack scan below, which reads upward from sp, is skipped:
+    // it faulted again inside this handler, so the report ended at the bt line
+    int overflow = 0;
+    if (sig == SIGSEGV || sig == SIGBUS) {
+        uint64_t a = (uint64_t)(uintptr_t)si->si_addr, sp = UC_SP(uc), pg = (uint64_t)getpagesize(), spg = sp & ~(pg - 1);
+        if (sp > 0x10000 && a >= sp - 0x10000 && a < spg + pg) {
+            char nm[32] = "?";
+#if defined(__linux__)
+            prctl(PR_GET_NAME, nm, 0, 0, 0); nm[sizeof nm - 1] = 0;
+#else
+            pthread_getname_np(pthread_self(), nm, sizeof nm);
+#endif
+            fprintf(stderr, "[dm] 【红】stack overflow (guard page) on thread %s tid=%d sp=%#llx fault=%#llx (sp%+lld); stack scan skipped\n",
+                    nm, fault_tid(), (unsigned long long)sp, (unsigned long long)a, (long long)(a - sp));
+            overflow = 1;
+        }
+    }
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
     dm_backtrace(UC_FP(uc));
 #ifdef DM_GAME_DOOM
-    {   // [DOOM, from the Eternal port] guest code addresses found on the stack (return addresses even when fp / lr are garbage)
+    if (!overflow) {   // [DOOM, from the Eternal port] guest code addresses found on the stack (return addresses even when fp / lr are garbage)
         const uint64_t *sp = (const uint64_t *)(uintptr_t)UC_SP(uc); int n = 0;
+        uint64_t w[512]; int nw = sp && !((uintptr_t)sp & 7) ? crash_read_words(sp, w, 512) : 0;
         fprintf(stderr, "[dm] stack scan:");
-        for (int i = 0; sp && !((uintptr_t)sp & 7) && i < 512 && n < 24; i++) {
-            module_t *m = module_of((const void *)(uintptr_t)sp[i]);
-            if (m && sp[i] >= (uint64_t)(uintptr_t)m->base && sp[i] < (uint64_t)(uintptr_t)m->base + m->text_end) { off("", sp[i]); fprintf(stderr, "@%d", i); n++; }
+        for (int i = 0; i < nw && n < 24; i++) {
+            module_t *m = module_of((const void *)(uintptr_t)w[i]);
+            if (m && w[i] >= (uint64_t)(uintptr_t)m->base && w[i] < (uint64_t)(uintptr_t)m->base + m->text_end) { off("", w[i]); fprintf(stderr, "@%d", i); n++; }
         }
+        if (nw < 512) fprintf(stderr, " (end of readable stack after %d words)", nw);
         fputc('\n', stderr);
     }
+#else
+    (void)overflow;
 #endif
     if (g_dump_hook) g_dump_hook();
     if (g_report_hook) { fflush(stderr); g_report_hook(1, sig, (uint64_t)(uintptr_t)si->si_addr, UC_PC(uc)); }

@@ -77,17 +77,39 @@ typedef struct {
     dm_sem notify_sem;
     pthread_t notify_th; _Atomic int notify_run, notify_pending, notify_armed;
     _Atomic uint64_t notify_ns;        // 最近一次「有缓冲释放、要通知」的时刻（量通知线程被叫醒的延迟） | Time of the most recent "buffer released, needs notifying" event (to measure the notification thread's wake-up latency)
-    int dry;                           // 这次声卡回调里待播队列空了（在播放态）= 一次欠载（断音） | The pending playback queue was empty in this audio callback (while playing) = one underrun (audio dropout)
+    _Atomic int dry;                   // 这次声卡回调里待播队列空了（在播放态）= 一次欠载（断音） | The pending playback queue was empty in this audio callback (while playing) = one underrun (audio dropout)
     dm_audio_fill_fn src; void *src_ctx;
     dm_sem rel_sem;                    // host PCM outputs only (dm_pcmout_open): posted for each released block, so a producer blocks instead of polling   // 宿主音源（DOOM AudioRenderer 混音器）：非空时样本由它现算，不走客体缓冲队列 | Host source (DOOM AudioRenderer mixer): when set, samples come from it instead of the guest buffer queue
+    // [DOOM] 声卡与墙钟两个消费者的交接（issues #12/#20）：dm 锁住 au / dev_on / null_live / 重开状态；owner = 1 时墙钟（静音接收端线程）
+    // 消费客体队列，声卡回调只出静音；pulling 是 pull 的互斥（trylock，回调里永不阻塞），保证任何时刻只有一个消费者动队列
+    // [DOOM] Handover between the two consumers, sound card and wall clock (issues #12/#20): dm guards au / dev_on / null_live / the reopen state; with owner = 1
+    // the wall clock (silent sink thread) consumes the guest queue and the sound card callback only outputs silence; pulling makes pull exclusive (a trylock,
+    // never blocking in the callback), so only one consumer touches the queue at any time
+    pthread_mutex_t dm;
+    _Atomic int owner, pulling;
+    int null_live, dev_on;             // 静音接收端线程在跑 / 声卡流已启动 | silent sink thread running / sound card stream started
+    _Atomic uint64_t renders, last_render_ns, rel_n;   // 声卡回调次数、最近一次回调时刻、累计释放块数（日志） | sound card callbacks, time of the latest one, blocks released so far (log)
+    uint64_t dev_start_ns;
+    // 安卓看护线程（aa_keeper）：卡死检测、桥接、关流重开 | Android keeper thread (aa_keeper): stall detection, bridging, close and reopen
+    pthread_t keep_th; _Atomic int keep_run; dm_sem keep_sem; int keep_live;
+    _Atomic int dev_err; _Atomic uintptr_t err_st;     // 错误回调报的错与报错的流（只认当前流的错） | error reported by the error callback and the stream that reported it (only the current stream's errors count)
+    int ll, reopen, handover, fails, incidents;   // 当前流是低延迟 / 待重开 / 新流已启动、等它第一次回调再交还队列 / 连续重开失败次数 / 出事次数（日志限流） | current stream is low latency / reopen pending / new stream started, queue handed back at its first callback / consecutive reopen failures / incidents (log rate limit)
+    uint64_t hand_renders, next_try_ns, bridge_ns, bridge_rel0, fake_t0; int fake_logged;
 } aout;
+static void *null_sink(void *p);
+static void null_on(aout *a);
 
 // 打开中的输出登记表：前端生命周期（切后台）一次性暂停 / 恢复
 // Registry of open outputs: suspended / resumed all at once by the front-end lifecycle (going to background)
 #define AOMAX 8
 static aout *g_aos[AOMAX];
 static pthread_mutex_t g_aos_lock = PTHREAD_MUTEX_INITIALIZER;
-static int g_suspended;
+static _Atomic int g_suspended;        // 写在 g_aos_lock 里；看护线程只读，不拿 g_aos_lock（锁序 g_aos_lock → a->dm） | written under g_aos_lock; the keeper only reads it, without g_aos_lock (lock order g_aos_lock -> a->dm)
+// [DOOM] 打开数超限时的 Result：audio 模块 153、描述 5 = 0xa99（SDK AddDeviceSink 无空槽同样回它，见 hle_doom_audio.c AR_SINK_FAIL；
+// audout 服务「会话用完」按 yuzu / Ryujinx 也是 audio 5，固件里没核）。以前这里 die，issues #12/#20 的 FATAL 就是它
+// [DOOM] Result when too many outputs are open: audio module 153, description 5 = 0xa99 (what the SDK's AddDeviceSink returns without a free slot, see
+// hle_doom_audio.c AR_SINK_FAIL; audout's "out of sessions" is audio 5 too per yuzu / Ryujinx, not checked against firmware). This used to die: the FATAL of issues #12/#20
+#define RES_AUDOUT_OUT_OF_SESSIONS 0xa99u
 static aout *ao(const void *g) { aout *a = objmap_get(g); if (!a) die("AudioOut %p 不是宿主建的", g); return a; }
 
 // 通知线程 QoS 对照（公开 iPhone 15 Pro Max 移动时断音，提议把这条线程提到交互级、与混音线程一致）。
@@ -147,9 +169,12 @@ static void *event_notify(void *p) {
 // 从待播队列取 n 字节交给出声端；整块播完就挪到已释放并通知普通线程。
 // Take n bytes from the pending queue and hand them to the output side; once a whole block has played, move it to released and notify the ordinary thread.
 static void pull(aout *a, uint8_t *dst, uint64_t n) {
+    // [DOOM] 交接的边界上声卡回调与墙钟可能同时进来：抢不到的一方出静音 / 跳过这一拍（不阻塞声卡回调） | [DOOM] at a handover boundary the sound card callback and the wall clock may both enter: the loser outputs silence / skips this tick (never blocks the callback)
+    if (atomic_exchange_explicit(&a->pulling, 1, memory_order_acquire)) { memset(dst, 0, n); return; }
     if (a->src) {   // 宿主音源：播放态现算，其余静音 | Host source: rendered on demand while started, silence otherwise
         if (atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED) a->src(a->src_ctx, (int16_t *)dst, (unsigned)(n / (2u * (unsigned)a->ch)));
         else memset(dst, 0, n);
+        atomic_store_explicit(&a->pulling, 0, memory_order_release);
         return;
     }
     int released = 0;
@@ -169,10 +194,11 @@ static void pull(aout *a, uint8_t *dst, uint64_t n) {
             atomic_store_explicit(&a->rel_tail, rw + 1, memory_order_release);
             qh++;
             atomic_store_explicit(&a->q_head, qh, memory_order_release);
-            a->pos = 0; released = 1;
+            a->pos = 0; released++;
         }
     }
-    if (released) { notify_release(a); if (a->rel_sem) sem_up(a->rel_sem); }
+    atomic_store_explicit(&a->pulling, 0, memory_order_release);
+    if (released) { atomic_fetch_add_explicit(&a->rel_n, (uint64_t)released, memory_order_relaxed); notify_release(a); if (a->rel_sem) sem_up(a->rel_sem); }
 }
 
 static _Atomic uint64_t g_render_calls;   // 声卡回调累计（生命周期验证：恢复后须继续增长） | Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
@@ -195,8 +221,10 @@ static void downmix51(const int16_t *in, int16_t *out, unsigned frames) {
 // Common part of the sound card callback (one copy for both platforms): fill an output buffer of bytes bytes
 static void render(aout *a, void *data, uint32_t bytes) {
     atomic_fetch_add_explicit(&g_render_calls, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&a->renders, 1, memory_order_relaxed); atomic_store_explicit(&a->last_render_ns, now_ns(), memory_order_relaxed);   // 看护线程的进度读数 | progress reading for the keeper
     a->dry = 0;
-    if (!a->mix) pull(a, data, bytes);
+    if (atomic_load_explicit(&a->owner, memory_order_acquire)) memset(data, 0, bytes);   // [DOOM] 墙钟在消费（桥接 / 暂停 / 交接中）：声卡只出静音 | [DOOM] the wall clock is consuming (bridge / suspend / handover): the sound card outputs silence
+    else if (!a->mix) pull(a, data, bytes);
     else { int16_t *o = data; unsigned left = bytes / 4;   // 双声道 16 位：每帧 4 字节 | stereo 16-bit: 4 bytes per frame
         while (left) { unsigned k = left < MIXMAX ? left : MIXMAX; pull(a, (uint8_t *)a->mixbuf, (uint64_t)k * 12); downmix51(a->mixbuf, o, k); o += 2 * k; left -= k; } }
     // 诊断开关 DM_AUDIO_OUT_DUMP=<文件>：交给 CoreAudio 的那份数据原样续写（下混后是双声道）。本机没有回环设备录不到系统输出，判「对白有没有交出去」看这份
@@ -264,20 +292,19 @@ static int32_t oh_event(OH_AudioRenderer *r, void *ctx, OH_AudioStream_Event e) 
 static int32_t oh_interrupt(OH_AudioRenderer *r, void *ctx, OH_AudioInterrupt_ForceType t, OH_AudioInterrupt_Hint h) {
     (void)r; (void)ctx; LOG("audio：音频焦点中断 type=%d hint=%d", (int)t, (int)h); return 0;
 }
-static void *null_sink(void *p);
 static int au_open(aout *a);
+static void dev_drop(aout *a); static int dev_go(aout *a);
 static void *oh_reopen(void *p) {
     aout *a = p;
-    pthread_mutex_lock(&g_aos_lock);
+    pthread_mutex_lock(&g_aos_lock); pthread_mutex_lock(&a->dm);
     if (a->au) {
         int playing = !g_suspended && atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED;
-        OH_AudioRenderer_Release(a->au); a->au = NULL;
-        if (au_open(a)) { LOG("【红】音频流出错后重开失败：这一路改用静音接收端（不出声）");
-                          if (playing) { atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); } }
-        else if (playing && OH_AudioRenderer_Start(a->au) != AUDIOSTREAM_SUCCESS) LOG("【红】音频流重开后启动失败");
+        dev_drop(a);
+        if (au_open(a)) { LOG("【红】音频流出错后重开失败：这一路改用静音接收端（不出声）"); if (playing) null_on(a); }
+        else if (playing && dev_go(a)) LOG("【红】音频流重开后启动失败");
         else LOG("audio：音频流出错，已重开");
     }
-    pthread_mutex_unlock(&g_aos_lock);
+    pthread_mutex_unlock(&a->dm); pthread_mutex_unlock(&g_aos_lock);
     return NULL;
 }
 static int32_t oh_error(OH_AudioRenderer *r, void *ctx, OH_AudioStream_Result err) {
@@ -312,57 +339,96 @@ static int dev_start(aout *a) { return OH_AudioRenderer_Start(a->au) == AUDIOSTR
 static void dev_stop(aout *a) { OH_AudioRenderer_Stop(a->au); }
 static void dev_close(aout *a) { OH_AudioRenderer_Release(a->au); a->au = NULL; }
 #else
-// 安卓：AAudio 低延迟输出流（16 位、48 kHz、游戏用途），回调直接调 render。
-// 流断开（耳机插拔、蓝牙切换、系统音频服务重启）时 AAudio 在错误回调里通知：回调里不能关流，交给一条普通线程关掉重开，原来在播就接着播。
-// Android: AAudio low-latency output stream (16-bit, 48 kHz, game usage), the callback calls render directly.
-// When the stream is disconnected (headphones plugged / unplugged, Bluetooth switch, system audio service restart) AAudio notifies in the error callback: the stream must not be closed inside the callback, so an ordinary thread closes and reopens it, and resumes playback if it was playing.
+// 安卓：AAudio 输出流（16 位、48 kHz、游戏用途），回调直接调 render。缺省低延迟（性能模式 12）；出过卡死 / 超时 / 启动失败后本进程改用
+// 性能模式 NONE（AudioTrack 那条路，不走 MMAP），见 aa_keeper。错误回调里不能关流：只记下错误、叫醒这一路的看护线程，由它关掉重开。
+// Android: AAudio output stream (16-bit, 48 kHz, game usage), the callback calls render directly. Low latency by default (performance mode 12); after a
+// stall / timeout / start failure this process switches to performance mode NONE (the AudioTrack path, no MMAP), see aa_keeper. The stream must not be
+// closed inside the error callback: it only records the error and wakes this output's keeper thread, which closes and reopens it.
+//
+// [DOOM] issues #12/#20（Samsung S23+ SM-S916B，Android 17）：两路流同时开成 MMAP 低延迟，一路 requestStart 报「stream was probably stolen」，
+// 之后每一路 MMAP 流第一次 write 就卡在 processData，1 s 后 AAUDIO_ERROR_TIMEOUT、回调线程退出；拿到 Legacy（perf = NO）的运行全都正常。
+// 以前这里只记一行红字，流就死了：客体缓冲不再释放，游戏的 Wwise 输出（main+0x21d7180 每个设备一轮，状态 +0xb4 = 2 时约每秒一次
+// 0x21d68d0 → 0x21fec30 → 汇点工厂 0x21ff1f0 → 0x21ff33c OpenDefaultAudioOut）每秒重建一次汇点，8 次后 h_au_Open die。
+// [DOOM] issues #12/#20 (Samsung S23+ SM-S916B, Android 17): two streams opened together as MMAP low latency, one requestStart reported "stream was
+// probably stolen", after which every MMAP stream stalled in processData on its first write, got AAUDIO_ERROR_TIMEOUT after 1 s and its callback thread
+// exited; runs that got Legacy (perf = NO) were all fine. This used to log one red line and leave the stream dead: guest buffers were no longer released,
+// and the game's Wwise output (main+0x21d7180, one round per device; with state +0xb4 = 2 about once a second 0x21d68d0 -> 0x21fec30 -> sink factory
+// 0x21ff1f0 -> 0x21ff33c OpenDefaultAudioOut) rebuilt its sink every second until h_au_Open died on the 9th open.
+// DM_AUDIO_LOWLATENCY：不设 / 1 = 低延迟（出事后自动降级）；0 = 一开始就用 NONE | unset / 1 = low latency (automatic fallback after a failure); 0 = NONE from the start
+static _Atomic int g_aa_safe = -1;
+static int aa_safe(void) {
+    int s = atomic_load(&g_aa_safe);
+    if (s < 0) { const char *e = getenv("DM_AUDIO_LOWLATENCY"); s = e && !atoi(e);
+                 int exp = -1; if (atomic_compare_exchange_strong(&g_aa_safe, &exp, s) && s) LOG("audio：DM_AUDIO_LOWLATENCY=0：AAudio 流用性能模式 NONE（不走 MMAP 低延迟）"); s = atomic_load(&g_aa_safe); }
+    return s;
+}
+static void aa_go_safe(const char *why) {
+    aa_safe();
+    if (atomic_exchange(&g_aa_safe, 1) == 0) LOG("【红】audio：低延迟 AAudio 流%s：本进程之后的流改用性能模式 NONE（AudioTrack 路径，不走 MMAP；issues #12/#20）", why);
+}
+// DM_AUDIO_STALL_MS：声卡在播却这么久没有回调就算卡死（缺省 250；0 = 只认错误回调） | DM_AUDIO_STALL_MS: a playing stream without a callback for this long counts as stalled (default 250; 0 = error callbacks only)
+static _Atomic int g_stall_ms = -1;
+static uint64_t aa_stall_ns(void) {
+    int s = atomic_load(&g_stall_ms);
+    if (s < 0) { const char *e = getenv("DM_AUDIO_STALL_MS"); s = e ? atoi(e) : 250; if (s < 0) s = 0; if (e) LOG("audio：DM_AUDIO_STALL_MS=%d", s); atomic_store(&g_stall_ms, s); }
+    return (uint64_t)s * 1000000ull;
+}
+// 诊断开关 DM_AUDIO_FAKE_STALL=<毫秒>：每路低延迟流回调满这么久就假装卡死（回调回 STOP，流停住、不报错），用来在任何手机上走一遍
+// 「卡死检测 → 墙钟桥接 → 降级 NONE 重开 → 交还」；NONE 流不受影响，所以降级后声音应当回来
+// Diagnostic switch DM_AUDIO_FAKE_STALL=<ms>: every low-latency stream pretends to stall after its callbacks have run this long (the callback returns STOP,
+// the stream stops without an error), to exercise "stall detection -> wall-clock bridge -> reopen as NONE -> hand back" on any phone; NONE streams are not
+// affected, so the sound should come back after the fallback
+static int g_fake_ms = -1;
+static int aa_fake_ms(void) { if (g_fake_ms < 0) { const char *e = getenv("DM_AUDIO_FAKE_STALL"); g_fake_ms = e ? atoi(e) : 0; if (g_fake_ms < 0) g_fake_ms = 0; } return g_fake_ms; }
 static aaudio_data_callback_result_t aa_render(AAudioStream *st, void *ctx, void *data, int32_t frames) {
-    render(ctx, data, (uint32_t)frames * (uint32_t)AAudioStream_getChannelCount(st) * 2u);
+    aout *a = ctx;
+    if (aa_fake_ms() && AAudioStream_getPerformanceMode(st) == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY) {
+        uint64_t t = now_ns();
+        if (!a->fake_t0) a->fake_t0 = t;
+        else if (t - a->fake_t0 > (uint64_t)aa_fake_ms() * 1000000ull) {
+            if (!a->fake_logged) { a->fake_logged = 1; LOG("【红】audio：DM_AUDIO_FAKE_STALL：低延迟流回调 %d ms 后假装卡死（回调回 STOP）", aa_fake_ms()); }
+            return AAUDIO_CALLBACK_RESULT_STOP;
+        }
+    }
+    render(a, data, (uint32_t)frames * (uint32_t)AAudioStream_getChannelCount(st) * 2u);
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
-static void *null_sink(void *p);
-static int au_open(aout *a);
-static void *aa_reopen(void *p) {
-    aout *a = p;
-    pthread_mutex_lock(&g_aos_lock);
-    if (a->au) {
-        int playing = !g_suspended && atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED;
-        AAudioStream_close(a->au); a->au = NULL;
-        if (au_open(a)) { LOG("【红】音频流断开后重开失败：这一路改用静音接收端（不出声）");
-                          if (playing) { atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); } }
-        else if (playing && AAudioStream_requestStart(a->au) != AAUDIO_OK) LOG("【红】音频流重开后启动失败");
-        else LOG("audio：音频流断开（输出设备变化），已重开");
-    }
-    pthread_mutex_unlock(&g_aos_lock);
-    return NULL;
-}
 static void aa_error(AAudioStream *st, void *ctx, aaudio_result_t err) {
-    (void)st;
-    if (err != AAUDIO_ERROR_DISCONNECTED) { LOG("【红】音频流错误 %d（%s）", (int)err, AAudio_convertResultToText(err)); return; }
-    pthread_t th; if (!pthread_create(&th, NULL, aa_reopen, ctx)) pthread_detach(th);
+    aout *a = ctx;
+    if (err != AAUDIO_ERROR_DISCONNECTED) LOG("【红】音频流错误 %d（%s）：交给看护线程关掉重开", (int)err, AAudio_convertResultToText(err));
+    atomic_store(&a->err_st, (uintptr_t)st); atomic_store(&a->dev_err, err ? (int)err : -1);
+    if (a->keep_sem) sem_up(a->keep_sem);
 }
-static int au_open(aout *a) {   // 0 = 声卡开好了；-1 = 开不了（a->au 置空，调用方走静音接收端） | 0 = the sound card is open; -1 = it cannot be opened (a->au set to null, the caller uses the silent sink)
+// 开一路流写进 *out（不碰 a->au：看护线程在锁外开新流）；*ll = 拿到的是低延迟。0 = 开好了 | Open one stream into *out (a->au untouched: the keeper opens new streams outside the lock); *ll = it got low latency. 0 = opened
+static int aa_open(aout *a, dm_audev *out, int *ll) {
     a->mix = a->ch == 6; if (a->mix && !a->mixbuf) a->mixbuf = malloc(MIXMAX * 12);   // 5.1：我们自己下混，声卡只收双声道 | 5.1: we downmix ourselves, the sound card only takes stereo
-    if (a->mix && !a->mixbuf) { a->au = NULL; LOG("【红】下混暂存申请不到：这一路改用静音接收端（不出声）"); return -1; }
-    int och = a->mix ? 2 : a->ch;
+    if (a->mix && !a->mixbuf) { *out = NULL; LOG("【红】下混暂存申请不到：这一路改用静音接收端（不出声）"); return -1; }
+    int och = a->mix ? 2 : a->ch, safe = aa_safe();
     AAudioStreamBuilder *b = NULL;
-    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) { a->au = NULL; LOG("【红】AAudio 建不出来：这一路改用静音接收端（不出声）"); return -1; }
+    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK) { *out = NULL; LOG("【红】AAudio 建不出来：这一路改用静音接收端（不出声）"); return -1; }
     AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
     AAudioStreamBuilder_setSampleRate(b, RATE);
     AAudioStreamBuilder_setChannelCount(b, och);
     AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
-    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setPerformanceMode(b, safe ? AAUDIO_PERFORMANCE_MODE_NONE : AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+    AAudioStreamBuilder_setSharingMode(b, AAUDIO_SHARING_MODE_SHARED);   // 本来就是缺省；写明：从不要 MMAP 独占 | the default anyway; spelled out: never ask for MMAP exclusive
     AAudioStreamBuilder_setUsage(b, AAUDIO_USAGE_GAME);
     AAudioStreamBuilder_setContentType(b, AAUDIO_CONTENT_TYPE_SONIFICATION);
     AAudioStreamBuilder_setDataCallback(b, aa_render, a);
     AAudioStreamBuilder_setErrorCallback(b, aa_error, a);
-    aaudio_result_t r = AAudioStreamBuilder_openStream(b, &a->au);
+    aaudio_result_t r = AAudioStreamBuilder_openStream(b, out);
     AAudioStreamBuilder_delete(b);
-    if (r != AAUDIO_OK) { a->au = NULL; LOG("【红】AAudio 打开失败 %d（%s）：这一路改用静音接收端（不出声）", (int)r, AAudio_convertResultToText(r)); return -1; }
+    if (r != AAUDIO_OK) { *out = NULL; LOG("【红】AAudio 打开失败 %d（%s）", (int)r, AAudio_convertResultToText(r)); return -1; }
     if (a->mix) LOG("audio：游戏给 6 声道（5.1）→ 交给声卡前自己下混成双声道（中置 / 后环绕 ×0.707 并入左右，低音不并入，整体 −3 dB、饱和截断）");
-    LOG("audio：AAudio 流 %d Hz %d 声道，性能模式 %d，每次回调 %d 帧，缓冲 %d / %d 帧", AAudioStream_getSampleRate(a->au), AAudioStream_getChannelCount(a->au),
-        (int)AAudioStream_getPerformanceMode(a->au), AAudioStream_getFramesPerBurst(a->au), AAudioStream_getBufferSizeInFrames(a->au), AAudioStream_getBufferCapacityInFrames(a->au));
+    *ll = AAudioStream_getPerformanceMode(*out) == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY;
+    LOG("audio：AAudio 流 %d Hz %d 声道，性能模式 %d%s，每次回调 %d 帧，缓冲 %d / %d 帧", AAudioStream_getSampleRate(*out), AAudioStream_getChannelCount(*out),
+        (int)AAudioStream_getPerformanceMode(*out), safe ? "（NONE：安全模式）" : "", AAudioStream_getFramesPerBurst(*out), AAudioStream_getBufferSizeInFrames(*out), AAudioStream_getBufferCapacityInFrames(*out));
     return 0;
+}
+static int au_open(aout *a) {   // 0 = 声卡开好了；-1 = 开不了（a->au 置空，调用方走静音接收端） | 0 = the sound card is open; -1 = it cannot be opened (a->au set to null, the caller uses the silent sink)
+    int ll = 0, r = aa_open(a, &a->au, &ll); a->ll = ll; a->fake_t0 = 0;
+    if (r) LOG("【红】这一路改用静音接收端（不出声）");
+    return r;
 }
 static int dev_start(aout *a) { return AAudioStream_requestStart(a->au) == AAUDIO_OK ? 0 : -1; }
 static void dev_stop(aout *a) { AAudioStream_requestStop(a->au); }
@@ -379,6 +445,95 @@ static void *null_sink(void *p) {
     }
     return NULL;
 }
+// 墙钟消费者开 / 关（a->dm 里调；重复调无害）。开着时 owner = 1，声卡回调只出静音；关掉（join 完）才把队列交还声卡
+// Wall-clock consumer on / off (called under a->dm; repeated calls are harmless). While on, owner = 1 and the sound card callback outputs silence; the queue
+// goes back to the sound card only after it is off (joined)
+static void null_on(aout *a) {
+    if (a->null_live) return;
+    atomic_store_explicit(&a->owner, 1, memory_order_release); atomic_store_explicit(&a->null_run, 1, memory_order_release);
+    if (pthread_create(&a->null_th, NULL, null_sink, a)) { atomic_store(&a->null_run, 0); atomic_store(&a->owner, 0); LOG("【红】静音接收端线程建不出来"); return; }
+    a->null_live = 1;
+}
+static void null_off(aout *a) {
+    if (!a->null_live) return;
+    atomic_store_explicit(&a->null_run, 0, memory_order_release); pthread_join(a->null_th, NULL); a->null_live = 0;
+    atomic_store_explicit(&a->owner, 0, memory_order_release);
+}
+// 声卡流启动 / 停 / 关的记账包装（a->dm 里调） | Bookkeeping wrappers for starting / stopping / closing the sound card stream (called under a->dm)
+static int dev_go(aout *a) { if (a->dev_on) return 0; int r = dev_start(a); if (!r) { a->dev_on = 1; a->dev_start_ns = now_ns(); } return r; }
+static void dev_halt(aout *a) { if (a->dev_on) { dev_stop(a); a->dev_on = 0; } }
+static void dev_drop(aout *a) { dev_close(a); a->dev_on = 0; }
+#if !defined(__APPLE__) && !defined(__OHOS__)
+// [DOOM] 看护线程（每路真出声的 AudioOut 一条，issues #12/#20）。Switch 上 audout 不管下游怎样都按采样率把缓冲放回，客体从来看不到
+// 「设备停了」；这里照做：声卡流报错（错误回调）或在播却 DM_AUDIO_STALL_MS 没有回调时，先把这一路交给墙钟（静音接收端按 48 kHz 释放
+// 客体缓冲，游戏照常），再在锁外关掉旧流（卡在 processData 的回调线程最多再等 1 s）、开新流（低延迟出的事 → 本进程改用 NONE），
+// 新流第一次回调后把队列交还声卡。重开连续失败 3 次（每次隔 1 s）就放弃：这一路留在静音接收端（不出声，节奏不断）。
+// [DOOM] Keeper thread (one per real-sound AudioOut, issues #12/#20). On the Switch audout hands buffers back at the sample rate whatever happens downstream,
+// and the guest never sees "the device stopped"; this does the same: when the sound card stream reports an error (error callback) or is playing yet has had
+// no callback for DM_AUDIO_STALL_MS, the output first goes to the wall clock (the silent sink releases guest buffers at 48 kHz, the game carries on), then
+// the old stream is closed outside the lock (a callback thread stuck in processData may take up to 1 more second), a new one is opened (trouble on a low-latency
+// stream -> this process switches to NONE), and the queue goes back to the sound card at the new stream's first callback. After 3 failed reopens in a row
+// (1 s apart) it gives up: the output stays on the silent sink (no sound, pacing unbroken).
+enum { AA_STALL = 1 };   // 伪错误码：在播但没有回调 | pseudo error code: playing but no callbacks
+static void *aa_keeper(void *p) {
+    aout *a = p;
+    pthread_setname_np(pthread_self(), "dm-audio-keep");
+    while (atomic_load_explicit(&a->keep_run, memory_order_acquire)) {
+        sem_down_ms(a->keep_sem, 50);
+        if (!atomic_load_explicit(&a->keep_run, memory_order_acquire)) break;
+        uint64_t now = now_ns(), stall = aa_stall_ns();
+        pthread_mutex_lock(&a->dm);
+        int started = atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED, susp = g_suspended, err = 0; uint64_t quiet = 0;
+        { int e = atomic_exchange(&a->dev_err, 0); if (e && a->au && atomic_load(&a->err_st) == (uintptr_t)a->au) err = e; }   // 已关掉的旧流晚到的错不算 | a late error from an already closed stream does not count
+        if (!err && a->au && a->dev_on && started && !susp) {
+            if (a->handover) {   // 新流已启动、墙钟还在顶：第一次回调就交还；2 s 都没有回调 = 新流也不动 | new stream started, the wall clock still covering: hand back at its first callback; none for 2 s = the new stream does not run either
+                if (atomic_load(&a->renders) != a->hand_renders) {
+                    null_off(a); a->handover = 0; a->fails = 0;
+                    if (a->incidents <= 10 || a->incidents % 100 == 0) LOG("audio：音频流已重开并接上：墙钟桥接 %.0f ms，期间按实时释放客体缓冲 %llu 块", (double)(now - a->bridge_ns) / 1e6, (unsigned long long)(atomic_load(&a->rel_n) - a->bridge_rel0));
+                } else if (now - a->dev_start_ns > 2000000000ull) { err = AA_STALL; quiet = now - a->dev_start_ns; }
+            } else if (stall && !atomic_load(&a->owner)) {
+                uint64_t last = atomic_load(&a->last_render_ns); if (last < a->dev_start_ns) last = a->dev_start_ns;
+                if (now > last && now - last > stall) { err = AA_STALL; quiet = now - last; }
+            }
+        }
+        if (err) {   // 先桥接，再锁外关旧流 | bridge first, then close the old stream outside the lock
+            dm_audev old = a->au; int was_ll = a->ll, hand = a->handover;
+            a->au = NULL; a->dev_on = 0; a->handover = 0; a->reopen = 1; a->next_try_ns = 0;
+            if (!hand) { a->bridge_ns = now; a->bridge_rel0 = atomic_load(&a->rel_n); } else a->fails++;   // 重开的流一直不回调也算一次失败 | a reopened stream that never calls back counts as a failure
+            if (started && !susp) null_on(a);   // 客体缓冲照常按 48 kHz 放回（Switch 的 audout 也是这样） | guest buffers keep coming back at 48 kHz (as the Switch's audout does)
+            int nth = ++a->incidents, loud = nth <= 10 || nth % 100 == 0;   // 设备反复出事时日志限流；这一路出事 50 次就不再重开 | rate-limit the log when the device keeps failing; after 50 incidents on this output it is not reopened any more
+            if (nth >= 50) a->fails = 3;
+            pthread_mutex_unlock(&a->dm);
+            if (loud) {
+                if (err == AAUDIO_ERROR_DISCONNECTED) LOG("audio：音频流断开（输出设备变化）：墙钟接手，重开");
+                else if (err == AA_STALL) LOG("【红】audio：音频流%s卡死（%s %.0f ms 没有回调）：墙钟接手释放客体缓冲，关掉重开（第 %d 次；issues #12/#20）", was_ll ? "（低延迟）" : "",
+                                             hand ? "重开的流启动后" : "在播却", (double)quiet / 1e6, nth);
+                else LOG("audio：音频流错误 %d：墙钟接手释放客体缓冲，关掉重开（第 %d 次）", err, nth);
+            }
+            if (err != AAUDIO_ERROR_DISCONNECTED && was_ll) aa_go_safe(err == AA_STALL ? "卡死" : "报错");
+            AAudioStream_close(old);
+            pthread_mutex_lock(&a->dm);
+        }
+        if (a->reopen && !a->au && a->fails >= 3) { a->reopen = 0; LOG("【红】audio：音频流连续 %d 次重开失败：这一路留在静音接收端（不出声，节奏照常）", a->fails); }
+        if (a->reopen && !a->au && atomic_load_explicit(&a->keep_run, memory_order_acquire) && now_ns() >= a->next_try_ns) {
+            pthread_mutex_unlock(&a->dm);
+            dm_audev nu = NULL; int ll = 0, r = aa_open(a, &nu, &ll);
+            pthread_mutex_lock(&a->dm);
+            started = atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED; susp = g_suspended;
+            if (!r && atomic_load_explicit(&a->keep_run, memory_order_acquire)) {
+                a->au = nu; a->ll = ll; a->reopen = 0; a->fake_t0 = 0; a->fake_logged = 0;
+                if (started && !susp) {   // 没在播：留着空闲的新流，Start / 恢复时再启动 | not playing: keep the new stream idle, Start / resume starts it
+                    if (dev_go(a)) { LOG("【红】audio：重开的音频流启动失败"); dev_drop(a); a->reopen = 1; a->fails++; if (a->ll) aa_go_safe("启动失败"); }
+                    else if (a->null_live) { a->handover = 1; a->hand_renders = atomic_load(&a->renders); }
+                }
+            } else { if (!r) AAudioStream_close(nu); a->fails++; }
+            if (a->reopen) a->next_try_ns = now_ns() + 1000000000ull;
+        }
+        pthread_mutex_unlock(&a->dm);
+    }
+    return NULL;
+}
+#endif
 static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : DM_PHONE; }
 
 // AudioOutParameter = { int32 sampleRate; uint16 channelCount; uint16 _r; ... }，0 = 系统默认（48 kHz / 2 声道）
@@ -395,54 +550,96 @@ HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKN
     if (!ch) ch = 2;
     if (rate && rate != RATE) die("AudioOut 采样率 %d 不支持（只做 48 kHz）", rate);
     aout *a = calloc(1, sizeof *a);
-    pthread_mutex_init(&a->m, NULL); a->event = ev; a->ch = ch;
+    if (!a) die("AudioOut alloc");
+    pthread_mutex_init(&a->m, NULL); pthread_mutex_init(&a->dm, NULL); a->event = ev; a->ch = ch;
     atomic_init(&a->state, STATE_STOPPED);
     atomic_init(&a->q_head, 0); atomic_init(&a->q_tail, 0);
     atomic_init(&a->rel_head, 0); atomic_init(&a->rel_tail, 0);
     atomic_init(&a->null_run, 0); atomic_init(&a->notify_run, 1);
     atomic_init(&a->notify_pending, 0); atomic_init(&a->notify_armed, 0);
+    pthread_mutex_lock(&g_aos_lock);
+    int slot = -1; for (int i = 0; i < AOMAX; i++) if (!g_aos[i]) { slot = i; break; }
+    if (slot < 0) {   // [DOOM] 不再 die：回 Horizon 的错误码，游戏（Wwise）留在它的哑汇点、过一秒再试 | [DOOM] no longer dies: return Horizon's error code; the game (Wwise) stays on its dummy sink and retries a second later
+        pthread_mutex_unlock(&g_aos_lock);
+        static _Atomic unsigned n_full; unsigned k = atomic_fetch_add(&n_full, 1);
+        if (k < 3 || k % 60 == 0) LOG("【红】audio::OpenAudioOut：同时打开已有 %d 个，回 %#x（out of sessions；第 %u 次；issues #12/#20）", AOMAX, RES_AUDOUT_OUT_OF_SESSIONS, k + 1);
+        pthread_mutex_destroy(&a->dm); pthread_mutex_destroy(&a->m); free(a);
+        return RES_AUDOUT_OUT_OF_SESSIONS;
+    }
+    g_aos[slot] = a;   // 先登记（a->au 为空，暂停 / 恢复跳过它），再开声卡 | registered first (a->au is null, suspend / resume skip it), then the sound card is opened
+    pthread_mutex_unlock(&g_aos_lock);
     a->notify_sem = sem_new();
     pthread_create(&a->notify_th, NULL, event_notify, a);
     if (ev) hle_bind_system_event(ev, 1);   // 缓冲释放事件：客体线程上绑内核事件（自动清除），之后由音频线程触发 | Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
     objmap_put(g, a);
-    pthread_mutex_lock(&g_aos_lock);
-    int slot = -1; for (int i = 0; i < AOMAX; i++) if (!g_aos[i]) { slot = i; break; }
-    if (slot < 0) die("AudioOut 同时打开超过 %d 个", AOMAX);
-    g_aos[slot] = a;
-    pthread_mutex_unlock(&g_aos_lock);
+    // [DOOM] Horizon 的 OpenAudioOut 把会话对象写进 AudioOut 头 8 字节；游戏的 Wwise 汇点 Term（main+0x21ff4f0）只在这个字非 0 时
+    // 才 GetAudioOutState / StopAudioOut / CloseAudioOut。以前这里什么都不写（汇点构造时把它清 0，main+0x21ff290），
+    // 每次重建汇点旧的 AudioOut 都不关：这就是 issues #12/#20 里「8 次打开没有一次关闭」。写宿主对象指针（游戏只判非 0），Close 时清掉
+    // [DOOM] Horizon's OpenAudioOut writes the session object into the first 8 bytes of the AudioOut; the game's Wwise sink Term (main+0x21ff4f0) calls
+    // GetAudioOutState / StopAudioOut / CloseAudioOut only when that word is non-zero. Nothing was written here (the sink zeroes it at construction,
+    // main+0x21ff290), so every sink rebuild left the old AudioOut open: the "8 opens without a single close" of issues #12/#20. Write the host object
+    // pointer (the game only tests it for non-zero); Close clears it
+    *(void **)g = a;
     LOG("audio::OpenAudioOut %s 声道 %d %s", name ? name : "(默认)", ch, real_audio() ? "真出声" : "静音接收端");
-    if (real_audio()) au_open(a);   // 开不了就 a->au 为空，开始播放时走静音接收端 | if it cannot be opened, a->au is null, and playback goes to the silent sink when it starts
+    if (real_audio()) {
+#if !defined(__APPLE__) && !defined(__OHOS__)
+        a->keep_sem = sem_new();   // 错误回调可能在流一开就来，先建好 | the error callback may come as soon as the stream is open: create it first
+#endif
+        pthread_mutex_lock(&a->dm); int r = au_open(a); pthread_mutex_unlock(&a->dm);   // 开不了就 a->au 为空，开始播放时走静音接收端 | if it cannot be opened, a->au is null, and playback goes to the silent sink when it starts
+#if !defined(__APPLE__) && !defined(__OHOS__)
+        if (!r) { atomic_store(&a->keep_run, 1); if (!pthread_create(&a->keep_th, NULL, aa_keeper, a)) a->keep_live = 1; else LOG("【红】audio：看护线程建不出来（流卡死时不会自动恢复）"); }
+#else
+        (void)r;
+#endif
+    }
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", "开始播放", Result, h_au_Start, void *g) {
     aout *a = ao(g);
     pthread_mutex_lock(&a->m); int was = atomic_load_explicit(&a->state, memory_order_relaxed); atomic_store_explicit(&a->state, STATE_STARTED, memory_order_release); pthread_mutex_unlock(&a->m);
     if (was == STATE_STARTED) return RES_OK;
-    if (a->au && !g_suspended && dev_start(a)) { LOG("【红】声卡启动失败：这一路改用静音接收端（不出声）"); dev_close(a); }
-    if (!a->au || g_suspended) { atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); }
+    pthread_mutex_lock(&a->dm);
+    if (a->au && !g_suspended && dev_go(a)) {
+#if !defined(__APPLE__) && !defined(__OHOS__)
+        // [DOOM] issues #12/#20：MMAP 低延迟流 requestStart 报「stolen」。交给看护线程重开（低延迟出的事 → NONE），其间墙钟消费 | [DOOM] issues #12/#20: an MMAP low-latency stream's requestStart reported "stolen". The keeper reopens it (trouble on low latency -> NONE), the wall clock consumes meanwhile
+        LOG("【红】声卡启动失败：墙钟接手，交给看护线程重开");
+        if (a->ll) aa_go_safe("启动失败");
+        dev_drop(a);
+        if (a->keep_live) { a->reopen = 1; a->next_try_ns = 0; a->bridge_ns = now_ns(); a->bridge_rel0 = atomic_load(&a->rel_n); sem_up(a->keep_sem); }
+#else
+        LOG("【红】声卡启动失败：这一路改用静音接收端（不出声）"); dev_drop(a);
+#endif
+    }
+    if (!a->au || g_suspended) null_on(a);
+    pthread_mutex_unlock(&a->dm);
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE", "停止播放", void, h_au_Stop, void *g) {
     aout *a = ao(g);
     pthread_mutex_lock(&a->m); int was = atomic_load_explicit(&a->state, memory_order_relaxed); atomic_store_explicit(&a->state, STATE_STOPPED, memory_order_release); pthread_mutex_unlock(&a->m);
     if (was != STATE_STARTED) return;
-    pthread_mutex_lock(&g_aos_lock); int susp = g_suspended; pthread_mutex_unlock(&g_aos_lock);
-    if (a->au && !susp) dev_stop(a);
-    else { atomic_store_explicit(&a->null_run, 0, memory_order_release); pthread_join(a->null_th, NULL); }   // 静音接收端（含暂停期间接手的） | Silent sink (including one that took over during suspension)
+    pthread_mutex_lock(&a->dm);
+    if (a->au) dev_halt(a);
+    null_off(a); a->handover = 0;   // 静音接收端（没有声卡、暂停期间接手、桥接中的） | the silent sink (no sound card, taking over during suspension, bridging)
+    pthread_mutex_unlock(&a->dm);
 }
 HLE_FORCE("_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE", "关闭音频输出", void, h_au_Close, void *g) {
     h_au_Stop(g);
     aout *a = objmap_del(g);
+    LOG("audio::CloseAudioOut 声道 %d", a->ch);   // [DOOM] 对照 OpenAudioOut：issues #12/#20 里从来没有 Close | [DOOM] to pair with OpenAudioOut: issues #12/#20 never had a Close
+    if (a->keep_live) { atomic_store_explicit(&a->keep_run, 0, memory_order_release); sem_up(a->keep_sem); pthread_join(a->keep_th, NULL); a->keep_live = 0; }
     atomic_store_explicit(&a->notify_run, 0, memory_order_release);
     sem_up(a->notify_sem);
     pthread_join(a->notify_th, NULL);
     pthread_mutex_lock(&g_aos_lock);
     for (int i = 0; i < AOMAX; i++) if (g_aos[i] == a) g_aos[i] = NULL;
     pthread_mutex_unlock(&g_aos_lock);
-    if (a->au) dev_close(a);
+    pthread_mutex_lock(&a->dm); if (a->au) dev_drop(a); null_off(a); pthread_mutex_unlock(&a->dm);
+    *(void **)g = NULL;   // [DOOM] AudioOut 不再持有会话（见 h_au_Open） | [DOOM] the AudioOut no longer holds a session (see h_au_Open)
     sem_free(a->notify_sem);
     if (a->rel_sem) sem_free(a->rel_sem);
-    free(a->mixbuf); pthread_mutex_destroy(&a->m); free(a);
+    if (a->keep_sem) sem_free(a->keep_sem);
+    free(a->mixbuf); pthread_mutex_destroy(&a->dm); pthread_mutex_destroy(&a->m); free(a);
 }
 HLE_FORCE("_ZN2nn5audio16GetAudioOutStateEPKNS0_8AudioOutE", "播放状态", int, h_au_State, const void *g) { return atomic_load_explicit(&ao(g)->state, memory_order_acquire); }
 HLE_FORCE("_ZN2nn5audio21GetAudioOutSampleRateEPKNS0_8AudioOutE", "采样率", int, h_au_Rate, const void *g) { (void)ao(g); return RATE; }
@@ -490,15 +687,26 @@ void dm_audio_suspend(int on) {
         g_suspended = on; int failed = 0;
         for (int i = 0; i < AOMAX; i++) {
             aout *a = g_aos[i];
-            if (!a || !a->au || atomic_load_explicit(&a->state, memory_order_acquire) != STATE_STARTED) continue;
+            if (!a) continue;
+            pthread_mutex_lock(&a->dm);   // 锁序 g_aos_lock → a->dm | lock order g_aos_lock -> a->dm
+            if (!a->au || atomic_load_explicit(&a->state, memory_order_acquire) != STATE_STARTED) { pthread_mutex_unlock(&a->dm); continue; }
             // 暂停期间改由静音接收端按实时消耗：否则缓冲不再释放，FMOD 输出线程永久等待、游戏音频节奏卡死（来电打断同理）
             // While suspended the silent sink consumes in real time instead: otherwise buffers are no longer released, the FMOD output thread waits forever and the game's audio pacing stalls (same for an incoming call interruption)
-            if (on) { dev_stop(a); atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); }
-            else { atomic_store_explicit(&a->null_run, 0, memory_order_release); pthread_join(a->null_th, NULL);
-                   int st = dev_start(a);
+            if (on) { dev_halt(a); a->handover = 0; null_on(a); }
+            else { null_off(a);
+                   int st = dev_go(a);
                    if (st) {   // 会话还被别人占着（通话没挂就切回游戏、打断结束时人还在别的 App）：不致命，继续由静音接收端顶着，等下一次恢复再试 | The session is still held by someone else (switched back to the game with a call not yet hung up, or the user is still in another app when the interruption ends): not fatal, the silent sink keeps covering, and we retry at the next resume
+                       null_on(a);
+#if !defined(__APPLE__) && !defined(__OHOS__)
+                       if (a->keep_live) {   // [DOOM] 安卓：看护线程关掉重开（隔 1 s 再试，最多 3 次），不等下一次恢复 | [DOOM] Android: the keeper closes and reopens it (retries 1 s apart, at most 3), without waiting for the next resume
+                           LOG("【红】声卡恢复失败（状态 %d）：保持静音接收端，交给看护线程重开", st);
+                           dm_audev old = a->au; a->au = NULL; a->dev_on = 0; a->reopen = 1; a->next_try_ns = 0; a->bridge_ns = now_ns(); a->bridge_rel0 = atomic_load(&a->rel_n);
+                           AAudioStream_close(old); sem_up(a->keep_sem);
+                           pthread_mutex_unlock(&a->dm); continue; }
+#endif
                        LOG("【红】声卡恢复失败（状态 %d）：保持静音接收端，等下次恢复重试", st);
-                       atomic_store_explicit(&a->null_run, 1, memory_order_release); pthread_create(&a->null_th, NULL, null_sink, a); failed = 1; } }
+                       failed = 1; } }
+            pthread_mutex_unlock(&a->dm);
         }
         if (failed) g_suspended = 1;   // 没恢复成：状态留在「暂停」，下次调 0 会再试 | Resume did not succeed: the state stays "suspended", and the next call with 0 will retry
         LOG("audio %s", on ? "暂停（切后台 / 被打断）" : failed ? "恢复未成" : "恢复（回前台 / 打断结束）");

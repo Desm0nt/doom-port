@@ -29,6 +29,7 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_adreno_policy.h"
 #include "xbg_bc_policy.h"
 #include "xbg_astc_overlay.h"
+#include "xbg_spirv_clip.h"
 #include "xbg_writeback_policy.h"
 #include "xbg_clear_spv.h"
 #include "xbg_bright_spv.h"
@@ -242,6 +243,10 @@ uint64_t last_attachment_trace=UINT64_MAX;
 struct Capture {
     std::string directory;FILE *trace=nullptr;uint64_t frame=0,bytes=0;
     unsigned events=0,skip=0,seen=0,maxev=16;bool active=false;
+    // [DOOM] crop mode (gfx-capture-now "<skip> <max> <x> <y> <w> <h>"): only render-target outputs, only that rectangle of the
+    // images of the main render size (image coordinates: Switch layout, row 0 at the bottom), no inputs / buffers / vertices;
+    // small enough that every draw of a frame fits the budget (which draw writes a given pixel).
+    bool crop=false;uint32_t cx=0,cy=0,cw=0,ch=0;
     ~Capture(){if(trace)fclose(trace);}
 } capture;
 constexpr uint64_t capture_limit=64ull*1024*1024;
@@ -255,6 +260,7 @@ bool capture_begin(const char *kind,uint64_t present){
 }
 void capture_data(const char *label,const void *data,size_t bytes){
     if(!capture.active || !bytes)return;
+    if(capture.crop && strncmp(label,"rt",2) && strncmp(label,"st0-",4) && strncmp(label,"vertex",6) && strncmp(label,"index",5)){capture_log("SKIP label=%s reason=crop-mode",label);return;}   // crop mode keeps outputs + vertex-stage inputs
     if(bytes>capture_limit-capture.bytes){capture_log("SKIP label=%s bytes=%zu reason=64MiB-budget",label,bytes);return;}
     char leaf[256];snprintf(leaf,sizeof(leaf),"f%llu-e%u-%s.bin",(unsigned long long)capture.frame,capture.events,label);
     std::string path=capture.directory+"/"+leaf;FILE *file=fopen(path.c_str(),"wb");
@@ -2532,24 +2538,28 @@ void capture_image(Image &im,const view_t *view,const char *role){
     uint32_t base=view&&view->set_levels?view->base_level:0,levels=view&&view->set_levels?view->nlevels:im.levels;
     uint32_t layer=view&&view->set_layers?view->min_layer:0,layers=view&&view->set_layers?view->nlayers:im.layers;
     capture_log("IMAGE role=%s serial=%llu image=%p source=%p sourceBytes=%llu format=%#x vk=%u extent=%ux%ux%u levels=%u baseMip=%u count=%u baseLayer=%u layers=%u layout=%u uploaded=%u gpuWritten=%u",role,(unsigned long long)im.source.serial,(void*)im.image,im.source.mem,(unsigned long long)im.source.L.size,im.source.d.format,unsigned(im.fmt),im.width,im.height,im.depth,im.levels,base,levels,layer,layers,unsigned(im.layout),im.uploaded,im.gpu_written);
+    if(capture.crop && strncmp(role,"rt",2))return;   // crop mode: outputs only
     if(im.samples!=VK_SAMPLE_COUNT_1_BIT || im.layout==VK_IMAGE_LAYOUT_UNDEFINED){capture_log("SKIP role=%s reason=uninitialized-or-multisample",role);return;}
     if(base>=im.levels || levels>im.levels-base || layer>=im.layers || layers>im.layers-layer){capture_log("SKIP role=%s reason=invalid-view",role);return;}
     unsigned subresources=0;
     for(uint32_t l=layer;l<layer+layers;l++)for(uint32_t m=base;m<base+levels;m++){
         if(++subresources>16){capture_log("SKIP role=%s reason=16-subresource-limit",role);return;}
         uint32_t w=std::max(1u,im.width>>m),h=std::max(1u,im.height>>m),z=std::max(1u,im.depth>>m);
+        int32_t ox=0,oy=0;
+        if(capture.crop){if(m || l || z!=1 || capture.cx+capture.cw>w || capture.cy+capture.ch>h){capture_log("SKIP role=%s reason=crop-outside %ux%u",role,w,h);continue;}
+            ox=int32_t(capture.cx);oy=int32_t(capture.cy);w=capture.cw;h=capture.ch;}
         VkImageAspectFlags plane=im.aspects&VK_IMAGE_ASPECT_DEPTH_BIT?VK_IMAGE_ASPECT_DEPTH_BIT:im.aspects;
         uint32_t bpp=im.bpp;if(plane==VK_IMAGE_ASPECT_DEPTH_BIT){xbg_depth_format f;if(xbg_depth_format_info(im.source.d.format,&f)){capture_log("SKIP reason=unknown-depth-format");return;}bpp=im.source.d.format==0x32 && depth16_as_d24?4:f.depth_bytes;}
         uint64_t bytes=uint64_t(w)*h*z*bpp;
         if(!bytes || bytes>capture_limit-capture.bytes){capture_log("SKIP role=%s mip=%u layer=%u bytes=%llu reason=64MiB-budget",role,m,l,(unsigned long long)bytes);continue;}
         Buffer buffer=readback_buffer(size_t(bytes));Commands command;VkImageLayout saved=im.layout;
-        im.transition(command.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);VkBufferImageCopy region{};region.imageSubresource={plane,m,l,1};region.imageExtent={w,h,z};
+        im.transition(command.command,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);VkBufferImageCopy region{};region.imageSubresource={plane,m,l,1};region.imageOffset={ox,oy,0};region.imageExtent={w,h,z};
         region.bufferOffset=buffer.offset;vkrec::CmdCopyImageToBuffer(command.command,im.image,im.layout,buffer.buffer,1,&region);
         VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;host.srcQueueFamilyIndex=host.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;host.buffer=buffer.buffer;host.offset=buffer.offset;host.size=buffer.size;
         vkrec::CmdPipelineBarrier(command.command,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,0,nullptr);
         im.transition(command.command,saved);command.finish();gpu_sync(perf.sync_readback);buffer.invalidate();
         char label[160];snprintf(label,sizeof(label),"%s-s%llu-m%u-l%u",role,(unsigned long long)im.source.serial,m,l);
-        capture_log("PIXELS label=%s vk=%u aspect=%u width=%u height=%u depth=%u rowBytes=%u restoredLayout=%u",label,unsigned(im.fmt),plane,w,h,z,w*bpp,unsigned(im.layout));
+        capture_log("PIXELS label=%s vk=%u aspect=%u width=%u height=%u depth=%u rowBytes=%u restoredLayout=%u x=%d y=%d",label,unsigned(im.fmt),plane,w,h,z,w*bpp,unsigned(im.layout),ox,oy);
         capture_data(label,buffer.mapped,size_t(bytes));
     }
 }
@@ -2561,10 +2571,11 @@ FILE *draw_log_fp=nullptr;unsigned draw_log_n=0;
 uint64_t present_count_for_capture=0;
 void debug_dump_frame(const tex_t *presented){
     {static uint64_t tk=0;if(((++tk)%30)==0){std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');if(cut!=std::string::npos)dir.resize(cut);
-        const std::string trig=dir+"/gfx-capture-now";if(FILE *t=fopen(trig.c_str(),"rb")){unsigned sk=0,mx=16;if(fscanf(t,"%u %u",&sk,&mx)<1)sk=0;fclose(t);remove(trig.c_str());
+        const std::string trig=dir+"/gfx-capture-now";if(FILE *t=fopen(trig.c_str(),"rb")){unsigned sk=0,mx=16,c4[4]={};int nr=fscanf(t,"%u %u %u %u %u %u",&sk,&mx,&c4[0],&c4[1],&c4[2],&c4[3]);if(nr<1)sk=0;fclose(t);remove(trig.c_str());
+            capture.crop=nr==6 && c4[2] && c4[3];capture.cx=c4[0];capture.cy=c4[1];capture.cw=c4[2];capture.ch=c4[3];
             const std::string out=dir+"/capture";mkdir(out.c_str(),0775);if(capture.trace)fclose(capture.trace);capture.trace=fopen((out+"/capture.txt").c_str(),"wb");capture.directory=out;
             capture.frame=UINT64_MAX;capture.bytes=0;capture.events=0;capture.seen=0;capture.skip=sk;capture.maxev=mx;capture.active=false;
-            xbg_logf("NVN in-game capture: next frame, skip %u events, capture %u -> %s",sk,mx,out.c_str());}}}
+            xbg_logf("NVN in-game capture: next frame, skip %u events, capture %u -> %s%s",sk,mx,out.c_str(),capture.crop?" (crop mode: outputs only)":"");}}}
 
     if(draw_log_fp){fprintf(draw_log_fp,"PRESENT serial=%llu\n",presented?(unsigned long long)presented->serial:0ull);fclose(draw_log_fp);draw_log_fp=nullptr;}
     static uint64_t tick=0;if((++tick)%30)return;
@@ -3591,6 +3602,17 @@ void relaxed_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
     if(!relaxed_mode || stage!=4)return;size_t excl=0;size_t n=xbg_spirv_relax(w,unsigned(relaxed_mode.load()),&excl);
     if(n){++relaxed_shaders;relaxed_decorations+=n;}static std::atomic<unsigned> logged{0};if(logged++<400)xbg_logf("NVN relaxed shader=%s decorations=%zu kept_highp=%zu",key,n,excl);
 }
+// [DOOM] DM_GFX_CLIP_FIX (xbg_spirv_clip.cpp): the translator's gl_PerVertex declares ClipDistance[8] + CullDistance[1], over
+// maxCombinedClipAndCullDistances (8 on Adreno), and nothing writes them. The stock Adreno 740 driver then culled whole bodies and
+// monsters (black silhouettes, Mi 13 06.11). Default (auto): rewrite where the sum exceeds the device limit; 1 = always, 0 = off.
+std::atomic<int> clip_fix{-2};std::atomic<uint64_t> clip_fixed{0};
+void clip_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
+    if(clip_fix==-2){const char *e=getenv("DM_GFX_CLIP_FIX");clip_fix=e && *e?atoi(e):-1;
+        xbg_logf("NVN clip/cull distance fix=%s (DM_GFX_CLIP_FIX; device maxCombinedClipAndCullDistances=%u)",clip_fix==0?"off":clip_fix>0?"always":"auto",properties.limits.maxCombinedClipAndCullDistances);}
+    if(!clip_fix || stage>3)return;
+    if(xbg_spirv_clip_fix(w,properties.limits.maxCombinedClipAndCullDistances,clip_fix>0)){
+        const uint64_t n=++clip_fixed;if(n<=3 || !(n&(n-1)))xbg_logf("NVN clip/cull distances shrunk to one and zeroed in %s (stage %u, %llu modules so far)",key,stage,(unsigned long long)n);}
+}
 void early_tests_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
     if(early_z<0){const char *e=getenv("DM_GFX_EARLY_Z");early_z=e?atoi(e)!=0:1;}
     if(!early_z || stage!=4 || w.size()<5)return;
@@ -3854,7 +3876,7 @@ Shader *load_shader(const void *control){
     // Time of each part of the load (file read, SPIR-V rewrites, analysis, module creation), for the loaded line below.
     const uint64_t load_t1=timing_clock();uint64_t load_t2=0,load_t3=0;
     auto p=std::make_unique<Shader>();p->key=key;p->stage=h.stage;p->bindings.resize(h.binding_count);memcpy(p->bindings.data(),bytes.data()+offset,h.binding_count*sizeof(xbg_shader_binding));offset+=h.binding_count*sizeof(xbg_shader_binding);p->inputs.resize(h.input_count);memcpy(p->inputs.data(),bytes.data()+offset,h.input_count*4);offset+=h.input_count*4;p->c1.assign(bytes.begin()+offset,bytes.begin()+offset+h.c1_bytes);offset+=h.c1_bytes;
-    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());relaxed_rewrite(words,h.stage,key.c_str());gather_ext_rewrite(words,key.c_str());
+    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);clip_rewrite(words,h.stage,key.c_str());gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());relaxed_rewrite(words,h.stage,key.c_str());gather_ext_rewrite(words,key.c_str());
     {std::string gap=module_gap(words,h.stage);if(!gap.empty()){p->unusable=gap;xbg_logf("NVN shader %s stage=%u needs %s, which this device lacks: no module, its draws/dispatches are skipped%s",key.c_str(),h.stage,gap.c_str(),h.stage==3?" unless the GS is dropped as a pass-through":"");}}
     // [perf3] DOOM's culling GS is a pure position pass-through while its switch word is off: remember where the switch lives
     // (on the bundle's own SPIR-V, before any rewrite) so draw() can drop the stage (DM_GFX_GS_PASSTHRU, perf_round3.md).
@@ -4063,7 +4085,7 @@ VkShaderModule load_module(const std::string &key){
     if(r5_rawcache&1)r5raw::put(file,b);}
     xbg_shader_header h;memcpy(&h,b.data(),sizeof(h));if(h.magic!=0x31534758 || h.version!=1 || h.spirv_bytes%4)return VK_NULL_HANDLE;
     size_t off=sizeof(h)+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes;if(off+h.spirv_bytes!=b.size())return VK_NULL_HANDLE;
-    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(file,w);gscull_rewrite(w,h.stage,file.c_str(),"warm");lone_rewrite(w,h.stage,file.c_str(),"warm");early_tests_rewrite(w,h.stage,file.c_str());invariant_rewrite(w,h.stage,file.c_str());relaxed_rewrite(w,h.stage,file.c_str());gather_ext_rewrite(w,file.c_str());quad_rewrite(w,h.stage,file.c_str(),"warm");warp_rewrite(w,h.stage,file.c_str(),"warm");tidy_rewrite(w,vab?r3_ab_bit:0);
+    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(file,w);clip_rewrite(w,h.stage,file.c_str());gscull_rewrite(w,h.stage,file.c_str(),"warm");lone_rewrite(w,h.stage,file.c_str(),"warm");early_tests_rewrite(w,h.stage,file.c_str());invariant_rewrite(w,h.stage,file.c_str());relaxed_rewrite(w,h.stage,file.c_str());gather_ext_rewrite(w,file.c_str());quad_rewrite(w,h.stage,file.c_str(),"warm");warp_rewrite(w,h.stage,file.c_str(),"warm");tidy_rewrite(w,vab?r3_ab_bit:0);
     if(vnp){std::vector<uint32_t> o;if(h.stage!=0 || !xbg_spirv_strip_pointsize(w.data(),w.size(),o))return VK_NULL_HANDLE;w.swap(o);}
     if(keep_rewritten && !vab && !vnp){std::lock_guard<std::mutex> l(mu);rewritten.emplace(key,w);}
     if(!module_gap(w,h.stage).empty())return VK_NULL_HANDLE;   // [nonadreno] the device lacks a capability: the warm pipeline is not built
@@ -4445,7 +4467,9 @@ void init(){if(min_bytes>=0)return;const char *e=getenv("DM_GFX_ZC_UBO_MIN");min
     if(min_bytes || race)xbg_logf("NVN zc-ubo min=%d race=%d (DM_GFX_ZC_UBO_MIN / DM_GFX_ZC_RACE)",min_bytes,race);}
 bool bypass(size_t copy){init();if(min_bytes>0 && copy>=size_t(min_bytes)){++bypassed;return true;}return false;}
 // A zero-copy block was bound for the slot being recorded (it will be submitted as slot_serial).
-void bound(uint64_t addr,size_t bytes){if(race<=0 || bytes<size_t(std::max(4096,min_bytes)))return;
+// DM_GFX_ZC_RACE_MIN=<bytes> (default 4096): smallest block the detector tracks (the bone blocks of skinned models are ~2.7 KB).
+void bound(uint64_t addr,size_t bytes){static const int race_min=[]{const char *e=getenv("DM_GFX_ZC_RACE_MIN");return e && *e?std::max(16,atoi(e)):4096;}();
+    if(race<=0 || bytes<size_t(std::max(race_min,min_bytes)))return;
     for(auto &e:entries)if(e.addr==addr && e.bytes==bytes && e.serial==slot_serial)return;   // one entry per block per submission
     entries.push_back({addr,bytes,hash(reinterpret_cast<const void*>(uintptr_t(addr)),bytes),slot_serial,slot_index});++tracked;}
 // Guest submit boundary: the game may have written memory since the last one.
@@ -5816,6 +5840,11 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     rs.depthBiasSlopeFactor=state.bias[0];rs.depthBiasClamp=state.bias[2];if(rs.depthBiasClamp && !cfg.enabled_core.depthBiasClamp){static bool noted=false;if(!noted){noted=true;xbg_logf("NVN depth bias clamp %g requested but depthBiasClamp is not available: unclamped",double(rs.depthBiasClamp));}rs.depthBiasClamp=0;}   // [nonadreno] was fatal   // constant bias units: 2^-16 for D16, 2^-24 for the X8_D24 stand-in; slope and clamp do not depend on the format
     VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=p.samples;ms.alphaToCoverageEnable=state.ms.a2c;need(!state.ms.sl_en,"Custom sample locations unsupported");need(!state.ms.samples || state.ms.samples==uint32_t(p.samples),"NVN sample count differs from attachments");need(p.samples==VK_SAMPLE_COUNT_1_BIT || state.ms.enable,"Disabled multisampling on multisample target needs coverage emulation");
     VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};ds.depthTestEnable=state.ds.dt;ds.depthWriteEnable=state.ds.dw;ds.depthCompareOp=VkCompareOp(state.ds.df-1);ds.stencilTestEnable=state.ds.st;ds.front=stencil(false);ds.back=stencil(true);ds.depthBoundsTestEnable=state.bounds.enable;ds.minDepthBounds=state.bounds.minimum;ds.maxDepthBounds=state.bounds.maximum;
+    // [DOOM] Debug (DM_GFX_DEBUG_ZALWAYS=<vs key>,<vs key>...): the listed vertex shaders' pipelines pass every depth test, to tell
+    // a failing depth comparison from geometry that never rasterizes (black bodies on the stock Adreno 740 driver, 06.11).
+    {static const std::string zl=[]{const char *e=getenv("DM_GFX_DEBUG_ZALWAYS");return std::string(e?e:"");}();
+     if(!zl.empty() && state.shader[0] && ds.depthTestEnable && zl.find(state.shader[0]->key)!=std::string::npos){ds.depthCompareOp=VK_COMPARE_OP_ALWAYS;
+        static std::unordered_set<std::string> told;if(told.insert(state.shader[0]->key).second)xbg_logf("NVN debug: depth test ALWAYS for vs=%s (DM_GFX_DEBUG_ZALWAYS)",state.shader[0]->key.c_str());}}
     // [nonadreno] depthBounds is 0 on every Mali / PowerVR report: the test is an optimization (light volumes), so it is dropped there
     // instead of stopping the game (was fatal); the pixels it would have rejected are shaded and must fade out on their own.
     if(ds.depthBoundsTestEnable && !cfg.enabled_core.depthBounds){static bool noted=false;if(!noted){noted=true;xbg_logf("NVN depth bounds test requested but depthBounds is not available (Mali / PowerVR): drawn without it");}ds.depthBoundsTestEnable=VK_FALSE;++depth_bounds_dropped;}

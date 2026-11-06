@@ -54,6 +54,7 @@ typedef struct event { int signaled; int refs; } event_t;
 typedef struct thr {
     uint32_t handle; uint64_t id;
     uint64_t entry, arg, stack_top; int prio, core; uint64_t mask;
+    uint64_t host_sp;          // [DOOM] sp of the host pthread stack when thread_main entered the guest (0 = none, e.g. the main thread): thread_exit runs there
     uint64_t born_ns, exit_ns; uint32_t born_tick, exit_tick;   // 建立 / 退出的时刻与当时的游戏拍（现场导出用：作业工人是不是在卡住前退的） | Time of creation / exit and the game tick at that time (for the state dump: did the job worker exit before the stall)
     int started, exited, cancel;
     pthread_t pt; pthread_cond_t cv;
@@ -338,7 +339,14 @@ static void *thread_main(void *p) {
     t->tid = (int)gettid();
 #endif
     while (!t->started) pthread_cond_wait(&t->cv, &G);
-    thr_host_name(t); pthread_mutex_unlock(&G);
+    thr_host_name(t);
+#if defined(__aarch64__)
+    // [DOOM] issues #12/#20: remember where this pthread's own 1 MiB stack stands before leaving it for the guest stack. Nothing
+    // below this sp is live once dm_thread_enter has switched (thread_main never resumes), so thread_exit can run the host-side
+    // teardown there instead of on the guest's small stack
+    { uint64_t hsp; __asm__ volatile("mov %0, sp" : "=r"(hsp)); t->host_sp = hsp; }
+#endif
+    pthread_mutex_unlock(&G);
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
     die("客体线程入口返回");
 }
@@ -350,10 +358,27 @@ static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 
 }
 static const char *thr_name(thr_t *t, char *buf, size_t n);
 static void wake_sync_waiters_obj(const void *obj);
+// [DOOM] issues #12/#20 (Samsung S23+, Android 17): pthread_exit used to run on the guest thread's own stack, which Horizon code
+// sizes small because the real kernel runs SVCs on a kernel stack. bionic's thread teardown there (key destructors, stack unmap)
+// ran into the guard page below it: SIGSEGV at pc=libc.so+0x8ac44 with the fault address next to sp, backtrace svc_dispatch ->
+// gate_dispatch -> the bl pthread_exit in svc_thread. thread_exit now switches to the saved host pthread stack (host_sp) first and
+// does the whole teardown there; nothing on the guest stack (the dm_gate frame, the SVC regs) is used again. The guest may
+// also free or reuse that stack as soon as it sees the thread exited, which used to race with pthread_exit still running on it.
+// x18 (bionic's shadow call stack) is the host's: the gate never loads the guest's x18, so it stays valid across the switch.
+extern void dm_call_on_stack(uint64_t sp, void (*fn)(void *), void *arg) __attribute__((noreturn));   // entry.S
+static void thread_exit_body(void *p) __attribute__((noreturn));
 static void thread_exit(thr_t *t) {
+    uint64_t hsp = t->host_sp;   // t stays valid here: it is freed only once it is both exited and closed
+    if (hsp) dm_call_on_stack(hsp, thread_exit_body, t);
+    thread_exit_body(t);         // no saved host stack (the main thread runs on its host stack anyway)
+}
+static void thread_exit_body(void *p) {
+    thr_t *t = p;
     t->exit_ns = now_ns(); t->exit_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
     // 这里不打日志：退出发生在客体线程自己的栈上（有的只有十几 KiB），带浮点的 printf 会把栈撑爆（真机冒烟：LibcurlResolver 退出时 SIGBUS，回溯 fprintf → __dtoa）。时刻只记下来，现场导出时再打
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
+    // [DOOM] With host_sp set this runs on the host pthread stack (see above), where one line is safe: logged once per process
+    { static int said; if (t->host_sp && !__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED)) LOG("[thread] exit on host stack (first: %#x %s; issues #12/#20)", t->handle, t->hname); }
     pthread_mutex_lock(&G);
     t->exited = 1;
 #ifdef DM_GAME_DOOM
