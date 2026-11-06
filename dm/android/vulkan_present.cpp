@@ -241,6 +241,8 @@ void wait_resize(){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wai
 // compiled). DM_GFX_SHARPEN=<stops> turns it on (0 = strongest, 0.2 typical, 1 mild); used with DM_DOOM_RES (the game renders
 // 3D at a fraction and upscales it itself). Only for 8-bit UNORM RGBA/BGRA frames; anything else is presented unsharpened.
 extern "C" { int dm_vk_format_list=0; }
+// [nonadreno][afbc] VK_EXT_image_compression_control (query only) / VK_EXT or KHR_load_store_op_none enabled on the device (read by the engine)
+extern "C" { int dm_vk_compression_control=0,dm_vk_store_none=0; }
 // [DOOM] DM_TEX_DISCARD=1: a second queue of the same family for the engine's texture restore worker (xbg_tex_discard.inc), which
 // reads Vulkan images back while the translation thread owns the main queue (no engine lock on the fault path). Null = none.
 extern "C" { VkQueue dm_vk_aux_queue=VK_NULL_HANDLE; uint32_t dm_vk_aux_family=0; }   // VK_KHR_image_format_list enabled on the device (read by the Vulkan engine)
@@ -787,6 +789,38 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     if(indirect_count)dext.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     // [DOOM] format lists keep UBWC compression on images that need a second view format (xbg_game.cpp upgrade_mutable)
     if(format_list){dext.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);dm_vk_format_list=1;}
+    // [nonadreno][afbc] VK_EXT_image_compression_control: query only (never requests a compression), so the engine can log whether the
+    // driver compressed each image (AFBC / fixed rate / none; NVN afbc summary); plus a per-format probe here. VK_EXT/KHR_load_store_op_none:
+    // STORE_OP_NONE for attachment aspects a render pass does not write (DM_GFX_STORE_NONE). Both off on Adreno unless DM_GFX_AFBC_QUERY=1 /
+    // DM_GFX_STORE_NONE / DM_GFX_SIM_GPU ask, so the Adreno device is created exactly as before.
+    VkPhysicalDeviceImageCompressionControlFeaturesEXT compression_ctl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_COMPRESSION_CONTROL_FEATURES_EXT};
+    {VkPhysicalDeviceProperties pp{};vkGetPhysicalDeviceProperties(physical,&pp);dm_vk_compression_control=dm_vk_store_none=0;
+     auto env_on=[](const char *n){const char *e=getenv(n);return e && *e && strcmp(e,"0")!=0;};
+     const bool other=pp.vendorID!=0x5143 || env_on("DM_GFX_SIM_GPU");
+     bool cc=false,lsn_ext=false,lsn_khr=false;for(const auto &x:available){if(!strcmp(x.extensionName,VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME))cc=true;
+        if(!strcmp(x.extensionName,VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME))lsn_ext=true;if(!strcmp(x.extensionName,"VK_KHR_load_store_op_none"))lsn_khr=true;}
+     if(cc && (other || env_on("DM_GFX_AFBC_QUERY"))){VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};q.pNext=&compression_ctl;vkGetPhysicalDeviceFeatures2(physical,&q);
+        if(compression_ctl.imageCompressionControl){dext.push_back(VK_EXT_IMAGE_COMPRESSION_CONTROL_EXTENSION_NAME);compression_ctl.pNext=draw.pNext;draw.pNext=&compression_ctl;dm_vk_compression_control=1;}
+        // Which formats / usages the driver would compress (the image-level answer comes from the engine per created image).
+        auto probe_fn=(PFN_vkGetPhysicalDeviceImageFormatProperties2)vkGetInstanceProcAddr(instance,"vkGetPhysicalDeviceImageFormatProperties2");
+        if(probe_fn){static const struct{VkFormat f;const char *n;bool ds;} fmts[]={{VK_FORMAT_R8G8B8A8_UNORM,"rgba8",false},{VK_FORMAT_R8G8B8A8_SRGB,"rgba8s",false},{VK_FORMAT_B8G8R8A8_UNORM,"bgra8",false},
+                {VK_FORMAT_A2B10G10R10_UNORM_PACK32,"rgb10a2",false},{VK_FORMAT_B10G11R11_UFLOAT_PACK32,"r11g11b10f",false},{VK_FORMAT_R16G16_SFLOAT,"rg16f",false},{VK_FORMAT_R32_SFLOAT,"r32f",false},
+                {VK_FORMAT_R8_UNORM,"r8",false},{VK_FORMAT_R8G8_UNORM,"rg8",false},{VK_FORMAT_R16G16B16A16_SFLOAT,"rgba16f",false},{VK_FORMAT_D16_UNORM,"d16",true},{VK_FORMAT_X8_D24_UNORM_PACK32,"x8d24",true},
+                {VK_FORMAT_D24_UNORM_S8_UINT,"d24s8",true},{VK_FORMAT_D32_SFLOAT,"d32f",true},{VK_FORMAT_D32_SFLOAT_S8_UINT,"d32fs8",true}};
+            std::string line;
+            for(const auto &f:fmts){
+                const VkImageUsageFlags base=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|(f.ds?VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT:VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                char r[3]={'-','-','-'};   // plain, +storage, +mutable (no list): c = compressed (default), f = fixed rate, n = none, - = unsupported
+                for(int v=0;v<3;v++){if(f.ds && v)continue;
+                    VkPhysicalDeviceImageFormatInfo2 in{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2};in.format=f.f;in.type=VK_IMAGE_TYPE_2D;in.tiling=VK_IMAGE_TILING_OPTIMAL;in.usage=base|(v==1?VK_IMAGE_USAGE_STORAGE_BIT:0);in.flags=v==2?VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT:0;
+                    VkImageCompressionPropertiesEXT cp{VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT};VkImageFormatProperties2 out{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};out.pNext=&cp;
+                    if(probe_fn(physical,&in,&out)==VK_SUCCESS)r[v]=(cp.imageCompressionFlags&VK_IMAGE_COMPRESSION_DISABLED_EXT)?'n':(cp.imageCompressionFlags&VK_IMAGE_COMPRESSION_FIXED_RATE_EXPLICIT_EXT)?'f':'c';}
+                line+=' ';line+=f.n;line+='=';line.append(r,3);}
+            __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN afbc probe (plain/+storage/+mutable: c compressed, f fixed-rate, n none, - unsupported):%s",line.c_str());}}
+     else __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN afbc probe: VK_EXT_image_compression_control %s",cc?"present, not enabled on this GPU family (DM_GFX_AFBC_QUERY=1)":"not exposed by the driver");
+     const char *sn=getenv("DM_GFX_STORE_NONE");
+     if((lsn_ext || lsn_khr) && (sn && *sn?atoi(sn)!=0:other)){dext.push_back(lsn_khr?"VK_KHR_load_store_op_none":VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME);dm_vk_store_none=1;}
+     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN store ops: load_store_op_none ext=%d khr=%d enabled=%d image_compression_control=%d enabled=%d",int(lsn_ext),int(lsn_khr),dm_vk_store_none,int(cc),dm_vk_compression_control);}
     // [DOOM] zero-copy guest memory imports AHardwareBuffer pages as buffer memory (xbg_game.cpp zc)
     if(ahb && foreign){dext.push_back(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);dext.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);}
     // Diagnostic (marker gfx-pipe-stats): the driver's per-pipeline statistics (VK_KHR_pipeline_executable_properties).

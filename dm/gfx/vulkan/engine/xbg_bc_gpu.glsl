@@ -32,59 +32,36 @@
 #define XBG_DONT_UNROLL [[dont_unroll]]
 #endif
 
-// ---- Granite bitextract.h ----
+// ---- Bit extraction (Granite bitextract.h, rewritten 06.11) ----
+// Granite's version branched into a same-word and a cross-word path; the cross-word path, if a GPU compiler evaluates it for a field
+// that does not cross a word (or that ends in the last word), reads payload[4] and shifts by 32 or by a negative count, all undefined
+// in GLSL / SPIR-V. This one has no branch and no operation outside its defined range for any offset 0..127 and bits 1..32: the 64-bit
+// window lo:hi is shifted right by s with (hi << 1) << (31 - s) (0 for s = 0, never a shift by 32), the mask is ~0 >> (32 - n).
+// bits <= 0 gives 0 as before (no call site passes it). Same results as Granite's for every valid field (bc_gpu_decode_test).
+uint xbg_bits(uvec4 payload, int offset, int bits)
+{
+    uint o = uint(offset) & 127u, w = o >> 5, s = o & 31u;
+    uint lo = payload[w], hi = payload[min(w + 1u, 3u)];
+    uint v = (lo >> s) | ((hi << 1u) << (31u - s));
+    uint n = uint(clamp(bits, 1, 32));
+    return v & (0xffffffffu >> (32u - n));
+}
+
 int extract_bits(uvec4 payload, int offset, int bits)
 {
-    int last_offset = offset + bits - 1;
-    int result;
-    if (bits <= 0)
-        result = 0;
-    else if ((last_offset >> 5) == (offset >> 5))
-        result = int(bitfieldExtract(payload[offset >> 5], offset & 31, bits));
-    else
-    {
-        int first_bits = 32 - (offset & 31);
-        int result_first = int(bitfieldExtract(payload[offset >> 5], offset & 31, first_bits));
-        int result_second = int(bitfieldExtract(payload[(offset >> 5) + 1], 0, bits - first_bits));
-        result = result_first | (result_second << first_bits);
-    }
-    return result;
+    return bits > 0 ? int(xbg_bits(payload, offset, bits)) : 0;
 }
 
 int extract_bits_sign(uvec4 payload, int offset, int bits)
 {
-    int last_offset = offset + bits - 1;
-    int result;
-    if (bits <= 0)
-        result = 0;
-    else if ((last_offset >> 5) == (offset >> 5))
-        result = bitfieldExtract(int(payload[offset >> 5]), offset & 31, bits);
-    else
-    {
-        int first_bits = 32 - (offset & 31);
-        int result_first = int(bitfieldExtract(payload[offset >> 5], offset & 31, first_bits));
-        int result_second = bitfieldExtract(int(payload[(offset >> 5) + 1]), 0, bits - first_bits);
-        result = result_first | (result_second << first_bits);
-    }
-    return result;
+    uint k = 32u - uint(clamp(bits, 1, 32));
+    return bits > 0 ? int(xbg_bits(payload, offset, bits) << k) >> k : 0;
 }
 
 int extract_bits_reverse(uvec4 payload, int offset, int bits)
 {
-    int last_offset = offset + bits - 1;
-    int result;
-    if (bits <= 0)
-        result = 0;
-    else if ((last_offset >> 5) == (offset >> 5))
-        result = int(bitfieldReverse(bitfieldExtract(payload[offset >> 5], offset & 31, bits)) >> (32 - bits));
-    else
-    {
-        int first_bits = 32 - (offset & 31);
-        uint result_first = bitfieldExtract(payload[offset >> 5], offset & 31, first_bits);
-        uint result_second = bitfieldExtract(payload[(offset >> 5) + 1], 0, bits - first_bits);
-        result = int(bitfieldReverse(result_first | (result_second << first_bits)) >> (32 - bits));
-    }
-    return result;
+    uint k = 32u - uint(clamp(bits, 1, 32));
+    return bits > 0 ? int(bitfieldReverse(xbg_bits(payload, offset, bits)) >> k) : 0;
 }
 
 // ---- Granite bc7.comp / bc6.comp tables (BC6H uses the first 32 entries of the 2-subset tables) ----
@@ -1064,9 +1041,11 @@ uint xbg_e5_round(uint h, int e)
     uint he = (h >> 10) & 31u;
     uint m = he != 0u ? (h & 1023u) | 1024u : h & 1023u;
     int sh = e - (he != 0u ? int(he) - 1 : 0);
-    if (sh <= 0) return m << uint(-sh);
-    if (sh >= 32) return 0u;
-    return (m + (1u << uint(sh - 1))) >> uint(sh);
+    // Both results with shift counts clamped to 0..31 (a compiler may evaluate both sides of a branch), then selected.
+    uint up = m << uint(clamp(-sh, 0, 31));
+    uint k = uint(clamp(sh, 1, 31));
+    uint down = (m + (1u << (k - 1u))) >> k;
+    return sh <= 0 ? up : (sh >= 32 ? 0u : down);
 }
 
 uint xbg_e5b9g9r9(uint r, uint g, uint b)
@@ -1081,41 +1060,87 @@ uint xbg_e5b9g9r9(uint r, uint g, uint b)
     return xbg_e5_round(r, e) | (xbg_e5_round(g, e) << 9) | (xbg_e5_round(b, e) << 18) | (uint(e) << 27);
 }
 
-// BC6H pixel: RGBA16F (alpha 1.0) as two words, or E5B9G9R9 in .x (XBG_OPT bit 1, unsigned only).
-uvec2 bc6_pixel(uvec4 payload, int linear_pixel)
+// [nonadreno] 06.11: a BC6H block is decoded once (bc6_block: mode, partition, the unquantized endpoints of both subsets), then each
+// pixel only takes its subset, index and weight (bc6_pixel_b). Before, the whole mode decode ran per pixel inside the shader's two
+// rolled loops; on the Adreno 750 (Mi 14, DM_GFX_SIM_GPU=mali, DM_GFX_BC_VERIFY=1) every BC6H mode-1 block came out right in its first
+// pixel row and zero in rows 1-3, while the same code compiled for the host is exact (also under UBSan shift / bounds checks): a code
+// generation fault for that shape (BUGS_AND_FIXES §2.24). The endpoints come from Granite's mode functions unchanged (pixel 0, subset
+// 0 and 1); the per-pixel index is the one every two-subset (3-bit, anchor-aware) or one-subset (4-bit) mode of Granite reads.
+struct Bc6Block
 {
-    Bc6Interp interp;
+    ivec3 a0, a1, b0, b1;   // subset 0 / subset 1 endpoints (unquantized)
+    int part_index;
+    int anchor;
+    int kind;               // 0 reserved mode (zero), 1 one subset, 2 two subsets
+};
+
+Bc6Block bc6_block(uvec4 payload)
+{
     int mode = extract_bits(payload, 0, 5);
     int part_index = extract_bits(payload, 77, 5);
-    int part = (partition_table2[part_index] >> linear_pixel) & 1;
-    int anchor_pixel = anchor_table2[part_index];
+    int anchor = anchor_table2[part_index];
+    Bc6Interp s0 = Bc6Interp(ivec3(0), ivec3(0), 0);
+    Bc6Interp s1 = s0;
+    int kind = 2;
     if ((mode & 2) == 0)
     {
         if ((mode & 1) != 0)
-            interp = decode_bc6_mode1(payload, linear_pixel, part, anchor_pixel);
+        {
+            s0 = decode_bc6_mode1(payload, 0, 0, anchor);
+            s1 = decode_bc6_mode1(payload, 0, 1, anchor);
+        }
         else
-            interp = decode_bc6_mode0(payload, linear_pixel, part, anchor_pixel);
+        {
+            s0 = decode_bc6_mode0(payload, 0, 0, anchor);
+            s1 = decode_bc6_mode0(payload, 0, 1, anchor);
+        }
     }
     else
     {
         switch (mode)
         {
-        case 2: interp = decode_bc6_mode2(payload, linear_pixel, part, anchor_pixel); break;
-        case 3: interp = decode_bc6_mode3(payload, linear_pixel); break;
-        case 6: interp = decode_bc6_mode6(payload, linear_pixel, part, anchor_pixel); break;
-        case 7: interp = decode_bc6_mode7(payload, linear_pixel); break;
-        case 10: interp = decode_bc6_mode10(payload, linear_pixel, part, anchor_pixel); break;
-        case 11: interp = decode_bc6_mode11(payload, linear_pixel); break;
-        case 14: interp = decode_bc6_mode14(payload, linear_pixel, part, anchor_pixel); break;
-        case 15: interp = decode_bc6_mode15(payload, linear_pixel); break;
-        case 18: interp = decode_bc6_mode18(payload, linear_pixel, part, anchor_pixel); break;
-        case 22: interp = decode_bc6_mode22(payload, linear_pixel, part, anchor_pixel); break;
-        case 26: interp = decode_bc6_mode26(payload, linear_pixel, part, anchor_pixel); break;
-        case 30: interp = decode_bc6_mode30(payload, linear_pixel, part, anchor_pixel); break;
-        default: interp = Bc6Interp(ivec3(0), ivec3(0), 0); break;   // reserved modes: zero RGB
+        case 2: s0 = decode_bc6_mode2(payload, 0, 0, anchor); s1 = decode_bc6_mode2(payload, 0, 1, anchor); break;
+        case 6: s0 = decode_bc6_mode6(payload, 0, 0, anchor); s1 = decode_bc6_mode6(payload, 0, 1, anchor); break;
+        case 10: s0 = decode_bc6_mode10(payload, 0, 0, anchor); s1 = decode_bc6_mode10(payload, 0, 1, anchor); break;
+        case 14: s0 = decode_bc6_mode14(payload, 0, 0, anchor); s1 = decode_bc6_mode14(payload, 0, 1, anchor); break;
+        case 18: s0 = decode_bc6_mode18(payload, 0, 0, anchor); s1 = decode_bc6_mode18(payload, 0, 1, anchor); break;
+        case 22: s0 = decode_bc6_mode22(payload, 0, 0, anchor); s1 = decode_bc6_mode22(payload, 0, 1, anchor); break;
+        case 26: s0 = decode_bc6_mode26(payload, 0, 0, anchor); s1 = decode_bc6_mode26(payload, 0, 1, anchor); break;
+        case 30: s0 = decode_bc6_mode30(payload, 0, 0, anchor); s1 = decode_bc6_mode30(payload, 0, 1, anchor); break;
+        case 3: s0 = decode_bc6_mode3(payload, 0); kind = 1; break;
+        case 7: s0 = decode_bc6_mode7(payload, 0); kind = 1; break;
+        case 11: s0 = decode_bc6_mode11(payload, 0); kind = 1; break;
+        case 15: s0 = decode_bc6_mode15(payload, 0); kind = 1; break;
+        default: kind = 0; break;   // reserved modes: zero RGB
         }
     }
-    ivec3 rgb = ((64 - interp.weight) * interp.ep0 + interp.weight * interp.ep1 + 32) >> 6;
+    return Bc6Block(s0.ep0, s0.ep1, s1.ep0, s1.ep1, part_index, anchor, kind);
+}
+
+// BC6H pixel: RGBA16F (alpha 1.0) as two words, or E5B9G9R9 in .x (XBG_OPT bit 1, unsigned only).
+uvec2 bc6_pixel_b(Bc6Block b, uvec4 payload, int linear_pixel)
+{
+    ivec3 e0 = b.a0, e1 = b.a1;
+    int weight = 0;
+    if (b.kind == 2)
+    {
+        if (((partition_table2[b.part_index] >> linear_pixel) & 1) != 0)
+        {
+            e0 = b.b0;
+            e1 = b.b1;
+        }
+        int index = extract_bits(
+            payload,
+            max(81 + linear_pixel * 3 - int(linear_pixel > b.anchor), 82),
+            (linear_pixel == 0 || linear_pixel == b.anchor) ? 2 : 3);
+        weight = weight_table3[index];
+    }
+    else if (b.kind == 1)
+    {
+        int index = extract_bits(payload, max(64 + linear_pixel * 4, 65), linear_pixel == 0 ? 3 : 4);
+        weight = weight_table4[index];
+    }
+    ivec3 rgb = ((64 - weight) * e0 + weight * e1 + 32) >> 6;
     // Squeeze range.
     if (BC6_SIGNED)
     {
@@ -1132,6 +1157,11 @@ uvec2 bc6_pixel(uvec4 payload, int linear_pixel)
     if (!BC6_SIGNED && (XBG_OPT & 2u) != 0u)
         return uvec2(xbg_e5b9g9r9(uint(rgb.x), uint(rgb.y), uint(rgb.z)), 0u);
     return uvec2(uint(rgb.x) | (uint(rgb.y) << 16), uint(rgb.z) | (0x3c00u << 16));
+}
+
+uvec2 bc6_pixel(uvec4 payload, int linear_pixel)
+{
+    return bc6_pixel_b(bc6_block(payload), payload, linear_pixel);
 }
 
 // ---- BC1-BC5: integer arithmetic of xbg_texture.c color() / channel(), bcdec's float SNORM palette ----
@@ -1188,7 +1218,7 @@ uint bc_snorm16(uint lo, uint hi, int i)
 }
 
 // One decoded pixel (i = 4 * y + x) of the block p (16 bytes; 8-byte formats use p.x, p.y), little-endian as the CPU writes it.
-uvec2 xbg_bc_pixel(uvec4 p, int i)
+uvec2 xbg_bc_pixel_b(Bc6Block b6, uvec4 p, int i)
 {
     uint f = (XBG_FMT >= 0x45u && XBG_FMT <= 0x48u) ? XBG_FMT - 4u : XBG_FMT;   // sRGB BC1-BC3: the same bytes
     if (f == 0x41u || f == 0x42u) return uvec2(bc_color(p.x, p.y, i, false, f == 0x41u), 0u);
@@ -1208,7 +1238,20 @@ uvec2 xbg_bc_pixel(uvec4 p, int i)
     }
     if (f == 0x4cu) return uvec2(bc_snorm16(p.x, p.y, i) | (bc_snorm16(p.z, p.w, i) << 16), 0u);
     if (f == 0x4du || f == 0x4eu) return uvec2(bc7_pixel(p, i), 0u);
-    return bc6_pixel(p, i);
+    return bc6_pixel_b(b6, p, i);
+}
+
+// The per-block part of a pixel decode (BC6H only; for the other formats an unused zero block).
+Bc6Block xbg_block(uvec4 p)
+{
+    if (XBG_FMT == 0x4fu || XBG_FMT == 0x50u)
+        return bc6_block(p);
+    return Bc6Block(ivec3(0), ivec3(0), ivec3(0), ivec3(0), 0, 0, 0);
+}
+
+uvec2 xbg_bc_pixel(uvec4 p, int i)
+{
+    return xbg_bc_pixel_b(xbg_block(p), p, i);
 }
 
 // One pixel row r (4 pixels = bpp words) of the block: words 0-3 in lo, 4-7 (bpp 8 only) in hi. The loop is kept rolled so the
@@ -1219,12 +1262,13 @@ struct XbgRow
     uvec4 hi;
 };
 
-XbgRow xbg_bc_row(uvec4 p, int r, uint bpp)
+// b6: xbg_block(p), computed once per block by the caller (xbg_bc_decode.comp main).
+XbgRow xbg_bc_row_b(Bc6Block b6, uvec4 p, int r, uint bpp)
 {
     XbgRow w = XbgRow(uvec4(0u), uvec4(0u));
     XBG_DONT_UNROLL for (int c = 0; c < 4; c++)
     {
-        uvec2 v = xbg_bc_pixel(p, r * 4 + c);
+        uvec2 v = xbg_bc_pixel_b(b6, p, r * 4 + c);
         if (bpp == 8u)
         {
             if (c < 2) { w.lo[2 * c] = v.x; w.lo[2 * c + 1] = v.y; }
@@ -1235,6 +1279,11 @@ XbgRow xbg_bc_row(uvec4 p, int r, uint bpp)
         else w.lo[0] |= (v.x & 0xffu) << uint(8 * c);
     }
     return w;
+}
+
+XbgRow xbg_bc_row(uvec4 p, int r, uint bpp)
+{
+    return xbg_bc_row_b(xbg_block(p), p, r, bpp);
 }
 
 #endif

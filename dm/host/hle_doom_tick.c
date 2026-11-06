@@ -154,20 +154,43 @@ static void mrt_install(void) {
     LOG("[tick] menu realtime on (DM_DOOM_MENU_REALTIME): outside gameplay the fixed tic follows real time (SetGameHz slot main+%#x)", VT_SETGAMEHZ);
 }
 
+// ---- Gameplay hz change (DM_DOOM_FORCE_HZ_CHANGE, default 1) ----
+// In game state 6 the frame loop takes the adaptive branch only while the tick object's allowHzChange (+0x24) is set; with it clear
+// (0x1ed012c) gameplay keeps the frozen 30 Hz tick (33 ms) and still runs one game frame per render frame, so at our 60 fps it ran at
+// 2x (Mi 14, 06.11: after loading a save, allowHzChange=0, [tick] 0 adaptive frames at 45-60 fps, owner: "runs twice as fast" until
+// a later script set it again). The map sets the byte at 0x4c6abc / 0x4d64dc, ae_setAllowHzChange toggles it, 0x4f15c8 clears it.
+// On the Switch Min = Max = 30, so both branches give 30 Hz and the flag changes nothing; here it decides real time vs 2x. So the
+// host keeps it set (once per present, the game thread only reads it in the frame loop); outside state 6 the branch is not taken.
+static int hzc_enabled(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_DOOM_FORCE_HZ_CHANGE"); v = !(e && *e == '0'); } return v; }
+static uint64_t hzc_sets;
+static void hzc_keep(void) {
+    if (cv_i(GOT_ADAPTIVE) <= 0 || cv_i(GOT_IMMEDIATE) <= 0) return;   // adaptive tick off: gameplay is fixed-tic by choice
+    uint64_t tg = *(uint64_t *)(g_mb + GOT_TICKOBJ), tobj = ok_ptr(tg, 8) ? *(uint64_t *)tg : 0;
+    if (!tobj || !ok_ptr(tobj, 0x28)) return;
+    volatile uint8_t *allow = (volatile uint8_t *)(tobj + 0x24);
+    if (*allow) return;
+    *allow = 1;
+    if (++hzc_sets <= 5 || !(hzc_sets & (hzc_sets - 1)))
+        LOG("[tick] allowHzChange was clear (tick hz %d): set again so gameplay follows real time (#%llu; DM_DOOM_FORCE_HZ_CHANGE=0 keeps the game's)",
+            *(int32_t *)tobj, (unsigned long long)hzc_sets);
+}
+
 void dm_doom_tick_diag(void) {
-    static int on = -1, mrt; static float scale;
+    static int on = -1, mrt, hzc; static float scale;
     if (on < 0) {
-        const char *e = getenv("DM_DOOM_TICKLOG"); on = e && *e == '1'; scale = tick_scale(); mrt = mrt_enabled();
-        LOG("[tick] game speed: adaptive tick at %.3fx real time (DM_DOOM_TICK_SCALE; %s); menus: %s", scale,
+        const char *e = getenv("DM_DOOM_TICKLOG"); on = e && *e == '1'; scale = tick_scale(); mrt = mrt_enabled(); hzc = hzc_enabled();
+        LOG("[tick] game speed: adaptive tick at %.3fx real time (DM_DOOM_TICK_SCALE; %s); menus: %s; gameplay allowHzChange: %s", scale,
             scale > 0.9601f ? "the host tops up the game's own 0.96 through its carry" : "the game's own 0.96, nothing written",
-            mrt ? "real time (DM_DOOM_MENU_REALTIME=1)" : "fixed 30 Hz tic per frame (DM_DOOM_MENU_REALTIME=0)");
+            mrt ? "real time (DM_DOOM_MENU_REALTIME=1)" : "fixed 30 Hz tic per frame (DM_DOOM_MENU_REALTIME=0)",
+            hzc ? "kept set (DM_DOOM_FORCE_HZ_CHANGE=1)" : "the game's (DM_DOOM_FORCE_HZ_CHANGE=0)");
     }
-    if (!on && !(scale > 0.9601f) && !(mrt && !mrt_state)) return;
+    if (!on && !(scale > 0.9601f) && !(mrt && !mrt_state) && !hzc) return;
     if (!main_ok()) {
-        if (g_main_state < 0) { LOG("[tick] main is not the expected update build: speed fix, menu realtime and diagnostic off"); on = 0; scale = 0.96f; mrt = 0; }
+        if (g_main_state < 0) { LOG("[tick] main is not the expected update build: speed fix, menu realtime and diagnostic off"); on = 0; scale = 0.96f; mrt = 0; hzc = 0; }
         return;   // (modules not loaded yet: look again next present)
     }
     if (mrt && !mrt_state) mrt_install();
+    if (hzc) hzc_keep();
     uint8_t *S = g_mb + STATIC_S;
     uint64_t ts = *(volatile uint64_t *)(S + 0x90);
     int mn = cv_i(GOT_MINHZ), mx = cv_i(GOT_MAXHZ);

@@ -114,8 +114,8 @@ int main(){
     // the render-area cut is Mali only (PowerVR's Mesa driver reloads depth for a partial area).
     for(XbgGpuFamily fam:{XBG_GPU_ADRENO,XBG_GPU_XCLIPSE,XBG_GPU_OTHER,XBG_GPU_MALEOON}){
         CHECK(!xbg_noload_default(fam));CHECK(!xbg_tile_area_default(fam));CHECK(!xbg_tile_barrier_default(fam));CHECK(xbg_chunk_mid_split_default(fam));}
-    CHECK(!xbg_noload_default(XBG_GPU_MALI) && xbg_tile_area_default(XBG_GPU_MALI) && xbg_tile_barrier_default(XBG_GPU_MALI) && !xbg_chunk_mid_split_default(XBG_GPU_MALI));
-    CHECK(!xbg_noload_default(XBG_GPU_POWERVR) && !xbg_tile_area_default(XBG_GPU_POWERVR) && xbg_tile_barrier_default(XBG_GPU_POWERVR) && !xbg_chunk_mid_split_default(XBG_GPU_POWERVR));
+    CHECK(xbg_noload_default(XBG_GPU_MALI) && xbg_tile_area_default(XBG_GPU_MALI) && xbg_tile_barrier_default(XBG_GPU_MALI) && !xbg_chunk_mid_split_default(XBG_GPU_MALI));
+    CHECK(xbg_noload_default(XBG_GPU_POWERVR) && !xbg_tile_area_default(XBG_GPU_POWERVR) && xbg_tile_barrier_default(XBG_GPU_POWERVR) && !xbg_chunk_mid_split_default(XBG_GPU_POWERVR));
     CHECK(xbg_tile_area_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("mali"))));
     CHECK(!xbg_tile_area_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("nobc,subgroup16"))));   // capability tokens alone keep Adreno's defaults
 
@@ -135,6 +135,39 @@ int main(){
      a=xbg_area_align(XbgRect{0,0,1590,700},32,32,1600,720,0.9f);CHECK(a.x0==0 && a.y0==0 && a.x1==1600 && a.y1==720);   // >= 90 %: whole framebuffer
      a=xbg_area_align(XbgRect{0,0,0,0},16,16,64,64,0.9f);CHECK(a.x1==64 && a.y1==64);
      a=xbg_area_align(XbgRect{3,3,5,5},1,1,64,64,0.9f);CHECK(a.x0==3 && a.y0==3 && a.x1==5 && a.y1==5);}
+
+    // [afbc] Lean usage / store ops: off on Adreno, on for Mali and PowerVR.
+    CHECK(!xbg_lean_usage_default(XBG_GPU_ADRENO) && !xbg_store_none_default(XBG_GPU_ADRENO) && !xbg_store_dead_default(XBG_GPU_ADRENO));
+    CHECK(xbg_lean_usage_default(XBG_GPU_MALI) && xbg_store_none_default(XBG_GPU_MALI) && xbg_store_dead_default(XBG_GPU_MALI));
+    CHECK(xbg_lean_usage_default(XBG_GPU_POWERVR) && xbg_store_none_default(XBG_GPU_POWERVR) && !xbg_lean_usage_default(XBG_GPU_XCLIPSE));
+    {const VkImageUsageFlags rt=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+     // A plain 2D render target: nothing blocks; with STORAGE only storage; mutable with and without a list; 3D, MSAA, BC, 64-bit.
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_OPTIMAL,rt,0,false,32,false)==0);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_OPTIMAL,rt|VK_IMAGE_USAGE_STORAGE_BIT,0,false,32,false)==XBG_AFBC_STORAGE);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_OPTIMAL,rt,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,false,32,false)==XBG_AFBC_MUTABLE);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_OPTIMAL,rt,VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,true,32,false)==XBG_AFBC_LISTED);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_3D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_OPTIMAL,rt,0,false,32,false)==XBG_AFBC_NOT2D);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_4_BIT,VK_IMAGE_TILING_OPTIMAL,rt,0,false,32,false)==XBG_AFBC_MSAA);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_OPTIMAL,rt,0,false,128,true)==XBG_AFBC_BLOCK);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_OPTIMAL,rt,0,false,64,false)==XBG_AFBC_WIDE);
+     CHECK(xbg_afbc_blockers(VK_IMAGE_TYPE_2D,VK_SAMPLE_COUNT_1_BIT,VK_IMAGE_TILING_LINEAR,rt,0,false,32,false)==XBG_AFBC_LINEAR);
+     // STORAGE is dropped only when nothing certain blocks AFBC anyway; wide / mutable do not keep it; no STORAGE -> unchanged.
+     const VkImageUsageFlags st=rt|VK_IMAGE_USAGE_STORAGE_BIT;
+     CHECK(xbg_lean_usage(st,XBG_AFBC_STORAGE)==rt);
+     CHECK(xbg_lean_usage(st,XBG_AFBC_STORAGE|XBG_AFBC_WIDE|XBG_AFBC_LISTED)==rt);
+     CHECK(xbg_lean_usage(st,XBG_AFBC_STORAGE|XBG_AFBC_NOT2D)==st);
+     CHECK(xbg_lean_usage(st,XBG_AFBC_STORAGE|XBG_AFBC_MSAA)==st);
+     CHECK(xbg_lean_usage(rt,0)==rt);
+     CHECK(!strcmp(xbg_afbc_reason_name(0),"storage") && !strcmp(xbg_afbc_reason_name(XBG_AFBC_REASONS-1),"alias"));}
+    {VkAttachmentDescription d[3]{};for(auto &x:d){x.storeOp=x.stencilStoreOp=VK_ATTACHMENT_STORE_OP_STORE;}
+     // colour 0, colour 1, depth-stencil 2: none on colour 1 and the depth + stencil of 2, dead on the depth of 2 (wins)
+     CHECK(xbg_store_twin(d,3,(1u<<2)|(1u<<4)|(2u<<4),1u<<4,VK_ATTACHMENT_STORE_OP_NONE,true));
+     CHECK(d[0].storeOp==VK_ATTACHMENT_STORE_OP_STORE && d[0].stencilStoreOp==VK_ATTACHMENT_STORE_OP_STORE);
+     CHECK(d[1].storeOp==VK_ATTACHMENT_STORE_OP_NONE && d[1].stencilStoreOp==VK_ATTACHMENT_STORE_OP_STORE);
+     CHECK(d[2].storeOp==VK_ATTACHMENT_STORE_OP_DONT_CARE && d[2].stencilStoreOp==VK_ATTACHMENT_STORE_OP_NONE);
+     VkAttachmentDescription e[1]{};e[0].storeOp=e[0].stencilStoreOp=VK_ATTACHMENT_STORE_OP_STORE;
+     CHECK(!xbg_store_twin(e,1,0,0,VK_ATTACHMENT_STORE_OP_NONE,false) && e[0].storeOp==VK_ATTACHMENT_STORE_OP_STORE);
+     CHECK(xbg_store_twin(e,1,2u,0,VK_ATTACHMENT_STORE_OP_NONE,false)==false);}   // a stencil bit on a colour attachment changes nothing
 
     if(failures){printf("%d failure(s)\n",failures);return 1;}
     printf("vendor_policy_test: all checks passed\n");return 0;

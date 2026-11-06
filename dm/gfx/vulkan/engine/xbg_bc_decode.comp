@@ -42,10 +42,13 @@ void main()
     }
     uint row_words = src.words[R + 6u];
     uint base = src.words[R + 5u] + (z * by_n + by) * 4u * row_words + bx * pc.bpp;
+    // The per-block decode (BC6H mode and endpoints) once, outside the row loop (06.11, BUGS_AND_FIXES §2.24: decoded per pixel inside
+    // the loops, BC6H mode-1 blocks came out zero in rows 1-3 on the Adreno 750).
+    Bc6Block b6 = xbg_block(p);
     XBG_DONT_UNROLL for (int r = 0; r < 4; r++)
     {
         uint at = base + uint(r) * row_words;
-        XbgRow q = xbg_bc_row(p, r, pc.bpp);
+        XbgRow q = xbg_bc_row_b(b6, p, r, pc.bpp);
         dst.words[at] = q.lo.x;
         if (pc.bpp >= 2u) dst.words[at + 1u] = q.lo.y;
         if (pc.bpp >= 4u) { dst.words[at + 2u] = q.lo.z; dst.words[at + 3u] = q.lo.w; }

@@ -135,9 +135,11 @@ inline bool xbg_noout_mask_default(XbgGpuFamily f){return f!=XBG_GPU_ADRENO;}
 inline bool xbg_tile_family(XbgGpuFamily f){return f==XBG_GPU_MALI || f==XBG_GPU_POWERVR;}
 // DM_GFX_NOLOAD: a pass whose first draw provably overwrites every colour pixel (first_draw_covers) begins with colour loadOp
 // DONT_CARE instead of LOAD (DOOM's ~40 full-screen post-process passes a frame).
-// Off by default on every family since 06.11: with DM_GFX_TILE_POISON=1 under DM_GFX_SIM_GPU=mali the scene flashed magenta now and then,
-// i.e. first_draw_covers sometimes accepts a pass whose old contents are still read. =1 forces it for testing.
-inline bool xbg_noload_default(XbgGpuFamily){return false;}
+// Known issue (06.11, DM_GFX_TILE_POISON=1 under DM_GFX_SIM_GPU=mali): a rare magenta flash, i.e. first_draw_covers now and then accepted
+// a pass whose old contents are still read. Kept on for tilers (the owner: rare, and it saves ~50 ms a frame on a Mali-G57 MC2). Later on
+// 06.11 first_draw_covers also refuses rasterizer discard, a viewport draw() skips after the begin, zero instances and a first draw that
+// samples its own colour attachment (the likely causes; to be confirmed with the poison run).
+inline bool xbg_noload_default(XbgGpuFamily f){return xbg_tile_family(f);}
 // DM_GFX_TILE_AREA: renderArea = the bounding box of the draws the pass will hold (look-ahead over the guest command stream,
 // enforced per draw), so a tiler loads / stores only those tiles (4096x4096 shadow atlas updates). Mali only: Mesa's PowerVR
 // driver turns a renderArea that is not the whole image into an extra depth/stencil load (pvr_is_render_area_tile_aligned).
@@ -149,6 +151,78 @@ inline bool xbg_tile_barrier_default(XbgGpuFamily f){return xbg_tile_family(f);}
 // DM_GFX_CHUNK_MID_SPLIT: a mid-submit chunk cut every N draws may end an open render pass (a store + reload of every attachment
 // on a tiler); off, the every-N-draws cut waits until no pass is open (cuts at pass ends are unchanged).
 inline bool xbg_chunk_mid_split_default(XbgGpuFamily f){return !xbg_tile_family(f);}
+
+// [nonadreno][afbc] AFBC-friendly images and store ops (docs/research/tile_gpu_impl.md section 7). Every default is "off" on 0x5143.
+// DM_GFX_LEAN_USAGE: an NVN texture with NVN_TEXTURE_FLAGS_IMAGE is created without VK_IMAGE_USAGE_STORAGE_BIT when nothing else
+// already rules AFBC out; the first storage bind recreates it with the bit and copies the contents (upgrade_mutable). Arm's AFBC
+// sample (Vulkan-Samples performance/afbc): no AFBC with STORAGE / TRANSIENT usage, MUTABLE_FORMAT / ALIAS, samples > 1, not 2D,
+// not OPTIMAL tiling, or a format outside the list (Valhall: any format up to 32 bits per texel).
+inline bool xbg_lean_usage_default(XbgGpuFamily f){return xbg_tile_family(f);}
+// DM_GFX_STORE_NONE: an attachment aspect that no draw or clear of the render pass instance writes ends it with STORE_OP_NONE
+// (VK_EXT/KHR_load_store_op_none): no write-back of a read-only depth / stencil (depth-tested transparents, fog, decals).
+inline bool xbg_store_none_default(XbgGpuFamily f){return xbg_tile_family(f);}
+// DM_GFX_STORE_DEAD: STORE_OP_DONT_CARE for an aspect whose contents the guest command stream provably overwrites (a full clear)
+// before anything can read them (store_scan).
+inline bool xbg_store_dead_default(XbgGpuFamily f){return xbg_tile_family(f);}
+
+// Why the driver would not compress an image (Arm's documented rules; one bit per reason). The CERTAIN ones hold on every Mali
+// generation; STORAGE / MUTABLE / WIDE were relaxed on some newer ones (VK_EXT_image_compression_control tells, NVN afbc summary).
+enum : uint32_t {
+    XBG_AFBC_STORAGE  =1u<<0,   // VK_IMAGE_USAGE_STORAGE_BIT
+    XBG_AFBC_MUTABLE  =1u<<1,   // MUTABLE_FORMAT without a VkImageFormatListCreateInfo
+    XBG_AFBC_LISTED   =1u<<2,   // MUTABLE_FORMAT with a format list (allowed by drivers that check the list, else as MUTABLE)
+    XBG_AFBC_MSAA     =1u<<3,   // samples > 1
+    XBG_AFBC_NOT2D    =1u<<4,   // 1D / 3D image
+    XBG_AFBC_BLOCK    =1u<<5,   // block-compressed format (BC / ASTC / ETC2): already compressed
+    XBG_AFBC_WIDE     =1u<<6,   // more than 32 bits per texel (Valhall <= 3rd gen documents 32 at most)
+    XBG_AFBC_LINEAR   =1u<<7,   // VK_IMAGE_TILING_LINEAR
+    XBG_AFBC_TRANSIENT=1u<<8,   // VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT
+    XBG_AFBC_ALIAS    =1u<<9,   // VK_IMAGE_CREATE_ALIAS_BIT
+    XBG_AFBC_REASONS  =10
+};
+constexpr uint32_t XBG_AFBC_CERTAIN=XBG_AFBC_MSAA|XBG_AFBC_NOT2D|XBG_AFBC_BLOCK|XBG_AFBC_LINEAR|XBG_AFBC_TRANSIENT|XBG_AFBC_ALIAS;
+inline const char *xbg_afbc_reason_name(unsigned bit){
+    static const char *const n[XBG_AFBC_REASONS]={"storage","mutable","listed","msaa","not2d","block","wide","linear","transient","alias"};
+    return bit<XBG_AFBC_REASONS?n[bit]:"?";}
+// texel_bits: bits per texel of an uncompressed format (0 unknown); block: the format is block-compressed.
+inline uint32_t xbg_afbc_blockers(VkImageType type,VkSampleCountFlagBits samples,VkImageTiling tiling,VkImageUsageFlags usage,VkImageCreateFlags flags,
+                                  bool format_list,uint32_t texel_bits,bool block){
+    uint32_t r=0;
+    if(usage&VK_IMAGE_USAGE_STORAGE_BIT)r|=XBG_AFBC_STORAGE;
+    if(flags&VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)r|=format_list?XBG_AFBC_LISTED:XBG_AFBC_MUTABLE;
+    if(samples!=VK_SAMPLE_COUNT_1_BIT)r|=XBG_AFBC_MSAA;
+    if(type!=VK_IMAGE_TYPE_2D)r|=XBG_AFBC_NOT2D;
+    if(block)r|=XBG_AFBC_BLOCK;
+    else if(texel_bits>32)r|=XBG_AFBC_WIDE;
+    if(tiling!=VK_IMAGE_TILING_OPTIMAL)r|=XBG_AFBC_LINEAR;
+    if(usage&VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)r|=XBG_AFBC_TRANSIENT;
+    if(flags&VK_IMAGE_CREATE_ALIAS_BIT)r|=XBG_AFBC_ALIAS;
+    return r;
+}
+// DM_GFX_LEAN_USAGE decision: the usage to create with. STORAGE goes only when it is the one thing between the image and AFBC on
+// some generation (no CERTAIN blocker; WIDE / MUTABLE are not certain on newer GPUs, so they do not keep it). Anything else as wanted.
+inline VkImageUsageFlags xbg_lean_usage(VkImageUsageFlags wanted,uint32_t blockers){
+    if(!(wanted&VK_IMAGE_USAGE_STORAGE_BIT) || (blockers&XBG_AFBC_CERTAIN))return wanted;
+    return wanted&~VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT);
+}
+// Store-op twins (DM_GFX_STORE_NONE / DM_GFX_STORE_DEAD): attachment k's bit 2k is its colour or depth aspect, bit 2k+1 its stencil.
+// none: aspects no draw / clear of the instance writes -> none_op (STORE_OP_NONE; DONT_CARE only with DM_GFX_STORE_NONE=2);
+// dead: aspects whose contents are provably overwritten before any read -> DONT_CARE (wins over none). Only store ops change, so
+// the twin is compatible with the base pass, its framebuffers and pipelines. Returns whether anything changed.
+inline bool xbg_store_twin(VkAttachmentDescription *d,uint32_t n,uint32_t none,uint32_t dead,VkAttachmentStoreOp none_op,bool depth_last){
+    bool any=false;
+    for(uint32_t k=0;k<n && k<16;k++){
+        const bool ds=depth_last && k+1==n;
+        const uint32_t a=1u<<(2*k),s=2u<<(2*k);
+        if(dead&a){d[k].storeOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;any=true;}
+        else if(none&a){d[k].storeOp=none_op;any=true;}
+        if(ds){
+            if(dead&s){d[k].stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;any=true;}
+            else if(none&s){d[k].stencilStoreOp=none_op;any=true;}
+        }
+    }
+    return any;
+}
 
 // [tile] Render-area geometry (DM_GFX_TILE_AREA), pure so tests/vendor_policy_test.cpp checks it. A rectangle as x0,y0 (inclusive)
 // .. x1,y1 (exclusive) in framebuffer pixels.
