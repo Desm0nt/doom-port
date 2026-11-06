@@ -43,7 +43,7 @@ sys.path.insert(0, str(TOOLS))
 BASE_TID, UPDATE_TID, UPDATE_VERSION = 0x0100416004C00000, 0x0100416004C00800, 262144
 BUILD_ID = '2847991952b3d7abd228624fcd3b0779'
 APP_ID, PHONE_DIR = 'org.doom.port', '/sdcard/Download/DOOM Mobile'
-APK_URL = 'https://github.com/Desm0nt/doom-port/releases/latest/download/DOOM-Mobile-arm64.apk'
+APK_URL = 'https://github.com/Desm0nt/doom-port/releases/latest (DOOM-Mobile-v<version>-arm64.apk; Android 10/11: ...-arm64-android10.apk)'
 MODULE_FILES = [f'{m}.{e}' for m in ('main', 'sdk') for e in ('patched.bin', 'fixups.tsv', 'gates.tsv')]
 PY_PACKAGES = (('cryptography', 'decrypting your packages'), ('zstandard', 'NSZ / XCZ input'), ('lz4', 'NSO modules'),
                ('capstone', 'the offline patcher'))
