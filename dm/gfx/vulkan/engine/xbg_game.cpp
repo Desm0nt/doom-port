@@ -446,7 +446,7 @@ void timing_boundary(){
 std::atomic<double> perf_gpu_ms{-1},perf_cpu_ms{-1};
 extern "C" double xbg_recent_gpu_ms(void){return perf_gpu_ms.load();}
 extern std::atomic<uint64_t> drs_busy_total_ns;   // [r6] defined before retire_slot
-extern std::atomic<uint64_t> bones_ssbo_modules,bones_ssbo_realign;namespace warm{extern std::atomic<uint64_t> ssbo_patched,ssbo_stale;}   // [DOOM] DM_GFX_BONES_SSBO (ssbo_rewrite)
+extern std::atomic<uint64_t> bones_ssbo_modules,bones_ssbo_realign,bones_ssbo_copied;namespace warm{extern std::atomic<uint64_t> ssbo_patched,ssbo_stale;}   // [DOOM] DM_GFX_BONES_SSBO (ssbo_rewrite)
 extern "C" uint64_t xbg_gpu_busy_total_ns(void){return drs_busy_total_ns.load(std::memory_order_relaxed);}
 extern "C" double xbg_recent_cpu_ms(void){return perf_cpu_ms.load();}
 bool sync_mode=false; // diagnostic: marker files/gfx-sync-mode resolves all GPU results at each submit end
@@ -1125,6 +1125,9 @@ struct Slot {
     };
     bool prof=false;VkQueryPool prof_pool{};uint32_t prof_used=0,prof_slot=0,prof_skipped=0;uint64_t prof_frame=0;
     std::vector<PassRec> prof_recs;int prof_open=-1;
+    // [DOOM] DM_GFX_DRAWPROBE (BUGS_AND_FIXES 2.34): one precise occlusion query around each draw of the probed frame's slots.
+    struct ProbeRec{std::string vs,ps;int32_t count=0,base_vertex=0;uint32_t instances=1,w=0,h=0,df=0,dw=0,dt=0,c5=0,ssbo=0;uint64_t ib=0,vb=0,c5a=0;float gate=-1;};
+    bool probe=false;VkQueryPool probe_pool{};uint32_t probe_used=0;uint64_t probe_frame=0;std::vector<ProbeRec> probe_recs;
     std::unordered_map<VkDescriptorSetLayout,std::vector<VkDescriptorSet>> used_sets;
     std::vector<struct Descriptors*> desc_used; // pooled per-draw descriptor records, returned after this slot's fence // handed out this frame; recycled into spare_sets after the slot fence (no per-frame pool reset)
 };
@@ -1299,6 +1302,20 @@ bool pass_prof_enabled=false;uint64_t pass_prof_next=300,pass_prof_draws=0,pass_
 // Vertices (or indices) times instances drawn, for the per-pass verts= of NVN GPASS.
 uint64_t pass_prof_verts=0;
 uint32_t pass_prof_queries=0,pass_prof_slots=0,pass_prof_skipped_slots=0;
+// [DOOM] DM_GFX_DRAWPROBE="<from> <period> [count]" (default unset = off; BUGS_AND_FIXES 2.34, stock Adreno 740 black bodies): in the
+// selected frames (present number from, from+period, ... count frames, count 0/absent = 1) every draw recorded into a slot's main
+// command buffer gets its own precise occlusion query (none while a guest samples-passed run is open: Vulkan allows one active
+// occlusion query). After the slot's fence one line per draw: "NVN DRAWPROBE f= slot= i= vs= ps= n= bv= inst= ib= vb= pass=WxH dt= dw=
+// df=(NVN) c5=<bytes>@<guest> ssbo= gate=<VS uniform slot 0 word 0 at record time> samples=". Pairing a depth pre-pass draw with
+// the G-buffer draw of the same mesh (same ib/vb/n/bv) shows which draws lose their fragments in the whole frame, not only in a crop.
+// tools/drawprobe_report.py pairs them; zdelta: tools/capture_zdelta.py. Queries cost GPU time; diagnostic only.
+constexpr uint32_t drawprobe_query_limit=4096;
+int drawprobe_on=-1;uint64_t drawprobe_from=0,drawprobe_period=1,drawprobe_count=1;
+bool drawprobe_enabled(){if(drawprobe_on<0){const char *e=getenv("DM_GFX_DRAWPROBE");unsigned long long a=0,b=0,c=0;int n=e?sscanf(e,"%llu %llu %llu",&a,&b,&c):0;
+        drawprobe_on=n>=1;if(drawprobe_on){drawprobe_from=a;drawprobe_period=n>=2 && b?b:1;drawprobe_count=n>=3 && c?c:1;}
+        xbg_logf("NVN drawprobe %s (DM_GFX_DRAWPROBE=%s) from=%llu period=%llu count=%llu",drawprobe_on?"on":"off",e?e:"unset",(unsigned long long)drawprobe_from,(unsigned long long)drawprobe_period,(unsigned long long)drawprobe_count);}
+    return drawprobe_on>0;}
+bool drawprobe_selected(uint64_t frame){if(!drawprobe_enabled() || frame<drawprobe_from)return false;const uint64_t k=(frame-drawprobe_from)/drawprobe_period;return k<drawprobe_count && (frame-drawprobe_from)%drawprobe_period==0;}
 void pass_prof_end(VkCommandBuffer cmd,int line=0);
 void pass_prof_depth_idle(VkCommandBuffer cmd);
 uint64_t depth_idle_passes=0;
@@ -1513,6 +1530,15 @@ void retire_slot(Slot &s){
         if(complete)span_us=double((last-first)&mask)*per;
         xbg_logf("NVN GPASS frame=%llu slot=%u ring=%u summary recorded=%zu complete=%zu skipped=%u queries=%u result=%d pass_us=%.0f compute_us=%.0f span_us=%.0f",(unsigned long long)s.prof_frame,s.prof_slot,unsigned(&s-slots),s.prof_recs.size(),complete,s.prof_skipped,s.prof_used,int(status),pass_us,compute_us,span_us);
     }
+    if(s.probe){s.probe=false;   // [DOOM] DM_GFX_DRAWPROBE: the fence has signalled; availability is still checked per query
+        struct Res{uint64_t value=0,available=0;};std::vector<Res> t(s.probe_used);
+        const VkResult status=s.probe_used?vkGetQueryPoolResults(cfg.device,s.probe_pool,0,s.probe_used,t.size()*sizeof(Res),t.data(),sizeof(Res),VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT):VK_SUCCESS;
+        for(size_t i=0;i<s.probe_recs.size() && i<t.size();i++){const auto &r=s.probe_recs[i];
+            xbg_logf("NVN DRAWPROBE f=%llu slot=%u i=%zu vs=%s ps=%s n=%d bv=%d inst=%u ib=%#llx vb=%#llx pass=%ux%u dt=%u dw=%u df=%u c5=%u@%#llx ssbo=%u gate=%g samples=%lld",
+                (unsigned long long)s.probe_frame,unsigned(&s-slots),i,r.vs.c_str(),r.ps.c_str(),r.count,r.base_vertex,r.instances,(unsigned long long)r.ib,(unsigned long long)r.vb,r.w,r.h,r.dt,r.dw,r.df,r.c5,(unsigned long long)r.c5a,r.ssbo,double(r.gate),
+                t[i].available?(long long)t[i].value:-1ll);}
+        xbg_logf("NVN DRAWPROBE f=%llu slot=%u summary draws=%zu queries=%u result=%d",(unsigned long long)s.probe_frame,unsigned(&s-slots),s.probe_recs.size(),s.probe_used,int(status));
+    }
     if(s.timestamps){uint64_t t[2]{};if(vkGetQueryPoolResults(cfg.device,s.timestamps,0,2,sizeof(t),t,8,VK_QUERY_RESULT_64_BIT)==VK_SUCCESS && t[1]>=t[0]){uint64_t mask=timestamp_bits<64?(uint64_t(1)<<timestamp_bits)-1:~0ull;const uint64_t ns=uint64_t(double((t[1]-t[0])&mask)*properties.limits.timestampPeriod);perf.gpu_ns+=ns;++perf.gpu_samples;hud::gpu_add(s.hud_frame,ns);drs_busy_add(s.serial,t[0],t[1],ns);}else drs_busy_add(s.serial,0,0,0);}
     else drs_busy_add(s.serial,0,0,0);   // an empty span keeps the submission order moving
     CPU_SCOPE(Cleanup);uint64_t c0=timing_clock();
@@ -1610,6 +1636,11 @@ Slot &recording_slot(){
                 }else ++pass_prof_skipped_slots;
             }
         }
+        // [DOOM] DM_GFX_DRAWPROBE: every slot recorded for a selected frame; reset outside any render pass (none is open here).
+        s.probe=false;s.probe_used=0;s.probe_recs.clear();
+        if(drawprobe_selected(frame) && cfg.enabled_core.occlusionQueryPrecise){
+            if(!s.probe_pool){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_OCCLUSION;q.queryCount=drawprobe_query_limit;VK(vkCreateQueryPool(cfg.device,&q,nullptr,&s.probe_pool));}
+            vkrec::CmdResetQueryPool(s.cmd,s.probe_pool,0,drawprobe_query_limit);s.probe=true;s.probe_frame=frame;}
         // Order against work of earlier submissions on this queue.
         {VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkrec::CmdPipelineBarrier(s.cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;frag_seq=write_seq;passes_since_full=0;++mt_hz_gen;}
         for(auto q:s.occlusion_pools)vkrec::CmdResetQueryPool(s.cmd,q,0,256);
@@ -1769,8 +1800,8 @@ void perf_frame(){
     perf_vlogf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
     perf_vlogf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
     perf_vlogf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
-    perf_vlogf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu bones_ssbo_modules=%llu ssbo_realign=%llu warm_ssbo_patched=%llu warm_ssbo_stale=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed),
-        (unsigned long long)bones_ssbo_modules.load(),(unsigned long long)bones_ssbo_realign.load(),(unsigned long long)warm::ssbo_patched.load(),(unsigned long long)warm::ssbo_stale.load());
+    perf_vlogf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu bones_ssbo_modules=%llu ssbo_realign=%llu ssbo_copied=%llu warm_ssbo_patched=%llu warm_ssbo_stale=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed),
+        (unsigned long long)bones_ssbo_modules.load(),(unsigned long long)bones_ssbo_realign.load(),(unsigned long long)bones_ssbo_copied.load(),(unsigned long long)warm::ssbo_patched.load(),(unsigned long long)warm::ssbo_stale.load());
     if(r3_log){xbg_logf("NVN PERF r3 ab=%d ldc_canon=%llu canon_merges=%llu halfflag=%llu f2i_notrunc=%llu texcoord_unguarded=%llu psize_modules=%llu lazy_clear folded=%.2f flushed=%.2f appended=%.2f flipfold=%.2f deadbox=%.1f deadbox_total=%llu ab_variant=%#x",
         int(ab_frame_on),(unsigned long long)r3_canon.load(),(unsigned long long)r3_canon_merges.load(),(unsigned long long)r3_half.load(),(unsigned long long)r3_f2i.load(),(unsigned long long)r3_texnan.load(),(unsigned long long)r3_psize.load(),r3_lazy_folded/f,r3_lazy_flushed/f,r3_lazy_appended/f,r3_flipfold/f,r3_deadbox/f,(unsigned long long)r3_deadbox_total,r3_ab_bit);
         r3_lazy_folded=r3_lazy_flushed=r3_lazy_appended=r3_flipfold=r3_deadbox=0;}
@@ -2589,7 +2620,12 @@ void debug_dump_frame(const tex_t *presented){
             capture.crop=nr>=6 && c4[2] && c4[3];capture.crop_inputs=nr<7 || vin!=0;capture.cx=c4[0];capture.cy=c4[1];capture.cw=c4[2];capture.ch=c4[3];
             const std::string out=dir+"/capture";mkdir(out.c_str(),0775);if(capture.trace)fclose(capture.trace);capture.trace=fopen((out+"/capture.txt").c_str(),"wb");capture.directory=out;
             capture.frame=UINT64_MAX;capture.bytes=0;capture.events=0;capture.seen=0;capture.skip=sk;capture.maxev=mx;capture.active=false;
-            xbg_logf("NVN in-game capture: next frame, skip %u events, capture %u -> %s%s",sk,mx,out.c_str(),capture.crop?" (crop mode: outputs only)":"");}}}
+            xbg_logf("NVN in-game capture: next frame, skip %u events, capture %u -> %s%s",sk,mx,out.c_str(),capture.crop?" (crop mode: outputs only)":"");}
+        // [DOOM] marker gfx-drawprobe-now "[count] [period]" (default 1 1): DM_GFX_DRAWPROBE for count frames from the next-but-one
+        // present, every period-th (the env form needs the present number in advance; this one is dropped while standing on the spot)
+        const std::string dpt=dir+"/gfx-drawprobe-now";if(FILE *t=fopen(dpt.c_str(),"rb")){unsigned long long c=1,pe=1;int nr=fscanf(t,"%llu %llu",&c,&pe);fclose(t);remove(dpt.c_str());
+            drawprobe_enabled();drawprobe_on=1;drawprobe_from=stats.presents.load()+2;drawprobe_count=nr>=1 && c?c:1;drawprobe_period=nr>=2 && pe?pe:1;
+            xbg_logf("NVN drawprobe marker: %llu frame(s) from present %llu, period %llu",(unsigned long long)drawprobe_count,(unsigned long long)drawprobe_from,(unsigned long long)drawprobe_period);}}}
 
     if(draw_log_fp){fprintf(draw_log_fp,"PRESENT serial=%llu\n",presented?(unsigned long long)presented->serial:0ull);fclose(draw_log_fp);draw_log_fp=nullptr;}
     static uint64_t tick=0;if((++tick)%30)return;
@@ -3619,10 +3655,17 @@ void relaxed_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
 // [DOOM] DM_GFX_CLIP_FIX (xbg_spirv_clip.cpp): the translator's gl_PerVertex declares ClipDistance[8] + CullDistance[1], over
 // maxCombinedClipAndCullDistances (8 on Adreno), and nothing writes them. The stock Adreno 740 driver then culled whole bodies and
 // monsters (black silhouettes, Mi 13 06.11). Default (auto): rewrite where the sum exceeds the device limit; 1 = always, 0 = off.
+// [DOOM] issue #25 (POCO X6 Pro, Mali-G615, v0.4.17): auto needs shaderClipDistance + shaderCullDistance and a limit of at least 2.
+// That Mali has neither (limit 0): the rewrite's zero stores made the module write builtins the device lacks, and a driver thread
+// crashed at startup (SIGSEGV, fault addr 0x40, no game frame); v0.4.16 left the unused arrays alone and ran. Such devices keep
+// the module unchanged again.
 std::atomic<int> clip_fix{-2};std::atomic<uint64_t> clip_fixed{0};
 void clip_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
-    if(clip_fix==-2){const char *e=getenv("DM_GFX_CLIP_FIX");clip_fix=e && *e?atoi(e):-1;
-        xbg_logf("NVN clip/cull distance fix=%s (DM_GFX_CLIP_FIX; device maxCombinedClipAndCullDistances=%u)",clip_fix==0?"off":clip_fix>0?"always":"auto",properties.limits.maxCombinedClipAndCullDistances);}
+    if(clip_fix==-2){const char *e=getenv("DM_GFX_CLIP_FIX");int v=e && *e?atoi(e):-1;
+        const bool able=cfg.enabled_core.shaderClipDistance && cfg.enabled_core.shaderCullDistance && properties.limits.maxCombinedClipAndCullDistances>=2;
+        if(v<0 && !able)v=0;clip_fix=v;
+        xbg_logf("NVN clip/cull distance fix=%s (DM_GFX_CLIP_FIX=%s; device clip %u cull %u maxCombinedClipAndCullDistances=%u)",v==0?"off":v>0?"always":"auto",e && *e?e:"auto",
+                 unsigned(cfg.enabled_core.shaderClipDistance),unsigned(cfg.enabled_core.shaderCullDistance),properties.limits.maxCombinedClipAndCullDistances);}
     if(!clip_fix || stage>3)return;
     if(xbg_spirv_clip_fix(w,properties.limits.maxCombinedClipAndCullDistances,clip_fix>0)){
         const uint64_t n=++clip_fixed;if(n<=3 || !(n&(n-1)))xbg_logf("NVN clip/cull distances shrunk to one and zeroed in %s (stage %u, %llu modules so far)",key,stage,(unsigned long long)n);}
@@ -3636,10 +3679,25 @@ void clip_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
 // but other draws of the same shaders (a door, floor plates, the weapon) then dropped out of the G-buffer pass (07.11, validation
 // clean; BUGS_AND_FIXES 2.34). Decided once at init (bones_ssbo_decide), before the warm-up threads start.
 constexpr uint32_t XBG_BIND_SSBO=1u<<30;   // xbg_shader_binding.flags of a guest uniform block bound as a storage buffer
-std::atomic<int> bones_ssbo{-1};std::atomic<uint64_t> bones_ssbo_modules{0},bones_ssbo_realign{0};
+// DM_GFX_DEBUG_ZWRITE (see the pipeline's depth state): the current vertex shader is listed.
+bool zwrite_listed(){static const std::string zl=[]{const char *e=getenv("DM_GFX_DEBUG_ZWRITE");return std::string(e?e:"");}();
+    return !zl.empty() && state.shader[0] && zl.find(state.shader[0]->key)!=std::string::npos;}
+std::atomic<int> bones_ssbo{-1};std::atomic<uint64_t> bones_ssbo_modules{0},bones_ssbo_realign{0},bones_ssbo_copied{0};
+// [DOOM] Test variants of the SSBO bones (all default 0 = the behaviour above; read with DM_GFX_BONES_SSBO, BUGS_AND_FIXES 2.34):
+//  DM_GFX_BONES_SSBO_NODYN=1: the storage-buffer blocks take a plain STORAGE_BUFFER descriptor with the offset written into the set
+//    instead of STORAGE_BUFFER_DYNAMIC (every other uniform block keeps its dynamic offset). Sets holding one are never kept across
+//    frames by the descriptor memo (their snapshot offset is baked in). Tells a driver fault in mixed UBO/SSBO dynamic offsets.
+//  DM_GFX_BONES_SSBO_COPY=1: the block is always copied into this slot's stream arena when it is bound (no zero-copy view of the
+//    AHardwareBuffer-imported guest pool, no pending-result view, no snapshot cache). Tells a fault of storage reads of imported memory.
+//  DM_GFX_BONES_SSBO_PAD=<bytes> (power of two, 16..65536; implies COPY): descriptor range and copy rounded up to a multiple of it,
+//    the tail zeroed. 65536 = the declared vec4[4096]. Tells a fault in small / unaligned storage ranges (48, 96, 144, 1104 bytes...).
+int bones_ssbo_nodyn=0,bones_ssbo_copy=0;size_t bones_ssbo_pad=0;
 void bones_ssbo_decide(){
     const char *e=getenv("DM_GFX_BONES_SSBO");const bool stock=properties.vendorID==0x5143 && !strstr(properties.deviceName,"Turnip");
     const int v=e && *e?(atoi(e)!=0):0;bones_ssbo=v;
+    {const char *x=getenv("DM_GFX_BONES_SSBO_NODYN");bones_ssbo_nodyn=x && atoi(x)!=0;x=getenv("DM_GFX_BONES_SSBO_COPY");bones_ssbo_copy=x && atoi(x)!=0;
+     x=getenv("DM_GFX_BONES_SSBO_PAD");long pad=x?atol(x):0;bones_ssbo_pad=(pad>=16 && pad<=65536 && !(pad&(pad-1)))?size_t(pad):0;if(bones_ssbo_pad)bones_ssbo_copy=1;
+     if(v)xbg_logf("NVN bones ssbo variants nodyn=%d copy=%d pad=%zu (DM_GFX_BONES_SSBO_NODYN / _COPY / _PAD)",bones_ssbo_nodyn,bones_ssbo_copy,bones_ssbo_pad);}
     xbg_logf("NVN bones ssbo=%s (DM_GFX_BONES_SSBO=%s; default off, 1 for the stock Qualcomm driver test, here %s) minStorageBufferOffsetAlignment=%llu minUniformBufferOffsetAlignment=%llu maxDescriptorSetStorageBuffersDynamic=%u",
              v?"on":"off",e && *e?e:"auto",stock?"stock Qualcomm":"not stock Qualcomm",(unsigned long long)properties.limits.minStorageBufferOffsetAlignment,
              (unsigned long long)properties.limits.minUniformBufferOffsetAlignment,properties.limits.maxDescriptorSetStorageBuffersDynamic);}
@@ -4130,7 +4188,8 @@ bool ssbo_patch(const std::vector<std::string> &keys,std::vector<uint32_t> &word
     bool patched=false;
     for(uint32_t j=0;j<nb;j++){uint32_t *e=&words[4+size_t(j)*4];const uint32_t bnd=e[0],flags=e[3];
         for(const SsboInfo *m:mods){if(!(flags&(1u<<m->stage)) || !std::binary_search(m->bindings.begin(),m->bindings.end(),bnd))continue;
-            if(m->applied){if(e[1]==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){e[1]=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;patched=true;}else if(e[1]==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC){e[1]=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;patched=true;}}
+            if(m->applied){if(e[1]==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){e[1]=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;patched=true;}else if(e[1]==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC){e[1]=bones_ssbo_nodyn?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;patched=true;}
+                else if(e[1]==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && bones_ssbo_nodyn){e[1]=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;patched=true;}}   // DM_GFX_BONES_SSBO_NODYN
             else if(e[1]==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e[1]==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC){++ssbo_stale;return false;}}}
     if(patched)++ssbo_patched;
     return true;
@@ -4611,7 +4670,12 @@ Buffer uniform_snapshot_slow(uint64_t address,size_t copy){
 // [DOOM] DM_GFX_BONES_SSBO: a guest uniform block bound as a storage buffer. Same data as uniform_snapshot (zero-copy view, pending
 // GPU result or copy); a view whose offset misses minStorageBufferOffsetAlignment (it was aligned for minUniformBufferOffsetAlignment
 // only) is copied into the stream arena instead, whose alignment covers both (arena_alignment).
-Buffer ssbo_snapshot(uint64_t address,size_t copy){Buffer b=uniform_snapshot(address,copy);const VkDeviceSize a=properties.limits.minStorageBufferOffsetAlignment;
+// DM_GFX_BONES_SSBO_PAD: the descriptor range of a storage-buffer bones block (uniform_range otherwise).
+size_t ssbo_range(size_t copy){size_t n=uniform_range(copy);if(bones_ssbo_pad)n=(n+bones_ssbo_pad-1)&~(bones_ssbo_pad-1);return n;}
+Buffer ssbo_snapshot(uint64_t address,size_t copy){
+    // DM_GFX_BONES_SSBO_COPY / _PAD: a private zero-padded copy of exactly ssbo_range bytes (stream arena: aligned for storage buffers)
+    if(bones_ssbo_copy){++bones_ssbo_copied;cpu_access(address,copy,2);return stream_buffer(ssbo_range(copy),reinterpret_cast<const void*>(address),copy,true);}
+    Buffer b=uniform_snapshot(address,copy);const VkDeviceSize a=properties.limits.minStorageBufferOffsetAlignment;
     if(a>1 && b.offset%a){++bones_ssbo_realign;cpu_access(address,copy,2);b=stream_buffer(uniform_range(copy),reinterpret_cast<const void*>(address),copy,true);}
     return b;}
 // Descriptor memo (iOS "same inputs -> reuse the parameter block"): within one guest submit, a draw whose shaders and
@@ -4699,7 +4763,8 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute);
 // Dynamic uniform buffers (Claude C151): Maleoon allows 8 per pipeline layout. Mode 1 = every uniform buffer dynamic (fits);
 // mode 2 = only the per-draw ones (guest uniform buffers, driver blocks) dynamic, the support block (depends on the viewport
 // only, kept in the static arena) and c1 constants (static) bound at fixed offsets; mode 0 = none dynamic.
-#define UBO_DYN(mode,b) ((b).type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && ((mode)==1 || ((mode)==2 && ((b).source==XBG_SOURCE_UNIFORM||(b).source==XBG_SOURCE_DRIVER0||(b).source==XBG_SOURCE_DRIVER2))))
+#define UBO_DYN(mode,b) ((b).type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && ((mode)==1 || ((mode)==2 && ((b).source==XBG_SOURCE_UNIFORM||(b).source==XBG_SOURCE_DRIVER0||(b).source==XBG_SOURCE_DRIVER2))) \
+    && !(bones_ssbo_nodyn && ((b).flags&XBG_BIND_SSBO)))   /* [DOOM] DM_GFX_BONES_SSBO_NODYN: storage-buffer bones never dynamic */
 // [DOOM] DM_GFX_BONES_SSBO: a guest uniform block bound as a storage buffer (XBG_BIND_SSBO) stays a uniform block everywhere in the
 // engine (UBO_DYN, snapshots, memo keys) and only takes the Vulkan type STORAGE_BUFFER(_DYNAMIC) here; its dynamic count is checked
 // against maxDescriptorSetStorageBuffersDynamic (dyn_mode_for).
@@ -4708,7 +4773,7 @@ inline VkDescriptorType desc_type(unsigned mode,const xbg_shader_binding &b){con
     if(bind_ssbo(b))return dyn?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     return dyn?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VkDescriptorType(b.type);}
 unsigned dyn_mode_for(bool compute,bool *no_ubo=nullptr){unsigned all=0,vary=0,ssbo=0;
-    for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){if(bind_ssbo(b)){ssbo+=b.count;continue;}all+=b.count;if(b.source==XBG_SOURCE_UNIFORM||b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2)vary+=b.count;}
+    for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){if(bind_ssbo(b)){if(!bones_ssbo_nodyn)ssbo+=b.count;continue;}all+=b.count;if(b.source==XBG_SOURCE_UNIFORM||b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2)vary+=b.count;}
     if(no_ubo)*no_ubo=all+ssbo==0;unsigned lim=properties.limits.maxDescriptorSetUniformBuffersDynamic;
     if(!ubo_dynamic_on)return 0;   // [nonadreno] DM_GFX_UBO_DYNAMIC=0 / PowerVR: no dynamic uniform buffers (unused-dynamic-UBO overrun)
     if(ssbo>properties.limits.maxDescriptorSetStorageBuffersDynamic)return 0;   // [DOOM] bones as dynamic storage buffers (all are guest blocks: dynamic in modes 1 and 2)
@@ -4862,6 +4927,8 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){storage_image
         if(sg_hit){++r4_sg_desc;sg::desc_call=sg::desc_calls;}
         else{dyn_ubos.clear();
         bool no_ubo=false;const unsigned dmode=dyn_mode_for(false,&no_ubo);memo_dyn_ok=dmode!=0 || no_ubo;
+        // [DOOM] DM_GFX_BONES_SSBO_NODYN: a set with a non-dynamic bones block holds this submit's snapshot offset: frame-local only
+        if(bones_ssbo_nodyn && memo_dyn_ok)for(unsigned st=0;st<5 && memo_dyn_ok;st++)if(state.shader[st])for(auto &b:state.shader[st]->bindings)if(bind_ssbo(b)){memo_dyn_ok=false;break;}
         for(unsigned st=0;st<5;st++){key.push_back(uint64_t(uintptr_t(state.shader[st])));if(tags)ktag.push_back(0);}
         key.push_back(state.texture_pool.pool?uint64_t(uintptr_t(state.texture_pool.pool->mem)):0);key.push_back(uint64_t(state.texture_pool.off));key.push_back(uint64_t(state.texture_pool.n));if(tags)ktag.insert(ktag.end(),3,1);
         key.push_back(state.sampler_pool.pool?uint64_t(uintptr_t(state.sampler_pool.pool->mem)):0);key.push_back(uint64_t(state.sampler_pool.off));if(tags)ktag.insert(ktag.end(),2,1);
@@ -5075,7 +5142,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 Buffer *buffer=nullptr;bool is_storage=b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;uint32_t slot=b.slot+element;size_t n=0,buffer_offset=0;const void *data=nullptr;size_t copy=0;
                 if(b.source==XBG_SOURCE_UNIFORM || b.source==XBG_SOURCE_STORAGE){need(slot<16,"Buffer slot out of bounds");auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];need(r.address && r.size,"Required NVN buffer slot is unbound");data=reinterpret_cast<void*>(r.address);copy=r.size;
                     if(is_storage){n=copy;for(auto &v:out.storage)if(r.address>=v.first.first && r.address+r.size<=v.first.first+v.first.second){buffer=v.second;buffer_offset=r.address-v.first.first;if((gscull_mask()&32) && shader.storage_writes.count(b.binding))n=(n+3)&~size_t(3);break;}if(!buffer){{static unsigned dumped=0;if(dumped++<3){for(auto &v:out.storage)xbg_logf("NVN alias dump: out.storage %#llx+%llu",(unsigned long long)v.first.first,(unsigned long long)v.first.second);for(unsigned q=0;q<6;q++)if(state.shader[q] && (q==5)==compute)for(auto &bb:state.shader[q]->bindings)if(bb.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned i=0;i<bb.count;i++){auto rr=bb.source==XBG_SOURCE_UNIFORM?state.ub[nvn_stage[q]][bb.slot+i]:state.sb[nvn_stage[q]][bb.slot+i];xbg_logf("NVN alias dump: st=%u key=%s binding=%u slot=%u src=%d written=%d range=%#llx+%llu",q,state.shader[q]->key.c_str(),bb.binding,bb.slot+i,int(bb.source),int(state.shader[q]->storage_writes.count(bb.binding)),(unsigned long long)rr.address,(unsigned long long)rr.size);}xbg_logf("NVN alias dump: now st=%u key=%s binding=%u slot=%u ns=%u",st,shader.key.c_str(),b.binding,slot,ns);}}static unsigned told=0;if(told++<10)xbg_logf("NVN storage alias not found addr=%#llx+%llu storage_ranges=%zu (own buffer, written=%d)",(unsigned long long)r.address,(unsigned long long)r.size,out.storage.size(),int(shader.storage_writes.count(b.binding)));if(shader.storage_writes.count(b.binding)){cpu_access(r.address,r.size,3);buffer=out.keep(readback_buffer(size_t(r.size),reinterpret_cast<void*>(r.address),size_t(r.size)));out.storage.push_back({{r.address,r.size},buffer});out.written.push_back({{r.address,r.size},buffer});}else{snap_no_sync=true;buffer=out.keep(snapshot(r.address,size_t(r.size),properties.limits.minStorageBufferOffsetAlignment));snap_no_sync=false;}buffer_offset=0;}need(buffer_offset%properties.limits.minStorageBufferOffsetAlignment==0,"NVN storage offset violates Vulkan alignment");}
-                    else{copy=std::min<size_t>(copy,b.bytes?b.bytes:65536);n=uniform_range(copy);buffer=out.keep(bind_ssbo(b)?ssbo_snapshot(r.address,copy):uniform_snapshot(r.address,copy));}
+                    else{copy=std::min<size_t>(copy,b.bytes?b.bytes:65536);n=bind_ssbo(b)?ssbo_range(copy):uniform_range(copy);buffer=out.keep(bind_ssbo(b)?ssbo_snapshot(r.address,copy):uniform_snapshot(r.address,copy));}
                 }else if(b.source==XBG_SOURCE_SUPPORT){n=1392;need(state.color.alpha_func==8,"Nontrivial NVN alpha test not translated");
                     Buffer &sb=support_block();data=sb.mapped;copy=n;buffer=out.keep(sb);}
                 else if(b.source==XBG_SOURCE_C1){
@@ -5088,7 +5155,12 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 need(n && n<=size_t(is_storage?properties.limits.maxStorageBufferRange:properties.limits.maxUniformBufferRange),"Descriptor range exceeds device limit");
                 if(write.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || write.descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC){buffer_infos.push_back({buffer->buffer,0,n});if(desc_memo_recording)desc_memo_dyn.push_back({(uint64_t(b.binding)<<32)|element,buffer->buffer,uint32_t(buffer->offset+buffer_offset),b.source==XBG_SOURCE_UNIFORM,uint8_t(b.source),uint8_t(ns),uint8_t(b.source==XBG_SOURCE_DRIVER0?0:1)});dynamic_list.push_back({(uint64_t(b.binding)<<32)|element,uint32_t(buffer->offset+buffer_offset)});}
                 else buffer_infos.push_back({buffer->buffer,buffer->offset+buffer_offset,n});write.pBufferInfo=&buffer_infos.back();
-                if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-buffer",st,b.binding,element);capture_log("BUFFER label=%s shader=%s nvnStage=%u sourceKind=%u slot=%u guest=%p copied=%zu descriptorBytes=%zu bufferOffset=%zu",label,shader.key.c_str(),ns,b.source,slot,data,copy,n,buffer_offset);capture_data(label,static_cast<const uint8_t*>(buffer->mapped)+buffer_offset,n);}
+                if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-buffer",st,b.binding,element);
+                    // [DOOM] vkBuffer/vkOffset/descType/zc (BUGS_AND_FIXES 2.34): the Vulkan buffer, its (dynamic) offset, the descriptor type
+                    // and whether the buffer is a zero-copy view of an imported guest pool (1) or an arena copy (0).
+                    bool zc_view=false;for(int zi=0,zn=zc::count.load(std::memory_order_acquire);zi<zn;zi++)if(zc::table[zi].buffer==buffer->buffer){zc_view=true;break;}
+                    capture_log("BUFFER label=%s shader=%s nvnStage=%u sourceKind=%u slot=%u guest=%p copied=%zu descriptorBytes=%zu bufferOffset=%zu vkBuffer=%#llx vkOffset=%llu descType=%u zc=%u",label,shader.key.c_str(),ns,b.source,slot,data,copy,n,buffer_offset,
+                        (unsigned long long)(uint64_t)buffer->buffer,(unsigned long long)(buffer->offset+buffer_offset),unsigned(write.descriptorType),unsigned(zc_view));capture_data(label,static_cast<const uint8_t*>(buffer->mapped)+buffer_offset,n);}
             }else{
                 DESC_SCOPE(ImageLookup);
                 bool img_fast=false,img_cacheable=false;ImgKey ikey{};
@@ -5944,6 +6016,21 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     {static const std::string zl=[]{const char *e=getenv("DM_GFX_DEBUG_ZALWAYS");return std::string(e?e:"");}();
      if(!zl.empty() && state.shader[0] && ds.depthTestEnable && zl.find(state.shader[0]->key)!=std::string::npos){ds.depthCompareOp=VK_COMPARE_OP_ALWAYS;
         static std::unordered_set<std::string> told;if(told.insert(state.shader[0]->key).second)xbg_logf("NVN debug: depth test ALWAYS for vs=%s (DM_GFX_DEBUG_ZALWAYS)",state.shader[0]->key.c_str());}}
+    // [DOOM] Debug (DM_GFX_DEBUG_ZWRITE=<vs key>,<vs key>...; with DM_GFX_DEBUG_ZALWAYS): the listed vertex shaders' pipelines also write
+    // depth, so a crop capture (gfx-capture-now) shows the depth the G-buffer draw itself computes next to the pre-pass depth of the
+    // same pixels (tools/capture_zdelta.py; BUGS_AND_FIXES 2.34: EQUAL mismatch by a few ulps vs. geometry that never rasterizes). Later EQUAL draws then test
+    // against these values: a debug view only.
+    if(zwrite_listed() && ds.depthTestEnable && state.rt.depth && !ds.depthWriteEnable){ds.depthWriteEnable=VK_TRUE;
+        static std::unordered_set<std::string> told;if(told.insert(state.shader[0]->key).second)xbg_logf("NVN debug: depth write forced for vs=%s (DM_GFX_DEBUG_ZWRITE)",state.shader[0]->key.c_str());}
+    // [DOOM] Debug (DM_GFX_DEBUG_ZEQ_LE=<vs key>,<vs key>...; DM_GFX_DEBUG_ZEQ_BIAS=<units>, default 0): the listed vertex shaders'
+    // EQUAL-test pipelines without depth write (DOOM's G-buffer after the pre-pass) test LESS_OR_EQUAL, with the constant depth bias
+    // -units (toward the camera; 2^-24 per unit on the D24 stand-in). A G-buffer draw whose own depth is a few units behind the
+    // pre-pass depth (tools/capture_zdelta.py on a DM_GFX_DEBUG_ZWRITE capture) passes again; one that never rasterizes stays missing.
+    {static const std::string zl=[]{const char *e=getenv("DM_GFX_DEBUG_ZEQ_LE");return std::string(e?e:"");}();
+     static const float zb=[]{const char *e=getenv("DM_GFX_DEBUG_ZEQ_BIAS");return e?float(atof(e)):0.0f;}();
+     if(!zl.empty() && state.shader[0] && ds.depthTestEnable && !ds.depthWriteEnable && ds.depthCompareOp==VK_COMPARE_OP_EQUAL && zl.find(state.shader[0]->key)!=std::string::npos){
+        ds.depthCompareOp=VK_COMPARE_OP_LESS_OR_EQUAL;if(zb!=0){rs.depthBiasEnable=VK_TRUE;rs.depthBiasConstantFactor=-zb;rs.depthBiasSlopeFactor=0;rs.depthBiasClamp=0;}
+        static std::unordered_set<std::string> told;if(told.insert(state.shader[0]->key).second)xbg_logf("NVN debug: EQUAL -> LESS_OR_EQUAL bias -%g for vs=%s (DM_GFX_DEBUG_ZEQ_LE / _BIAS)",double(zb),state.shader[0]->key.c_str());}}
     // [nonadreno] depthBounds is 0 on every Mali / PowerVR report: the test is an optimization (light volumes), so it is dropped there
     // instead of stopping the game (was fatal); the pixels it would have rejected are shaded and must fade out on their own.
     if(ds.depthBoundsTestEnable && !cfg.enabled_core.depthBounds){static bool noted=false;if(!noted){noted=true;xbg_logf("NVN depth bounds test requested but depthBounds is not available (Mali / PowerVR): drawn without it");}ds.depthBoundsTestEnable=VK_FALSE;++depth_bounds_dropped;}
@@ -6038,7 +6125,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         open_pass.area_part=area_part;open_pass.area=area;}
     if(lazy_pending)lazy_clear_begin(p,c.command);   // [r3] the pending pass of a lazy clear (same pass and framebuffer): begin it, clears as load ops
     if(state.ds.dt || state.ds.st || state.bounds.enable)open_pass.depth_used=true;
-    if(state.rt.depth && (state.ds.dw || state.ds.st))open_pass.depth_written=true;if(active_colors)open_pass.color_targets=true;
+    if(state.rt.depth && (state.ds.dw || state.ds.st || (state.ds.dt && zwrite_listed())))open_pass.depth_written=true;if(active_colors)open_pass.color_targets=true;   // zwrite: DM_GFX_DEBUG_ZWRITE
     if(new_run){end_occlusion_query();begin_occlusion_query(c.command,occlusion,occlusion_index);}
     BindCache &bc=bind_cache;if(!bind_cache_enabled || bc.cmd!=c.command || pipeline.transient){bc=BindCache{};bc.cmd=c.command;}
     if(bc.pipe!=pipeline.pipeline){vkrec::CmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline.pipeline);bc.pipe=pipeline.pipeline;}else ++binds_skipped;
@@ -6068,10 +6155,23 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         vkrec::CmdBindVertexBuffers(c.command,b.first,1,&b.second->buffer,&off);if(b.first<16){bc.vb[b.first]=b.second->buffer;bc.vbo[b.first]=off;}}
     pass_prof_draw(c.command);
     if(crumbs::active)crumbs::note_draw(crumbs::k64(state.shader[0]),crumbs::k64(state.shader[3]),crumbs::k64(state.shader[4]));   // [DOOM] DM_GFX_CRUMBS
+    // [DOOM] DM_GFX_DRAWPROBE: this draw's own samples-passed query (not while a guest counting run holds the one occlusion query)
+    int probe_q=-1;
+    {Slot &ps_=slots[slot_index];if(ps_.probe && c.command==ps_.cmd && !open_occlusion.cmd && ps_.probe_used<drawprobe_query_limit){
+        Slot::ProbeRec r;r.vs=state.shader[0]?state.shader[0]->key:"-";r.ps=state.shader[4]?state.shader[4]->key:"-";r.count=count;r.instances=indexed?uint32_t(indexed->instances):instances;
+        r.base_vertex=indexed?indexed->base_vertex:first;r.ib=indexed?uint64_t(indexed->ibuf):0;r.vb=bindings.empty()?0:uint64_t(state.vb[bindings[0].binding].address);
+        r.w=p.width;r.h=p.height;r.dt=state.ds.dt;r.dw=state.ds.dw;r.df=state.ds.df;
+        if(state.shader[0])for(auto &b:state.shader[0]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM && b.count==1 && b.slot<16){
+            const auto &u=state.ub[nvn_stage[0]][b.slot];
+            if(b.slot==0 && u.address && u.size>=4){float g;memcpy(&g,reinterpret_cast<const void*>(u.address),4);r.gate=g;}
+            if(b.slot==2){r.c5=uint32_t(u.size);r.c5a=u.address;r.ssbo=bind_ssbo(b)?1u:0u;}}
+        probe_q=int(ps_.probe_used++);ps_.probe_recs.push_back(std::move(r));
+        vkrec::CmdBeginQuery(c.command,ps_.probe_pool,uint32_t(probe_q),VK_QUERY_CONTROL_PRECISE_BIT);}}
     if(indexed){if(bc.ib!=ib->buffer || bc.ibo!=ib->offset || bc.it!=index_type){vkrec::CmdBindIndexBuffer(c.command,ib->buffer,ib->offset,index_type);bc.ib=ib->buffer;bc.ibo=ib->offset;bc.it=index_type;}else ++binds_skipped;if(gi){if(gi->count)draw_indexed_indirect_count(c.command,gi->args->buffer,gi->args->offset,gi->count->buffer,gi->count->offset,gi->max_count,gi->stride);else vkrec::CmdDrawIndexedIndirect(c.command,gi->args->buffer,gi->args->offset,1,gi->stride);}
         else vkrec::CmdDrawIndexed(c.command,count,indexed->instances,0,indexed->base_vertex,indexed->base_instance);}
     else if(gi){if(gi->count)draw_indirect_count(c.command,gi->args->buffer,gi->args->offset,gi->count->buffer,gi->count->offset,gi->max_count,gi->stride);else vkrec::CmdDrawIndirect(c.command,gi->args->buffer,gi->args->offset,1,gi->stride);}
     else vkrec::CmdDraw(c.command,count,instances,first,first_instance);
+    if(probe_q>=0)vkrec::CmdEndQuery(c.command,slots[slot_index].probe_pool,uint32_t(probe_q));   // [DOOM] DM_GFX_DRAWPROBE
     DRAW_MARK(6);   // [perf4] section boundary (DM_GFX_DRAW_PROFILE): time since the previous mark goes to section 6-1
     mark_storage_images();
     for(unsigned st=0;st<5 && !storage_image_draw;st++)if(state.shader[st])for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE){storage_image_draw=true;break;}

@@ -354,6 +354,18 @@ available` и `dm-vulkan [wide] live: centre 16:9 crop`; картинка сра
 table`); включить — во весь экран без перезапуска. (3) Без `DM_DOOM_WIDE_LIVE`: тост «со следующего запуска», поведение как раньше.
 Смотреть меню, паузу, заставки, загрузочные экраны в обоих режимах; FPS в режиме «выкл» сравнить со старым 1280×720.
 
+### 2.36 v0.4.17 не запускается на Mali-G615: clip-fix писал в ClipDistance/CullDistance, которых у устройства нет (issue #25, POCO X6 Pro / MT6897, 07.11; исправлено в v0.4.18-test2)
+- **Симптом.** v0.4.16 запускалась, v0.4.17 вылетает сразу после `nnMain`, кадра нет. В crash.txt нет нашей строки `CRASH`, только logcat:
+  `Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x40` в безымянном потоке, созданном за миг до этого (как и соседний, он пишет
+  `get api level success, 34`) — поток драйвера, а не наш.
+- **Причина (по логу).** `gpu 0 features: … clip 0 cull 0`, `NVN clip/cull distance fix=auto (… maxCombinedClipAndCullDistances=0)`, сразу
+  `clip/cull distances shrunk to one and zeroed in 456a4f9a72cd3414`. Режим auto сравнивал 9 с лимитом 0 и переписывал модули: нулевые записи
+  в `ClipDistance`/`CullDistance` на устройстве без этих возможностей. В v0.4.16 массивы только объявлены, ничего в них не пишется, и драйвер
+  Mali их выбрасывал.
+- **Исправление.** auto включается только при `shaderClipDistance` и `shaderCullDistance` и лимите ≥ 2; иначе модуль не трогается, как в
+  v0.4.16. `DM_GFX_CLIP_FIX=1` по-прежнему форсирует. Лог: `NVN clip/cull distance fix=off (DM_GFX_CLIP_FIX=auto; device clip 0 cull 0 …)`.
+  На Adreno (`clip 1 cull 1`, лимит 8) поведение прежнее. На Mali не проверено (устройства нет).
+
 ## 3. Производительность (Mi 14 Ultra, 720p)
 
 | Этап | Результат |
@@ -1536,6 +1548,13 @@ TIMEOUT), WSL gcc, 15 проверок зелёные: слово сессии �
   рисует и тела, и дверь, и плиты пола. В теневых draw индексы костей ровно укладываются в привязанный `c5` (max = костей−1).
   Следующий тест: `DM_VK_ROBUST=0` (устройство без robustBufferAccess) и захват со входами на G-buffer-draw двери.
   Инструменты: `DM_GFX_BONES_SSBO_ONLY`/`_SKIP` (по ключам модулей), `DM_GFX_BONES_SSBO_LOG=1` (все переписанные модули).
+- **Офлайн-разбор захватов (07.11).** Поломка привязана к паре «модуль + вариант», а не к данным draw. При UBO ломается `97106c2f415fb619`
+  (монстры, руки view-model), при SSBO ломается `0a2486a44cd37021` (дверь, плиты пола, ствол view-model). Плиты пропадают при gate = 0
+  (`vp_c3[0].x`), когда кости вообще не читаются, поэтому версии про значения, индексы и диапазон костей отпадают. Позиции pre-pass и G-buffer
+  в нашем SPIR-V совпадают по выражениям (`fc05bdb8` ≡ `0a2486a4`, `badf12d9` ≡ `97106c2f`), так что расхождение возникает в компиляторе
+  драйвера. В режиме захвата каждый draw идёт в своём проходе, и пропадание остаётся. Инструменты для теста на телефоне: `DM_GFX_DRAWPROBE`
+  и маркер `gfx-drawprobe-now` (occlusion-счёт сэмплов каждого draw), `DM_GFX_DEBUG_ZWRITE`, `DM_GFX_DEBUG_ZEQ_LE`/`_BIAS`,
+  `DM_GFX_BONES_SSBO_NODYN`/`_COPY`/`_PAD`; разбор — `tools/drawprobe_report.py`, `tools/capture_zdelta.py`.
 ### 2.35 «fault loop» в `write_texels` на переходе уровня: dma-buf VMA упираются в `vm.max_map_count` (issue #21, POCO F7 SD 8s Gen 4 / Adreno 825, Turnip; Galaxy S24; 07.11; тестовая сборка v0.4.18-test1; перемап проверен на Mi 14, переход уровня — нет)
 
 - **Симптом.** Вылет на переходе к следующему уровню (кампания, испытания рун), ~23 мин игры. crash.txt (v0.4.16): `【红】fault loop: 20000 identical faults
