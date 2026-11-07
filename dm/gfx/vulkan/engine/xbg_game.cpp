@@ -2439,6 +2439,7 @@ struct Image {
     VkImageUsageFlags lean_dropped=0;uint8_t afbc_state=0;
     bool subst=false;int64_t subst_bytes=0;   // [nonadreno] ASTC overlay: created in the substitute format of its BC format (bc_store BC_SUBST), blocks uploaded as they are
     bool subst_cpu=false;   // [nonadreno] 2.37 DM_GFX_ASTC_CPU: a substitute decoded on the CPU into the BC path's uncompressed format (decoded=true)
+    bool bc_drop=false;     // [nonadreno] 2.37 DM_GFX_BC_SERIAL=<serial>=drop: decoded, every upload replaced by zero blocks
        // [DOOM] storage-only images (VT feedback) need no barrier between draws
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;int64_t mem_bytes=0,bc_bytes=0,bc_data=0,dec_bytes=0,dec_native=0;bool bc_first_done=false;   // dec_*: decoded BC (decoded_bytes_live); bc_first_done: first full upload counted (bct_first_*)
     // 最近一次经 get_image 取用时的 slot_serial：等于当前值，说明这次提交里已有命令用过它（gfx-upload-prologue 据此判断能否提前上传）。
@@ -3095,8 +3096,20 @@ void astc_ov_note(const tex_t *t,uint32_t layers,const char *kept,VkFormat vf){
 // run to run (25 transSort atlas BC5, 26 light atlas BC4, 27 decal atlas BC7, 94 probe array BC6H). Wrong if the image holds overlay
 // blocks (they then read as BC: garbage in that texture); right if the game fills it with real BC itself.
 std::vector<uint64_t> astc_keep_serials;
+// [nonadreno] 2.37 DM_GFX_BC_SERIAL=<serial>=<mode>[,...] (bisection; default none): how one BC texture is stored, whatever the
+// policy: decode (GPU / CPU BC decode, BC_DECODED), native (real BC when the device samples it, even under DM_GFX_SIM_GPU=nobc),
+// subst (the overlay's substitute format, past the keep rules: only when that format is substituted), drop (decoded, but every
+// upload replaced by zero blocks: the texture reads black / zero). Serials of the early textures are stable from run to run
+// (94 probe array, 103 VT cache BC3, 1848 / 1880 VT caches BC6H). grep "NVN bc serial".
+enum { BCS_DECODE = 1, BCS_NATIVE, BCS_SUBST, BCS_DROP };
+std::unordered_map<uint64_t,int> bc_serial_mode;
+int bc_serial(const tex_t *t){if(bc_serial_mode.empty())return 0;auto it=bc_serial_mode.find(t->serial);return it==bc_serial_mode.end()?0:it->second;}
 VkFormat astc_ov_format(const tex_t *t,uint32_t layers,const char **kept){
     *kept=nullptr;if(!astc_ov_mask)return VK_FORMAT_UNDEFINED;
+    if(bc_serial(t)==BCS_SUBST && (astc_ov_mask&xbg_astc_format_bit(t->d.format))){const VkFormat f=xbg_astc_substitute_format(t->d.format);
+        VkFormatProperties fp;vkGetPhysicalDeviceFormatProperties(cfg.physical,f,&fp);
+        if((fp.optimalTilingFeatures&(VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT))==(VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT))return f;}
+    if(bc_serial(t) && bc_serial(t)!=BCS_SUBST){*kept="bc-serial";return VK_FORMAT_UNDEFINED;}
     for(uint64_t k:astc_keep_serials)if(k==t->serial && xbg_astc_format_bit(t->d.format) && (astc_ov_mask&xbg_astc_format_bit(t->d.format))){*kept="keep-serial";return VK_FORMAT_UNDEFINED;}
     const char *why=nullptr;const VkFormat vf=xbg_astc_texture_format(astc_ov_mask,t->d.format,t->d.target,t->d.width,t->d.height,t->d.levels,layers,&why);
     if(vf==VK_FORMAT_UNDEFINED){if(why && strcmp(why,"format"))*kept=why;return vf;}
@@ -3200,6 +3213,15 @@ void astc_sanitize_upload(const Image &im,const tex_t *t,uint8_t *p,size_t bytes
 }
 BcStore bc_store(const tex_t *t,VkSampleCountFlagBits samples){
     xbg_bc_format info;if(xbg_bc_format_info(t->d.format,&info))return BC_NOT;
+    if(const int m=bc_serial(t)){   // [nonadreno] 2.37 DM_GFX_BC_SERIAL
+        BcStore r=BC_DECODED;const char *why="decode";
+        if(m==BCS_SUBST && astc_ov_mask && samples==VK_SAMPLE_COUNT_1_BIT){const char *kept=nullptr;if(astc_ov_format(t,t->L.layers,&kept)!=VK_FORMAT_UNDEFINED){r=BC_SUBST;why="subst";}else why="subst impossible (format not substituted / unsupported): decode";}
+        else if(m==BCS_NATIVE && samples==VK_SAMPLE_COUNT_1_BIT){const VkFormatFeatureFlags need_bc=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+            VkFormatProperties np;vkGetPhysicalDeviceFormatProperties(cfg.physical,format(t->d.format),&np);if((np.optimalTilingFeatures&need_bc)==need_bc){r=BC_NATIVE;why="native";}else why="native impossible (no device BC): decode";}
+        else if(m==BCS_DROP)why="drop (decoded, uploads zeroed)";
+        xbg_logf("NVN bc serial: serial=%llu fmt=%#x %ux%u levels=%u layers=%u target=%d -> %s (DM_GFX_BC_SERIAL)",(unsigned long long)t->serial,t->d.format,t->d.width,t->d.height,t->d.levels,t->L.layers,t->d.target,why);
+        if(r==BC_DECODED)bc_decode_init();
+        return r;}
     if(astc_ov_mask && samples==VK_SAMPLE_COUNT_1_BIT){const char *kept=nullptr;if(astc_ov_format(t,t->L.layers,&kept)!=VK_FORMAT_UNDEFINED)return BC_SUBST;}
     if(native_bc && samples==VK_SAMPLE_COUNT_1_BIT){const VkFormatFeatureFlags need_bc=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         VkFormatProperties np;vkGetPhysicalDeviceFormatProperties(cfg.physical,format(t->d.format),&np);if((np.optimalTilingFeatures&need_bc)==need_bc)return BC_NATIVE;}
@@ -3232,6 +3254,33 @@ void astc_subst_decode_linear(uint32_t fmt,uint32_t nbx,uint32_t nby,uint32_t nz
                 if(eight)o[c]=uint8_t((v*255u+1023u)/2047u);else{const uint16_t w=uint16_t((v*65535u+1023u)/2047u);memcpy(o+2*c,&w,2);}}}
     }
 }
+// [nonadreno] 2.37 BC census: while an overlay is mounted, does a texture on the BC path (decoded or native) receive the overlay's
+// re-encoded blocks? Then they are read as BC: garbage (BC6H: HDR garbage), and on the decode path not necessarily the same garbage
+// as on native BC hardware. 16-byte formats (BC3 / BC5 / BC6H / BC7): a non-zero block that is a valid ASTC block (LDR predicate;
+// BC6H also the HDR one) is overlay-like; real BC3 / BC7 blocks are valid ASTC in 1.4 % / 0.5 % of cases (tools/astc_ldr_scan.cpp
+// on the RomFS), the overlay's ASTC in 100 %. BC5 also and BC4 only: xbg_eac_vs_bc4 per 8-byte half (EAC-like = overlay-like;
+// real BC4 / BC5 0.4 %, the overlay's EAC 99.6 % of decided halves). BC1 is never converted: not counted. One line per image at its
+// first full upload, and when its overlay-like count reaches 1, 2, 4, ... with a share above 10 % (at most 96 lines):
+// grep "NVN bc census".
+struct BcCensus{uint64_t blocks=0,zero=0,overlay=0,real=0;unsigned logged=0;bool first=true;};std::unordered_map<uint64_t,BcCensus> bc_census;uint64_t bc_census_overlay=0,bc_census_blocks=0;
+void bc_census_upload(const Image &im,const tex_t *t,const uint8_t *p,size_t bytes,const char *path){
+    if(!astc_ov_mask || im.subst || im.subst_cpu)return;
+    const uint32_t f=t->d.format;if(f<0x43 || f>0x50 || f==0x45 || f==0x46)return;   // BC1 (0x41 0x42 0x45 0x46) is never converted
+    int bw=4,bh=4;const size_t bb=size_t(nvn_fmt_bpb(f,&bw,&bh));if(bb!=8 && bb!=16)return;
+    BcCensus &c=bc_census[t->serial];uint64_t ov=0,real=0,zero=0;
+    for(size_t at=0;at+bb<=bytes;at+=bb){uint64_t lo,hi=0;memcpy(&lo,p+at,8);if(bb==16)memcpy(&hi,p+at+8,8);if(!(lo|hi)){++zero;continue;}
+        if(f==0x49 || f==0x4a || f==0x4b || f==0x4c){for(size_t h=0;h<bb;h+=8){const int v=xbg_eac_vs_bc4(p+at+h);if(v>0)++ov;else if(v<0)++real;}continue;}
+        const bool valid=!xbg_astc_block_error(p+at,0) || ((f==0x4f || f==0x50) && !xbg_astc_block_error(p+at,1));
+        if(valid)++ov;else ++real;}
+    c.blocks+=bytes/bb;c.zero+=zero;c.overlay+=ov;c.real+=real;bc_census_blocks+=bytes/bb;bc_census_overlay+=ov;
+    const double share=c.overlay+c.real?double(c.overlay)/double(c.overlay+c.real):0.0;
+    unsigned k=0;for(uint64_t v=c.overlay;v>1;v>>=1)++k;
+    const bool full=strcmp(path,"partial")!=0;static unsigned lines=0;
+    if(lines<96 && ((ov && share>0.10 && k>=c.logged) || (full && c.first))){if(ov && share>0.10 && k>=c.logged)c.logged=k+1;if(full)c.first=false;++lines;
+        xbg_logf("NVN bc census: serial=%llu fmt=%#x %ux%u layers=%u levels=%u target=%d %s %s upload: %llu overlay-like / %llu real-BC-like of %zu blocks here; image total blocks=%llu zero=%llu overlay-like=%llu real=%llu -> %s (overlay-like share %.1f%%; real BC ~0.5-1.5%%)",
+            (unsigned long long)t->serial,f,im.width,im.height,im.layers,im.levels,t->d.target,im.decoded?"decoded":"native",path,(unsigned long long)ov,(unsigned long long)real,bytes/bb,
+            (unsigned long long)c.blocks,(unsigned long long)c.zero,(unsigned long long)c.overlay,(unsigned long long)c.real,share>0.5?"OVERLAY DATA IN A BC TEXTURE":share>0.10?"mixed: some overlay data":"real BC",100*share);}
+}
 struct BcUpload {
     Image &im;const tex_t *t;bool pro;int mode=0;   // pro: batches go to the slot's prologue; mode 0 copy as is, 1 CPU decode, 2 GPU decode
     bool partial=false;   // dirty GOB blocks (partial_upload), for the DM_GFX_BC_VERIFY log
@@ -3250,6 +3299,8 @@ struct BcUpload {
     // cache hashes `raw` here (content key) and either substitutes cached ASTC blocks or queues this rectangle for encoding.
     void blocks(uint32_t level,uint32_t layer,const uint8_t *raw,uint32_t nbx,uint32_t nby,uint32_t nz,int32_t x,int32_t y,int32_t z,uint32_t w,uint32_t h,uint32_t d){
         const size_t n=size_t(nbx)*nby*nz,raw_n=n*block_bytes,out_n=mode?n*16*bpp:raw_n;
+        if(im.decoded && !im.subst_cpu)bc_census_upload(im,t,raw,raw_n,partial?"partial":"full");   // [nonadreno] 2.37
+        static std::vector<uint8_t> zeros;if(im.bc_drop){if(zeros.size()<raw_n)zeros.assign(raw_n,0);raw=zeros.data();}   // DM_GFX_BC_SERIAL drop
         raw_bytes+=raw_n;if(mode)out_bytes+=out_n;++rects;
         VkBufferImageCopy c{};c.imageSubresource={im.aspects,level,layer,1};c.imageOffset={x,y,z};c.imageExtent={w,h,d};
         c.bufferRowLength=nbx*(mode?4:bw);c.bufferImageHeight=nby*(mode?4:bh);
@@ -3382,7 +3433,8 @@ bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
                 memcpy(linear.data()+at+(size_t(z)*ny+y)*xb+x,t->mem+base+nvn_bl_offset(x0+x,y0+y,z0+z,row_bytes,rows,th,td),n);}
             if(r5_deswz==2){static std::vector<uint8_t> cmp;cmp.resize(size_t(xb)*ny*nz);nvn_deswizzle_gob_block(bl,th,xb,ny,nz,cmp.data());++r5_dz_cmp;   // [r5] compare: the old bytes are used
                 if(memcmp(cmp.data(),linear.data()+at,cmp.size())){++r5_dz_mism;if(r5_dz_mism<=16)xbg_logf("NVN r5 deswz MISMATCH partial serial=%llu fmt=%#x level=%u layer=%u block=%u,%u,%u th=%u td=%u",(unsigned long long)t->serial,t->d.format,level,layer,bx,by,bz,th,td);}}}
-            if(im.subst)astc_sanitize_upload(im,t,linear.data()+at,size_t(xb)*ny*nz,"partial");   // [nonadreno] ASTC HDR error blocks (2.37)
+            if(im.subst)astc_sanitize_upload(im,t,linear.data()+at,size_t(xb)*ny*nz,"partial");
+            else if(!bc)bc_census_upload(im,t,linear.data()+at,size_t(xb)*ny*nz,"partial");   // [nonadreno] 2.37 native BC census (decoded: in BcUpload)   // [nonadreno] ASTC HDR error blocks (2.37)
             VkBufferImageCopy c{};c.bufferOffset=at;c.bufferRowLength=(xb/bpb)*bw;c.bufferImageHeight=ny*bh;
             c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,level,layer,1};
             c.imageOffset={int32_t((x0/bpb)*bw),int32_t(y0*bh),int32_t(z0)};
@@ -3446,6 +3498,7 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         // BC4/BC5 decode to 8-bit channels so linear-filtered samplers stay valid.
         {static int bc8=-1;if(bc8<0){VkFormatProperties q;vkGetPhysicalDeviceFormatProperties(cfg.physical,VK_FORMAT_R16G16_UNORM,&q);bc8=!(q.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);if(bc8)xbg_logf("NVN caps bc 8bit: R16G16_UNORM optimalFeatures=%#x lacks SAMPLED_IMAGE_FILTER_LINEAR",q.optimalTilingFeatures);}if(bc8)xbg_bc_8bit_channels=1;}
         const BcStore store=bc_store(t,p->samples);p->decoded=store==BC_DECODED;p->subst=store==BC_SUBST;   // [nonadreno] issue #6: the one decision point
+        if(p->decoded && bc_serial(t)==BCS_DROP)p->bc_drop=true;   // [nonadreno] 2.37 DM_GFX_BC_SERIAL=…=drop
         if(p->subst && (astc_cpu_mask&xbg_astc_format_bit(t->d.format))){   // [nonadreno] 2.37 DM_GFX_ASTC_CPU: the substitute's blocks decoded on the CPU
             bc_decode_init();p->subst=false;p->decoded=true;p->subst_cpu=true;
             static unsigned told=0;if(told++<16)xbg_logf("NVN astc cpu: serial=%llu fmt=%#x %ux%u levels=%u layers=%u target=%d: substitute decoded on the CPU into the BC path's format (DM_GFX_ASTC_CPU)",
@@ -3557,9 +3610,14 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);subs.push_back({level,layer,pitch});}
             staging=stream_buffer(total,nullptr,0,false);uint8_t *dst=static_cast<uint8_t*>(staging.mapped);
             for(size_t i=0;i<subs.size();i++)need(nvn_deswizzle_gob(&t->d,subs[i].level,subs[i].layer,t->mem,dst+copies[i].bufferOffset,subs[i].pitch)==0,"Texture deswizzle failed");
-            if(im.subst && im.fmt==VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK)for(size_t i=0;i<subs.size();i++){const size_t end=i+1<subs.size()?copies[i+1].bufferOffset:total;   // [nonadreno] ASTC HDR error blocks (2.37)
+            // [nonadreno] ASTC HDR and LDR error / all-zero blocks (2.37): every substitute, not only HDR. 07.11: the decal atlas
+            // (serial 27, BC7 -> ASTC, ~85% never-written) takes this path on its full upload; sanitizing only its partial uploads
+            // left the white glows / Mali black squares near bright lights (issue #28 on 0.4.19, Mi 14 with DM_GFX_SIM_GPU=nobc).
+            if(im.subst && (im.fmt==VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK || im.fmt==VK_FORMAT_ASTC_4x4_UNORM_BLOCK || im.fmt==VK_FORMAT_ASTC_4x4_SRGB_BLOCK))
+                for(size_t i=0;i<subs.size();i++){const size_t end=i+1<subs.size()?copies[i+1].bufferOffset:total;
                 astc_sanitize_upload(im,t,dst+copies[i].bufferOffset,(end-copies[i].bufferOffset)&~size_t(15),"full");}
-            else if(im.subst)astc_census_upload(im,t,reinterpret_cast<const uint8_t*>(t->mem),size_t(t->L.size)&~size_t(15),"full");   // LDR census: the guest copy (cached), not the mapped staging
+            else if(im.subst)astc_census_upload(im,t,reinterpret_cast<const uint8_t*>(t->mem),size_t(t->L.size)&~size_t(15),"full");
+            else bc_census_upload(im,t,reinterpret_cast<const uint8_t*>(t->mem),size_t(t->L.size)&~size_t(15),"full");   // [nonadreno] 2.37 native BC census   // LDR census: the guest copy (cached), not the mapped staging
             staging.flush();for(auto &copy:copies)copy.bufferOffset+=staging.offset;up_bytes=total;
         }else{
         auto dz_cmp=[&](uint32_t level,uint32_t layer,const uint8_t *old,size_t n,size_t pitch){   // [r5] DM_GFX_DESWZ_DIRECT=2
@@ -3580,6 +3638,7 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 uint32_t bx=(w+cbw-1)/cbw,by=(h+cbh-1)/cbh;linear.resize(begin+size_t(bx)*by*depth*im.bpp);
                 need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(bx)*im.bpp)==0,"Compressed texture deswizzle failed");
                 astc_sanitize_upload(im,t,linear.data()+begin,size_t(bx)*by*depth*im.bpp,"full");   // [nonadreno] ASTC HDR error blocks (2.37)
+                if(!im.subst)bc_census_upload(im,t,linear.data()+begin,size_t(bx)*by*depth*im.bpp,"full");   // [nonadreno] 2.37 native BC census
                 if(r5_deswz==2)dz_cmp(level,layer,linear.data()+begin,size_t(bx)*by*depth*im.bpp,size_t(bx)*im.bpp);
                 VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);continue;}
             linear.resize(begin+size_t(w)*h*depth*im.bpp);
@@ -7610,6 +7669,11 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      {FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-tex-dirty").c_str(),"rb");tex_dirty=false;if(v){tex_dirty=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_TEX_DIRTY"))tex_dirty=atoi(e)!=0;
       xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}
      {astc_ov_mask=xbg_astc_formats_mask(getenv("DM_GFX_ASTC_FORMATS"));astc_cpu_mask=astc_ov_mask?xbg_astc_formats_mask(getenv("DM_GFX_ASTC_CPU"))&astc_ov_mask&~uint32_t(XBG_AO_BC6H|XBG_AO_BC1):0;
+      if(const char *bs=getenv("DM_GFX_BC_SERIAL")){std::string list;   // [nonadreno] 2.37 "103=drop,1848=native"
+        for(const char *q=bs;*q;){char *e=nullptr;const unsigned long long v=strtoull(q,&e,10);if(e==q){++q;continue;}q=e;if(*q!='='){continue;}++q;
+            int m=!strncmp(q,"decode",6)?BCS_DECODE:!strncmp(q,"native",6)?BCS_NATIVE:!strncmp(q,"subst",5)?BCS_SUBST:!strncmp(q,"drop",4)?BCS_DROP:0;
+            while(*q && *q!=',' && *q!=' ')++q;if(m){bc_serial_mode[v]=m;list+=" "+std::to_string(v)+"="+(m==BCS_DECODE?"decode":m==BCS_NATIVE?"native":m==BCS_SUBST?"subst":"drop");}}
+        if(!list.empty())xbg_logf("NVN bc serial: DM_GFX_BC_SERIAL%s",list.c_str());}
       if(astc_ov_mask)if(const char *ks=getenv("DM_GFX_ASTC_KEEP")){std::string list;for(const char *q=ks;*q;){char *e=nullptr;const unsigned long long v=strtoull(q,&e,10);if(e==q){++q;continue;}astc_keep_serials.push_back(v);list+=" "+std::to_string(v);q=e;}
         if(!list.empty())xbg_logf("NVN astc overlay: DM_GFX_ASTC_KEEP serials kept on the BC path:%s",list.c_str());}
       if(astc_cpu_mask){char cm[64];xbg_astc_formats_str(astc_cpu_mask,cm,sizeof cm);xbg_logf("NVN astc cpu: substitutes of %s decoded on the CPU into the BC path's uncompressed formats (DM_GFX_ASTC_CPU, bisection)",cm);}   // [nonadreno] ASTC overlay: set by the boot choice (vulkan_present.cpp) only when mounted

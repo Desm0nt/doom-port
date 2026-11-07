@@ -53,7 +53,8 @@ int main(int argc, char **argv) {
     if (!rd(magic, 4) || memcmp(magic, "AHL1", 4)) { fprintf(stderr, "bad stream\n"); return 2; }
     static const char *names[5] = {"?", "bc3->astc", "bc4->eac_r11", "bc5->eac_rg11", "bc7->astc"};
     Stat fmt[5]; uint64_t textures[5] = {}, errblocks[5] = {};
-    uint64_t disc[2][3] = {};   // [substitute EAC / source BC4][bc4-like, undecided, eac-like]
+    uint64_t disc[2][3] = {};
+    uint64_t bcval[2][2] = {};   // [bc3 / bc7 source][invalid, valid] as ASTC LDR   // [substitute EAC / source BC4][bc4-like, undecided, eac-like]
     struct Tex { double psnr; float maxerr; int code; std::string name; double mean[4]; };
     std::vector<Tex> worst;
     std::vector<uint8_t> src, sub, rgba;
@@ -72,6 +73,10 @@ int main(int argc, char **argv) {
             for (uint32_t i = 0; i < nb; i++) {
                 const uint32_t bx = i % bw, by = i / bw;
                 if (code == 1 || code == 4) {
+                    {   // the BC-path census calibration: how often is a real BC3 / BC7 block (non-zero) a valid ASTC LDR block?
+                        uint64_t lo, hi; memcpy(&lo, &src[i * 16], 8); memcpy(&hi, &src[i * 16 + 8], 8);
+                        if (lo | hi) { ++bcval[code == 1 ? 0 : 1][xbg_astc_block_error(&src[i * 16], 0) ? 0 : 1]; }
+                    }
                     uint16_t px[64]; AstcRefInfo info; astcref::decode_block(&sub[i * 16], 4, 4, 0, px, &info);
                     if (info.error) ++errblocks[code];
                     for (int tx = 0; tx < 16; tx++) {
@@ -108,6 +113,9 @@ int main(int argc, char **argv) {
     if (disc[0][0] + disc[0][1] + disc[0][2])
         printf("EAC census discriminator (xbg_eac_vs_bc4): EAC substitute halves: eac-like %llu, bc4-like %llu, undecided %llu; their BC4 source halves: eac-like %llu, bc4-like %llu, undecided %llu\n",
                (unsigned long long)disc[0][2], (unsigned long long)disc[0][0], (unsigned long long)disc[0][1], (unsigned long long)disc[1][2], (unsigned long long)disc[1][0], (unsigned long long)disc[1][1]);
+    if (bcval[0][0] + bcval[0][1] + bcval[1][0] + bcval[1][1])
+        printf("BC-path census calibration: real BC3 blocks valid as ASTC LDR %llu of %llu, real BC7 %llu of %llu (the overlay's ASTC: all)\n",
+               (unsigned long long)bcval[0][1], (unsigned long long)(bcval[0][0] + bcval[0][1]), (unsigned long long)bcval[1][1], (unsigned long long)(bcval[1][0] + bcval[1][1]));
     std::sort(worst.begin(), worst.end(), [](const Tex &a, const Tex &b) { return a.psnr < b.psnr; });
     printf("worst textures:\n");
     for (int i = 0; i < show && i < int(worst.size()); i++)
