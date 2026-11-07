@@ -110,6 +110,47 @@ inline bool xbg_env_or(const char *environment,bool fallback){
     return fallback;
 }
 
+// A level switch ("0" .. "hi" from the environment, clamped to lo..hi) or the family default.
+inline int xbg_env_level(const char *environment,int fallback,int lo,int hi){
+    int v=environment && *environment?atoi(environment):fallback;
+    return v<lo?lo:v>hi?hi:v;
+}
+
+// [pvr] DM_GFX_FENCE_GUARD (BUGS_AND_FIXES 2.38). The PowerVR B-Series 1.15 driver (moto g64, BXM-8-256, 07.11) returned VK_TIMEOUT
+// from the pool-reset worker's vkWaitForFences 1 ms after its own sync_wait failed with EINVAL ("PVRSRVFenceWaitI ... 22 Invalid
+// argument": the fence's sync file descriptor was not valid any more), while the translation thread's wait on the same fence then
+// succeeded: a fence shared by threads, not a GPU hang. Our side touched slot fences from three threads, one of them in a Vulkan race
+// (vkGetFenceStatus of a fence the record thread was passing to vkQueueSubmit, whose fence is externally synchronized). Level 1: no
+// slot fence access before its SUBMIT ran; 2: also one thread at a time, waits poll vkGetFenceStatus. 2 on PowerVR, 0 elsewhere.
+inline int xbg_fence_guard_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR?2:0;}
+// DM_GFX_CRUMBS family default: GPU progress markers on PowerVR (1), where no run has worked yet, so the next hang log names the pass /
+// dispatch the GPU was in. Costs a barrier + fill per pass end; DM_GFX_CRUMBS=0 turns it off. Off elsewhere.
+inline int xbg_crumbs_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR?1:0;}
+// A fence wait that came back VK_TIMEOUT well before its timeout: the driver gave up (a fence error), the GPU did not run the whole time.
+// Only for timeouts of 100 ms and more (a short or zero timeout is a poll).
+inline bool xbg_fence_wait_early(VkResult r,uint64_t waited_ns,uint64_t timeout_ns){
+    return r==VK_TIMEOUT && timeout_ns>=100000000ull && waited_ns<timeout_ns/2;
+}
+// Back-off of a polled fence wait: n-th status check -> microseconds to sleep before the next (0 = just yield). 16 yields, then 10 us
+// more per check up to 200 us: a polled wait ends at most ~0.2 ms after the fence signals.
+inline unsigned xbg_fence_pause_us(uint64_t n){
+    if(n<=16)return 0;
+    const uint64_t us=(n-16)*10;
+    return us>200?200u:unsigned(us);
+}
+// A fence wait made of status checks: status() -> VK_SUCCESS / VK_NOT_READY / an error, now() -> ns, pause(n) between checks.
+// Returns VK_SUCCESS, the error, or VK_TIMEOUT once timeout_ns has passed (timeout 0: one check, as vkWaitForFences with 0).
+template<class Status,class Now,class Pause>
+inline VkResult xbg_fence_poll(Status status,Now now,Pause pause,uint64_t timeout_ns,uint64_t *checks){
+    const uint64_t t0=now();uint64_t n=0;
+    for(;;){
+        const VkResult r=status();++n;
+        if(r!=VK_NOT_READY){if(checks)*checks=n;return r;}
+        if(now()-t0>=timeout_ns){if(checks)*checks=n;return VK_TIMEOUT;}
+        pause(n);
+    }
+}
+
 // Zero-copy guest memory (AHardwareBuffer BLOB pages imported as VkBuffer memory, CPU-cached pages read by the GPU through IO
 // coherency) was proven only on Adreno (work/zc_test). Elsewhere the copy path is the default: a GPU that does not snoop the CPU
 // caches would read stale vertices / uniforms (Arm documents ACE-Lite only for some SoCs). DM_GFX_ZEROCOPY=1 forces it on.

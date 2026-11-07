@@ -1,0 +1,41 @@
+#version 450
+// [nonadreno] ASTC 4x4 HDR self-test (xbg_astc_hdr.h, xbg_astc_hdr_vk.h; docs/BUGS_AND_FIXES.md 2.37): one query per invocation,
+// the sampled RGBA written as float. Query = (x, y, layer, level | kind << 8):
+//   kind 0: texelFetch through the 2D array view (the decoder alone)
+//   kind 1: textureLod through the cube array view, direction to the centre of texel (x, y) of face layer % 6 of cube layer / 6
+//           (Vulkan cube face selection: +X -X +Y -Y +Z -Z), NEAREST sampler
+//   kind 2: textureLod through the 2D array view with a LINEAR sampler at the corner (x, y) between four texels
+// Regenerate xbg_astc_hdr_selftest_spv.h after editing (the command is at the top of that file).
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) uniform samplerCubeArray cube_nearest;
+layout(set = 0, binding = 1) uniform sampler2DArray flat_nearest;
+layout(set = 0, binding = 2) uniform sampler2DArray flat_linear;
+layout(set = 0, binding = 3, std430) readonly buffer Queries { uvec4 q[]; };
+layout(set = 0, binding = 4, std430) writeonly buffer Results { vec4 r[]; };
+layout(push_constant) uniform Push { uint count; uint size; } pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) return;
+    uvec4 a = q[i];
+    uint level = a.w & 0xffu, kind = a.w >> 8;
+    float dim = float(max(pc.size >> level, 1u));
+    vec4 v;
+    if (kind == 0u) {
+        v = texelFetch(flat_nearest, ivec3(a.xyz), int(level));
+    } else if (kind == 1u) {
+        float u = 2.0 * (float(a.x) + 0.5) / dim - 1.0, w = 2.0 * (float(a.y) + 0.5) / dim - 1.0;
+        uint face = a.z % 6u;
+        vec3 d;
+        if (face == 0u) d = vec3(1.0, -w, -u);
+        else if (face == 1u) d = vec3(-1.0, -w, u);
+        else if (face == 2u) d = vec3(u, 1.0, w);
+        else if (face == 3u) d = vec3(u, -1.0, -w);
+        else if (face == 4u) d = vec3(u, -w, 1.0);
+        else d = vec3(-u, -w, -1.0);
+        v = textureLod(cube_nearest, vec4(d, float(a.z / 6u)), float(level));
+    } else {
+        v = textureLod(flat_linear, vec3(vec2(a.xy) / dim, float(a.z)), float(level));
+    }
+    r[i] = v;
+}

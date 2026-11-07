@@ -169,6 +169,40 @@ int main(){
      CHECK(!xbg_store_twin(e,1,0,0,VK_ATTACHMENT_STORE_OP_NONE,false) && e[0].storeOp==VK_ATTACHMENT_STORE_OP_STORE);
      CHECK(xbg_store_twin(e,1,2u,0,VK_ATTACHMENT_STORE_OP_NONE,false)==false);}   // a stencil bit on a colour attachment changes nothing
 
+    // [pvr] DM_GFX_FENCE_GUARD / DM_GFX_CRUMBS family defaults (BUGS_AND_FIXES 2.38): PowerVR only; Adreno and Mali keep 0.
+    CHECK(xbg_fence_guard_default(XBG_GPU_POWERVR)==2);
+    for(XbgGpuFamily f:{XBG_GPU_ADRENO,XBG_GPU_MALI,XBG_GPU_XCLIPSE,XBG_GPU_MALEOON,XBG_GPU_OTHER}){CHECK(xbg_fence_guard_default(f)==0);CHECK(xbg_crumbs_default(f)==0);}
+    CHECK(xbg_crumbs_default(XBG_GPU_POWERVR)==1);
+    // the simulated PowerVR family (DM_GFX_SIM_GPU=powervr on Adreno) takes the PowerVR defaults
+    CHECK(xbg_fence_guard_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("powervr")))==2);
+    CHECK(xbg_fence_guard_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("mali")))==0);
+    // level switches: the environment wins, clamped; unset / empty = the family default
+    CHECK(xbg_env_level(nullptr,2,0,2)==2 && xbg_env_level("",1,0,2)==1);
+    CHECK(xbg_env_level("0",2,0,2)==0 && xbg_env_level("1",2,0,2)==1 && xbg_env_level("7",0,0,2)==2 && xbg_env_level("-3",2,0,2)==0);
+    // Early VK_TIMEOUT: the 07.11 log (1 ms of a 10 s wait) is early; a whole timeout, a success, short / zero timeouts (polls) are not.
+    CHECK(xbg_fence_wait_early(VK_TIMEOUT,1000000ull,10000000000ull));
+    CHECK(!xbg_fence_wait_early(VK_TIMEOUT,10000000000ull,10000000000ull));
+    CHECK(!xbg_fence_wait_early(VK_TIMEOUT,6000000000ull,10000000000ull));
+    CHECK(!xbg_fence_wait_early(VK_SUCCESS,1000000ull,10000000000ull));
+    CHECK(!xbg_fence_wait_early(VK_ERROR_DEVICE_LOST,1000000ull,10000000000ull));
+    CHECK(!xbg_fence_wait_early(VK_TIMEOUT,0,0) && !xbg_fence_wait_early(VK_TIMEOUT,1000ull,50000000ull));
+    CHECK(xbg_fence_wait_early(VK_TIMEOUT,1000000ull,UINT64_MAX));   // an endless wait that returns at all returned early
+    // Back-off: 16 yields, then 10 us steps up to 200 us.
+    CHECK(xbg_fence_pause_us(1)==0 && xbg_fence_pause_us(16)==0 && xbg_fence_pause_us(17)==10 && xbg_fence_pause_us(26)==100 && xbg_fence_pause_us(36)==200 && xbg_fence_pause_us(1000000)==200);
+    // Polled waits on a simulated clock (1 us per clock read, pauses advance it by their length).
+    {uint64_t clock=0;auto now=[&]{return clock++*1000ull;};auto pause=[&](uint64_t n){clock+=xbg_fence_pause_us(n);};uint64_t checks=0;
+     int calls=0;auto after5=[&]{return ++calls>=5?VK_SUCCESS:VK_NOT_READY;};
+     CHECK(xbg_fence_poll(after5,now,pause,10000000000ull,&checks)==VK_SUCCESS && checks==5 && calls==5);
+     auto never=[]{return VK_NOT_READY;};clock=0;
+     CHECK(xbg_fence_poll(never,now,pause,5000000ull,&checks)==VK_TIMEOUT && clock*1000ull>=5000000ull);   // gives up once 5 ms passed
+     calls=0;auto once=[&]{++calls;return VK_NOT_READY;};
+     CHECK(xbg_fence_poll(once,now,pause,0,&checks)==VK_TIMEOUT && calls==1 && checks==1);                 // timeout 0: one check
+     calls=0;auto lost=[&]{++calls;return VK_ERROR_DEVICE_LOST;};
+     CHECK(xbg_fence_poll(lost,now,pause,10000000000ull,&checks)==VK_ERROR_DEVICE_LOST && calls==1);      // an error at once
+     // The 07.11 sequence: the driver's wait gave up early, the fence signalled 23 ms later; the recovery poll finds it.
+     clock=0;const uint64_t signal_at=23000;auto later=[&]{return clock>=signal_at?VK_SUCCESS:VK_NOT_READY;};
+     CHECK(xbg_fence_wait_early(VK_TIMEOUT,1000000ull,10000000000ull) && xbg_fence_poll(later,now,pause,10000000000ull,&checks)==VK_SUCCESS && clock<signal_at+400);}
+
     if(failures){printf("%d failure(s)\n",failures);return 1;}
     printf("vendor_policy_test: all checks passed\n");return 0;
 }

@@ -47,7 +47,9 @@ __attribute__((weak)) unsigned dm_present_record_mask(void);   // [DOOM] weak an
 VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer c,const VkCommandBufferBeginInfo *b){tag("begin");put(c);put(b->flags);return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer c){tag("end");put(c);return VK_SUCCESS;}
 std::atomic<uint64_t> queue_submits{0};
-VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *si,VkFence f){tag("submit");put(q);put(f);for(uint32_t i=0;i<n;i++)putn(si[i].pCommandBuffers,si[i].commandBufferCount);++queue_submits;return VK_SUCCESS;}
+// [pvr] DM_GFX_FENCE_GUARD=2: a simulated status poll holds fguard::mu with in_status set; a submit must never run inside one.
+std::atomic<int> in_status{0},submit_in_status{0};
+VKAPI_ATTR VkResult VKAPI_CALL vkQueueSubmit(VkQueue q,uint32_t n,const VkSubmitInfo *si,VkFence f){if(in_status.load())++submit_in_status;tag("submit");put(q);put(f);for(uint32_t i=0;i<n;i++)putn(si[i].pCommandBuffers,si[i].commandBufferCount);++queue_submits;return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL vkCmdPipelineBarrier(VkCommandBuffer c,VkPipelineStageFlags s,VkPipelineStageFlags d,VkDependencyFlags f,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *im){
     tag("barrier");put(c);put(s);put(d);put(f);put(nm);for(uint32_t i=0;i<nm;i++){put(m[i].srcAccessMask);put(m[i].dstAccessMask);}put(nb);for(uint32_t i=0;i<nb;i++){put(b[i].buffer);put(b[i].offset);put(b[i].size);put(b[i].srcAccessMask);}
     put(ni);for(uint32_t i=0;i<ni;i++){put(im[i].image);put(im[i].oldLayout);put(im[i].newLayout);put(im[i].subresourceRange);put(im[i].srcAccessMask);put(im[i].dstAccessMask);}}
@@ -177,6 +179,14 @@ int main(){
      for(int k=0;k<200;k++){VkCommandBuffer c=hd<VkCommandBuffer>(0x1000+k%3);vkrec::begin(c);for(int i=0;i<50;i++)vkrec::CmdDraw(c,3,1,0,0);vkrec::end(c);(void)vkrec::submit(1,&c,hd<VkFence>(0x2000+k%3),false);}
      w.join();vkrec::sync(vkrec::W_SHUTDOWN);CHECK(seen.load()==200,"tickets seen %d/200",seen.load());
      CHECK(!vkrec::wait_submitted(vkrec::sub_enq+1,2000000),"wait_submitted of a future ticket did not time out");}
+    // [pvr] DM_GFX_FENCE_GUARD=2 (BUGS_AND_FIXES 2.38): the record thread's vkQueueSubmit takes fguard::Lock. Same trace as direct while
+    // another thread keeps taking the lock as the engine's status polls do, and no submit ever runs while that thread holds it.
+    {fguard::level=2;std::atomic<bool> stop{false};uint64_t polls=0;
+     std::thread poller([&]{while(!stop.load()){{fguard::Lock g;in_status=1;for(volatile int i=0;i<200;i++){}in_status=0;}++polls;std::this_thread::yield();}});
+     int bad=0;for(int rep=0;rep<4;rep++){Run g=script(1,false,slots);if(g.trace!=d.trace){if(!bad++)diff("mode 1 fence guard 2",d.trace,g.trace);}}
+     stop=true;poller.join();fguard::level=0;
+     CHECK(!bad,"mode 1 with fence guard 2: trace differs in %d/4 runs",bad);CHECK(!submit_in_status.load(),"%d submits ran inside a guarded status poll",submit_in_status.load());
+     CHECK(polls>0,"the poller never ran");printf("fence guard 2: %llu guarded polls beside the record thread, %d submits inside one\n",(unsigned long long)polls,submit_in_status.load());}
     printf("fallbacks direct-run %llu, mode2 %llu, mode1 %llu; syncs %llu; ring %llu KB, written %llu KB; record thread executed %llu packets\n",(unsigned long long)d.fallbacks,(unsigned long long)m2.fallbacks,(unsigned long long)m1.fallbacks,(unsigned long long)m1.syncs_n,
         (unsigned long long)(vkrec::cap>>10),(unsigned long long)(vkrec::wpos>>10),(unsigned long long)vkrec::executed.load());
     printf(fails?"t_vkrec: %d FAILED\n":"t_vkrec: PASS\n",fails);fflush(stdout);_exit(fails?1:0);   // the record thread is never joined (as in the engine)

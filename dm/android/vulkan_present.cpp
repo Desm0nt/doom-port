@@ -31,6 +31,7 @@ extern "C" void dm_aperf_frame_tid(int);   // [mt 2a] perf_android.c: the ADPF s
 #include <sys/stat.h>
 #include "cpu_topo.h"   // [DOOM] thread placement by core capacity (DM_CPU_TOPO)
 #include "../gfx/vulkan/engine/xbg_astc_overlay.h"   // [nonadreno] ASTC / ETC2 / EAC overlay (variant A): the boot choice below
+#include "../gfx/vulkan/engine/xbg_astc_hdr_vk.h"   // [nonadreno] its ASTC HDR GPU self-test (BUGS_AND_FIXES 2.37)
 #include <thread>
 #include <unistd.h>
 #include <time.h>
@@ -691,15 +692,25 @@ extern "C" int dm_android_vk_has_window(){return has_window(nullptr);}
 // DM_ASTC_OVERLAY_DIR, else the folder next to DM_ROMFS (Download/DOOM Mobile/astc). It is used only when its manifest parses,
 // every overlay file has the size the manifest lists (an interrupted copy to the phone is caught here, not by a short read in
 // the game), the RomFS files it was made from have their sizes, and xbg_astc_choose agrees (auto: only without device BC, so
-// Adreno is untouched). On use: DM_ROMFS_OVERLAY = <dir>/data (or <dir>/nohdr:<dir>/data without ASTC HDR: BC6H keeps the
-// original index entries) in front of any existing value, and DM_GFX_ASTC_FORMATS = the substituted formats for the engine
-// (xbg_game.cpp bc_store). One line either way: grep "NVN astc overlay". Returns whether ASTC HDR must be enabled.
+// Adreno is untouched). Two steps around vkCreateDevice (BUGS_AND_FIXES 2.37):
+//   astc_overlay_boot (before): the choice; returns whether ASTC HDR must be enabled on the device (variant data, or the
+//     self-test forced with DM_GFX_ASTC_HDR_SELFTEST=force / fail on a device that has ASTC HDR).
+//   astc_overlay_mount (after, before dm_main): variant data runs the ASTC HDR GPU self-test first (engine/xbg_astc_hdr_vk.h);
+//     a failure mounts nohdr instead (BC6H keeps the original index entries and goes through the GPU BC decoder). Then
+//     DM_ROMFS_OVERLAY = <dir>/data (nohdr: <dir>/nohdr:<dir>/data) in front of any existing value, and DM_GFX_ASTC_FORMATS =
+//     the substituted formats for the engine (xbg_game.cpp bc_store).
+// One line each: grep "NVN astc overlay", "NVN astc hdr selftest".
+namespace astc_boot {
+XbgAstcManifest m;XbgAstcChoice c;std::string dir;char why[256]="";bool have=false;const char *mode_env=nullptr;
+int test_mode=XBG_AHS_AUTO;bool device_hdr=false;bool run_test=false;
+}
 static bool astc_overlay_boot(const VkPhysicalDeviceFeatures &f,bool hdr_feature){
-    const char *mode_env=getenv("DM_GFX_ASTC_OVERLAY");const int mode=xbg_astc_mode(mode_env);
-    std::string dir;
+    using namespace astc_boot;
+    dir.clear();why[0]=0;have=false;run_test=false;   // a repeated initialization starts over
+    mode_env=getenv("DM_GFX_ASTC_OVERLAY");const int mode=xbg_astc_mode(mode_env);
+    test_mode=xbg_astc_hdr_selftest_mode(getenv("DM_GFX_ASTC_HDR_SELFTEST"));device_hdr=hdr_feature;
     if(const char *d=getenv("DM_ASTC_OVERLAY_DIR"))dir=d;
     else if(const char *r=getenv("DM_ROMFS")){std::string s=r;while(s.size()>1 && s.back()=='/')s.pop_back();size_t cut=s.find_last_of('/');dir=(cut==std::string::npos?std::string("."):s.substr(0,cut))+"/astc";}
-    static XbgAstcManifest m;char why[256]="";bool have=false;
     if(mode!=0 && !dir.empty()){
         if(FILE *mf=fopen((dir+"/manifest.json").c_str(),"rb")){
             std::string text;char buf[4096];size_t n;while(text.size()<(1u<<20) && (n=fread(buf,1,sizeof buf,mf))>0)text.append(buf,n);fclose(mf);
@@ -712,18 +723,61 @@ static bool astc_overlay_boot(const VkPhysicalDeviceFeatures &f,bool hdr_feature
             }
         }else snprintf(why,sizeof why,"no %s/manifest.json",dir.c_str());
     }
-    const XbgAstcChoice c=xbg_astc_choose(mode,f.textureCompressionBC,f.textureCompressionASTC_LDR,f.textureCompressionETC2,hdr_feature,have?&m:nullptr);
+    c=xbg_astc_choose(mode,f.textureCompressionBC,f.textureCompressionASTC_LDR,f.textureCompressionETC2,hdr_feature,have?&m:nullptr);
+    // BUGS_AND_FIXES 2.37: BC6H stays on the BC path by default (variant nohdr: native BC on Adreno, GPU BC decode on Mali). With
+    // variant data the light-probe array is ASTC HDR, and on the Mi 14 Ultra (Turnip, self-test PASS) it showed white glows (Mali:
+    // black rectangles) although every overlay block decodes right; the probe array also takes data that is not overlay data.
+    // DM_GFX_ASTC_HDR=1 opts in to variant data again (then the self-test and the sanitizer below apply).
+    {const char *he=getenv("DM_GFX_ASTC_HDR");const bool optin=he && *he && atoi(he)!=0;
+     if(c.use && c.hdr && !optin){static char whyb[200];snprintf(whyb,sizeof whyb,"%s; BC6H kept on BC: DM_GFX_ASTC_HDR=0",c.why);
+        c.hdr=0;c.mask=m.nohdr_mask;c.variant="nohdr";c.why=whyb;}}
+    // The GPU self-test: before mounting variant data (auto), or on its own with force / fail (no overlay needed: the test blocks
+    // are in the binary). It needs the device's ASTC HDR, which is then enabled even when no overlay uses it.
+    const bool forced=test_mode==XBG_AHS_FORCE || test_mode==XBG_AHS_FAIL;
+    run_test=test_mode!=XBG_AHS_OFF && hdr_feature && ((c.use && c.hdr) || forced);
+    if(forced && !hdr_feature)
+        fprintf(stderr,"NVN astc hdr selftest: not run: the device has no ASTC HDR (textureCompressionASTC_HDR=0 or no VK_EXT_texture_compression_astc_hdr) -> nothing to test (DM_GFX_ASTC_HDR_SELFTEST=%s)\n",
+            xbg_astc_hdr_selftest_mode_name(test_mode));
+    return (c.use && c.hdr) || run_test;
+}
+static void astc_overlay_mount(VkPhysicalDevice phys,VkDevice dev,VkQueue q,uint32_t fam,const VkPhysicalDeviceFeatures &f){
+    using namespace astc_boot;
+    if(run_test){
+        const XbgAhsRun t=xbg_astc_hdr_selftest_run(phys,dev,q,fam,f.imageCubeArray!=VK_FALSE);
+        const bool faked=test_mode==XBG_AHS_FAIL;
+        const bool failed=faked || !t.ran || !t.verdict.pass;   // a test that could not run does not vouch for the decoder either
+        const bool fallback=failed && c.use && c.hdr;
+        char res[640];
+        if(!t.ran)snprintf(res,sizeof res,"NOT RUN (%s)",t.why);
+        else{const XbgAhsVerdict &v=t.verdict;char first[224]="";
+            if(v.first_bad>=0)snprintf(first,sizeof first," first=\"%s\" kind=%s got=%g want=%g",xbg_astc_hdr_tests[v.first_bad].label,v.first_kind==XBG_AHS_FETCH?"fetch":v.first_kind==XBG_AHS_CUBE?"cube":"linear",v.first_got,v.first_want);
+            snprintf(res,sizeof res,"%s blocks=%u vectors=%d queries=%u fetch_bad=%u cube_bad=%u linear_bad=%u nonfinite=%u max_rel=%.2g%s edge_bad=%u edge_nonfinite=%u zero_block=%s(%g,%g,%g,%g) ms=%.1f",
+                v.pass?"PASS":"FAIL",t.blocks,int(XBG_ASTC_HDR_TEST_BLOCKS),t.queries,v.fetch_bad,v.cube_bad,v.linear_bad,v.nonfinite,v.max_rel,first,v.edge_bad,v.edge_nonfinite,
+                v.zero_block_nan?"nan":"finite",v.zero_block[0],v.zero_block[1],v.zero_block[2],v.zero_block[3],t.ms);}
+        fprintf(stderr,"NVN astc hdr selftest: %s%s -> %s (DM_GFX_ASTC_HDR_SELFTEST=%s)\n",res,faked?" [failure faked by DM_GFX_ASTC_HDR_SELFTEST=fail]":"",
+            !(c.use && c.hdr)?"log only (no ASTC HDR overlay in use)":fallback?"variant nohdr":"variant data",xbg_astc_hdr_selftest_mode_name(test_mode));
+        if(fallback){c.hdr=0;c.mask=m.nohdr_mask;c.variant="nohdr";c.why="ASTC HDR self-test failed";}
+    }else if(c.use && c.hdr)fprintf(stderr,"NVN astc hdr selftest: skipped (DM_GFX_ASTC_HDR_SELFTEST=off) -> variant data\n");
+    // BUGS_AND_FIXES 2.37 bisection: DM_GFX_ASTC_ONLY=<bc3|bc4|bc5|bc7> mounts <dir>/only-<fmt> (an index with only that format's
+    // records pointing at the overlay: tools/astc_hdr_selftest_gen.py onlyindex, 14.7 MB) in front of <dir>/data and substitutes only
+    // that format; everything else stays real BC. Needs the folder; without it the switch is logged and ignored.
+    std::string only_layer;
+    if(const char *oe=getenv("DM_GFX_ASTC_ONLY"))if(*oe && c.use){
+        const uint32_t bit=xbg_astc_formats_mask(oe);struct stat st;const std::string pi=dir+"/only-"+oe+"/base/gameresources_003.pindex";
+        const bool ok=bit && !(bit&(bit-1)) && (bit&c.mask) && !stat(pi.c_str(),&st) && m.nsources && uint64_t(st.st_size)==m.source_size[0];
+        fprintf(stderr,"NVN astc overlay: DM_GFX_ASTC_ONLY=%s %s (%s)\n",oe,ok?"used: only this format substituted":"ignored",ok?pi.c_str():
+            (!bit || (bit&(bit-1)))?"one of bc3 bc4 bc5 bc7":!(bit&c.mask)?"not substituted by this variant":"index missing or of another size: tools/astc_hdr_selftest_gen.py onlyindex");
+        if(ok){c.mask=bit;only_layer=dir+"/only-"+oe;static std::string v;v=std::string("only-")+oe;c.variant=v.c_str();}}
     char fm[64];xbg_astc_formats_str(c.mask,fm,sizeof fm);
     if(c.use){
-        std::string layers=dir+"/"+c.variant;if(!c.hdr)layers+=":"+dir+"/data";
+        std::string layers=only_layer.empty()?dir+"/"+c.variant:only_layer;if(!c.hdr || !only_layer.empty())layers+=":"+dir+"/data";
         if(const char *o=getenv("DM_ROMFS_OVERLAY"))if(*o){layers+=":";layers+=o;}
         setenv("DM_ROMFS_OVERLAY",layers.c_str(),1);setenv("DM_GFX_ASTC_FORMATS",fm,1);
     }else unsetenv("DM_GFX_ASTC_FORMATS");
     // stderr: the log file and logcat (tag dm), like the engine's lines
     fprintf(stderr,"NVN astc overlay: %s variant=%s formats=%s (%s%s%s) dir=%s device bc=%u astcLdr=%u etc2=%u astcHdr=%u DM_GFX_ASTC_OVERLAY=%s\n",
         c.use?"USED":"not used",c.use?c.variant:"-",c.use?fm:"-",c.why,*why?"; ":"",why,dir.empty()?"-":dir.c_str(),unsigned(f.textureCompressionBC),
-        unsigned(f.textureCompressionASTC_LDR),unsigned(f.textureCompressionETC2),unsigned(hdr_feature),mode_env?mode_env:"auto");
-    return c.use && c.hdr;
+        unsigned(f.textureCompressionASTC_LDR),unsigned(f.textureCompressionETC2),unsigned(device_hdr),mode_env?mode_env:"auto");
 }
 extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t bytes){
     if(path){std::string dir=path;size_t cut=dir.find_last_of('/');if(FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-native").c_str(),"rb")){present_native=fgetc(m)!='0';fclose(m);}
@@ -776,7 +830,8 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
      VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};VkPhysicalDeviceProperties2 pr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};pr.pNext=&host;vkGetPhysicalDeviceProperties2(physical,&pr);
      __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Device %s api=%u.%u.%u driver=%#x minImportedHostPointerAlignment=%llu",pr.properties.deviceName,VK_VERSION_MAJOR(pr.properties.apiVersion),VK_VERSION_MINOR(pr.properties.apiVersion),VK_VERSION_PATCH(pr.properties.apiVersion),pr.properties.driverVersion,(unsigned long long)host.minImportedHostPointerAlignment);}
     // [nonadreno] ASTC overlay (astc_overlay_boot above), decided before the device exists: ASTC HDR is queried here and enabled
-    // only when the chosen overlay variant uses it (never on Adreno in auto mode, where the overlay is not used at all).
+    // only when the chosen overlay variant uses it or its self-test is forced (never on Adreno in auto mode, where the overlay is
+    // not used at all); the variant is mounted after vkCreateDevice (astc_overlay_mount, after the ASTC HDR self-test).
     VkPhysicalDeviceTextureCompressionASTCHDRFeaturesEXT astc_hdr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXTURE_COMPRESSION_ASTC_HDR_FEATURES_EXT};
     bool astc_hdr_ext=false;for(const auto &x:available)if(!strcmp(x.extensionName,VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME))astc_hdr_ext=true;
     if(astc_hdr_ext){VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};q.pNext=&astc_hdr;vkGetPhysicalDeviceFeatures2(physical,&q);}
@@ -836,6 +891,7 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     {const char *e=getenv("DM_TEX_DISCARD");const bool want=e && atoi(e)>0;if(want && q[family].queueCount>=2)qc.queueCount=2;   // [DOOM] restore worker queue (default off)
      if(want)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","DM_TEX_DISCARD: family %u has %u queues -> aux queue %s",family,q[family].queueCount,qc.queueCount==2?"created":"unavailable (texture discard stays off)");}
     VkDeviceCreateInfo dc{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};dc.pNext=&draw;dc.pEnabledFeatures=&features.features;dc.queueCreateInfoCount=1;dc.pQueueCreateInfos=&qc;dc.enabledExtensionCount=uint32_t(dext.size());dc.ppEnabledExtensionNames=dext.data();if((r=vkCreateDevice(physical,&dc,nullptr,&device)))return fail("vkCreateDevice",r);vkGetDeviceQueue(device,family,0,&queue);if(qc.queueCount==2){vkGetDeviceQueue(device,family,1,&dm_vk_aux_queue);dm_vk_aux_family=family;}
+    astc_overlay_mount(physical,device,queue,family,features.features);   // [nonadreno] before dm_main mounts the RomFS (BUGS_AND_FIXES 2.37)
     for(;;){
         wait_window();
         if(!surface||window_changed()){

@@ -169,6 +169,11 @@ t_copy_pitch: t_copy_pitch.c ../nvn/nvn_copy_pitch.h
 # NDK sysroot (searched after the system headers): make t_vkrec && ./t_vkrec
 VK_INC ?= $(firstword $(wildcard /mnt/g/Tools/Android/Sdk/ndk/*/toolchains/llvm/prebuilt/*/sysroot/usr/include) /usr/include)
 t_vkrec: t_vkrec.cpp ../vulkan/engine/xbg_game.cpp
-	awk '/^\/\/ \[mtb\] DM_GFX_RECORD_THREAD=1\|2/{p=1} /^struct Slot \{/{p=0} p' ../vulkan/engine/xbg_game.cpp | tr -d '
-' > vkrec_block.inc
+	awk '/^\/\/ \[mtb\] DM_GFX_RECORD_THREAD=1\|2/{p=1} /^struct Slot \{/{p=0} p' ../vulkan/engine/xbg_game.cpp | tr -d '' > vkrec_block.inc
 	g++ -std=c++17 -O2 -g -Wall -Wno-unused-function -pthread -idirafter $(VK_INC) -o $@ t_vkrec.cpp
+
+# [nonadreno] ASTC HDR safety of the BC6H -> ASTC overlay (BUGS_AND_FIXES 2.37): the error-block predicate, the sanitizer and the GPU
+# self-test plan / verdict of xbg_astc_hdr.h against the independent reference decoder (engine/xbg_astc_ref_decode.h), and the
+# embedded test vectors bit for bit. Any C++17 compiler (macOS, WSL, Windows LLVM): make t_astc_hdr && ./t_astc_hdr
+t_astc_hdr: ../vulkan/engine/tests/astc_hdr_test.cpp ../vulkan/engine/xbg_astc_ref_decode.h ../vulkan/engine/xbg_astc_hdr.h ../vulkan/engine/xbg_astc_hdr_data.h
+	$(CXX) -std=c++17 -O2 -Wall -Wno-unused-function -o $@ ../vulkan/engine/tests/astc_hdr_test.cpp

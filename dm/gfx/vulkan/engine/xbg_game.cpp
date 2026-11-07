@@ -29,6 +29,8 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_adreno_policy.h"
 #include "xbg_bc_policy.h"
 #include "xbg_astc_overlay.h"
+#include "xbg_astc_hdr.h"   // [nonadreno] ASTC HDR error blocks -> black (DM_GFX_ASTC_SANITIZE, BUGS_AND_FIXES 2.37)
+#include "xbg_astc_ref_decode.h"   // [nonadreno] its diagnostic (DM_GFX_ASTC_DIAG): decodes uploaded blocks
 #include "xbg_spirv_clip.h"
 #include "xbg_spirv_ubo2ssbo.h"
 #include "xbg_writeback_policy.h"
@@ -776,6 +778,20 @@ void invalidate(){desc_valid=false;pipe_valid=false;++desc_gen;++pso_gen;}
 //    drops to the retire of the recording slot (after its fence, so after every earlier packet ran); bulk teardown (shutdown, finish) drains.
 //  - any direct queue operation of the front (inline present, vkQueueWaitIdle) drains first.
 // The ring is never resized: a packet larger than 1/8 of it (or with a pNext chain) is executed synchronously after a drain (fallbacks=).
+// [pvr] DM_GFX_FENCE_GUARD (xbg_vendor_policy.h, BUGS_AND_FIXES 2.38): how the slot fences are touched from several threads. The
+// helpers (status / wait / reset) follow struct Slot (they need vkrec); the record thread's vkQueueSubmit takes the lock below too.
+//  0 (default but on PowerVR): as before. 1: a slot fence is not touched before its SUBMIT ran (vkQueueSubmit's fence is externally
+//  synchronized in Vulkan: a vkGetFenceStatus of a slot the record thread is submitting is a race; an unsubmitted fence is unsignalled,
+//  so the poll answers VK_NOT_READY without the driver). 2 (PowerVR): also one thread at a time on any slot fence, and the waits poll
+//  vkGetFenceStatus instead of sleeping in vkWaitForFences. recover (DM_GFX_FENCE_RECOVER, default 1, every GPU; only acts after a
+//  driver fence error): a wait that returns VK_TIMEOUT long before its timeout (the PowerVR 1.15 driver did 1 ms after sync_wait EINVAL)
+//  polls the status up to the deadline, and a pool-reset worker wait that failed on a fence retire_slot then waited for successfully
+//  resets the pool on the translation thread instead of a fatal "GPU hang".
+namespace fguard {
+std::atomic<int> level{0};std::atomic<bool> recover{true};std::mutex mu;
+std::atomic<uint64_t> unsubmitted{0},polls{0},early{0},early_recovered{0},pool_recovered{0};   // NVN PERF fence: unsubmitted / polls per window, the rest whole run
+struct Lock{std::unique_lock<std::mutex> l;Lock():l(mu,std::defer_lock){if(level.load(std::memory_order_relaxed)>=2)l.lock();}};
+}
 namespace vkrec {
 int mode=0;bool on=false;   // on: the slot being recorded goes through packets (decided when a slot starts recording: A/B target recthread)
 enum Op:uint32_t{K_SKIP,K_BEGIN,K_END,K_SUBMIT,K_PRESENT,K_BARRIER,K_BEGIN_QUERY,K_END_QUERY,K_BEGIN_RP,K_END_RP,K_RESET_QP,K_TIMESTAMP,K_COPY_QP,K_COPY_BUF,
@@ -827,8 +843,8 @@ void exec(const Hdr *h){
         if(!dead){const uint64_t t0=timing_clock();VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=q.n;si.pCommandBuffers=q.cbs;VkResult r=VK_SUCCESS;
             if(q.pt){const uint64_t w=dm_present_wait_submitted();if(w)ptwait_ns.fetch_add(w,std::memory_order_relaxed);   // [mt 2a] after every handed present's blit
                 if(const int e=dm_present_last_error())fail(K_PRESENT,e);
-                if(!dead){dm_present_queue_lock();r=vkQueueSubmit(cfg.queue,1,&si,q.fence);dm_present_queue_unlock();if(r)fail(K_SUBMIT,r);}}
-            else{r=vkQueueSubmit(cfg.queue,1,&si,q.fence);if(r)fail(K_SUBMIT,r);}
+                if(!dead){dm_present_queue_lock();{fguard::Lock g;r=vkQueueSubmit(cfg.queue,1,&si,q.fence);}dm_present_queue_unlock();if(r)fail(K_SUBMIT,r);}}
+            else{{fguard::Lock g;r=vkQueueSubmit(cfg.queue,1,&si,q.fence);}if(r)fail(K_SUBMIT,r);}
             submit_ns.fetch_add(timing_clock()-t0,std::memory_order_relaxed);submits.fetch_add(1,std::memory_order_relaxed);}
         sub_done.store(q.ticket,std::memory_order_seq_cst);notify_waiters();break;}
     case K_PRESENT:{const PPresent &q=*reinterpret_cast<const PPresent*>(p);
@@ -1084,8 +1100,13 @@ void report(int ab,double f){
 struct BcVerify;
 struct BcJob{VkBuffer buffer;VkDeviceSize offset,size;VkPipeline pipeline;uint32_t regions,blocks,bpp,block_words;VkImage image;std::vector<VkBufferImageCopy> copies;std::shared_ptr<BcVerify> verify{};};
 namespace bcgpu{void record(VkCommandBuffer cmd,const BcJob &job);}
+struct Shader;
 struct Slot {
     bool reset_queued=false,reset_busy=false;VkResult reset_result=VK_SUCCESS;   // poolreset: a reset job was queued for this submission / still runs (under poolreset::mu)
+    uint64_t reset_wait_ns=0;bool reset_fence_failed=false;   // [pvr] poolreset: how long the worker's fence wait took and whether it failed (under poolreset::mu; fence_fatal)
+    // [pvr] What this recording holds, for fence_fatal (any GPU): passes ended, draws and dispatches recorded, the shaders of the first
+    // and the last draw (vs / ps, vs / gs / ps) and of the last dispatch. Shader objects live until shutdown. submit_t: timing_clock at submit.
+    struct Diag{uint32_t passes=0,draws=0,dispatches=0;const Shader *first_vs=nullptr,*first_ps=nullptr,*last_vs=nullptr,*last_gs=nullptr,*last_ps=nullptr,*last_cs=nullptr;uint64_t submit_t=0;} diag;
     // xview: this submission read a pending result of the other slot through pending_view (from its readback arena).
     bool xview=false;
     // 提交时的 HLE 帧：退休时这次提交的 GPU 时间记到它名下（hud::gpu_add）。
@@ -1195,6 +1216,38 @@ std::atomic<uint64_t> regwait_calls{0},regwait_blocked{0},regwait_ns{0};   // [p
 // already rewrote (after quad, warp and tidy) instead of rewriting it again on the submit thread; on the Redmi K50 Ultra the rewrites
 // are about 80% of a load, 6-9 ms for a large fragment shader. 2: rewrite as well and compare, using the rewritten result.
 int shader_reuse=0;uint64_t shaders_reused=0,shader_reuse_mismatches=0;
+// [pvr] DM_GFX_FENCE_GUARD helpers (see namespace fguard before vkrec; here, after struct Slot, so tests/t_vkrec's cut of the vkrec
+// block stays free of the device). Any thread; logging through vkrec::rlog (xbg_logf's timing is
+// translation-thread state). With level 0 and recover off these are exactly the old vkGetFenceStatus / vkWaitForFences / vkResetFences.
+namespace fguard {
+// The SUBMIT packet with this ticket ran (0: submitted directly, on the thread that also touches the fence).
+inline bool ran(uint64_t ticket){return !ticket || vkrec::sub_done.load(std::memory_order_acquire)>=ticket;}
+inline VkResult raw_status(VkFence f){Lock g;return vkGetFenceStatus(cfg.device,f);}
+// A slot fence's status. ticket: the slot's rec_ticket (its SUBMIT packet).
+VkResult status(VkFence f,uint64_t ticket){
+    const int lv=level.load(std::memory_order_relaxed);if(!lv)return vkGetFenceStatus(cfg.device,f);
+    if(!ran(ticket)){unsubmitted.fetch_add(1,std::memory_order_relaxed);return VK_NOT_READY;}
+    return raw_status(f);
+}
+inline void pause(uint64_t n){const unsigned us=xbg_fence_pause_us(n);if(!us)std::this_thread::yield();else std::this_thread::sleep_for(std::chrono::microseconds(us));}
+inline VkResult poll(VkFence f,uint64_t timeout_ns){uint64_t n=0;const VkResult r=xbg_fence_poll([&]{return raw_status(f);},timing_clock,pause,timeout_ns,&n);polls.fetch_add(n,std::memory_order_relaxed);return r;}
+// Wait for a submitted slot fence (the caller already waited for its SUBMIT: wait_submitted). waited_ns: wall time spent here.
+VkResult wait(VkFence f,uint64_t timeout_ns,uint64_t *waited_ns,const char *who){
+    const uint64_t t0=timing_clock();
+    VkResult r=level.load(std::memory_order_relaxed)>=2?poll(f,timeout_ns):vkWaitForFences(cfg.device,1,&f,VK_TRUE,timeout_ns);
+    const uint64_t t1=timing_clock();
+    if(recover.load(std::memory_order_relaxed) && xbg_fence_wait_early(r,t1-t0,timeout_ns)){
+        // A real VK_TIMEOUT only comes after the timeout. Poll up to the deadline, at most 10 s more (an endless wait stays bounded).
+        const uint64_t left=std::min<uint64_t>(timeout_ns-(t1-t0),10000000000ull);const uint64_t n=early.fetch_add(1,std::memory_order_relaxed);
+        const VkResult p=poll(f,left);if(p==VK_SUCCESS)early_recovered.fetch_add(1,std::memory_order_relaxed);
+        if(n<8 || p!=VK_SUCCESS)vkrec::rlog("NVN fence wait (%s): vkWaitForFences returned VK_TIMEOUT after %.1f ms of its %.0f ms timeout (the driver gave up early: a fence error, not a GPU hang); polled the status for up to %.0f ms more: %d (%s; early waits %llu, recovered %llu)",
+            who,(t1-t0)/1e6,timeout_ns/1e6,left/1e6,int(p),p==VK_SUCCESS?"signalled":p==VK_TIMEOUT?"still not signalled":"error",(unsigned long long)n+1,(unsigned long long)early_recovered.load());
+        r=p;}
+    if(waited_ns)*waited_ns=timing_clock()-t0;
+    return r;
+}
+inline VkResult reset(VkFence f){Lock g;return vkResetFences(cfg.device,1,&f);}
+}
 // Command pool resets off the render thread. vkResetCommandPool took ~0.4 ms of every frame on the Redmi K50 Ultra's render
 // thread. After a slot is submitted, the reset thread waits for its fence and resets its pool; retiring the slot first waits
 // for that job, so vkResetFences never overlaps the thread's wait (concurrent waits are allowed), and reusing the slot skips
@@ -1202,24 +1255,44 @@ int shader_reuse=0;uint64_t shaders_reused=0,shader_reuse_mismatches=0;
 // poolreset, decided per submission. NVN PERF poolreset: resets queued, retirements that had to wait for one, and how long.
 namespace poolreset {
 bool enabled=false,stop=false;std::thread *worker=nullptr;std::mutex mu;std::condition_variable cv;   // never destroyed: a joinable std::thread left at exit would terminate
-struct Job{Slot *slot;VkFence fence;VkCommandPool pool;uint64_t ticket;};std::vector<Job> jobs;   // ticket: [mtb] the SUBMIT packet (0: submitted directly)
+struct Job{Slot *slot;VkFence fence;VkCommandPool pool;uint64_t ticket,serial;};std::vector<Job> jobs;   // ticket: [mtb] the SUBMIT packet (0: submitted directly); serial: slot_serial
 uint64_t queued=0,waits=0,wait_ns=0;   // render thread only
 void run(){
     for(;;){Job j;{std::unique_lock<std::mutex> l(mu);cv.wait(l,[]{return stop || !jobs.empty();});if(jobs.empty())return;j=jobs.front();jobs.erase(jobs.begin());}
-        const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);
-        VkResult r=vkrec::wait_submitted(j.ticket)?vkWaitForFences(cfg.device,1,&j.fence,VK_TRUE,timeout):VK_ERROR_DEVICE_LOST;   // [mtb] the record thread submitted it first
+        const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);uint64_t waited=0;
+        VkResult r=vkrec::wait_submitted(j.ticket)?fguard::wait(j.fence,timeout,&waited,"pool reset worker"):VK_ERROR_DEVICE_LOST;   // [mtb] the record thread submitted it first
         // 栅栏一直不亮而驱动又不报 DEVICE_LOST 时，这里只剩 VK_TIMEOUT；把它说清楚，别让崩在后面的检查里只留下一个 2。
         // When the fence never signals and the driver does not report DEVICE_LOST, all that is left here is VK_TIMEOUT; say so,
         // so the fatal check later does not leave just a 2 in the crash report.
-        if(r==VK_TIMEOUT)xbg_logf("NVN command pool reset: the slot's fence did not signal within %llu ms (GPU hang)",(unsigned long long)(timeout/1000000ull));
-        if(r==VK_SUCCESS)r=vkResetCommandPool(cfg.device,j.pool,0);
-        {std::lock_guard<std::mutex> l(mu);j.slot->reset_result=r;j.slot->reset_busy=false;}cv.notify_all();}
+        // [pvr] With the time it really waited: the PowerVR 1.15 driver returned VK_TIMEOUT 1 ms after its sync_wait failed (EINVAL),
+        // which used to read "did not signal within 10000 ms (GPU hang)" (BUGS_AND_FIXES 2.38).
+        if(r==VK_TIMEOUT)vkrec::rlog("NVN command pool reset: the slot's fence (serial %llu) did not signal: VK_TIMEOUT after %.1f ms of %llu ms (%s)",(unsigned long long)j.serial,waited/1e6,
+                                     (unsigned long long)(timeout/1000000ull),xbg_fence_wait_early(r,waited,timeout)?"early: a driver fence error, not a GPU hang":"the whole timeout: GPU hang");
+        else if(r!=VK_SUCCESS)vkrec::rlog("NVN command pool reset: the slot's fence (serial %llu) wait failed: %d after %.1f ms",(unsigned long long)j.serial,int(r),waited/1e6);
+        const bool fence_failed=r!=VK_SUCCESS;if(r==VK_SUCCESS)r=vkResetCommandPool(cfg.device,j.pool,0);
+        {std::lock_guard<std::mutex> l(mu);j.slot->reset_result=r;j.slot->reset_wait_ns=waited;j.slot->reset_fence_failed=fence_failed;j.slot->reset_busy=false;}cv.notify_all();}
 }
 void start(){if(enabled && !worker){stop=false;worker=new std::thread(run);}}
-void queue(Slot &s){if(!s.pool || !worker || ab_off("poolreset"))return;{std::lock_guard<std::mutex> l(mu);s.reset_busy=true;s.reset_queued=true;jobs.push_back({&s,s.fence,s.pool,s.rec_ticket});}cv.notify_one();++queued;}
+void queue(Slot &s){if(!s.pool || !worker || ab_off("poolreset"))return;{std::lock_guard<std::mutex> l(mu);s.reset_busy=true;s.reset_queued=true;jobs.push_back({&s,s.fence,s.pool,s.rec_ticket,slot_serial});}cv.notify_one();++queued;}
 // Wait for this slot's job, if one is queued: before its fence is reset and before its pool is reused.
 void finish(Slot &s){if(!s.reset_queued)return;std::unique_lock<std::mutex> l(mu);if(s.reset_busy){uint64_t t0=timing_clock();cv.wait(l,[&]{return !s.reset_busy;});wait_ns+=timing_clock()-t0;++waits;}}
 void drain(){if(!worker)return;{std::lock_guard<std::mutex> l(mu);stop=true;}cv.notify_all();worker->join();delete worker;worker=nullptr;}
+}
+// [pvr] A slot fence wait failed (any GPU; defined after Shader): what every pending slot holds, then a fatal that says whether the
+// wait ran its whole timeout (GPU hang) or the driver gave up early (fence error). Translation thread, engine lock held.
+[[noreturn]] void fence_fatal(Slot &s,VkResult r,uint64_t waited_ns,uint64_t timeout_ns,const char *who);
+// [pvr] The pool-reset worker's wait on this slot's fence failed. retire_slot has since waited for the same fence successfully (a slot with
+// reset_queued is always retired before its next recording, and a retire that cannot wait is a fatal), so the GPU finished this
+// submission and the driver's wait failure was a fence error, not a hang (the 07.11 PowerVR log: VK_TIMEOUT 1 ms after sync_wait EINVAL,
+// then this thread's own wait on that fence succeeded within 23 ms and the old code died with "GPU hang"). DM_GFX_FENCE_RECOVER=1
+// (default, any GPU; only reached after such a failure): reset the pool here. =0: the fatal, with fence_fatal's report.
+void pool_reset_failed(Slot &s){
+    const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);
+    if(!fguard::recover.load(std::memory_order_relaxed))fence_fatal(s,s.reset_result,s.reset_wait_ns,timeout,"pool reset worker");
+    const uint64_t n=fguard::pool_recovered.fetch_add(1,std::memory_order_relaxed);
+    if(n<8 || (n&(n+1))==0)xbg_logf("NVN command pool reset: the worker's fence wait failed (%d after %.1f ms of %.0f ms), but retire_slot then waited for the same fence: the pool is reset here (a driver fence error, not a GPU hang; %llu so far, DM_GFX_FENCE_RECOVER)",
+        int(s.reset_result),s.reset_wait_ns/1e6,timeout/1e6,(unsigned long long)n+1);
+    s.reset_result=VK_SUCCESS;s.reset_fence_failed=false;VK(vkResetCommandPool(cfg.device,s.pool,0));
 }
 // Where the CPU blocks on a busy slot fence, and why slots are submitted (NVN PERF block_ms).
 // The outermost site wins, except that a ring wrap in recording_slot is always counted as ring.
@@ -1375,7 +1448,7 @@ bool create(){
 bool init(){
     if(mode>=0)return active;
     auto env_i=[](const char *n,long d){const char *e=getenv(n);return e && *e?strtol(e,nullptr,0):d;};
-    mode=int(std::clamp(env_i("DM_GFX_CRUMBS",0),0l,2l));stall_ms=unsigned(std::max(0l,env_i("DM_GFX_CRUMBS_STALL_MS",2000)));
+    mode=int(std::clamp(env_i("DM_GFX_CRUMBS",xbg_crumbs_default(gpu_policy)),0l,2l));stall_ms=unsigned(std::max(0l,env_i("DM_GFX_CRUMBS_STALL_MS",2000)));   // [pvr] DM_GFX_CRUMBS family default: 1 on PowerVR (BUGS_AND_FIXES 2.38)
     if(mode && !create())mode=0;active=mode>0;
     xbg_logf("NVN crumbs switches: crumbs=%d (DM_GFX_CRUMBS: 0 off, 1 pass ends + dispatches + buffer ends, 2 dispatches + buffer ends) stall_ms=%u (DM_GFX_CRUMBS_STALL_MS)",mode,stall_ms.load());
     return active;
@@ -1422,7 +1495,7 @@ void store_dead_poison(const OpenPass &o);   // [afbc] DM_GFX_STORE_DEAD + DM_GF
 // [afbc] Attachments whose last pass discarded contents (DM_GFX_STORE_DEAD) until the clear store_scan proved; a read or a draw into
 // one before it is a broken proof (store_dead_violations, logged). Run-time check only: the proof already rules it out.
 std::vector<Image*> dead_pending;
-void end_open_pass(int line){if(open_pass.cmd){++mt_hz_gen;if(lazy_pending)lazy_clear_flush();++pass_end_lines[line];end_occlusion_query();vkrec::CmdEndRenderPass(open_pass.cmd);if(open_pass.dead_mask){if(tile_poison)store_dead_poison(open_pass);for(uint32_t k=0;k<open_pass.images.size();k++)if((open_pass.dead_mask>>(2*k))&3u){if(dead_pending.size()>=64)dead_pending.erase(dead_pending.begin());dead_pending.push_back(open_pass.images[k]);}}if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd,line);crumbs::mark(open_pass.cmd,crumbs::PASS);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];if(tile_barrier_on)++passes_since_full;}}
+void end_open_pass(int line){if(open_pass.cmd){++mt_hz_gen;if(lazy_pending)lazy_clear_flush();++pass_end_lines[line];end_occlusion_query();vkrec::CmdEndRenderPass(open_pass.cmd);if(open_pass.dead_mask){if(tile_poison)store_dead_poison(open_pass);for(uint32_t k=0;k<open_pass.images.size();k++)if((open_pass.dead_mask>>(2*k))&3u){if(dead_pending.size()>=64)dead_pending.erase(dead_pending.begin());dead_pending.push_back(open_pass.images[k]);}}if(open_pass.depth_attached && !open_pass.depth_used){++depth_idle_passes;pass_prof_depth_idle(open_pass.cmd);}pass_prof_end(open_pass.cmd,line);++slots[slot_index].diag.passes;crumbs::mark(open_pass.cmd,crumbs::PASS);open_pass=OpenPass{};++pass_end_by[cur_op<64?cur_op:63];if(tile_barrier_on)++passes_since_full;}}
 void full_barrier(VkCommandBuffer cmd){++mt_hz_gen;storage_unbarriered=false;storage_dirty.clear();VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;vkrec::CmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&b,0,nullptr,0,nullptr);barrier_seq=write_seq;frag_seq=write_seq;passes_since_full=0;++barrier_by[cur_op<64?cur_op:63];}
 // [nonadreno][tile] DM_GFX_TILE_BARRIER: the read barrier of a draw whose images are read by the fragment shader only. Everything
 // before it (any stage) is made visible to the fragment stages (and attachment access) after it, so the vertex / tiling work that
@@ -1506,8 +1579,9 @@ void retire_slot(Slot &s){
     if(!s.pending)return;
     poolreset::finish(s);
     if(!vkrec::wait_submitted(s.rec_ticket))vkrec::check_err();   // [mtb] DM_GFX_RECORD_THREAD: its SUBMIT packet ran (0: submitted directly)
-    {CPU_SCOPE(Fence);bool busy=vkGetFenceStatus(cfg.device,s.fence)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
-     VK(vkWaitForFences(cfg.device,1,&s.fence,VK_TRUE,std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull)));
+    {CPU_SCOPE(Fence);bool busy=fguard::status(s.fence,s.rec_ticket)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
+     const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);uint64_t waited=0;
+     const VkResult fr=fguard::wait(s.fence,timeout,&waited,"retire");if(fr!=VK_SUCCESS)fence_fatal(s,fr,waited,timeout,"retire");   // [pvr] was VK(vkWaitForFences(...))
      if(busy){block_ns[sync_site]+=timing_clock()-b0;++block_calls[sync_site];}}
     ++perf.waits;
     if(s.prof){
@@ -1554,7 +1628,7 @@ void retire_slot(Slot &s){
     s.occlusion_used=0;s.timestamp_used=0;uint64_t c1=timing_clock();
     if(!resolving_pending){resolve_slot_writebacks(&s);resolve_known_reports();
         bool waiting=false;for(auto &r:pending_reports)if(r.slot==&s)waiting=true;if(!waiting)publish_completed(std::max(completed.load(),s.covers));}
-    uint64_t c2=timing_clock();while(s.waiters.n.load())std::this_thread::yield();VK(vkResetFences(cfg.device,1,&s.fence));   // 栅栏已发信号，等待者马上返回 | the fence has signalled, so waiters return at once
+    uint64_t c2=timing_clock();while(s.waiters.n.load())std::this_thread::yield();VK(fguard::reset(s.fence));   // 栅栏已发信号，等待者马上返回 | the fence has signalled, so waiters return at once
     for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();
     for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();
     uint64_t c3=timing_clock();s.retire.run();release_descriptors(s);uint64_t c4=timing_clock();
@@ -1623,7 +1697,8 @@ Slot &recording_slot(){
         s.readback.cached=rb_ab?!r4_off("rbcached"):readback_cached;
         if(!s.fence){VkFenceCreateInfo f{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VK(vkCreateFence(cfg.device,&f,nullptr,&s.fence));}
         if(!s.timestamps && timestamp_bits){VkQueryPoolCreateInfo q{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};q.queryType=VK_QUERY_TYPE_TIMESTAMP;q.queryCount=2;VK(vkCreateQueryPool(cfg.device,&q,nullptr,&s.timestamps));}
-        bind_cache_reset();if(s.pool){if(s.reset_queued){poolreset::finish(s);s.reset_queued=false;if(s.reset_result==VK_TIMEOUT)xbg_fatalf("The GPU did not finish this slot's work within %llu ms (fence wait timed out), so the device is hung",(unsigned long long)(std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull)/1000000ull));else VK(s.reset_result);}else VK(vkResetCommandPool(cfg.device,s.pool,0));}else{VK(vkResetCommandBuffer(s.cmd,0));if(s.pro)VK(vkResetCommandBuffer(s.pro,0));}vkrec::begin(s.cmd);
+        bind_cache_reset();if(s.pool){if(s.reset_queued){poolreset::finish(s);s.reset_queued=false;if(s.reset_result!=VK_SUCCESS){if(s.reset_fence_failed)pool_reset_failed(s);else check(s.reset_result,"vkResetCommandPool (pool reset worker)");}}else VK(vkResetCommandPool(cfg.device,s.pool,0));}else{VK(vkResetCommandBuffer(s.cmd,0));if(s.pro)VK(vkResetCommandBuffer(s.pro,0));}vkrec::begin(s.cmd);
+        s.diag=Slot::Diag{};   // [pvr] fence_fatal: what this recording holds
         if(s.timestamps){vkrec::CmdResetQueryPool(s.cmd,s.timestamps,0,2);vkrec::CmdWriteTimestamp(s.cmd,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,s.timestamps,0);}
         s.recording=true;s.ops=0;
         const uint64_t frame=stats.presents.load()+1;
@@ -1698,8 +1773,8 @@ void submit_slots(bool wait){
             vkrec::end(s.pro);cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;
         {CPU_SCOPE(Submit);if(vkrec::on)s.rec_ticket=vkrec::submit(ncb,cbs,s.fence,pt_mode!=0);   // [mtb] the record thread submits (after the present thread's blits, under the queue lock)
-         else{s.rec_ticket=0;if(pt_mode){pt_before_submit();dm_present_queue_lock();const VkResult qr=vkQueueSubmit(cfg.queue,1,&si,s.fence);dm_present_queue_unlock();VK(qr);}else VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}}++submit_by[sync_site];poolreset::queue(s);crumbs::submitted();
-        s.recording=false;s.pending=true;s.covers=submitted;s.serial=slot_serial;s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index=slot_index+1<slot_count?slot_index+1:0;++perf.submits;snapshot_reset();++slot_serial;
+         else{s.rec_ticket=0;if(pt_mode){pt_before_submit();dm_present_queue_lock();VkResult qr;{fguard::Lock g;qr=vkQueueSubmit(cfg.queue,1,&si,s.fence);}dm_present_queue_unlock();VK(qr);}else{fguard::Lock g;VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}}}++submit_by[sync_site];poolreset::queue(s);crumbs::submitted();
+        s.recording=false;s.pending=true;s.covers=submitted;s.serial=slot_serial;s.diag.submit_t=timing_clock();s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index=slot_index+1<slot_count?slot_index+1:0;++perf.submits;snapshot_reset();++slot_serial;
         pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
     }
     if(wait)for(unsigned k=0;k<slot_count;k++)retire_slot(ring_slot(k));   // oldest first: writebacks land in submission order
@@ -1786,6 +1861,8 @@ void perf_frame(){
     double wall=double(now-perf.window_start)/1e6,f=double(perf.frames);
     perf_quiet_now=perf_quiet && !perf_force_verbose && !pass_prof_enabled && !r4_off("perfquiet");   // [r4] DM_GFX_PERF_VERBOSE=0
     if(poolreset::enabled){perf_vlogf("NVN PERF poolreset queued=%.2f waits=%.2f wait_ms=%.3f",poolreset::queued/f,poolreset::waits/f,poolreset::wait_ns/1e6/f);poolreset::queued=poolreset::waits=poolreset::wait_ns=0;}
+    if(fguard::level.load() || fguard::early.load() || fguard::pool_recovered.load())perf_vlogf("NVN PERF fence guard=%d unsubmitted=%.2f polls=%.2f early=%llu early_recovered=%llu pool_recovered=%llu",fguard::level.load(),fguard::unsubmitted.exchange(0)/f,fguard::polls.exchange(0)/f,
+        (unsigned long long)fguard::early.load(),(unsigned long long)fguard::early_recovered.load(),(unsigned long long)fguard::pool_recovered.load());   // [pvr]
     const double tf=perf_timed_frames?double(perf_timed_frames):1.0;   // parts and descriptor timers come from the timed frames only
     xbg_logf("NVN PERF v=1 sync=%d frames=%llu wall_ms=%.1f fps=%.2f submit_cpu_ms=%.2f present_cpu_ms=%.2f gpu_ms=%.2f gpu_samples=%llu submits=%.2f waits=%.2f sync_wb=%llu sync_rb=%llu sync_q=%llu ops=%.1f folded=%.1f passes=%.1f draws=%.1f dispatches=%.1f why=w%llu/p%llu/a%llu(%llu,%llu,%llu,%llu,%llu,%llu|%llu,%llu,%llu,%llu)/c%llu/f%llu/s%llu views=%llu snap_hit=%llu snap_miss=%llu snap_mb=%.1f arena_peak_mb=%.1f pipelines=%zu layouts=%zu samplers=%zu passes=%zu images=%zu host_segments=%zu host_mb=%.1f",
         int(sync_mode),(unsigned long long)perf.frames,wall,f*1000.0/wall,double(perf.submit_cpu_ns)/1e6/f,double(perf.present_cpu_ns)/1e6/f,perf.gpu_samples?double(perf.gpu_ns)/1e6/f:-1.0,(unsigned long long)perf.gpu_samples,
@@ -2361,6 +2438,7 @@ struct Image {
     // afbc_state: the driver's compression of the image (VK_EXT_image_compression_control): 0 not asked, 1 default (AFBC), 2 none, 3 fixed rate.
     VkImageUsageFlags lean_dropped=0;uint8_t afbc_state=0;
     bool subst=false;int64_t subst_bytes=0;   // [nonadreno] ASTC overlay: created in the substitute format of its BC format (bc_store BC_SUBST), blocks uploaded as they are
+    bool subst_cpu=false;   // [nonadreno] 2.37 DM_GFX_ASTC_CPU: a substitute decoded on the CPU into the BC path's uncompressed format (decoded=true)
        // [DOOM] storage-only images (VT feedback) need no barrier between draws
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;int64_t mem_bytes=0,bc_bytes=0,bc_data=0,dec_bytes=0,dec_native=0;bool bc_first_done=false;   // dec_*: decoded BC (decoded_bytes_live); bc_first_done: first full upload counted (bct_first_*)
     // 最近一次经 get_image 取用时的 slot_serial：等于当前值，说明这次提交里已有命令用过它（gfx-upload-prologue 据此判断能否提前上传）。
@@ -2916,7 +2994,7 @@ void wait_fence(uint64_t fence){
 bool gpu_poll_complete(){
     SiteScope site(SITE_POLL);
     Slot &cur=slots[slot_index];if(cur.recording && cur.ops)submit_slots(false);
-    for(auto &s:slots)if(s.pending){if(vkGetFenceStatus(cfg.device,s.fence)!=VK_SUCCESS)return false;}
+    for(auto &s:slots)if(s.pending){if(fguard::status(s.fence,s.rec_ticket)!=VK_SUCCESS)return false;}
     ++perf.why_poll;complete_all(); // everything signaled: retiring/resolving does not block
     return true;
 }
@@ -3012,8 +3090,14 @@ void astc_ov_note(const tex_t *t,uint32_t layers,const char *kept,VkFormat vf){
 // [nonadreno] ASTC overlay: the substitute format of this texture, or VK_FORMAT_UNDEFINED (not substituted; *kept names a BC shape
 // rule when the format is substituted but this texture keeps real BC). A substitute the device cannot sample with linear filtering
 // and copy into (never with astcLdr / etc2 / astcHdr enabled: those features require it) is logged and treated as not substituted.
+// [nonadreno] 2.37 DM_GFX_ASTC_KEEP=<serial,serial,...> (bisection; default none): these NVN textures stay on the BC path even when their
+// format is substituted (as if xbg_astc_keep_bc named them; reason "keep-serial"). Serials of the early, fixed textures are stable from
+// run to run (25 transSort atlas BC5, 26 light atlas BC4, 27 decal atlas BC7, 94 probe array BC6H). Wrong if the image holds overlay
+// blocks (they then read as BC: garbage in that texture); right if the game fills it with real BC itself.
+std::vector<uint64_t> astc_keep_serials;
 VkFormat astc_ov_format(const tex_t *t,uint32_t layers,const char **kept){
     *kept=nullptr;if(!astc_ov_mask)return VK_FORMAT_UNDEFINED;
+    for(uint64_t k:astc_keep_serials)if(k==t->serial && xbg_astc_format_bit(t->d.format) && (astc_ov_mask&xbg_astc_format_bit(t->d.format))){*kept="keep-serial";return VK_FORMAT_UNDEFINED;}
     const char *why=nullptr;const VkFormat vf=xbg_astc_texture_format(astc_ov_mask,t->d.format,t->d.target,t->d.width,t->d.height,t->d.levels,layers,&why);
     if(vf==VK_FORMAT_UNDEFINED){if(why && strcmp(why,"format"))*kept=why;return vf;}
     const VkFormatFeatureFlags need_f=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
@@ -3025,6 +3109,94 @@ VkFormat astc_ov_format(const tex_t *t,uint32_t layers,const char **kept){
         return VK_FORMAT_UNDEFINED;
     }
     return vf;
+}
+// [nonadreno] DM_GFX_ASTC_SANITIZE (default 1; BUGS_AND_FIXES 2.37, issues #7 #14 #25 #28): every upload into an ASTC HDR substitute
+// (BC6H -> VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK: the light-probe cube array and the probe files; only with the opt-in variant data,
+// DM_GFX_ASTC_HDR=1) is scanned for ASTC error blocks (xbg_astc_block_error), which the HDR profile decodes to NaN. The overlay's
+// own blocks are all valid (tools/astc_hdr_scan.cpp); what is not is memory the game never wrote (all zero: black through BC6H,
+// NaN through ASTC HDR) or blocks of another format. They are replaced by a black void-extent block in the staging copy (the game's
+// memory is not touched). =0: counted and logged only. grep "NVN astc hdr sanitize".
+// DM_GFX_ASTC_DIAG (default 1): before that, the blocks are classified with the reference decoder (xbg_astc_ref_decode.h): all
+// zero / ASTC error / valid but "wild" (decodes above 2048 or non-finite: the whole overlay stays at or below 1024, so a wild block
+// is almost surely not overlay data but e.g. BC6H bytes that happen to be a valid ASTC block, ~5 % of random bytes) / plausible.
+// 1 = partial (dirty-block) uploads, 2 = full uploads too (slow: ~1 us a block). Separate log throttles per path: grep
+// "NVN astc hdr partial" / "NVN astc hdr full"; totals in "NVN astc overlay totals".
+int astc_sanitize_on=-1,astc_diag=-1;uint64_t astc_san_blocks=0,astc_san_zero=0,astc_san_uploads=0;
+struct AstcDiag{uint64_t uploads=0,blocks=0,zero=0,error=0,wild=0;float max=0;};AstcDiag astc_diag_part,astc_diag_full;
+// [nonadreno] Census of the LDR substitutes (2.37): does an image hold the overlay's blocks, or data the game wrote itself (real BC)?
+//   ASTC 4x4 (BC3 / BC7): the LDR error-block predicate. The overlay's ASTC blocks are never invalid (tools/astc_hdr_scan.cpp:
+//     27.6 M blocks, 0 errors), real BC7 / BC3 bytes mostly are; "invalid" = non-zero blocks that are ASTC errors.
+//   EAC R11 / RG11 (BC4 / BC5): any bits are valid EAC, so validity says nothing (the 07.11 census line for vk 153 / 155 was
+//     meaningless). xbg_eac_vs_bc4 reads each 8-byte half both ways and asks which reading is smooth inside the block: on the real
+//     overlay 95 % of the decided EAC halves read as EAC, on their BC4 / BC5 sources 84 % read as BC4 (tools/astc_ldr_scan.cpp).
+//     "foreign" = bc4-like halves; an image whose decided halves are mostly bc4-like holds real BC4 / BC5.
+// All-zero blocks (memory never written) are counted apart. One line per image when its foreign count reaches 1, 2, 4, ... (at most
+// 64 lines) and at its first full upload; grep "NVN astc census". Always on (a few dozen ns a block).
+struct AstcCensus{uint64_t blocks=0,zero=0,foreign=0,native=0;unsigned logged=0;bool first=true;};std::unordered_map<uint64_t,AstcCensus> astc_census;uint64_t astc_census_foreign=0,astc_census_blocks=0;
+void astc_census_upload(const Image &im,const tex_t *t,const uint8_t *p,size_t bytes,const char *path){
+    const bool astc=im.fmt>=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && im.fmt<=VK_FORMAT_ASTC_4x4_SRGB_BLOCK,eac=im.fmt==VK_FORMAT_EAC_R11_UNORM_BLOCK || im.fmt==VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+    if(!astc && !eac)return;
+    const size_t bb=im.fmt==VK_FORMAT_EAC_R11_UNORM_BLOCK?8:16;
+    AstcCensus &c=astc_census[t->serial];uint64_t foreign=0,native=0,zero=0;
+    for(size_t at=0;at+bb<=bytes;at+=bb){uint64_t lo,hi=0;memcpy(&lo,p+at,8);if(bb==16)memcpy(&hi,p+at+8,8);if(!(lo|hi)){++zero;continue;}
+        if(astc){if(xbg_astc_block_error(p+at,0))++foreign;else ++native;continue;}
+        for(size_t h=0;h<bb;h+=8){const int v=xbg_eac_vs_bc4(p+at+h);if(v<0)++foreign;else if(v>0)++native;}}
+    c.blocks+=bytes/bb;c.zero+=zero;c.foreign+=foreign;c.native+=native;astc_census_blocks+=bytes/bb;astc_census_foreign+=foreign;
+    static unsigned lines=0;
+    unsigned k=0;for(uint64_t v=c.foreign;v>1;v>>=1)++k;
+    const bool full=strcmp(path,"partial")!=0;
+    if(lines<64 && ((foreign && k>=c.logged) || (full && c.first))){if(foreign && k>=c.logged)c.logged=k+1;if(full)c.first=false;++lines;
+        const double share=c.foreign+c.native?double(c.foreign)/double(c.foreign+c.native):0.0;
+        xbg_logf("NVN astc census: serial=%llu fmt=%#x -> vk=%d %ux%u layers=%u levels=%u target=%d %s upload: %s %llu foreign / %llu overlay-like of %zu blocks here; image total blocks=%llu zero=%llu foreign=%llu overlay-like=%llu -> %s (foreign share %.0f%%%s)",
+            (unsigned long long)t->serial,t->d.format,int(im.fmt),im.width,im.height,im.layers,im.levels,t->d.target,path,astc?"ASTC invalid":"EAC bc4-like halves",
+            (unsigned long long)foreign,(unsigned long long)native,bytes/bb,(unsigned long long)c.blocks,(unsigned long long)c.zero,(unsigned long long)c.foreign,(unsigned long long)c.native,
+            astc?(c.foreign?"FOREIGN DATA (real BC in an ASTC substitute)":"overlay data"):(share>0.5?"LOOKS LIKE REAL BC4/BC5":share>0.15?"mixed / unclear":"overlay data (EAC)"),
+            100*share,astc?"":"; overlay EAC ~5%, real BC4/BC5 ~84%");}
+}
+void astc_sanitize_upload(const Image &im,const tex_t *t,uint8_t *p,size_t bytes,const char *path){
+    if(!im.subst || !bytes)return;
+    if(im.fmt!=VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK){astc_census_upload(im,t,p,bytes,path);   // LDR / EAC: census, then LDR sanitize
+        // [nonadreno] Mi 14 A/B 07.11 (BUGS 2.37): the decal / particle atlases are mostly never-written (all-zero) memory. All-zero
+        // BC7 / BC3 is transparent black, all-zero ASTC is an error block that the GPU draws in the error colour (opaque magenta):
+        // bright patches that bloom spreads (white glows on Adreno, black squares on Mali). Same replacement as HDR, LDR flavour.
+        if(im.fmt!=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && im.fmt!=VK_FORMAT_ASTC_4x4_SRGB_BLOCK)return;
+        static int ldr_on=-1;if(ldr_on<0){const char *e=getenv("DM_GFX_ASTC_SANITIZE");ldr_on=!(e && *e && !atoi(e));
+            xbg_logf("NVN astc ldr sanitize=%d (DM_GFX_ASTC_SANITIZE): ASTC LDR error / all-zero blocks in uploads %s",ldr_on,ldr_on?"-> transparent black void extent":"are kept");}
+        if(!ldr_on)return;
+        size_t zero=0;const size_t n=xbg_astc_sanitize(p,bytes,0,&zero);if(!n)return;
+        static uint64_t blocks=0,zeros=0;static unsigned told=0;blocks+=n;zeros+=zero;++told;
+        if(told<=16 || (told&(told-1))==0)xbg_logf("NVN astc ldr sanitize: serial=%llu fmt=%#x %ux%u layers=%u levels=%u %s upload: replaced %zu blocks (%zu all-zero) of %zu; run total %llu (%llu all-zero)",
+            (unsigned long long)t->serial,t->d.format,im.width,im.height,im.layers,im.levels,path,n,zero,bytes/16,(unsigned long long)blocks,(unsigned long long)zeros);
+        return;}
+    if(astc_sanitize_on<0){const char *e=getenv("DM_GFX_ASTC_SANITIZE");astc_sanitize_on=!(e && *e && !atoi(e));
+        const char *d=getenv("DM_GFX_ASTC_DIAG");astc_diag=d && *d?atoi(d):1;
+        xbg_logf("NVN astc hdr sanitize=%d (DM_GFX_ASTC_SANITIZE): ASTC HDR error blocks in uploads %s; diag=%d (DM_GFX_ASTC_DIAG: 1 partial uploads, 2 also full)",
+            astc_sanitize_on,astc_sanitize_on?"-> black void extent":"are counted, not replaced",astc_diag);}
+    const bool partial=!strcmp(path,"partial");
+    if(astc_diag>=(partial?1:2)){
+        AstcDiag &d=partial?astc_diag_part:astc_diag_full;AstcDiag u;u.uploads=1;
+        for(size_t at=0;at+16<=bytes;at+=16){const uint8_t *b=p+at;++u.blocks;uint64_t lo,hi;memcpy(&lo,b,8);memcpy(&hi,b+8,8);
+            if(!(lo|hi)){++u.zero;continue;}
+            if(xbg_astc_block_error(b,1)){++u.error;continue;}
+            uint16_t px[64];astcref::decode_block(b,4,4,1,px);float m=0;bool nf=false;
+            for(int k=0;k<64;k++){if((k&3)==3)continue;const float f=xbg_ahs_half(px[k]);if(!std::isfinite(f))nf=true;else if(f>m)m=f;}
+            if(m>u.max)u.max=m;if(nf || m>2048.0f)++u.wild;}
+        d.uploads+=1;d.blocks+=u.blocks;d.zero+=u.zero;d.error+=u.error;d.wild+=u.wild;if(u.max>d.max)d.max=u.max;
+        static unsigned told_p=0,told_f=0;unsigned &told=partial?told_p:told_f;++told;
+        if(told<=16 || (told&255)==0 || ((u.error || u.wild) && told<=256))
+            xbg_logf("NVN astc hdr %s: serial=%llu %ux%u layers=%u levels=%u blocks=%llu zero=%llu invalid=%llu wild=%llu max=%g | run uploads=%llu blocks=%llu zero=%llu invalid=%llu wild=%llu max=%g",
+                path,(unsigned long long)t->serial,im.width,im.height,im.layers,im.levels,(unsigned long long)u.blocks,(unsigned long long)u.zero,(unsigned long long)u.error,
+                (unsigned long long)u.wild,u.max,(unsigned long long)d.uploads,(unsigned long long)d.blocks,(unsigned long long)d.zero,(unsigned long long)d.error,(unsigned long long)d.wild,d.max);
+    }
+    size_t n=0,zero=0;
+    if(astc_sanitize_on)n=xbg_astc_sanitize(p,bytes,1,&zero);
+    else for(size_t at=0;at+16<=bytes;at+=16){static const uint8_t z[16]={};const bool zb=!memcmp(p+at,z,16);if(zb || xbg_astc_block_error(p+at,1) || xbg_astc_hdr_void_nonfinite(p+at)){++n;zero+=zb;}}
+    if(!n)return;
+    astc_san_blocks+=n;astc_san_zero+=zero;++astc_san_uploads;
+    static unsigned told_p=0,told_f=0;unsigned &told=partial?told_p:told_f;++told;   // per path: the many full-upload subresources do not hide partial lines
+    if(told<=16 || (told&(told-1))==0)xbg_logf("NVN astc hdr sanitize: serial=%llu fmt=%#x %ux%u layers=%u levels=%u %s upload: %s %zu error blocks (%zu all-zero) of %zu; run total %llu blocks (%llu all-zero) in %llu uploads",
+        (unsigned long long)t->serial,t->d.format,im.width,im.height,im.layers,im.levels,path,astc_sanitize_on?"replaced":"found (not replaced)",n,zero,bytes/16,
+        (unsigned long long)astc_san_blocks,(unsigned long long)astc_san_zero,(unsigned long long)astc_san_uploads);
 }
 BcStore bc_store(const tex_t *t,VkSampleCountFlagBits samples){
     xbg_bc_format info;if(xbg_bc_format_info(t->d.format,&info))return BC_NOT;
@@ -3040,6 +3212,26 @@ void bc_vram_note(const Image &im,const tex_t *t){
         decoded_bytes_live/1048576.0,decoded_native_live/1048576.0,(unsigned long long)decoded_bc_images,(unsigned long long)t->serial,t->d.format,im.width,im.height,im.depth,im.layers,im.levels,int(im.fmt),im.mem_bytes/1048576.0,
         bct_raw/1048576.0,bct_out/1048576.0);
 }
+// [nonadreno] 2.37 DM_GFX_ASTC_CPU=<bc3 bc4 bc5 bc7 ...> (bisection; default none): substituted textures of these formats are created in the
+// BC path's uncompressed format (RGBA8 / RGBA8 sRGB, R16 / RG16 or R8 / RG8) and their substitute blocks are decoded here, on the CPU,
+// with spec decoders (ASTC LDR: xbg_astc_ref_decode.h; EAC R11 / RG11: xbg_astc_hdr.h xbg_eac_r11_block). Same data, no GPU decoder of the substitute format
+// involved: an artifact that goes away with it comes from sampling that format on this GPU; one that stays comes from the data or
+// from something that reads it as BC. Uploads go through BcUpload in CPU mode (full and partial). grep "NVN astc cpu".
+uint32_t astc_cpu_mask=0;
+void astc_subst_decode_linear(uint32_t fmt,uint32_t nbx,uint32_t nby,uint32_t nz,const uint8_t *raw,uint8_t *out,uint32_t bpp){
+    const uint32_t W=nbx*4,H=nby*4;const bool eac=fmt==0x49 || fmt==0x4b;const uint32_t bb=fmt==0x49?8:16;
+    for(uint32_t z=0;z<nz;z++)for(uint32_t by=0;by<nby;by++)for(uint32_t bx=0;bx<nbx;bx++){
+        const uint8_t *b=raw+((size_t(z)*nby+by)*nbx+bx)*bb;
+        if(!eac){uint16_t px[64];astcref::decode_block(b,4,4,0,px);
+            for(uint32_t t=0;t<16;t++){uint8_t *o=out+((size_t(z)*H+by*4+t/4)*W+bx*4+t%4)*bpp;for(int c=0;c<4;c++)o[c]=uint8_t((uint32_t(px[t*4+c])*255u+32767u)/65535u);}
+            continue;}
+        uint16_t ch[2][16];xbg_eac_r11_block(b,ch[0]);if(fmt==0x4b)xbg_eac_r11_block(b+8,ch[1]);
+        const int nch=fmt==0x4b?2:1;const bool eight=bpp==uint32_t(nch);   // R8 / RG8 (xbg_bc_8bit_channels) or R16 / RG16
+        for(uint32_t t=0;t<16;t++){uint8_t *o=out+((size_t(z)*H+by*4+t/4)*W+bx*4+t%4)*bpp;
+            for(int c=0;c<nch;c++){const uint32_t v=ch[c][t];
+                if(eight)o[c]=uint8_t((v*255u+1023u)/2047u);else{const uint16_t w=uint16_t((v*65535u+1023u)/2047u);memcpy(o+2*c,&w,2);}}}
+    }
+}
 struct BcUpload {
     Image &im;const tex_t *t;bool pro;int mode=0;   // pro: batches go to the slot's prologue; mode 0 copy as is, 1 CPU decode, 2 GPU decode
     bool partial=false;   // dirty GOB blocks (partial_upload), for the DM_GFX_BC_VERIFY log
@@ -3050,7 +3242,7 @@ struct BcUpload {
         int w=1,h=1;const int b=nvn_fmt_bpb(fmt,&w,&h);bw=uint32_t(std::max(w,1));bh=uint32_t(std::max(h,1));
         if(!im.decoded){block_bytes=bpp=im.bpp;return;}
         need(b==8 || b==16,"BC block size");block_bytes=uint32_t(b);bpp=im.bpp;opt=(xbg_bc_8bit_channels && (fmt==0x49 || fmt==0x4b)?1u:0u)|(xbg_bc6_e5 && fmt==0x50?2u:0u);   // only where it changes the output: one pipeline per format
-        mode=bc_mode==2?2:1;
+        mode=bc_mode==2 && !im.subst_cpu?2:1;
         if(mode==2){pipe=bcgpu::pipeline(fmt,opt);if(!pipe){mode=1;static bool told=false;if(!told){told=true;xbg_logf("NVN BC decode: no GPU pipeline for fmt=%#x opt=%u, decoding on the CPU",fmt,opt);}}}
     }
     // One block rectangle of a subresource: nbx x nby blocks x nz slices, tight rows of raw blocks (as nvn_deswizzle writes them), to
@@ -3070,7 +3262,8 @@ struct BcUpload {
         data.resize(at+out_n);c.bufferOffset=at;copies.push_back(c);
         if(!mode){memcpy(data.data()+at,raw,raw_n);return;}
         const uint64_t t0=timing_clock();
-        need(xbg_decode_bc_linear(fmt,nbx*4,nby*4,nz,raw,raw_n,0,0,data.data()+at,out_n)==0,"BC image decode failed");
+        if(im.subst_cpu)astc_subst_decode_linear(fmt,nbx,nby,nz,raw,data.data()+at,bpp);   // [nonadreno] 2.37 DM_GFX_ASTC_CPU
+        else need(xbg_decode_bc_linear(fmt,nbx*4,nby*4,nz,raw,raw_n,0,0,data.data()+at,out_n)==0,"BC image decode failed");
         bcw_cpu_ns+=timing_clock()-t0;
     }
     void flush(){
@@ -3113,6 +3306,7 @@ size_t upload_banded(Image &im,const tex_t *t,bool pro){
         const uint32_t w=std::max(1u,im.width>>level),h=std::max(1u,im.height>>level),depth=std::max(1u,im.depth>>level);
         const uint32_t bx=(w+up.bw-1)/up.bw,by=(h+up.bh-1)/up.bh;raw.resize(size_t(bx)*by*depth*up.block_bytes);
         need(nvn_deswizzle(&t->d,level,layer,t->mem,raw.data(),size_t(bx)*up.block_bytes)==0,"Texture deswizzle (chunked upload) failed");
+        astc_sanitize_upload(im,t,raw.data(),raw.size(),"chunked");   // [nonadreno] ASTC HDR error blocks (2.37)
         xbg_upload_bands(bx,by,depth,up.mode?16*up.bpp:up.block_bytes,up.mode==2?std::min(up.cap,bcgpu::out_cap()):up.cap,bands);
         for(const XbgBand &b:bands){const XbgCopy c=xbg_band_copy(0,b,bx,w,h,up.bw,up.bh);
             up.blocks(level,layer,raw.data()+(size_t(b.z0)*by+b.by0)*bx*up.block_bytes,bx,b.nby,b.nz,c.x,c.y,c.z,c.w,c.h,c.d);}
@@ -3188,6 +3382,7 @@ bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
                 memcpy(linear.data()+at+(size_t(z)*ny+y)*xb+x,t->mem+base+nvn_bl_offset(x0+x,y0+y,z0+z,row_bytes,rows,th,td),n);}
             if(r5_deswz==2){static std::vector<uint8_t> cmp;cmp.resize(size_t(xb)*ny*nz);nvn_deswizzle_gob_block(bl,th,xb,ny,nz,cmp.data());++r5_dz_cmp;   // [r5] compare: the old bytes are used
                 if(memcmp(cmp.data(),linear.data()+at,cmp.size())){++r5_dz_mism;if(r5_dz_mism<=16)xbg_logf("NVN r5 deswz MISMATCH partial serial=%llu fmt=%#x level=%u layer=%u block=%u,%u,%u th=%u td=%u",(unsigned long long)t->serial,t->d.format,level,layer,bx,by,bz,th,td);}}}
+            if(im.subst)astc_sanitize_upload(im,t,linear.data()+at,size_t(xb)*ny*nz,"partial");   // [nonadreno] ASTC HDR error blocks (2.37)
             VkBufferImageCopy c{};c.bufferOffset=at;c.bufferRowLength=(xb/bpb)*bw;c.bufferImageHeight=ny*bh;
             c.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,level,layer,1};
             c.imageOffset={int32_t((x0/bpb)*bw),int32_t(y0*bh),int32_t(z0)};
@@ -3251,7 +3446,11 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         // BC4/BC5 decode to 8-bit channels so linear-filtered samplers stay valid.
         {static int bc8=-1;if(bc8<0){VkFormatProperties q;vkGetPhysicalDeviceFormatProperties(cfg.physical,VK_FORMAT_R16G16_UNORM,&q);bc8=!(q.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);if(bc8)xbg_logf("NVN caps bc 8bit: R16G16_UNORM optimalFeatures=%#x lacks SAMPLED_IMAGE_FILTER_LINEAR",q.optimalTilingFeatures);}if(bc8)xbg_bc_8bit_channels=1;}
         const BcStore store=bc_store(t,p->samples);p->decoded=store==BC_DECODED;p->subst=store==BC_SUBST;   // [nonadreno] issue #6: the one decision point
-        xbg_bc_format info{};if(store!=BC_NOT && store!=BC_SUBST){xbg_bc_format_info(t->d.format,&info);++(p->decoded?decoded_bc_images:native_bc_images);}   // after bc_store: DM_GFX_BC6_E5 is set
+        if(p->subst && (astc_cpu_mask&xbg_astc_format_bit(t->d.format))){   // [nonadreno] 2.37 DM_GFX_ASTC_CPU: the substitute's blocks decoded on the CPU
+            bc_decode_init();p->subst=false;p->decoded=true;p->subst_cpu=true;
+            static unsigned told=0;if(told++<16)xbg_logf("NVN astc cpu: serial=%llu fmt=%#x %ux%u levels=%u layers=%u target=%d: substitute decoded on the CPU into the BC path's format (DM_GFX_ASTC_CPU)",
+                (unsigned long long)t->serial,t->d.format,t->d.width,t->d.height,t->d.levels,t->L.layers,t->d.target);}
+        xbg_bc_format info{};if((store!=BC_NOT && store!=BC_SUBST) || p->subst_cpu){xbg_bc_format_info(t->d.format,&info);++(p->decoded?decoded_bc_images:native_bc_images);}   // after bc_store: DM_GFX_BC6_E5 is set
         if(p->decoded){p->bpp=info.bytes_per_pixel;p->fmt=decoded_format(info.pixels);need(p->samples==VK_SAMPLE_COUNT_1_BIT,"BC texture cannot be multisampled");}
         else if(p->subst){const char *kept=nullptr;p->fmt=astc_ov_format(t,t->L.layers,&kept);p->bpp=t->L.bpb;}   // [nonadreno] ASTC overlay: same block size, blocks as they are
         else {p->fmt=format(t->d.format);p->bpp=t->L.bpb;if(t->d.format==0x32 && depth16_as_d24)p->fmt=VK_FORMAT_X8_D24_UNORM_PACK32;}
@@ -3358,6 +3557,9 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);subs.push_back({level,layer,pitch});}
             staging=stream_buffer(total,nullptr,0,false);uint8_t *dst=static_cast<uint8_t*>(staging.mapped);
             for(size_t i=0;i<subs.size();i++)need(nvn_deswizzle_gob(&t->d,subs[i].level,subs[i].layer,t->mem,dst+copies[i].bufferOffset,subs[i].pitch)==0,"Texture deswizzle failed");
+            if(im.subst && im.fmt==VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK)for(size_t i=0;i<subs.size();i++){const size_t end=i+1<subs.size()?copies[i+1].bufferOffset:total;   // [nonadreno] ASTC HDR error blocks (2.37)
+                astc_sanitize_upload(im,t,dst+copies[i].bufferOffset,(end-copies[i].bufferOffset)&~size_t(15),"full");}
+            else if(im.subst)astc_census_upload(im,t,reinterpret_cast<const uint8_t*>(t->mem),size_t(t->L.size)&~size_t(15),"full");   // LDR census: the guest copy (cached), not the mapped staging
             staging.flush();for(auto &copy:copies)copy.bufferOffset+=staging.offset;up_bytes=total;
         }else{
         auto dz_cmp=[&](uint32_t level,uint32_t layer,const uint8_t *old,size_t n,size_t pitch){   // [r5] DM_GFX_DESWZ_DIRECT=2
@@ -3377,6 +3579,7 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
             if(native_blocks){ // ASTC etc.: copy whole blocks, rows of blocks
                 uint32_t bx=(w+cbw-1)/cbw,by=(h+cbh-1)/cbh;linear.resize(begin+size_t(bx)*by*depth*im.bpp);
                 need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(bx)*im.bpp)==0,"Compressed texture deswizzle failed");
+                astc_sanitize_upload(im,t,linear.data()+begin,size_t(bx)*by*depth*im.bpp,"full");   // [nonadreno] ASTC HDR error blocks (2.37)
                 if(r5_deswz==2)dz_cmp(level,layer,linear.data()+begin,size_t(bx)*by*depth*im.bpp,size_t(bx)*im.bpp);
                 VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);continue;}
             linear.resize(begin+size_t(w)*h*depth*im.bpp);
@@ -4041,6 +4244,29 @@ const std::array<Shader*,6> &program_shaders(const prog_t *prog){
     if(!prog->serial){static std::array<Shader*,6> scratch;scratch=out;return scratch;}
     return program_cache.emplace(prog->serial,out).first->second;
 }
+// [pvr] fence_fatal (declared before retire_slot). Any GPU: the lines say which wait failed, how long it really waited, and what each
+// slot still in flight (and the one being recorded) holds: passes, draws, dispatches, the first / last draw's and the last dispatch's
+// shader keys (the keys of "NVN shader <key> stage=..." lines and of the shader bundles). With DM_GFX_CRUMBS on (the PowerVR default) the
+// fatal then prints the GPU's progress markers too ("NVN crumbs"), i.e. which pass / dispatch the GPU was in.
+static const char *diag_key(const Shader *sh){return sh?sh->key.c_str():"-";}
+static void fence_slot_log(const Slot &o,const char *what,uint64_t now){
+    const auto &d=o.diag;
+    xbg_logf("NVN fence slot ring=%u %s serial=%llu ticket=%llu (%s) age=%.1f ms ops=%llu passes=%u draws=%u dispatches=%u first draw vs=%s ps=%s last draw vs=%s gs=%s ps=%s last dispatch cs=%s",
+        unsigned(&o-slots),what,(unsigned long long)o.serial,(unsigned long long)o.rec_ticket,fguard::ran(o.rec_ticket)?"submitted":"SUBMIT not run yet",
+        d.submit_t?(now-d.submit_t)/1e6:-1.0,(unsigned long long)o.ops,d.passes,d.draws,d.dispatches,diag_key(d.first_vs),diag_key(d.first_ps),diag_key(d.last_vs),diag_key(d.last_gs),diag_key(d.last_ps),diag_key(d.last_cs));
+}
+[[noreturn]] void fence_fatal(Slot &s,VkResult r,uint64_t waited_ns,uint64_t timeout_ns,const char *who){
+    const bool early=xbg_fence_wait_early(r,waited_ns,timeout_ns),timeout=r==VK_TIMEOUT;const uint64_t now=timing_clock();
+    xbg_logf("NVN fence failure (%s): result=%d after %.1f ms of a %.0f ms timeout (%s); fence guard=%d recover=%d, early waits %llu (recovered %llu), worker waits recovered %llu; record thread ran SUBMIT tickets through %llu",
+        who,int(r),waited_ns/1e6,timeout_ns/1e6,timeout?(early?"early VK_TIMEOUT: the driver gave up, not a GPU hang":"the whole timeout: the GPU did not finish"):r==VK_ERROR_DEVICE_LOST?"VK_ERROR_DEVICE_LOST":"an error result",
+        fguard::level.load(),int(fguard::recover.load()),(unsigned long long)fguard::early.load(),(unsigned long long)fguard::early_recovered.load(),(unsigned long long)fguard::pool_recovered.load(),
+        (unsigned long long)vkrec::sub_done.load());
+    fence_slot_log(s,"(the failed wait's)",now);
+    for(unsigned k=0;k<slot_count;k++){const Slot &o=ring_slot(k);if(&o==&s)continue;if(o.pending)fence_slot_log(o,"(in flight)",now);else if(o.recording)fence_slot_log(o,"(being recorded)",now);}
+    if(timeout && !early)xbg_fatalf("The GPU did not finish this slot's work within %llu ms (fence wait timed out), so the device is hung",(unsigned long long)(timeout_ns/1000000ull));
+    if(timeout)xbg_fatalf("The slot's fence wait (%s) gave up after %.1f ms of its %llu ms timeout with VK_TIMEOUT: a driver fence error, not a GPU hang",who,waited_ns/1e6,(unsigned long long)(timeout_ns/1000000ull));
+    xbg_fatalf("The slot's fence wait (%s) failed: %d after %.1f ms",who,int(r),waited_ns/1e6);
+}
 } // namespace
 
 extern "C" void xbg_logf(const char *fmt,...){CPU_SCOPE(Log);char text[1024];va_list a;va_start(a,fmt);vsnprintf(text,sizeof(text),fmt,a);va_end(a);if(cfg.log)cfg.log(cfg.userdata,text);else fprintf(stderr,"[xbg] %s\n",text);}
@@ -4619,7 +4845,7 @@ void bound(uint64_t addr,size_t bytes){static const int race_min=[]{const char *
 // Guest submit boundary: the game may have written memory since the last one.
 void check(){if(race<=0 || entries.empty())return;size_t keep=0;
     for(auto &e:entries){const Slot &s=slots[e.slot];
-        const bool live=(e.serial==slot_serial && s.recording) || (e.serial<slot_serial && slot_serial-e.serial<slot_count && s.pending && vkGetFenceStatus(cfg.device,s.fence)==VK_NOT_READY);
+        const bool live=(e.serial==slot_serial && s.recording) || (e.serial<slot_serial && slot_serial-e.serial<slot_count && s.pending && fguard::status(s.fence,s.rec_ticket)==VK_NOT_READY);
         if(!live)continue;++checks;
         if(hash(reinterpret_cast<const void*>(uintptr_t(e.addr)),e.bytes)!=e.hash){++changed;changed_bytes+=e.bytes;
             static unsigned told=0;if(told++<24)xbg_logf("NVN zc-ubo race: block %#llx+%llu bound for submission %llu changed on the CPU while %s (frame %llu)",(unsigned long long)e.addr,(unsigned long long)e.bytes,(unsigned long long)e.serial,e.serial==slot_serial?"still recording":"in flight",(unsigned long long)stats.presents.load());
@@ -6155,6 +6381,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
         vkrec::CmdBindVertexBuffers(c.command,b.first,1,&b.second->buffer,&off);if(b.first<16){bc.vb[b.first]=b.second->buffer;bc.vbo[b.first]=off;}}
     pass_prof_draw(c.command);
     if(crumbs::active)crumbs::note_draw(crumbs::k64(state.shader[0]),crumbs::k64(state.shader[3]),crumbs::k64(state.shader[4]));   // [DOOM] DM_GFX_CRUMBS
+    {auto &dg=slots[slot_index].diag;if(!dg.draws++){dg.first_vs=state.shader[0];dg.first_ps=state.shader[4];}dg.last_vs=state.shader[0];dg.last_gs=state.shader[3];dg.last_ps=state.shader[4];}   // [pvr] fence_fatal
     // [DOOM] DM_GFX_DRAWPROBE: this draw's own samples-passed query (not while a guest counting run holds the one occlusion query)
     int probe_q=-1;
     {Slot &ps_=slots[slot_index];if(ps_.probe && c.command==ps_.cmd && !open_occlusion.cmd && ps_.probe_used<drawprobe_query_limit){
@@ -6565,7 +6792,7 @@ void after_dispatch(Commands &c){
 }
 const Buffer *dispatch_indirect=nullptr;   // [DOOM] DispatchComputeIndirect whose arguments are pending GPU results (see gpu_indirect_try)
 void dispatch(const p_dispatch &p){if(skip_unusable("compute dispatch"))return;preflight_cpu_reads();
-    if(draw_log_fp)fprintf(draw_log_fp,"DISPATCH %u cs=%s %dx%dx%d\n",draw_log_n++,state.shader[5]?state.shader[5]->key.c_str():"-",p.x,p.y,p.z);CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;if(pipeguard::skipped(state.shader[5]->key))return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=r3_module(*state.shader[5]);ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}if(!pipeline.pipeline){c.finish();return;}vkrec::CmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkrec::CmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);if(dispatch_indirect)vkrec::CmdDispatchIndirect(c.command,dispatch_indirect->buffer,dispatch_indirect->offset);else vkrec::CmdDispatch(c.command,p.x,p.y,p.z);crumbs::mark(c.command,crumbs::DISPATCH,crumbs::active?crumbs::k64(state.shader[5]):0);mark_storage_images();pass_prof_complete(c.command,prof_dispatch);bright::after_dispatch(c);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkrec::CmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
+    if(draw_log_fp)fprintf(draw_log_fp,"DISPATCH %u cs=%s %dx%dx%d\n",draw_log_n++,state.shader[5]?state.shader[5]->key.c_str():"-",p.x,p.y,p.z);CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;if(pipeguard::skipped(state.shader[5]->key))return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");Commands c;Descriptors &d=acquire_descriptors();descriptors(d,c,true);VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=r3_module(*state.shader[5]);ci.stage.pName="main";ci.layout=d.pipeline_layout;PipelineLease pipeline;{CPU_SCOPE(Pipeline);XbgPipelineKey key;bool cacheable=xbg_compute_pipeline_key(key,ci,d.entry->definition.view());pipeline_lookup(pipeline,key,cacheable,nullptr,&ci);}if(!pipeline.pipeline){c.finish();return;}vkrec::CmdBindPipeline(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline.pipeline);vkrec::CmdBindDescriptorSets(c.command,VK_PIPELINE_BIND_POINT_COMPUTE,d.pipeline_layout,0,1,&d.set,uint32_t(d.dynamic_offsets.size()),d.dynamic_offsets.data());int prof_dispatch=pass_prof_compute_begin(c.command,p);if(dispatch_indirect)vkrec::CmdDispatchIndirect(c.command,dispatch_indirect->buffer,dispatch_indirect->offset);else vkrec::CmdDispatch(c.command,p.x,p.y,p.z);crumbs::mark(c.command,crumbs::DISPATCH,crumbs::active?crumbs::k64(state.shader[5]):0);{auto &dg=slots[slot_index].diag;++dg.dispatches;dg.last_cs=state.shader[5];}/*[pvr] fence_fatal*/mark_storage_images();pass_prof_complete(c.command,prof_dispatch);bright::after_dispatch(c);VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;b.dstAccessMask=VK_ACCESS_HOST_READ_BIT;vkrec::CmdPipelineBarrier(c.command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&b,0,nullptr,0,nullptr);c.finish();++perf.dispatches;d.defer_writeback();++stats.dispatches;}
 
 struct MaskedClear {
     VkShaderModule vs{},fs{};VkPipelineLayout layout{};VkPipeline pipeline{};
@@ -7125,9 +7352,9 @@ template<class T>T variable_payload(const uint8_t *p,size_t n){T out{};memcpy(&o
 // thread blocked on an older fence is released while the next frame is still being translated.
 void poll_retire(){
     bool any=false;
-    if(slot_count==2){for(auto &s:slots)if(s.pending && !s.recording && vkGetFenceStatus(cfg.device,s.fence)==VK_SUCCESS){retire_slot(s);any=true;}}
+    if(slot_count==2){for(auto &s:slots)if(s.pending && !s.recording && fguard::status(s.fence,s.rec_ticket)==VK_SUCCESS){retire_slot(s);any=true;}}
     else for(unsigned k=0;k<slot_count;k++){Slot &s=ring_slot(k);if(!s.pending || s.recording)continue;   // [DOOM] 3 slots: oldest first, stop at the
-        if(vkGetFenceStatus(cfg.device,s.fence)!=VK_SUCCESS)break;retire_slot(s);any=true;}               // first busy one (fences signal in order; a newer slot's writebacks must not land first)
+        if(fguard::status(s.fence,s.rec_ticket)!=VK_SUCCESS)break;retire_slot(s);any=true;}               // first busy one (fences signal in order; a newer slot's writebacks must not land first)
     if(any){{std::lock_guard<std::mutex> l(gfx_job_mutex);}gfx_idle_cv.notify_all();}
 }
 // [DOOM] DM_GFX_CHUNK_MID: cut the chunk inside a guest submit. Checked only at command boundaries of execute(), where the arena
@@ -7163,7 +7390,7 @@ void chunk_mid_check(){
     ++chunk::checks;const uint64_t now=timing_clock();
     if(perf.submits!=chunk::seen_submits){chunk::seen_submits=perf.submits;chunk::acc_ns=0;chunk::t0=now;}   // another submission (arena, event, wait) restarted the budget
     if(chunk::acc_ns+(now-chunk::t0)<uint64_t(chunk::us)*1000u)return;
-    const Slot &next=ring_slot(1);if(next.pending && vkGetFenceStatus(cfg.device,next.fence)!=VK_SUCCESS){++chunk::not_ready;return;}
+    const Slot &next=ring_slot(1);if(next.pending && fguard::status(next.fence,next.rec_ticket)!=VK_SUCCESS){++chunk::not_ready;return;}
     {SiteScope site(SITE_CHUNK);submit_slots(false);}chunk::seen_submits=perf.submits;chunk::acc_ns=0;chunk::t0=timing_clock();chunk::was_open=false;++chunk::mid_cuts;
 }
 void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
@@ -7361,6 +7588,10 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      area_gran_fn=tile_area_on?reinterpret_cast<PFN_vkGetRenderAreaGranularity>(vkGetDeviceProcAddr(cfg.device,"vkGetRenderAreaGranularity")):nullptr;
      xbg_logf("NVN tile policy: area=%d barrier=%d chunk_mid_split=%d poison=%d noload default=%d (DM_GFX_TILE_AREA / TILE_BARRIER / CHUNK_MID_SPLIT / TILE_POISON / NOLOAD)",
               int(tile_area_on),int(tile_barrier_on),int(chunk_mid_split),int(tile_poison),int(xbg_noload_default(gpu_policy)));
+     // [pvr] slot fences across threads (namespace fguard, BUGS_AND_FIXES 2.38): before the poolreset worker and the record thread start.
+     {const char *e=getenv("DM_GFX_FENCE_GUARD");fguard::level=xbg_env_level(e,xbg_fence_guard_default(gpu_policy),0,2);fguard::recover=xbg_env_or(getenv("DM_GFX_FENCE_RECOVER"),true);
+      xbg_logf("NVN fence policy: guard=%d recover=%d crumbs default=%d (DM_GFX_FENCE_GUARD: 0 off, 1 no slot fence access before its vkQueueSubmit ran, 2 also one thread at a time with polled waits; DM_GFX_FENCE_RECOVER; DM_GFX_CRUMBS)",
+               fguard::level.load(),int(fguard::recover.load()),xbg_crumbs_default(gpu_policy));}
      // [nonadreno][afbc] AFBC-friendly usage, store ops and the compression query (xbg_vendor_policy.h, docs/research/tile_gpu_impl.md 7).
      lean_usage_on=xbg_env_or(getenv("DM_GFX_LEAN_USAGE"),xbg_lean_usage_default(gpu_policy));lean_dropped_images=lean_upgrades=0;
      {const char *e=getenv("DM_GFX_STORE_NONE");store_none_on=e && *e?atoi(e):(xbg_store_none_default(gpu_policy)?1:0);if(store_none_on<0 || store_none_on>2)store_none_on=1;}
@@ -7378,8 +7609,19 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}else if(const char *e=getenv("DM_GFX_DEFER_EVENTS")){int v=atoi(e);defer_events=v==1?1:v==2?2:0;}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *eg=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-event-guard").c_str(),"rb");evguard::enabled=eg!=nullptr;if(eg)fclose(eg);if(evguard::enabled)xbg_logf("NVN event guard on (marker gfx-event-guard)");}{FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-vcache").c_str(),"rb");vcache::enabled=false;if(v){vcache::enabled=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_VCACHE"))vcache::enabled=atoi(e)!=0;xbg_logf("NVN vertex/index cross-frame cache=%d tracker=%d (marker gfx-vcache)",int(vcache::enabled),int(nvn_dirty_since!=nullptr));}
      {FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-tex-dirty").c_str(),"rb");tex_dirty=false;if(v){tex_dirty=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_TEX_DIRTY"))tex_dirty=atoi(e)!=0;
       xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}
-     {astc_ov_mask=xbg_astc_formats_mask(getenv("DM_GFX_ASTC_FORMATS"));   // [nonadreno] ASTC overlay: set by the boot choice (vulkan_present.cpp) only when mounted
+     {astc_ov_mask=xbg_astc_formats_mask(getenv("DM_GFX_ASTC_FORMATS"));astc_cpu_mask=astc_ov_mask?xbg_astc_formats_mask(getenv("DM_GFX_ASTC_CPU"))&astc_ov_mask&~uint32_t(XBG_AO_BC6H|XBG_AO_BC1):0;
+      if(astc_ov_mask)if(const char *ks=getenv("DM_GFX_ASTC_KEEP")){std::string list;for(const char *q=ks;*q;){char *e=nullptr;const unsigned long long v=strtoull(q,&e,10);if(e==q){++q;continue;}astc_keep_serials.push_back(v);list+=" "+std::to_string(v);q=e;}
+        if(!list.empty())xbg_logf("NVN astc overlay: DM_GFX_ASTC_KEEP serials kept on the BC path:%s",list.c_str());}
+      if(astc_cpu_mask){char cm[64];xbg_astc_formats_str(astc_cpu_mask,cm,sizeof cm);xbg_logf("NVN astc cpu: substitutes of %s decoded on the CPU into the BC path's uncompressed formats (DM_GFX_ASTC_CPU, bisection)",cm);}   // [nonadreno] ASTC overlay: set by the boot choice (vulkan_present.cpp) only when mounted
       if(astc_ov_mask){char fm[64];xbg_astc_formats_str(astc_ov_mask,fm,sizeof fm);xbg_logf("NVN astc overlay: engine substitutes %s (DM_GFX_ASTC_FORMATS; rom overlay %s)",fm,getenv("DM_ROMFS_OVERLAY")?getenv("DM_ROMFS_OVERLAY"):"-");}}
+      // [nonadreno] 2.37: the per-format table in one line (what the BC path and the substitute path create, and the substitute's
+      // features on this device: s sampled, l linear filter, b blit src, t transfer dst), so one boot log answers "which VkFormat".
+      if(astc_ov_mask){std::string tab;
+        for(uint32_t code:{0x44u,0x48u,0x49u,0x4bu,0x4du,0x4eu,0x50u}){const VkFormat sub=xbg_astc_substitute_format(code);VkFormatProperties fp{};vkGetPhysicalDeviceFormatProperties(cfg.physical,sub,&fp);
+            const VkFormatFeatureFlags f=fp.optimalTilingFeatures;char e[160];
+            snprintf(e,sizeof e," %#x:%s bc=vk%d sub=vk%d[%c%c%c%c]",code,(astc_ov_mask&xbg_astc_format_bit(code))?"SUB":"bc",int(format(code)),int(sub),f&VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT?'s':'-',
+                f&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT?'l':'-',f&VK_FORMAT_FEATURE_BLIT_SRC_BIT?'b':'-',f&VK_FORMAT_FEATURE_TRANSFER_DST_BIT?'t':'-');tab+=e;}
+        xbg_logf("NVN astc overlay formats:%s (vk 131/132 BC1, 137/138 BC3, 139 BC4, 141 BC5, 143/144 BC6H, 145/146 BC7; 153 EAC R11, 155 EAC RG11, 157/158 ASTC 4x4 unorm/srgb, 1000066000 ASTC 4x4 sfloat)",tab.c_str());}
      {FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-noload").c_str(),"rb");noload_enabled=false;if(b){noload_enabled=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NOLOAD"))noload_enabled=atoi(e)!=0;else noload_enabled=xbg_noload_default(gpu_policy);draw_reads_on=noload_enabled;xbg_logf("NVN proven full-overwrite first draws skip the color load=%d (marker gfx-noload; A/B target noload; default on Mali / PowerVR)",int(noload_enabled));}{FILE *q=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-bright").c_str(),"rb");bright::enabled=true;if(q){bright::enabled=fgetc(q)!='0';fclose(q);}else if(const char *e=getenv("DM_GFX_BRIGHT"))bright::enabled=atoi(e)!=0;xbg_logf("NVN 3D brightening=%d (marker gfx-bright; A/B target bright)",int(bright::enabled));}{FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-perf-sample").c_str(),"rb");perf_sample=32;if(m){if(fscanf(m,"%u",&perf_sample)!=1)perf_sample=32;fclose(m);}else if(const char *e=getenv("DM_GFX_PERF_SAMPLE"))perf_sample=unsigned(atoi(e));perf_frame_timed=perf_sample!=0;perf_timed_frames=0;xbg_logf("NVN perf timing every %u frames (marker gfx-perf-sample; 0 = off)",perf_sample);}}
     // [DOOM] Chunked submit and ring depth (submit_chunk, chunk_mid_check, ring_slot). DM_GFX_SLOTS: 3 = 3-slot ring, else 2;
     // DM_GFX_CHUNK_MID: 1 = mid-submit cuts with forced checks every 32 draws, N > 1 = every N, unset / 0 = off (also off
@@ -7623,7 +7865,7 @@ extern "C" int xbg_game_profile_cpu(uint64_t first_frame,uint32_t frame_count){
     xbg_logf("NVN CPU_TIMING armed first=%llu count=%u maxSeconds=60 clock=steady elapsed-not-thread-cpu",(unsigned long long)first_frame,frame_count);
     if(first_frame==1)timing_start();return 0;
 }
-extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();++pend_gen;pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();vkrec::sync(vkrec::W_SHUTDOWN);VkResult r;if(pt_mode){dm_present_drain();dm_present_queue_lock();r=vkQueueWaitIdle(cfg.queue);dm_present_queue_unlock();}else r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();r5raw::clear();bright::shutdown();bcgpu::shutdown();if(astc_ov_mask){uint64_t all=0;for(uint64_t c:astc_ov_images)all+=c;xbg_logf("NVN astc overlay totals: textures substituted=%llu kept_bc=%llu live=%.1fMB",(unsigned long long)all,(unsigned long long)astc_ov_kept,astc_ov_bytes_live/1048576.0);}if(decoded_bc_images)xbg_logf("NVN BC totals raw=%.1fMB decoded=%.1fMB first raw=%.1fMB decoded=%.1fMB vram=%.1fMB",bct_raw/1048576.0,bct_out/1048576.0,bct_first_raw/1048576.0,bct_first_out/1048576.0,decoded_bytes_live/1048576.0);clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
+extern "C" int xbg_game_shutdown(){gfx_drain();gfx_async_stop();std::lock_guard<std::recursive_mutex> lock(mutex);if(!initialized)return 0;timing_report("shutdown-partial");provenance_close("SHUTDOWN");resolve_pending();submit_slots(true);save_pipeline_cache();pending_writebacks.clear();++pend_gen;pending_reports.clear();pending_events.clear();recording_events.clear();epochs.clear();vkrec::sync(vkrec::W_SHUTDOWN);VkResult r;if(pt_mode){dm_present_drain();dm_present_queue_lock();r=vkQueueWaitIdle(cfg.queue);dm_present_queue_unlock();}else r=vkQueueWaitIdle(cfg.queue);if(r!=VK_SUCCESS)return r;wtrack::release();destroy_slots();clear_pipeline_objects();cache_save_join();warm::shutdown();r5raw::clear();bright::shutdown();bcgpu::shutdown();if(astc_ov_mask){uint64_t all=0;for(uint64_t c:astc_ov_images)all+=c;xbg_logf("NVN astc overlay totals: textures substituted=%llu kept_bc=%llu live=%.1fMB ldr/eac census foreign=%llu of %llu blocks; hdr error blocks=%llu (all-zero %llu) in %llu uploads %s; hdr partial uploads=%llu blocks=%llu zero=%llu invalid=%llu wild=%llu max=%g; full blocks=%llu zero=%llu invalid=%llu wild=%llu max=%g",(unsigned long long)all,(unsigned long long)astc_ov_kept,astc_ov_bytes_live/1048576.0,(unsigned long long)astc_census_foreign,(unsigned long long)astc_census_blocks,(unsigned long long)astc_san_blocks,(unsigned long long)astc_san_zero,(unsigned long long)astc_san_uploads,astc_sanitize_on==0?"not replaced":"replaced",(unsigned long long)astc_diag_part.uploads,(unsigned long long)astc_diag_part.blocks,(unsigned long long)astc_diag_part.zero,(unsigned long long)astc_diag_part.error,(unsigned long long)astc_diag_part.wild,astc_diag_part.max,(unsigned long long)astc_diag_full.blocks,(unsigned long long)astc_diag_full.zero,(unsigned long long)astc_diag_full.error,(unsigned long long)astc_diag_full.wild,astc_diag_full.max);}if(decoded_bc_images)xbg_logf("NVN BC totals raw=%.1fMB decoded=%.1fMB first raw=%.1fMB decoded=%.1fMB vram=%.1fMB",bct_raw/1048576.0,bct_out/1048576.0,bct_first_raw/1048576.0,bct_first_out/1048576.0,decoded_bytes_live/1048576.0);clear_descriptor_caches();clear_render_pass_cache();images.clear();++images_epoch;for(auto &f:persistent_framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);persistent_framebuffers.clear();image_index.clear();image_index_dirty=true;program_cache.clear();shaders.clear();textures.clear();texture_pool_cache=nullptr;samplers.clear();null_textures.clear();texture_pool_cache=nullptr;pools.clear();host_segments.clear();host_ranges.clear();host_bytes=0;cmd_range_lo=0;cmd_range_bytes=0;vkDestroyPipelineCache(cfg.device,pipeline_cache,nullptr);pipeline_cache=VK_NULL_HANDLE;vkDestroyCommandPool(cfg.device,command_pool,nullptr);command_pool=VK_NULL_HANDLE;initialized=false;return 0;}
 extern "C" void xbg_game_get_stats(xbg_game_stats *out){if(out)*out={stats.submissions.load(),stats.draws.load(),stats.dispatches.load(),stats.presents.load(),stats.shader_loads.load()};}
 extern "C" void xbg_game_frame_counters(xbg_frame_counters *out){if(out)*out={hud::pipelines.load(),hud::pipeline_ns.load(),hud::shaders.load(),hud::shader_ns.load(),hud::uploads.load(),hud::reuploads.load(),hud::upload_bytes.load(),hud::upload_ns.load()};}
 extern "C" void xbg_game_set_frame(uint64_t frame){hud::frame.store(frame,std::memory_order_relaxed);}
@@ -7667,7 +7909,7 @@ void submit_chunk(uint64_t spent_ns){
     if(perf.submits!=chunk::seen_submits){chunk::seen_submits=perf.submits;chunk::acc_ns=0;}   // any submit (present, legacy wait, cut) restarts the budget
     chunk::acc_ns+=chunk::mid?timing_clock()-chunk::t0:spent_ns;Slot &cur=slots[slot_index];const Slot &other=ring_slot(1);
     if(chunk::acc_ns<uint64_t(chunk::us)*1000u || !cur.recording || !cur.ops || failed)return;
-    if(other.pending && vkGetFenceStatus(cfg.device,other.fence)!=VK_SUCCESS){if(chunk::diag)++chunk::not_ready;return;}
+    if(other.pending && fguard::status(other.fence,other.rec_ticket)!=VK_SUCCESS){if(chunk::diag)++chunk::not_ready;return;}
     submit_slots(false);chunk::seen_submits=perf.submits;chunk::acc_ns=0;if(chunk::diag)++chunk::end_cuts;
 }
 static void xbg_submit_now(int n,const uint64_t *handles){std::lock_guard<std::recursive_mutex> lock(mutex);
@@ -7704,7 +7946,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     if(completion_path && deadline.expired())return 0;
     if(!legacy_waitall){
         auto begin=std::chrono::steady_clock::now();
-        auto retire_done=[&]{for(unsigned i=0;i<slot_count;i++){if(completion_path && deadline.expired())break;Slot *o=oldest_pending();if(!o || vkGetFenceStatus(cfg.device,o->fence)!=VK_SUCCESS)break;SiteScope site(SITE_LEGACY_WAIT);retire_slot(*o);}};
+        auto retire_done=[&]{for(unsigned i=0;i<slot_count;i++){if(completion_path && deadline.expired())break;Slot *o=oldest_pending();if(!o || fguard::status(o->fence,o->rec_ticket)!=VK_SUCCESS)break;SiteScope site(SITE_LEGACY_WAIT);retire_slot(*o);}};
         for(int round=0;round<4;round++){
             if(completion_path && deadline.expired())return fence<=completed;
             retire_done();if(failed)return 0;if(fence<=completed)return 1;
@@ -7721,7 +7963,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
             XTRACE_COUNT("dm-legacy-slot", t-slots);XTRACE_COUNT("dm-legacy-covers", t->covers);
             XTRACE_COUNT("dm-legacy-completed", completed.load());
             VkFence f=t->fence;const uint64_t tk=t->rec_ticket;t->waiters.n.fetch_add(1);lock.unlock();   // tk: [mtb] its SUBMIT packet (0: submitted directly)
-            XTRACE_BEGIN("dm-legacy-wait");uint64_t b0=timing_clock();VkResult r=vkrec::wait_submitted(tk,remaining)?vkWaitForFences(cfg.device,1,&f,VK_TRUE,remaining):VK_TIMEOUT;uint64_t b1=timing_clock();XTRACE_END();
+            XTRACE_BEGIN("dm-legacy-wait");uint64_t b0=timing_clock();VkResult r=vkrec::wait_submitted(tk,remaining)?fguard::wait(f,remaining,nullptr,"legacy wait"):VK_TIMEOUT;uint64_t b1=timing_clock();XTRACE_END();
             // 先释放 waiter 再等待完成/重锁；此后槽可被另一线程复用，不再读取 t。
             // Release the waiter before completion/relock waits; another thread may now reuse the slot, so never read t again.
             t->waiters.n.fetch_sub(1);
@@ -7750,8 +7992,8 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
     for(unsigned oi=0;oi<slot_max;oi++)if(Slot &slot=slots[order[oi]];slot.pending){uint64_t remaining=completion_path?deadline.remaining_ns():timeout;
         if(completion_path && !remaining)return fence<=completed;
         if(!completion_path && timeout!=UINT64_MAX){auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();remaining=uint64_t(elapsed)>=timeout?0:timeout-uint64_t(elapsed);}
-        bool busy=vkGetFenceStatus(cfg.device,slot.fence)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
-        VkResult r=vkrec::wait_submitted(slot.rec_ticket,remaining)?vkWaitForFences(cfg.device,1,&slot.fence,VK_TRUE,remaining):VK_TIMEOUT;if(busy){block_ns[SITE_LEGACY_WAIT]+=timing_clock()-b0;++block_calls[SITE_LEGACY_WAIT];}
+        bool busy=fguard::status(slot.fence,slot.rec_ticket)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
+        VkResult r=vkrec::wait_submitted(slot.rec_ticket,remaining)?fguard::wait(slot.fence,remaining,nullptr,"legacy wait all"):VK_TIMEOUT;if(busy){block_ns[SITE_LEGACY_WAIT]+=timing_clock()-b0;++block_calls[SITE_LEGACY_WAIT];}
         if(r==VK_TIMEOUT)return 0;VK(r);retire_slot(slot);
     }
     resolve_known_reports();if(pending_writebacks.empty()&&pending_reports.empty()){publish_completed(submitted);}
