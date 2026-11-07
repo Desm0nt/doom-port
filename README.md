@@ -1,5 +1,21 @@
 # DOOM Mobile
 
+> [!IMPORTANT]
+> **Mali, PowerVR, Xclipse phones (Dimensity, Exynos, Tensor, Unisoc): make the `astc` texture cache.** Since
+> **v0.4.12**, setup can prepare a copy of the game's textures in formats these GPUs read directly (folder
+> `DOOM Mobile/astc`, about 0.85 GB). Without it the game converts textures on the fly: it needs several times more
+> graphics memory, stutters more and may be closed by the system while a level loads. If you prepared your files with an
+> older setup, run setup again (it only adds the new folder) and copy `astc` to `Download/DOOM Mobile/astc` on the
+> phone: [INSTALL, step 5](docs/INSTALL.md#step-5-copy-the-game-folder-to-the-phone). Snapdragon phones don't need it.
+>
+> **Телефоны с Mali, PowerVR, Xclipse (Dimensity, Exynos, Tensor, Unisoc): сделайте кэш текстур `astc`.** Начиная с
+> **v0.4.12** setup умеет готовить копию текстур игры в форматах, которые эти GPU читают напрямую (папка
+> `DOOM Mobile/astc`, около 0,85 ГБ). Без неё игра перекодирует текстуры на лету: ей нужно в несколько раз больше
+> графической памяти, больше подтормаживаний, и система может закрыть игру во время загрузки уровня. Если файлы
+> готовились старым setup, запустите его ещё раз (он только добавит новую папку) и скопируйте `astc` на телефон в
+> `Download/DOOM Mobile/astc`: [INSTALL, шаг 5](docs/INSTALL.ru.md#шаг-5-скопируйте-папку-игры-на-телефон).
+> Телефонам со Snapdragon она не нужна.
+
 **A native Android port of DOOM (2016) for Nintendo Switch.** The game's own AArch64 program runs directly on the
 phone's CPU; a small host provides the Switch system services, and the NVN graphics API is replayed on Vulkan.
 You bring the game: this repository contains no game content.
