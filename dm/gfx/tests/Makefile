@@ -22,6 +22,14 @@ t_dirty_gone: t_dirty_gone.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
 #   make t_dirty_pbgen && ./t_dirty_pbgen
 t_dirty_pbgen: t_dirty_pbgen.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
 	gcc -O1 -g -Wall -Wno-unused-function -I../../android/compat/include -include dm_android_compat.h -o $@ t_dirty_pbgen.c -lpthread
+# [DOOM] issue #21: mprotect ENOMEM at vm.max_map_count (real kernel limit, filler mapping); Linux only like t_dirty_gone:
+#   make t_dirty_enomem && ./t_dirty_enomem
+t_dirty_enomem: t_dirty_enomem.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
+	gcc -O1 -g -Wall -Wno-unused-function -I../../android/compat/include -include dm_android_compat.h -o $@ t_dirty_enomem.c -lpthread
+# [DOOM] issue #21: VMA coalescer of zero-copy chunks (memfd stands in for the dma-buf fd); Linux only like t_dirty_gone:
+#   make t_dirty_coalesce && ./t_dirty_coalesce
+t_dirty_coalesce: t_dirty_coalesce.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
+	gcc -O1 -g -Wall -Wno-unused-function -I../../android/compat/include -include dm_android_compat.h -o $@ t_dirty_coalesce.c -lpthread
 # [r5] DM_GFX_DESWZ_DIRECT: GOB-wise deswizzle == nvn_deswizzle byte for byte (formats, targets, sizes, mips, block heights);
 #   make t_deswz_direct && ./t_deswz_direct
 t_deswz_direct: t_deswz_direct.c ../tex/nvn_deswizzle.c ../tex/nvn_deswizzle.h ../nvn/nvn_tex.c ../nvn/nvn_tex.h

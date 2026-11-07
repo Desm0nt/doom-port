@@ -13,6 +13,19 @@ uint64_t nvn_dirty_now(void);                                      // 当前代�
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp); // 覆盖页在戳之后被写过 → 1 | Covered pages were written after the stamp -> 1
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps);           // 累计：游戏写触发的缺页次数、宿主写前解保护的页数 | Cumulative: number of page faults triggered by game writes, number of pages unprotected before host writes
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns);   // 累计：本模块 mprotect 调用次数、覆盖页数、耗时 | Cumulative: this module's mprotect call count, pages covered, time spent
+// [DOOM] issue #21, cumulative: failed mprotect calls (all / unprotect single page / protect or discard), unprotects rescued by
+// widening to the whole PROT run, and the last errno (12 = ENOMEM: vm.max_map_count). Atomics only: callable from a signal handler.
+void nvn_dirty_mp_fail(uint64_t *fails, uint64_t *unprot, uint64_t *prot, uint64_t *widened, int *last_errno);
+// [DOOM] issue #21: VMA coalescing of zero-copy (dma-buf) chunks, DM_DIRTY_COALESCE (nvn_dirty.c). The engine registers each
+// chunk right after mapping it at the guest address (MAP_SHARED|MAP_FIXED from fd at offset off); the tracker takes ownership of
+// fd and re-maps the chunk in place from it when its split VMAs pile up. The veto (engine) answers 1 for a range that holds
+// protection the tracker does not know about (wtrack storage snapshots); such a chunk is left alone.
+void nvn_dirty_zc_chunk(void *lo, size_t n, int fd, uint64_t off);
+void nvn_dirty_coalesce_veto_register(int (*fn)(uintptr_t lo, size_t len));
+void nvn_dirty_coalesce_hold(int on);   // 1 / 0 around the engine publishing a vetoed region and its mprotect (no coalesce in between)
+void nvn_dirty_coalesce_tick(void);                 // the "dm-vmacoal" thread every 500 ms; tests call it themselves (DM_DIRTY_COALESCE_THREAD=0)
+int nvn_dirty_coalesce_at(const void *addr);        // re-map the chunk containing addr now (tests); 1 = done
+void nvn_dirty_coalesce_stats(int *chunks, uint64_t *vmas, uint64_t *coalesces, uint64_t *aborts, uint64_t *ms);   // vmas: the model's total
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total); // 当前存活槽、槽表高水位、登记总次数 | Currently live slots, slot table high-water mark, total number of registrations
 // [DOOM] DM_TEX_DISCARD (engine: gfx/vulkan/engine/xbg_tex_discard.inc). Page-aligned ranges inside one tracked pool; only the
 // engine's restore worker calls begin/abort/commit/restore_*. Page states: 0 none, 1 write-protected, 2 busy, 3 gone (released,

@@ -19,6 +19,7 @@
 #include <sys/prctl.h>
 #include <sys/uio.h>       // struct iovec
 #include <sys/syscall.h>   // __NR_process_vm_readv (bionic declares the wrapper only under _GNU_SOURCE)
+#include <fcntl.h>         // open (dm_maps_count)
 #endif
 
 static _Atomic uint64_t g_watch_last_ns;
@@ -142,6 +143,30 @@ void dm_guest_write_prep_register(void (*fn)(void *addr, size_t len)) {
 // 宿主自己写客体内存（read() 直读进客体缓冲等）之前调用：写保护页不会对系统调用触发缺页、而是返回 EFAULT
 // Called before the host itself writes guest memory (read() straight into a guest buffer, etc.): for a system call a write-protected page does not trigger a page fault but returns EFAULT
 void dm_guest_write_prepare(void *addr, size_t len) { for (int i = 0; i < g_nwrite_prep; i++) g_write_prep[i](addr, len); }
+// [DOOM] issue #21: the dirty tracker's mprotect failure counters in the crash report (crash_mem_note below)
+static void (*g_crash_note)(void);
+void dm_crash_note_register(void (*fn)(void)) { g_crash_note = fn; }
+// [DOOM] issue #21: VMAs of this process (lines of /proc/self/maps) and vm.max_map_count. A protection change inside a VMA splits
+// it; past the limit mprotect fails with ENOMEM. open / read / close only (async-signal-safe): the crash handler calls it, and so
+// does the perf monitor once a minute. Reading maps takes the mm lock in short chunks; ~6 MB of text at 65k maps, a few ms.
+int dm_maps_count(long *max_map_count) {
+    *max_map_count = -1;
+#if defined(__linux__)
+    char b[2048]; ssize_t n; int fd = open("/proc/sys/vm/max_map_count", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { n = read(fd, b, sizeof b - 1); close(fd);
+        if (n > 0) { long v = 0; for (ssize_t i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++) v = v * 10 + (b[i] - '0'); *max_map_count = v; } }
+    fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC); if (fd < 0) return -1;
+    int lines = 0; while ((n = read(fd, b, sizeof b)) > 0) for (ssize_t i = 0; i < n; i++) lines += b[i] == '\n';
+    close(fd); return lines;
+#else
+    return -1;
+#endif
+}
+static void crash_mem_note(void) {
+    long mx; int maps = dm_maps_count(&mx);
+    if (maps >= 0) fprintf(stderr, "[dm] memory map: %d maps, vm.max_map_count %ld%s\n", maps, mx, mx > 0 && maps >= mx - 64 ? " (AT THE LIMIT: mprotect / mmap splits fail with ENOMEM)" : "");
+    if (g_crash_note) g_crash_note();
+}
 
 // 诊断模块（diag.c 的探针）与线程现场（hle_thread.c）由各自注册进来：单测只链本文件时不依赖它们
 // The diagnostics module (the probes in diag.c) and the thread state dump (hle_thread.c) each register themselves here: a unit test that links only this file does not depend on them
@@ -238,6 +263,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
             overflow = 1;
         }
     }
+    if (sig == SIGSEGV || sig == SIGBUS) crash_mem_note();   // [DOOM] issue #21: map count vs vm.max_map_count + the dirty tracker's mprotect failures
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, UC_X(uc, i), i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
     dm_backtrace(UC_FP(uc));

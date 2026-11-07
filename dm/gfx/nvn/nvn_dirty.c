@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <time.h>
 #include <limits.h>
+#include <errno.h>
 #ifdef __linux__
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -72,12 +73,70 @@ void nvn_dirty_stat(int *live, int *peak, int *cap) { *live = atomic_load(&g_liv
 static _Atomic int g_overflow_logged;
 static pthread_mutex_t g_slot_mu = PTHREAD_MUTEX_INITIALIZER;   // 建池 / 销池（客体线程，可能并发）互斥选槽；缺页处理路径不碰它 | Pool creation / destruction (guest threads, possibly concurrent) pick slots under a mutex; the page-fault handling path does not touch it
 static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;   // 本模块的 mprotect：调用次数、覆盖页数、耗时（mach 时基，缺页路径里也安全） | This module's mprotect: call count, pages covered, time spent (mach timebase, safe in the page-fault path too)
-static void mp(uintptr_t a, size_t len, int prot) {
-    uint64_t t = mach_absolute_time(); mprotect((void *)a, len, prot);
+// [DOOM] issue #21 (POCO F7 / Galaxy S24: "fault loop" in write_texels at level transitions): mprotect can fail. A protection
+// change inside a VMA splits it, and a split past vm.max_map_count (65530 on Android) fails with ENOMEM. With zero-copy
+// (DM_GFX_ZEROCOPY, Adreno default) the pools are dma-buf mappings, which are VM_PFNMAP and never merge back, so every page
+// this module ever protected or unprotected alone stays a VMA of its own and the count only grows over a session. mp() used to
+// ignore the result: an unprotect that failed still set the state NONE -> a read-only page in state NONE -> on_fault answered
+// "re-execute" forever (crash.c's fault-loop guard after 20000 faults). Now the result is returned and counted, and the callers
+// keep the invariant above: unprotect_page widens to the whole PROT run (whole VMAs, no split) or reports a real crash; a failed
+// protect leaves the pages NONE with a new generation (dirty: re-uploaded, never stale). errno is kept for the caller.
+static _Atomic uint64_t g_mp_fail, g_mp_fail_unprot, g_mp_fail_prot, g_mp_widened, g_mp_red_ns;
+static _Atomic int g_mp_errno;
+// [DOOM] issue #21: zero-copy chunks (dma-buf, VM_PFNMAP: their VMAs never merge) registered by the engine with their fd
+// (nvn_dirty_zc_chunk). Every mprotect of this module notes the VMA boundaries it can create in a per-chunk bitmap: a VMA of
+// such a mapping only ever splits, so 1 + the set bits is the chunk's VMA count (exact for our own calls; failed calls count
+// too, which can only overestimate). The coalescer (below, DM_DIRTY_COALESCE) re-maps a fragmented chunk in place from its fd.
+enum { MAX_ZC = 512 };
+typedef struct { uintptr_t lo, end; size_t np; int fd; uint64_t off; _Atomic uint64_t *bnd; _Atomic uint32_t vmas; } zc_chunk_t;
+static zc_chunk_t g_zc[MAX_ZC];
+static _Atomic int g_nzc;
+static _Atomic uint64_t g_coal_n;   // chunks re-mapped so far (crash note, stats)
+static _Atomic int g_coal_active;   // a coalesce holds its chunk's pages BUSY: protect waits for them instead of skipping them
+static zc_chunk_t *zc_of(uintptr_t a) {
+    int n = atomic_load_explicit(&g_nzc, memory_order_acquire);
+    for (int i = 0; i < n; i++) if (a >= g_zc[i].lo && a < g_zc[i].end) return &g_zc[i];
+    return NULL;
+}
+static void zc_bound(uintptr_t a) {   // a VMA boundary at page address a (signal-safe: atomics only)
+    zc_chunk_t *c = zc_of(a); if (!c || a == c->lo) return;
+    size_t i = (a - c->lo) >> g_shift; uint64_t bit = 1ull << (i & 63);
+    if (!(atomic_fetch_or(&c->bnd[i >> 6], bit) & bit)) atomic_fetch_add(&c->vmas, 1);
+}
+static int mp(uintptr_t a, size_t len, int prot) {
+    int saved = errno;
+    if (atomic_load_explicit(&g_nzc, memory_order_relaxed)) { zc_bound(a); zc_bound(a + len); }
+    uint64_t t = mach_absolute_time(); int rc = mprotect((void *)a, len, prot), e = rc ? errno : 0;
     atomic_fetch_add(&g_mp_ticks, mach_absolute_time() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
+    if (rc) { atomic_fetch_add(&g_mp_fail, 1); atomic_store(&g_mp_errno, e); }
+    errno = saved;
+    return rc;
 }
 
 static mach_timebase_info_data_t g_tb;   // 首次登记池时取好（缺页路径里只做乘除） | Obtained when a pool is first registered (the fault path only multiplies and divides)
+// One red line per 10 s at most (the fault path calls it; LOG as busy_wait does): what failed, errno, and the totals so far.
+// ok: -1 = a protect, 1 / 0 = an unprotect whose widened retry worked / failed too.
+static void mp_red(const char *what, uintptr_t a, size_t pages, int ok) {
+    uint64_t now = g_tb.denom ? mach_absolute_time() * g_tb.numer / g_tb.denom : 1, last = atomic_load(&g_mp_red_ns);
+    if (last && now - last < 10000000000ull) return;
+    if (!atomic_compare_exchange_strong(&g_mp_red_ns, &last, now ? now : 1)) return;
+    LOG("【红】脏页跟踪 / dirty tracker: mprotect failed (%s %p, %zu pages%s), errno %d (12 = ENOMEM: vm.max_map_count reached?); totals: failures %llu (unprotect %llu, protect %llu), widened %llu",
+        what, (void *)a, pages, ok < 0 ? "" : ok ? ", widened to the PROT run: ok" : ", widened to the PROT run: FAILED", atomic_load(&g_mp_errno),
+        (unsigned long long)atomic_load(&g_mp_fail), (unsigned long long)atomic_load(&g_mp_fail_unprot), (unsigned long long)atomic_load(&g_mp_fail_prot), (unsigned long long)atomic_load(&g_mp_widened));
+}
+void nvn_dirty_mp_fail(uint64_t *fails, uint64_t *unprot, uint64_t *prot, uint64_t *widened, int *last_errno) {
+    *fails = atomic_load(&g_mp_fail); *unprot = atomic_load(&g_mp_fail_unprot); *prot = atomic_load(&g_mp_fail_prot);
+    *widened = atomic_load(&g_mp_widened); *last_errno = atomic_load(&g_mp_errno);
+}
+// The crash report's line (crash.c dm_crash_note_register; in the signal handler, like the rest of the report)
+static void crash_note(void) {
+    int n = atomic_load_explicit(&g_nzc, memory_order_acquire); uint64_t v = 0; for (int i = 0; i < n; i++) v += atomic_load(&g_zc[i].vmas);
+    fprintf(stderr, "[dm] dirty tracker: mprotect calls %llu, failures %llu (unprotect %llu, protect %llu), widened %llu, last errno %d; zero-copy chunks %d with %llu VMAs (model), coalesced %llu times\n",
+            (unsigned long long)atomic_load(&g_mp_calls), (unsigned long long)atomic_load(&g_mp_fail), (unsigned long long)atomic_load(&g_mp_fail_unprot),
+            (unsigned long long)atomic_load(&g_mp_fail_prot), (unsigned long long)atomic_load(&g_mp_widened), atomic_load(&g_mp_errno), n, (unsigned long long)v,
+            (unsigned long long)atomic_load(&g_coal_n));
+}
+
 static _Atomic int g_busy_red;
 // 等这一页离开 BUSY。返回 1 = 已离开；0 = 等过了上限（报红一次）。信号处理里可用：只有原子读、mach_absolute_time、sched_yield
 // Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, mach_absolute_time and sched_yield
@@ -109,12 +168,36 @@ static int pbgen_read(void) {
     return g_pbgen;
 }
 static _Atomic int g_unprot_inflight;
-static void unprotect_page(range_t *r, uintptr_t p) {   // 调用方已把状态从 PROT 改成 BUSY | The caller has already changed the state from PROT to BUSY
+// Pages s..e (BUSY, really writable now) -> a new generation each -> NONE, inside the in-flight count: a page becomes NONE only
+// this way (unprotect, or a protect whose mprotect failed), which is what the window walk below relies on.
+static void mark_writable(range_t *r, uintptr_t s, uintptr_t e) {
     const int count = g_pbgen > 0; if (count) atomic_fetch_add(&g_unprot_inflight, 1);
-    mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
-    { uint64_t g = atomic_fetch_add(&g_now, 1) + 1; atomic_store(&r->gen[p], g); bgen_note(r, p, g); }
-    atomic_store(&r->state[p], PG_NONE);
+    for (uintptr_t k = s; k <= e; k++) { uint64_t g = atomic_fetch_add(&g_now, 1) + 1; atomic_store(&r->gen[k], g); bgen_note(r, k, g); atomic_store(&r->state[k], PG_NONE); }
     if (count) atomic_fetch_sub(&g_unprot_inflight, 1);
+}
+// 调用方已把状态从 PROT 改成 BUSY | The caller has already changed the state from PROT to BUSY.
+// Returns 1 = p is writable (NONE); 0 = it is still read-only (state PROT again): the fault must not be reported as handled.
+// [DOOM] issue #21: when the one-page mprotect fails (it needs a split, ENOMEM at vm.max_map_count), the whole run of PROT pages
+// around p is unprotected at once: its neighbours are NONE (writable, so a VMA boundary lies there) or the range edge (a pool
+// starts and ends a mapping), so the run consists of whole VMAs and mprotect needs no split. Every page of the run gets a new
+// generation (its textures re-upload once). A neighbour another thread holds BUSY also ends the run; then the retry may fail too.
+static int unprotect_page(range_t *r, uintptr_t p) {
+    const int count = g_pbgen > 0; if (count) atomic_fetch_add(&g_unprot_inflight, 1);   // held across the mprotect, as before
+    uintptr_t s = p, e = p;
+    int ok = !mp(r->base + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
+    if (!ok) {
+        const uintptr_t np = (r->end - r->base) >> g_shift;
+        atomic_fetch_add(&g_mp_fail_unprot, 1);
+        for (;;) { uint8_t st = PG_PROT; if (!s || !atomic_compare_exchange_strong(&r->state[s - 1], &st, PG_BUSY)) break; s--; }
+        for (;;) { uint8_t st = PG_PROT; if (e + 1 >= np || !atomic_compare_exchange_strong(&r->state[e + 1], &st, PG_BUSY)) break; e++; }
+        ok = !mp(r->base + (s << g_shift), (e - s + 1) << g_shift, PROT_READ | PROT_WRITE);
+        if (ok) atomic_fetch_add(&g_mp_widened, 1);
+        mp_red("unprotect", r->base + (p << g_shift), (size_t)(e - s + 1), ok);
+    }
+    if (ok) mark_writable(r, s, e);
+    else for (uintptr_t k = s; k <= e; k++) atomic_store(&r->state[k], PG_PROT);   // still read-only: the state says so
+    if (count) atomic_fetch_sub(&g_unprot_inflight, 1);
+    return ok;
 }
 // ---------- [DOOM] DM_TEX_DISCARD: restore requests (signal-safe: atomics, futex, nanosleep only) ----------
 enum { NREQ = 64, GONE_WAIT_MS = 60000 };
@@ -174,7 +257,9 @@ static int on_fault(void *addr, int is_write, void *uc) {
         if (!is_write) return s == PG_BUSY ? busy_wait(r, p) : 0;
     }
     uint8_t st = PG_PROT;
-    if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_faults, 1); return 1; }
+    if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) {   // 0 when the page stays read-only: a real crash report instead of a fault loop (issue #21)
+        if (!unprotect_page(r, p)) return 0;
+        atomic_fetch_add(&g_faults, 1); return 1; }
     if (st == PG_BUSY) return busy_wait(r, p);   // 别的线程正在改这页的保护：等它改完重执行（改成了只读就再缺页一次、走上面那一支） | Another thread is changing this page's protection: wait for it to finish and re-execute (if it became read-only, it faults once more and takes the branch above)
     return atomic_load(&r->gen[p]) != 0;   // 刚被别的线程解掉（本次缺页发生在解之前）：重执行；从未保护过的页不是我们的 | Just unprotected by another thread (this fault happened before the unprotect): re-execute; pages that were never protected are not ours
 }
@@ -186,7 +271,7 @@ static void prep_write(void *addr, size_t len) {
         uintptr_t stop = e < r->end ? e : r->end;
         for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) {
             for (;;) { uint8_t st = PG_PROT;   // 见 BUSY 等完要重看：对方可能是在设只读，等完这页是 PROT，照样得解 | After waiting out BUSY, look again: the other side may have been setting read-only, in which case the page is PROT after the wait and still has to be unprotected
-                if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { unprotect_page(r, p); atomic_fetch_add(&g_preps, 1); break; }
+                if (atomic_compare_exchange_strong(&r->state[p], &st, PG_BUSY)) { if (unprotect_page(r, p)) atomic_fetch_add(&g_preps, 1); break; }   // failed: the host write then faults into on_fault, which reports it
                 if (st == PG_GONE || st == PG_REST) { atomic_fetch_add(&g_gone_pw, 1); if (!gone_wait(r, p)) break; continue; }   // [DOOM] DM_TEX_DISCARD: restore first, then unprotect as usual
                 if (st != PG_BUSY || !busy_wait(r, p)) break; }
         }
@@ -194,11 +279,14 @@ static void prep_write(void *addr, size_t len) {
     }
 }
 
-void nvn_dirty_add_range(const void *mem, size_t size) {
+static void dirty_init(void) {   // first pool registration (or first zero-copy chunk, issue #21); guest threads that create pools, serialized by the game
     static int inited;
     if (!inited) { inited = 1; g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb);
         pbgen_read();   // before any page can be protected, so unprotect_page always sees the final value
-        dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); }
+        dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write); dm_crash_note_register(crash_note); }
+}
+void nvn_dirty_add_range(const void *mem, size_t size) {
+    dirty_init();
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -247,6 +335,13 @@ void nvn_dirty_remove_range(const void *mem) {
 int nvn_dirty_tracked(const void *addr, size_t len) {
     range_t *r = find((uintptr_t)addr); return r && (uintptr_t)addr + len <= r->end;
 }
+// Pages s..e (BUSY, writable) -> one mprotect(read-only) -> PROT. [DOOM] issue #21: if it fails (the run needs a split past
+// vm.max_map_count) they are still writable: NONE with a new generation each, so they count as written (re-uploaded at the next
+// check, protected again then) and can never be clean but writable.
+static void protect_flush(range_t *r, uintptr_t s, uintptr_t e) {
+    if (!mp(r->base + (s << g_shift), (e - s + 1) << g_shift, PROT_READ)) { for (uintptr_t k = s; k <= e; k++) atomic_store(&r->state[k], PG_PROT); return; }
+    atomic_fetch_add(&g_mp_fail_prot, 1); mark_writable(r, s, e); mp_red("protect", r->base + (s << g_shift), (size_t)(e - s + 1), -1);
+}
 // 设只读：先把页标成 BUSY，mprotect 落地后才标 PROT（次序与不变式见文件头的状态说明）
 // Set read-only: mark the page BUSY first, and mark it PROT only after mprotect has landed (for the order and the invariant see the state notes at the top of the file)
 void nvn_dirty_protect(const void *addr, size_t len) {
@@ -261,8 +356,9 @@ void nvn_dirty_protect(const void *addr, size_t len) {
     for (uintptr_t i = p; i <= q + 1; i++) {
         uint8_t st = PG_NONE;
         int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
+        if (!took && i <= q && st == PG_BUSY && atomic_load(&g_coal_active) && busy_wait(r, i)) { st = PG_NONE; took = atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY); }   // issue #21: a page the coalescer holds would stay unprotected
         if (took && !open) { run = i; open = 1; }
-        if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && open) { protect_flush(r, run, i - 1); open = 0; }
     }
 }
 uint64_t nvn_dirty_now(void) { return atomic_load(&g_now); }
@@ -292,10 +388,12 @@ static void protect_run(range_t *r, uintptr_t p, uintptr_t q, uint64_t verify_fl
     uintptr_t run = 0; int open = 0;
     for (uintptr_t i = p; i <= q + 1; i++) {
         int took = 0;
-        if (i <= q) { uint8_t st = atomic_load(&r->state[i]); if (st == PG_NONE) took = atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY); }
+        if (i <= q) { uint8_t st = atomic_load(&r->state[i]);
+            if (st == PG_BUSY && atomic_load(&g_coal_active) && busy_wait(r, i)) st = atomic_load(&r->state[i]);   // issue #21: wait out the coalescer (see nvn_dirty_protect)
+            if (st == PG_NONE) took = atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY); }
         if (took && verify_floor != UINT64_MAX && atomic_load(&r->gen[i]) <= verify_floor) ++*missed;
         if (took && !open) { run = i; open = 1; }
-        if (!took && open) { mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && open) { protect_flush(r, run, i - 1); open = 0; }
     }
 }
 // Why visiting only the windows (64-page blocks) whose summary bgen is above the cookie's floor protects every writable page:
@@ -357,6 +455,175 @@ void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ticks) * tb.numer / tb.denom;
 }
+// ---------- [DOOM] issue #21: VMA coalescing of zero-copy chunks (DM_DIRTY_COALESCE, default on) ----------
+// Why: a protection change inside a VMA splits it, and dma-buf mappings (VM_PFNMAP) never merge again, so in a zero-copy pool
+// every page this module ever unprotected alone stays a VMA of its own. The count only grows (it reached vm.max_map_count 65530
+// after ~23 min on a POCO F7, then splits failed with ENOMEM). On anonymous memory the kernel merges neighbours with equal
+// protection, so there the count stays near the minimum the protection pattern needs: 1 + the number of PROT / NONE changes.
+// What: re-map the whole chunk in place from the same dma-buf fd and offset (mmap MAP_SHARED|MAP_FIXED: one fresh VMA, the same
+// physical pages, the same address, so the content, guest pointers and the Vulkan import -- which holds the buffer itself, not
+// this CPU mapping -- are untouched), then re-apply the tracker's page states as a few large runs. That is the anonymous-memory
+// minimum again. Rejected alternatives: coarser protection granules for dma-buf pools bound the count, but a write makes a whole
+// granule writable and dirty (larger partial re-uploads of the VT caches every frame, a permanent cost); DM_GFX_ZC_MAX_MB only
+// moves the TextureBuffer pool off zero-copy (the vertex / UBO snapshots come back) and leaves the other pools growing.
+// Protocol (the page-state rules at the top of the file): under g_slot_mu (no pool registration / removal meanwhile) every page of
+// the chunk goes NONE / PROT -> BUSY (any other state: abort, retry at a later tick); mmap(PROT_READ, MAP_FIXED) replaces the
+// mapping atomically (other threads block on the mm lock, never see a hole); runs of formerly NONE pages get PROT_READ|PROT_WRITE
+// back; then each page gets its old state, generation unchanged. Meanwhile a game write faults, sees BUSY and waits (busy_wait),
+// a host pre-write waits for BUSY to clear, a pread that gets EFAULT is prepared and retried (hle_fs.c ReadFile), and a protect
+// waits for the coalescer's pages (g_coal_active) instead of skipping them. Writable pages are read-only only inside that window,
+// protected pages never become writable, so no write goes unseen. The in-flight unprotect count is held for the whole window, so
+// a concurrent window walk (DM_DIRTY_PROTECT_BGEN) keeps its old floor. Chunks with mprotect protection of the engine's own
+// (wtrack storage snapshots) are skipped through the veto hook the engine registers.
+// When: a thread ("dm-vmacoal") ticks every 500 ms. If the modelled zero-copy VMAs exceed DM_DIRTY_COALESCE_BUDGET (default
+// 16384, a quarter of the limit), the chunks with the largest excess over their minimum are coalesced (excess >= 64 and >= a
+// quarter of the chunk's count, so a chunk whose own protection pattern needs that many VMAs is not re-mapped in vain), up to
+// 8 a tick, until the total is under 3/4 of the budget. DM_DIRTY_COALESCE_TEST=<s>: every <s> seconds every chunk with any
+// excess is coalesced whatever the budget (phone test of the mechanics); DM_DIRTY_COALESCE=0: off (the model is still kept).
+static int g_coal_cfg = -1, g_coal_budget = 16384, g_coal_test_s, g_coal_broken;
+static pthread_mutex_t g_coal_mu = PTHREAD_MUTEX_INITIALIZER;
+static int (*g_coal_veto)(uintptr_t lo, size_t len);
+static _Atomic uint64_t g_coal_aborts, g_coal_vetoed, g_coal_ns, g_coal_reopen_fail, g_coal_before, g_coal_after;
+static int coal_cfg(void) {
+    if (g_coal_cfg < 0) {
+        const char *e = getenv("DM_DIRTY_COALESCE"); g_coal_cfg = e && *e ? atoi(e) != 0 : 1;
+        e = getenv("DM_DIRTY_COALESCE_BUDGET"); if (e && atoi(e) > 0) g_coal_budget = atoi(e);
+        e = getenv("DM_DIRTY_COALESCE_TEST"); if (e && atoi(e) > 0) g_coal_test_s = atoi(e);
+        LOG("[nvn] DM_DIRTY_COALESCE=%d budget %d VMAs%s (zero-copy chunks re-mapped in place when their split VMAs pile up, issue #21)", g_coal_cfg, g_coal_budget,
+            g_coal_test_s ? ", TEST: every chunk with any excess, periodically" : "");
+    }
+    return g_coal_cfg;
+}
+void nvn_dirty_coalesce_veto_register(int (*fn)(uintptr_t lo, size_t len)) { g_coal_veto = fn; }
+// The engine publishes a new protected region (and applies its mprotect) inside hold(1) / hold(0): a coalesce holds g_coal_mu from
+// its veto check to the end of the re-map, so it either sees the region and leaves the chunk alone or runs entirely before it.
+void nvn_dirty_coalesce_hold(int on) { if (on) pthread_mutex_lock(&g_coal_mu); else pthread_mutex_unlock(&g_coal_mu); }
+// The minimum VMA count of the chunk's current protection pattern (PROT = read-only, the rest writable; BUSY counts as its
+// neighbour), from the range covering it; 1 for an untracked chunk (all writable).
+static uint32_t coal_minimal(const zc_chunk_t *c, const range_t *r) {
+    if (!r) return 1;
+    uintptr_t p0 = (c->lo - r->base) >> g_shift; uint32_t m = 1; int prev = -1;
+    for (size_t k = 0; k < c->np; k++) { uint8_t s = atomic_load(&r->state[p0 + k]); if (s == PG_BUSY) continue; int ro = s == PG_PROT; if (prev >= 0 && ro != prev) m++; prev = ro; }
+    return m;
+}
+static range_t *coal_range(const zc_chunk_t *c) { range_t *r = find(c->lo); return r && c->lo >= r->base && c->end <= r->end ? r : NULL; }
+// Re-map one chunk (caller holds g_coal_mu). 1 = done, 0 = skipped (veto, failure), -1 = a page was busy (try again soon).
+static int coalesce(zc_chunk_t *c) {
+    if (g_coal_broken) return 0;
+    if (g_coal_veto && g_coal_veto(c->lo, c->end - c->lo)) { atomic_fetch_add(&g_coal_vetoed, 1); return 0; }
+    pthread_mutex_lock(&g_slot_mu);
+    range_t *r = coal_range(c);
+    if (!r && find(c->lo)) { pthread_mutex_unlock(&g_slot_mu); return 0; }   // a range covering only part of the chunk: never the case for pools (chunks are cut from one pool)
+    const uintptr_t p0 = r ? (c->lo - r->base) >> g_shift : 0, nw = (c->np + 63) >> 6;
+    uint64_t *was = calloc(nw, sizeof *was);   // bit set = the page was PROT
+    if (!was) { pthread_mutex_unlock(&g_slot_mu); return 0; }
+    uint64_t t0 = mach_absolute_time(); uint32_t before = atomic_load(&c->vmas);
+    const int count = g_pbgen > 0; if (count) atomic_fetch_add(&g_unprot_inflight, 1);
+    atomic_fetch_add(&g_coal_active, 1);
+    size_t taken = 0;
+    if (r) for (; taken < c->np; taken++) {
+        _Atomic uint8_t *s = &r->state[p0 + taken]; uint8_t st = atomic_load(s);
+        if ((st != PG_NONE && st != PG_PROT) || !atomic_compare_exchange_strong(s, &st, PG_BUSY)) break;
+        if (st == PG_PROT) was[taken >> 6] |= 1ull << (taken & 63);
+    }
+    int ok = !r || taken == c->np;
+    if (ok) {
+        void *m = mmap((void *)c->lo, c->end - c->lo, r ? PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, c->fd, (off_t)c->off);
+        if (m != (void *)c->lo) {   // a MAP_FIXED that failed may have left a hole: say so loudly, never try again
+            g_coal_broken = 1; ok = 0;
+            LOG("【红】[nvn] VMA coalesce: mmap MAP_FIXED of chunk %p+%#zx failed errno %d; coalescing off for this session", (void *)c->lo, (size_t)(c->end - c->lo), errno);
+        } else {
+            for (size_t w = 0; w < nw; w++) atomic_store(&c->bnd[w], 0);
+            atomic_store(&c->vmas, 1);
+            for (size_t k = 0; r && k < c->np;) {   // runs of formerly writable pages get write access back
+                if (was[k >> 6] >> (k & 63) & 1) { k++; continue; }
+                size_t e = k; while (e + 1 < c->np && !(was[(e + 1) >> 6] >> ((e + 1) & 63) & 1)) e++;
+                if (mp(c->lo + (k << g_shift), (e - k + 1) << g_shift, PROT_READ | PROT_WRITE)) {   // still read-only: PROT, and written as far as anyone can tell
+                    atomic_fetch_add(&g_coal_reopen_fail, 1);
+                    for (size_t j = k; j <= e; j++) { uint64_t g = atomic_fetch_add(&g_now, 1) + 1; atomic_store(&r->gen[p0 + j], g); bgen_note(r, p0 + j, g); was[j >> 6] |= 1ull << (j & 63); }
+                }
+                k = e + 1;
+            }
+        }
+    }
+    for (size_t k = 0; k < taken; k++) atomic_store(&r->state[p0 + k], (was[k >> 6] >> (k & 63) & 1) ? PG_PROT : PG_NONE);   // old states, old generations
+    atomic_fetch_sub(&g_coal_active, 1);
+    if (count) atomic_fetch_sub(&g_unprot_inflight, 1);
+    pthread_mutex_unlock(&g_slot_mu);
+    free(was);
+    if (!ok) { if (g_coal_broken) return 0; atomic_fetch_add(&g_coal_aborts, 1); return -1; }
+    if (g_coal_veto && g_coal_veto(c->lo, c->end - c->lo))   // an engine protection appeared during the re-map (wtrack activates rarely, at its first use)
+        LOG("【红】[nvn] VMA coalesce: chunk %p gained an engine-protected region while being re-mapped; its write tracking resyncs through its own spot checks", (void *)c->lo);
+    uint64_t ns = (mach_absolute_time() - t0) * g_tb.numer / g_tb.denom; uint32_t after = atomic_load(&c->vmas);
+    atomic_fetch_add(&g_coal_ns, ns); atomic_fetch_add(&g_coal_before, before); atomic_fetch_add(&g_coal_after, after);
+    uint64_t n = atomic_fetch_add(&g_coal_n, 1) + 1;
+    if (n <= 16 || !(n & (n - 1)))
+        LOG("[nvn] VMA coalesce #%llu: chunk %p+%zu MB re-mapped, VMAs %u -> %u, %.2f ms", (unsigned long long)n, (void *)c->lo, (size_t)((c->end - c->lo) >> 20), before, after, ns / 1e6);
+    return 1;
+}
+int nvn_dirty_coalesce_at(const void *addr) {   // tests / diagnostics: re-map the chunk containing addr now
+    zc_chunk_t *c = zc_of((uintptr_t)addr); if (!c) return 0;
+    pthread_mutex_lock(&g_coal_mu); int ok = coalesce(c); pthread_mutex_unlock(&g_coal_mu); return ok > 0;
+}
+void nvn_dirty_coalesce_tick(void) {
+    if (!coal_cfg() || g_coal_broken) return;
+    static uint64_t next_test;
+    int n = atomic_load_explicit(&g_nzc, memory_order_acquire); if (!n) return;
+    uint64_t total = 0; for (int i = 0; i < n; i++) total += atomic_load(&g_zc[i].vmas);
+    uint64_t now = mach_absolute_time() * g_tb.numer / g_tb.denom;
+    const int test = g_coal_test_s && now >= next_test;
+    if (!test && total <= (uint64_t)g_coal_budget) return;
+    if (test) next_test = now + (uint64_t)g_coal_test_s * 1000000000ull;
+    pthread_mutex_lock(&g_coal_mu);
+    static char tried[MAX_ZC]; memset(tried, 0, (size_t)n);   // this tick: skipped (vetoed / busy) or done
+    for (int done = 0, pass = 0; pass < n && done < 8; pass++) {
+        int best = -1; uint32_t best_ex = 0;
+        for (int i = 0; i < n; i++) {   // the chunk with the largest excess over its minimum
+            zc_chunk_t *c = &g_zc[i]; uint32_t v = atomic_load(&c->vmas); if (v <= 1 || tried[i]) continue;
+            range_t *r = coal_range(c); uint32_t m = coal_minimal(c, r), ex = v > m ? v - m : 0;
+            if (!test && (ex < 64 || ex < v / 4)) continue;
+            if (ex > best_ex) { best_ex = ex; best = i; }
+        }
+        if (best < 0 || !best_ex) break;
+        uint32_t v0 = atomic_load(&g_zc[best].vmas);
+        int ok = coalesce(&g_zc[best]);
+        for (int t = 0; ok < 0 && t < 4; t++) { struct timespec ts = {0, 200000L}; nanosleep(&ts, NULL); ok = coalesce(&g_zc[best]); }   // a page another thread had busy for a moment
+        tried[best] = 1;
+        if (ok <= 0) continue;   // still busy, or vetoed: the other chunks go on, this one waits for the next tick
+        done++; uint32_t v1 = atomic_load(&g_zc[best].vmas); if (v1 < v0) total = total > v0 - v1 ? total - (v0 - v1) : 0;
+        if (!test && total <= (uint64_t)g_coal_budget * 3 / 4) break;
+    }
+    pthread_mutex_unlock(&g_coal_mu);
+}
+static void *coal_thread(void *a) {
+    (void)a;
+#ifdef __APPLE__
+    pthread_setname_np("dm-vmacoal");
+#else
+    pthread_setname_np(pthread_self(), "dm-vmacoal");
+#endif
+    for (;;) { struct timespec ts = {0, 500000000L}; nanosleep(&ts, NULL); nvn_dirty_coalesce_tick(); }
+    return NULL;
+}
+void nvn_dirty_zc_chunk(void *lo, size_t n, int fd, uint64_t off) {
+    dirty_init();
+    if (fd < 0 || !n || ((uintptr_t)lo & (g_pg - 1)) || (n & (g_pg - 1))) { if (fd >= 0) close(fd); return; }
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; pthread_mutex_lock(&mu);
+    int i = atomic_load(&g_nzc);
+    if (i >= MAX_ZC) { pthread_mutex_unlock(&mu); close(fd); LOG("【红】[nvn] VMA coalesce: chunk table full (%d), %p not registered", MAX_ZC, lo); return; }
+    zc_chunk_t *c = &g_zc[i]; c->lo = (uintptr_t)lo; c->end = c->lo + n; c->np = n >> g_shift; c->fd = fd; c->off = off;
+    c->bnd = calloc((c->np + 63) >> 6, sizeof *c->bnd); if (!c->bnd) die("VMA coalesce: boundary bitmap (%zu pages)", c->np);
+    atomic_store(&c->vmas, 1);
+    atomic_store_explicit(&g_nzc, i + 1, memory_order_release);
+    pthread_mutex_unlock(&mu);
+    if (!i && coal_cfg()) { const char *e = getenv("DM_DIRTY_COALESCE_THREAD");   // tests: 0 = no thread, they tick themselves
+        if (!e || atoi(e)) { pthread_t th; if (!pthread_create(&th, NULL, coal_thread, NULL)) pthread_detach(th); } }
+}
+void nvn_dirty_coalesce_stats(int *chunks, uint64_t *vmas, uint64_t *coalesces, uint64_t *aborts, uint64_t *ms) {
+    int n = atomic_load_explicit(&g_nzc, memory_order_acquire); uint64_t v = 0; for (int i = 0; i < n; i++) v += atomic_load(&g_zc[i].vmas);
+    *chunks = n; *vmas = v; *coalesces = atomic_load(&g_coal_n); *aborts = atomic_load(&g_coal_aborts) + atomic_load(&g_coal_vetoed);
+    *ms = atomic_load(&g_coal_ns) / 1000000;
+}
 // ---------- [DOOM] DM_TEX_DISCARD: worker-side page transitions (see the PG_GONE notes at the top; nvn_dirty.h) ----------
 static range_t *pages_of(const void *lo, size_t len, uintptr_t *p, uintptr_t *q) {
     if (!len || ((uintptr_t)lo & (g_pg - 1)) || (len & (g_pg - 1)) || !nvn_dirty_tracked(lo, len)) return NULL;
@@ -380,7 +647,9 @@ void nvn_dirty_gone_abort(const void *lo, size_t len) {
 }
 void nvn_dirty_gone_commit(const void *lo, size_t len) {
     uintptr_t p, q; range_t *r = pages_of(lo, len, &p, &q); if (!r) return;
-    mp((uintptr_t)lo, len, PROT_NONE);
+    if (mp((uintptr_t)lo, len, PROT_NONE)) {   // issue #21: still readable -> no DONTNEED (it would zero live content); stays protected
+        atomic_fetch_add(&g_mp_fail_prot, 1); for (uintptr_t k = p; k < q; k++) atomic_store(&r->state[k], PG_PROT);
+        mp_red("discard", (uintptr_t)lo, len >> g_shift, -1); return; }
     madvise((void *)lo, len, MADV_DONTNEED);   // private anonymous memory: the pages are freed (a dma-buf / file mapping would keep them)
     for (uintptr_t k = p; k < q; k++) atomic_store(&r->state[k], PG_GONE);
     atomic_fetch_add(&g_gone_seq, 1); fx_wake(&g_gone_seq);

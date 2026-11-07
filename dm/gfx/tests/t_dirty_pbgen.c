@@ -13,6 +13,7 @@ static int (*g_hook)(void *, int, void *);
 static void (*g_prep)(void *, size_t);
 void dm_fault_hook_register(int (*fn)(void *, int, void *)) { g_hook = fn; }
 void dm_guest_write_prep_register(void (*fn)(void *, size_t)) { g_prep = fn; }
+void dm_crash_note_register(void (*fn)(void)) { (void)fn; }   // issue #21: the crash report line (crash.c)
 static void on_segv(int sig, siginfo_t *si, void *uc_) {
     (void)sig; ucontext_t *uc = uc_; int is_write = (uc->uc_mcontext.gregs[REG_ERR] & 2) != 0;
     if (g_hook && g_hook(si->si_addr, is_write, uc)) return;

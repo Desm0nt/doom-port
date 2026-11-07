@@ -121,6 +121,11 @@ int thr_limit_used(void);                             // the game's live threads
 // Page fault hook / hook before the host writes guest memory (crash.c; used for write-protect dirty page tracking)
 void dm_fault_hook_register(int (*fn)(void *addr, int is_write, void *uc));
 void dm_guest_write_prep_register(void (*fn)(void *addr, size_t len));
+// [DOOM] issue #21: a line the crash report prints after the CRASH line of a SIGSEGV / SIGBUS (the dirty tracker registers its
+// mprotect failure counters; must be async-signal-safe), and the process's memory map count against vm.max_map_count
+// (Linux: lines of /proc/self/maps, read with open/read only, so the crash handler and the perf monitor share it; -1 = unreadable)
+void dm_crash_note_register(void (*fn)(void));
+int dm_maps_count(long *max_map_count);
 void dm_res_report_register(void (*fn)(uint32_t tick, const char *why));   // 资源计数回调（图形层注册）：每 250 拍、读取画面已撤、记满退出时调 | Resource count callback (registered by the graphics layer): called every 250 ticks, when the loading screen has been dismissed, and on exit when the record is full
 void (*dm_res_report_cb(void))(uint32_t tick, const char *why);   // 取已注册的资源计数回调（未注册为空） | Get the registered resource count callback (null if not registered)
 void dm_guest_write_prepare(void *addr, size_t len);

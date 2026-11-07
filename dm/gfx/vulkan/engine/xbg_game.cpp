@@ -30,6 +30,7 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_bc_policy.h"
 #include "xbg_astc_overlay.h"
 #include "xbg_spirv_clip.h"
+#include "xbg_spirv_ubo2ssbo.h"
 #include "xbg_writeback_policy.h"
 #include "xbg_clear_spv.h"
 #include "xbg_bright_spv.h"
@@ -246,7 +247,8 @@ struct Capture {
     // [DOOM] crop mode (gfx-capture-now "<skip> <max> <x> <y> <w> <h>"): only render-target outputs, only that rectangle of the
     // images of the main render size (image coordinates: Switch layout, row 0 at the bottom), no inputs / buffers / vertices;
     // small enough that every draw of a frame fits the budget (which draw writes a given pixel).
-    bool crop=false;uint32_t cx=0,cy=0,cw=0,ch=0;
+    // A 7th number 0 drops the vertex-stage inputs too (outputs only: every draw of a frame fits).
+    bool crop=false,crop_inputs=true;uint32_t cx=0,cy=0,cw=0,ch=0;
     ~Capture(){if(trace)fclose(trace);}
 } capture;
 constexpr uint64_t capture_limit=64ull*1024*1024;
@@ -260,7 +262,7 @@ bool capture_begin(const char *kind,uint64_t present){
 }
 void capture_data(const char *label,const void *data,size_t bytes){
     if(!capture.active || !bytes)return;
-    if(capture.crop && strncmp(label,"rt",2) && strncmp(label,"st0-",4) && strncmp(label,"vertex",6) && strncmp(label,"index",5)){capture_log("SKIP label=%s reason=crop-mode",label);return;}   // crop mode keeps outputs + vertex-stage inputs
+    if(capture.crop && strncmp(label,"rt",2) && (!capture.crop_inputs || (strncmp(label,"st0-",4) && strncmp(label,"vertex",6) && strncmp(label,"index",5)))){capture_log("SKIP label=%s reason=crop-mode",label);return;}   // crop mode keeps outputs + vertex-stage inputs
     if(bytes>capture_limit-capture.bytes){capture_log("SKIP label=%s bytes=%zu reason=64MiB-budget",label,bytes);return;}
     char leaf[256];snprintf(leaf,sizeof(leaf),"f%llu-e%u-%s.bin",(unsigned long long)capture.frame,capture.events,label);
     std::string path=capture.directory+"/"+leaf;FILE *file=fopen(path.c_str(),"wb");
@@ -444,6 +446,7 @@ void timing_boundary(){
 std::atomic<double> perf_gpu_ms{-1},perf_cpu_ms{-1};
 extern "C" double xbg_recent_gpu_ms(void){return perf_gpu_ms.load();}
 extern std::atomic<uint64_t> drs_busy_total_ns;   // [r6] defined before retire_slot
+extern std::atomic<uint64_t> bones_ssbo_modules,bones_ssbo_realign;namespace warm{extern std::atomic<uint64_t> ssbo_patched,ssbo_stale;}   // [DOOM] DM_GFX_BONES_SSBO (ssbo_rewrite)
 extern "C" uint64_t xbg_gpu_busy_total_ns(void){return drs_busy_total_ns.load(std::memory_order_relaxed);}
 extern "C" double xbg_recent_cpu_ms(void){return perf_cpu_ms.load();}
 bool sync_mode=false; // diagnostic: marker files/gfx-sync-mode resolves all GPU results at each submit end
@@ -1766,7 +1769,8 @@ void perf_frame(){
     perf_vlogf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
     perf_vlogf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
     perf_vlogf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
-    perf_vlogf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed));
+    perf_vlogf("NVN PERF quad_rewrites=%llu warp_rewrites=%llu ldc_folds=%llu temps_forwarded=%llu nan_minmax=%llu bones_ssbo_modules=%llu ssbo_realign=%llu warm_ssbo_patched=%llu warm_ssbo_stale=%llu",(unsigned long long)quad_rewrites.load(std::memory_order_relaxed),(unsigned long long)warp_rewrites.load(std::memory_order_relaxed),(unsigned long long)ldc_folds.load(std::memory_order_relaxed),(unsigned long long)temps_forwarded.load(std::memory_order_relaxed),(unsigned long long)nan_minmax_swaps.load(std::memory_order_relaxed),
+        (unsigned long long)bones_ssbo_modules.load(),(unsigned long long)bones_ssbo_realign.load(),(unsigned long long)warm::ssbo_patched.load(),(unsigned long long)warm::ssbo_stale.load());
     if(r3_log){xbg_logf("NVN PERF r3 ab=%d ldc_canon=%llu canon_merges=%llu halfflag=%llu f2i_notrunc=%llu texcoord_unguarded=%llu psize_modules=%llu lazy_clear folded=%.2f flushed=%.2f appended=%.2f flipfold=%.2f deadbox=%.1f deadbox_total=%llu ab_variant=%#x",
         int(ab_frame_on),(unsigned long long)r3_canon.load(),(unsigned long long)r3_canon_merges.load(),(unsigned long long)r3_half.load(),(unsigned long long)r3_f2i.load(),(unsigned long long)r3_texnan.load(),(unsigned long long)r3_psize.load(),r3_lazy_folded/f,r3_lazy_flushed/f,r3_lazy_appended/f,r3_flipfold/f,r3_deadbox/f,(unsigned long long)r3_deadbox_total,r3_ab_bit);
         r3_lazy_folded=r3_lazy_flushed=r3_lazy_appended=r3_flipfold=r3_deadbox=0;}
@@ -1954,6 +1958,10 @@ bool pending_view(uint64_t address,uint64_t bytes,VkDeviceSize align,Buffer &out
 // into a persistent per-address buffer (two versions; a version is reused only once its frame slot retired).
 // Every 240th use is verified against guest memory in full. On by default where the host routes faults here
 // (xbg_wtrack_use_host_hooks); files/gfx-no-wtrack or gfx-wtrack = '0' disables it.
+// [DOOM] issue #21: the dirty tracker's VMA coalescer (nvn_dirty.c DM_DIRTY_COALESCE) re-maps zero-copy chunks in place; it must
+// not wipe wtrack's own protection (veto + hold), and it needs each chunk's dma-buf fd (nvn_dirty_zc_chunk)
+extern "C" void nvn_dirty_coalesce_hold(int on);
+extern "C" void nvn_dirty_zc_chunk(void *lo,size_t n,int fd,uint64_t off);
 namespace wtrack {
 constexpr size_t min_bytes=1u<<20;constexpr unsigned max_regions=8,versions=2;bool enabled=true;int marker=-1;   // marker: gfx-wtrack 1 / 0 (or gfx-no-wtrack), -1 = none
 struct Region{std::atomic<uintptr_t> begin{0},end{0};std::atomic<uint8_t> *dirty=nullptr;};
@@ -1993,8 +2001,10 @@ bool activate(Tracked &t){
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=type;VK(vkAllocateMemory(cfg.device,&ai,nullptr,&v.memory));VK(vkBindBufferMemory(cfg.device,v.buffer,v.memory,0));
         void *p=nullptr;VK(vkMapMemory(cfg.device,v.memory,0,VK_WHOLE_SIZE,0,&p));v.mapped=static_cast<uint8_t*>(p);v.stale.assign(npages,1);
     }
+    nvn_dirty_coalesce_hold(1);   // issue #21: no coalesce between publishing the region (its veto) and its mprotect
     regions[n].dirty=dirty;regions[n].begin.store(t.pbegin);regions[n].end.store(pend);nregions.store(n+1,std::memory_order_release);t.region=n;
-    if(mprotect(reinterpret_cast<void*>(t.pbegin),pend-t.pbegin,PROT_READ)){regions[n].end.store(t.pbegin);return false;}
+    if(mprotect(reinterpret_cast<void*>(t.pbegin),pend-t.pbegin,PROT_READ)){regions[n].end.store(t.pbegin);nvn_dirty_coalesce_hold(0);return false;}
+    nvn_dirty_coalesce_hold(0);
     t.npages=npages;xbg_logf("NVN wtrack region=%u addr=%#llx bytes=%zu pages=%zu",n,(unsigned long long)t.address,t.bytes,t.npages);return true;
 }
 void copy_page(Tracked &t,Version &v,size_t pg){
@@ -2054,6 +2064,9 @@ void release(){
 // -1.15 ms per frame, no mismatches); without it, it stays opt-in (gfx-wtrack = '1') with the engine's own handler.
 extern "C" void xbg_wtrack_use_host_hooks(void){wtrack::installed=wtrack::host_hooks=true;if(wtrack::marker!=0)wtrack::enabled=true;xbg_logf("NVN wtrack through host hooks enabled=%d",int(wtrack::enabled));}
 extern "C" int xbg_wtrack_fault(void *addr){return wtrack::unprotect(uintptr_t(addr),1);}
+// issue #21: the coalescer's veto -- 1 when [lo, lo+len) overlaps a wtrack region (its pages carry protection the dirty tracker does not know)
+extern "C" int xbg_wtrack_overlaps(uintptr_t lo,size_t len){unsigned n=wtrack::nregions.load(std::memory_order_acquire);
+    for(unsigned i=0;i<n;i++){uintptr_t b=wtrack::regions[i].begin.load(),e=wtrack::regions[i].end.load();if(e>b && lo<e && lo+len>b)return 1;}return 0;}
 extern "C" void xbg_wtrack_prepare(void *addr,size_t len){if(len)wtrack::unprotect(uintptr_t(addr),len);}
 // Texture content checks through the write-protect tracker (nvn_dirty.c), as nvn_mtl.m tex_mtl does on iOS: once a texture
 // has been unchanged for 4 checks its pages are write-protected with the tracker's stamp, and a check then hashes it only if
@@ -2167,8 +2180,9 @@ bool map_chunk(uint8_t *lo,size_t n){
     void *tmp=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
     if(tmp==MAP_FAILED){xbg_logf("NVN zero-copy: dma-buf mmap failed errno=%d",errno);close(fd);vkDestroyBuffer(cfg.device,buffer,nullptr);vkFreeMemory(cfg.device,memory,nullptr);AHardwareBuffer_release(ahb);return false;}
     memcpy(tmp,lo,n);
-    void *fixed=mmap(lo,n,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0);munmap(tmp,n);close(fd);
+    void *fixed=mmap(lo,n,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0);munmap(tmp,n);
     if(fixed!=lo)xbg_fatalf("NVN zero-copy: MAP_FIXED of guest pool %p+%zu failed errno=%d",(void*)lo,n,errno);   // the range is gone: cannot continue
+    nvn_dirty_zc_chunk(lo,n,fd,0);   // [DOOM] issue #21: the tracker keeps the fd (re-maps the chunk in place when its split VMAs pile up; closes it if it cannot)
     int i=count.load();if(i>=512)xbg_fatalf("NVN zero-copy: chunk table full");
     Chunk &c=table[i];c.lo=uintptr_t(lo);c.n=n;c.buffer=buffer;c.memory=memory;c.ahb=ahb;c.sticky.assign((n+4095)/4096,0);count.store(i+1,std::memory_order_release);mapped_bytes+=n;
     return true;
@@ -2571,8 +2585,8 @@ FILE *draw_log_fp=nullptr;unsigned draw_log_n=0;
 uint64_t present_count_for_capture=0;
 void debug_dump_frame(const tex_t *presented){
     {static uint64_t tk=0;if(((++tk)%30)==0){std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');if(cut!=std::string::npos)dir.resize(cut);
-        const std::string trig=dir+"/gfx-capture-now";if(FILE *t=fopen(trig.c_str(),"rb")){unsigned sk=0,mx=16,c4[4]={};int nr=fscanf(t,"%u %u %u %u %u %u",&sk,&mx,&c4[0],&c4[1],&c4[2],&c4[3]);if(nr<1)sk=0;fclose(t);remove(trig.c_str());
-            capture.crop=nr==6 && c4[2] && c4[3];capture.cx=c4[0];capture.cy=c4[1];capture.cw=c4[2];capture.ch=c4[3];
+        const std::string trig=dir+"/gfx-capture-now";if(FILE *t=fopen(trig.c_str(),"rb")){unsigned sk=0,mx=16,c4[4]={},vin=1;int nr=fscanf(t,"%u %u %u %u %u %u %u",&sk,&mx,&c4[0],&c4[1],&c4[2],&c4[3],&vin);if(nr<1)sk=0;fclose(t);remove(trig.c_str());
+            capture.crop=nr>=6 && c4[2] && c4[3];capture.crop_inputs=nr<7 || vin!=0;capture.cx=c4[0];capture.cy=c4[1];capture.cw=c4[2];capture.ch=c4[3];
             const std::string out=dir+"/capture";mkdir(out.c_str(),0775);if(capture.trace)fclose(capture.trace);capture.trace=fopen((out+"/capture.txt").c_str(),"wb");capture.directory=out;
             capture.frame=UINT64_MAX;capture.bytes=0;capture.events=0;capture.seen=0;capture.skip=sk;capture.maxev=mx;capture.active=false;
             xbg_logf("NVN in-game capture: next frame, skip %u events, capture %u -> %s%s",sk,mx,out.c_str(),capture.crop?" (crop mode: outputs only)":"");}}}
@@ -3613,6 +3627,47 @@ void clip_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
     if(xbg_spirv_clip_fix(w,properties.limits.maxCombinedClipAndCullDistances,clip_fix>0)){
         const uint64_t n=++clip_fixed;if(n<=3 || !(n&(n-1)))xbg_logf("NVN clip/cull distances shrunk to one and zeroed in %s (stage %u, %llu modules so far)",key,stage,(unsigned long long)n);}
 }
+// [DOOM] DM_GFX_BONES_SSBO (xbg_spirv_ubo2ssbo.cpp): on the stock Qualcomm driver of the Adreno 740 every skinned model drew black
+// (bodies, monsters; Mi 13, 06.11): the colour-pass VS read the bones with dynamically indexed uniform-buffer loads (vp_c5) and its
+// triangles dropped out frame to frame although data and math equalled the depth pre-pass. Guest uniform blocks that a pre-raster
+// stage (0..3) indexes dynamically become read-only storage buffers in the SPIR-V; the engine keeps them uniform blocks for its own
+// data path (snapshots, zero-copy views, dynamic offsets, trimming, memo) and only gives them the descriptor type STORAGE_BUFFER(_DYNAMIC)
+// (binding flag XBG_BIND_SSBO, desc_type). 0 / unset off, 1 on. Not on by default: on the Mi 13 stock driver it fixed the bodies
+// but other draws of the same shaders (a door, floor plates, the weapon) then dropped out of the G-buffer pass (07.11, validation
+// clean; BUGS_AND_FIXES 2.34). Decided once at init (bones_ssbo_decide), before the warm-up threads start.
+constexpr uint32_t XBG_BIND_SSBO=1u<<30;   // xbg_shader_binding.flags of a guest uniform block bound as a storage buffer
+std::atomic<int> bones_ssbo{-1};std::atomic<uint64_t> bones_ssbo_modules{0},bones_ssbo_realign{0};
+void bones_ssbo_decide(){
+    const char *e=getenv("DM_GFX_BONES_SSBO");const bool stock=properties.vendorID==0x5143 && !strstr(properties.deviceName,"Turnip");
+    const int v=e && *e?(atoi(e)!=0):0;bones_ssbo=v;
+    xbg_logf("NVN bones ssbo=%s (DM_GFX_BONES_SSBO=%s; default off, 1 for the stock Qualcomm driver test, here %s) minStorageBufferOffsetAlignment=%llu minUniformBufferOffsetAlignment=%llu maxDescriptorSetStorageBuffersDynamic=%u",
+             v?"on":"off",e && *e?e:"auto",stock?"stock Qualcomm":"not stock Qualcomm",(unsigned long long)properties.limits.minStorageBufferOffsetAlignment,
+             (unsigned long long)properties.limits.minUniformBufferOffsetAlignment,properties.limits.maxDescriptorSetStorageBuffersDynamic);}
+// Rewrites the guest uniform blocks (type UBO, source NVN uniform, one element) of a stage 0..3 module that are indexed dynamically.
+// bindings: the bindings rewritten; with the switch off the ones that would be (dry run, words unchanged). Returns true when rewritten.
+bool ssbo_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key,const std::vector<xbg_shader_binding> &binds,std::vector<uint32_t> &bindings){
+    bindings.clear();if(bones_ssbo<0)bones_ssbo_decide();
+    if(stage>3 || w.size()<5 || w[1]<0x00010300u)return false;   // < 1.3 would need an OpExtension, which validate_capabilities refuses
+    std::set<uint32_t> allowed;for(auto &b:binds)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM && b.count==1 && b.slot<16)allowed.insert(b.binding);
+    if(allowed.empty())return false;
+    // DM_GFX_BONES_SSBO_ONLY / _SKIP=<module keys or key prefixes, comma- or space-separated>: only these / all but these modules
+    // (bisecting the modules the rewrite breaks on a driver). DM_GFX_BONES_SSBO_LOG=1: one line per module key (applied or skipped).
+    static const auto list=[](const char *name){std::vector<std::string> v;const char *e=getenv(name);if(!e)return v;std::string s(e);
+        for(size_t i=0;i<s.size();){size_t j=s.find_first_of(", ;",i);if(j==std::string::npos)j=s.size();if(j>i)v.push_back(s.substr(i,j-i));i=j+1;}return v;};
+    static const std::vector<std::string> only=list("DM_GFX_BONES_SSBO_ONLY"),skip=list("DM_GFX_BONES_SSBO_SKIP");
+    static const bool log_all=[]{const char *e=getenv("DM_GFX_BONES_SSBO_LOG");return e && atoi(e)!=0;}();
+    auto listed=[&](const std::vector<std::string> &v){for(auto &p:v)if(!strncmp(key,p.c_str(),p.size()))return true;return false;};
+    const bool filtered=(!only.empty() && !listed(only)) || listed(skip);
+    const bool on=bones_ssbo>0 && !filtered;const bool cand=xbg_spirv_ubo2ssbo(w,&allowed,&bindings,!on)!=0;
+    if(log_all && cand){static std::mutex m;static std::set<std::string> seen;std::lock_guard<std::mutex> l(m);
+        if(seen.insert(key).second){std::string s;for(uint32_t b:bindings){if(!s.empty())s+=',';s+=std::to_string(b);}
+            xbg_logf("NVN ubo->ssbo-all %s stage %u bindings {%s} %s",key,stage,s.c_str(),on?"applied":filtered && bones_ssbo>0?"filtered":"off");}}
+    if(!cand || !on)return false;
+    const uint64_t n=++bones_ssbo_modules;
+    if(n<=6 || !(n&(n-1))){std::string s;for(uint32_t b:bindings){if(!s.empty())s+=',';s+=std::to_string(b);}
+        xbg_logf("NVN ubo->ssbo %s stage %u bindings {%s} (%llu modules so far)",key,stage,s.c_str(),(unsigned long long)n);}
+    return true;
+}
 void early_tests_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
     if(early_z<0){const char *e=getenv("DM_GFX_EARLY_Z");early_z=e?atoi(e)!=0:1;}
     if(!early_z || stage!=4 || w.size()<5)return;
@@ -3876,7 +3931,10 @@ Shader *load_shader(const void *control){
     // Time of each part of the load (file read, SPIR-V rewrites, analysis, module creation), for the loaded line below.
     const uint64_t load_t1=timing_clock();uint64_t load_t2=0,load_t3=0;
     auto p=std::make_unique<Shader>();p->key=key;p->stage=h.stage;p->bindings.resize(h.binding_count);memcpy(p->bindings.data(),bytes.data()+offset,h.binding_count*sizeof(xbg_shader_binding));offset+=h.binding_count*sizeof(xbg_shader_binding);p->inputs.resize(h.input_count);memcpy(p->inputs.data(),bytes.data()+offset,h.input_count*4);offset+=h.input_count*4;p->c1.assign(bytes.begin()+offset,bytes.begin()+offset+h.c1_bytes);offset+=h.c1_bytes;
-    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);clip_rewrite(words,h.stage,key.c_str());gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());relaxed_rewrite(words,h.stage,key.c_str());gather_ext_rewrite(words,key.c_str());
+    std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);clip_rewrite(words,h.stage,key.c_str());
+    {for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)b.flags&=~XBG_BIND_SSBO;   // [DOOM] DM_GFX_BONES_SSBO: the bit is ours, never the bundle's
+     std::vector<uint32_t> conv;if(ssbo_rewrite(words,h.stage,key.c_str(),p->bindings,conv))for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM && b.count==1 && std::binary_search(conv.begin(),conv.end(),b.binding))b.flags|=XBG_BIND_SSBO;}
+    gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());relaxed_rewrite(words,h.stage,key.c_str());gather_ext_rewrite(words,key.c_str());
     {std::string gap=module_gap(words,h.stage);if(!gap.empty()){p->unusable=gap;xbg_logf("NVN shader %s stage=%u needs %s, which this device lacks: no module, its draws/dispatches are skipped%s",key.c_str(),h.stage,gap.c_str(),h.stage==3?" unless the GS is dropped as a pass-through":"");}}
     // [perf3] DOOM's culling GS is a pure position pass-through while its switch word is off: remember where the switch lives
     // (on the bundle's own SPIR-V, before any rewrite) so draw() can drop the stage (DM_GFX_GS_PASSTHRU, perf_round3.md).
@@ -4054,6 +4112,29 @@ std::unordered_map<std::string,VkPipeline> ready;std::vector<std::thread> thread
 std::atomic<uint64_t> built{0},failed{0},build_ns{0},compiled{0};uint64_t hits=0,creates=0,create_ns=0,create_max_ns=0;bool enabled=true;
 std::unordered_map<std::string,VkShaderModule> modules;std::unordered_map<std::string,VkPipelineLayout> layouts;std::unordered_map<std::string,VkRenderPass> passes;
 std::vector<VkDescriptorSetLayout> set_layouts;
+// [DOOM] DM_GFX_BONES_SSBO: per module key, the uniform blocks ssbo_rewrite turned into storage buffers (applied) or would have
+// (switch off). A list record made under the other setting names them with the other descriptor type: ssbo_patch fixes it.
+struct SsboInfo{uint32_t stage=0;bool applied=false;std::vector<uint32_t> bindings;};std::unordered_map<std::string,SsboInfo> ssbo_info;
+std::atomic<uint64_t> ssbo_patched{0},ssbo_stale{0};
+VkShaderModule load_module(const std::string &key);
+// The record's set layout must give each rewritten block the type the module now declares (UBO <-> SSBO, dynamic kept). A
+// record from before the switch was on (or the shipped seed) is patched to STORAGE_BUFFER(_DYNAMIC), and the ready pipeline is
+// then keyed by the patched words, which equal the key the draw builds. A STORAGE record for a module the switch left a uniform
+// block is not built (false); the draw builds and records its pipeline itself.
+bool ssbo_patch(const std::vector<std::string> &keys,std::vector<uint32_t> &words){
+    if(words.size()<4 || words[0]!=1)return true;   // not a graphics record of this format: build() rejects it
+    std::vector<const SsboInfo*> mods;
+    for(auto &k:keys){if(!load_module(k))return true;std::lock_guard<std::mutex> l(mu);auto it=ssbo_info.find(k);if(it!=ssbo_info.end())mods.push_back(&it->second);}
+    if(mods.empty())return true;
+    const uint32_t ln=words[1];if(ln<2 || 2+size_t(ln)>words.size())return true;const uint32_t nb=words[3];if(4+size_t(nb)*4>2+size_t(ln))return true;
+    bool patched=false;
+    for(uint32_t j=0;j<nb;j++){uint32_t *e=&words[4+size_t(j)*4];const uint32_t bnd=e[0],flags=e[3];
+        for(const SsboInfo *m:mods){if(!(flags&(1u<<m->stage)) || !std::binary_search(m->bindings.begin(),m->bindings.end(),bnd))continue;
+            if(m->applied){if(e[1]==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){e[1]=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;patched=true;}else if(e[1]==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC){e[1]=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;patched=true;}}
+            else if(e[1]==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || e[1]==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC){++ssbo_stale;return false;}}}
+    if(patched)++ssbo_patched;
+    return true;
+}
 std::string list_path(){std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');return (cut==std::string::npos?dir:dir.substr(0,cut))+"/vk-pipeline-list.bin";}
 void record(const VkGraphicsPipelineCreateInfo &ci,const XbgPipelineKey &key){
     std::string bytes(reinterpret_cast<const char*>(key.words),size_t(key.count)*4);
@@ -4085,7 +4166,10 @@ VkShaderModule load_module(const std::string &key){
     if(r5_rawcache&1)r5raw::put(file,b);}
     xbg_shader_header h;memcpy(&h,b.data(),sizeof(h));if(h.magic!=0x31534758 || h.version!=1 || h.spirv_bytes%4)return VK_NULL_HANDLE;
     size_t off=sizeof(h)+size_t(h.binding_count)*sizeof(xbg_shader_binding)+size_t(h.input_count)*4+h.c1_bytes;if(off+h.spirv_bytes!=b.size())return VK_NULL_HANDLE;
-    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(file,w);clip_rewrite(w,h.stage,file.c_str());gscull_rewrite(w,h.stage,file.c_str(),"warm");lone_rewrite(w,h.stage,file.c_str(),"warm");early_tests_rewrite(w,h.stage,file.c_str());invariant_rewrite(w,h.stage,file.c_str());relaxed_rewrite(w,h.stage,file.c_str());gather_ext_rewrite(w,file.c_str());quad_rewrite(w,h.stage,file.c_str(),"warm");warp_rewrite(w,h.stage,file.c_str(),"warm");tidy_rewrite(w,vab?r3_ab_bit:0);
+    std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(file,w);clip_rewrite(w,h.stage,file.c_str());
+    {std::vector<xbg_shader_binding> hb(h.binding_count);if(h.binding_count)memcpy(hb.data(),b.data()+sizeof(h),hb.size()*sizeof(xbg_shader_binding));
+     SsboInfo si;si.stage=h.stage;si.applied=ssbo_rewrite(w,h.stage,file.c_str(),hb,si.bindings);if(!si.bindings.empty()){std::lock_guard<std::mutex> l(mu);ssbo_info.emplace(key,std::move(si));}}
+    gscull_rewrite(w,h.stage,file.c_str(),"warm");lone_rewrite(w,h.stage,file.c_str(),"warm");early_tests_rewrite(w,h.stage,file.c_str());invariant_rewrite(w,h.stage,file.c_str());relaxed_rewrite(w,h.stage,file.c_str());gather_ext_rewrite(w,file.c_str());quad_rewrite(w,h.stage,file.c_str(),"warm");warp_rewrite(w,h.stage,file.c_str(),"warm");tidy_rewrite(w,vab?r3_ab_bit:0);
     if(vnp){std::vector<uint32_t> o;if(h.stage!=0 || !xbg_spirv_strip_pointsize(w.data(),w.size(),o))return VK_NULL_HANDLE;w.swap(o);}
     if(keep_rewritten && !vab && !vnp){std::lock_guard<std::mutex> l(mu);rewritten.emplace(key,w);}
     if(!module_gap(w,h.stage).empty())return VK_NULL_HANDLE;   // [nonadreno] the device lacks a capability: the warm pipeline is not built
@@ -4115,7 +4199,8 @@ VkRenderPass make_pass(const uint32_t *w,uint32_t n){
     std::lock_guard<std::mutex> l(mu);auto ins=passes.emplace(k,rp);if(!ins.second){vkDestroyRenderPass(cfg.device,rp,nullptr);return ins.first->second;}return rp;
 }
 bool build(const Rec &rec){
-    Reader r{rec.words.data(),rec.words.size()};if(r.u()!=1)return false;
+    std::vector<uint32_t> words=rec.words;if(!ssbo_patch(rec.keys,words))return false;   // [DOOM] DM_GFX_BONES_SSBO
+    Reader r{words.data(),words.size()};if(r.u()!=1)return false;
     uint32_t ln=r.u();if(r.i+ln>r.n)return false;VkPipelineLayout layout=make_layout(r.w+r.i,ln);r.i+=ln;
     uint32_t pn=r.u();if(r.i+pn>r.n)return false;VkRenderPass pass=make_pass(r.w+r.i,pn);r.i+=pn;if(!layout || !pass)return false;
     VkGraphicsPipelineCreateInfo ci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};ci.flags=r.u();ci.subpass=r.u();uint32_t ns=r.u();if(ns>5 || ns!=rec.keys.size())return false;
@@ -4146,7 +4231,7 @@ bool build(const Rec &rec){
     uint64_t c0=timing_clock();VkPipeline pl=VK_NULL_HANDLE;VkResult made;{gpguard::Lock serial;const bool marked=gpguard::begin(combo);made=vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pl);if(marked)gpguard::end(combo,gpguard::built(made,pl));}
     if(!gpguard::built(made,pl)){if(pl)vkDestroyPipeline(cfg.device,pl,nullptr);return false;}
     if(timing_clock()-c0>=compile_ns)++compiled;
-    std::string bytes(reinterpret_cast<const char*>(rec.words.data()),rec.words.size()*4);
+    std::string bytes(reinterpret_cast<const char*>(words.data()),words.size()*4);
     std::lock_guard<std::mutex> l(mu);if(!ready.emplace(bytes,pl).second)vkDestroyPipeline(cfg.device,pl,nullptr);return true;
 }
 void worker(){
@@ -4202,7 +4287,7 @@ void start(){
 }
 void shutdown(){{std::lock_guard<std::mutex> l(mu);stop=true;}async_cv.notify_all();for(auto &t:threads)if(t.joinable())t.join();threads.clear();if(async_thread.joinable())async_thread.join();std::lock_guard<std::mutex> l(mu);async_q.clear();async_pending.clear();async_failed.clear();
     for(auto &p:ready)vkDestroyPipeline(cfg.device,p.second,nullptr);ready.clear();for(auto &p:layouts)vkDestroyPipelineLayout(cfg.device,p.second,nullptr);layouts.clear();for(auto s:set_layouts)vkDestroyDescriptorSetLayout(cfg.device,s,nullptr);set_layouts.clear();
-    for(auto &p:passes)vkDestroyRenderPass(cfg.device,p.second,nullptr);passes.clear();for(auto &m:modules)vkDestroyShaderModule(cfg.device,m.second,nullptr);modules.clear();ids.clear();id_keys.clear();recs.clear();known.clear();rewritten.clear();}
+    for(auto &p:passes)vkDestroyRenderPass(cfg.device,p.second,nullptr);passes.clear();for(auto &m:modules)vkDestroyShaderModule(cfg.device,m.second,nullptr);modules.clear();ids.clear();id_keys.clear();recs.clear();known.clear();rewritten.clear();ssbo_info.clear();}
 bool take(const std::string &bytes,VkPipeline &out){std::lock_guard<std::mutex> l(mu);auto it=ready.find(bytes);if(it==ready.end())return false;out=it->second;ready.erase(it);return true;}
 }
 // Diagnostic (marker gfx-pipe-stats, with the warm-up off): the driver's statistics of each pipeline as it is created, and
@@ -4342,7 +4427,7 @@ VkDescriptorSet allocate_set(VkDescriptorSetLayout layout){
     Slot &s=recording_slot();
     for(;;){
         if(s.pool_next==s.pools.size()){
-            std::vector<VkDescriptorPoolSize> sizes;for(uint32_t t=0;t<=VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;t++)sizes.push_back({VkDescriptorType(t),t==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER||t==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER||t==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC||t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER?16384u:2048u});
+            std::vector<VkDescriptorPoolSize> sizes;for(uint32_t t=0;t<=VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;t++)sizes.push_back({VkDescriptorType(t),t==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER||t==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER||t==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC||t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||t==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC?16384u:2048u});
             VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};ci.maxSets=2048;ci.poolSizeCount=sizes.size();ci.pPoolSizes=sizes.data();
             VkDescriptorPool pool;VK(vkCreateDescriptorPool(cfg.device,&ci,nullptr,&pool));s.pools.push_back(pool);
         }
@@ -4523,6 +4608,12 @@ Buffer uniform_snapshot_slow(uint64_t address,size_t copy){
     ++perf.snapshot_misses;perf.snapshot_bytes+=copy;snap_site_bytes[5]+=copy;snap_site_req[5]+=copy;cpu_access(address,copy,2);
     Buffer b=stream_buffer(n,reinterpret_cast<const void*>(address),copy,true);uniform_snapshots.emplace(key,b);snapshot_maxlen=std::max<uint64_t>(snapshot_maxlen,copy);return b;
 }
+// [DOOM] DM_GFX_BONES_SSBO: a guest uniform block bound as a storage buffer. Same data as uniform_snapshot (zero-copy view, pending
+// GPU result or copy); a view whose offset misses minStorageBufferOffsetAlignment (it was aligned for minUniformBufferOffsetAlignment
+// only) is copied into the stream arena instead, whose alignment covers both (arena_alignment).
+Buffer ssbo_snapshot(uint64_t address,size_t copy){Buffer b=uniform_snapshot(address,copy);const VkDeviceSize a=properties.limits.minStorageBufferOffsetAlignment;
+    if(a>1 && b.offset%a){++bones_ssbo_realign;cpu_access(address,copy,2);b=stream_buffer(uniform_range(copy),reinterpret_cast<const void*>(address),copy,true);}
+    return b;}
 // Descriptor memo (iOS "same inputs -> reuse the parameter block"): within one guest submit, a draw whose shaders and
 // bound inputs (buffer ranges, texture/sampler handles, pools, driver generations, viewport) equal an earlier draw's
 // reuses that draw's set and dynamic offsets. Snapshots are per-submit too, so the bound data is the same. On a hit
@@ -4582,7 +4673,7 @@ void upgrade_mutable(Image &im,VkFormat want,VkImageUsageFlags add_usage,bool ma
 struct DescMemo{const LayoutEntry *entry;VkDescriptorSet set;VkPipelineLayout pipeline_layout;std::vector<uint32_t> dynamic_offsets;std::vector<MemoImage> images;struct Dyn{uint64_t order;VkBuffer buffer;uint32_t offset;bool uniform;uint8_t src=0,ns=0,bank=0;};std::vector<Dyn> dyn;bool persistent=false;std::vector<std::pair<uint64_t,const void*>> tex_ids;struct Stor{uint64_t base,bytes;VkBuffer buffer;VkDeviceSize offset;};std::vector<Stor> stor;
     struct Texel{const RegisteredTexture *record;uint64_t revision,base,bytes,gen;uint32_t format;};std::vector<Texel> texel;uint64_t checked_gen=0;size_t reserve=0;
     uint64_t hz_gen=0,hz_sub=0,hz_slot=0,hz_img=0,hz_chk=0;};   // [mt S2] epochs at the last clean pass of the image loop (hz_gen 0 = none)   // checked_gen: memo_check_gen at its last passed image checks   // texel: resident uniform texel buffers (texel_acquire)
-struct DynUbo{uint64_t order,address;size_t copy;};
+struct DynUbo{uint64_t order,address;size_t copy;bool ssbo=false;};   // ssbo: DM_GFX_BONES_SSBO block (ssbo_snapshot)
 // Cross-frame memo (Claude C147): the memo lives per frame slot and survives submits. An entry is persistent when its set
 // holds no per-frame snapshot except dynamic uniform buffers (re-snapshotted on every hit, only the offset moves) and the
 // support / driver parameter blocks (recomputed on every hit, buffer must be the same arena buffer). Entries with storage
@@ -4609,11 +4700,19 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute);
 // mode 2 = only the per-draw ones (guest uniform buffers, driver blocks) dynamic, the support block (depends on the viewport
 // only, kept in the static arena) and c1 constants (static) bound at fixed offsets; mode 0 = none dynamic.
 #define UBO_DYN(mode,b) ((b).type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && ((mode)==1 || ((mode)==2 && ((b).source==XBG_SOURCE_UNIFORM||(b).source==XBG_SOURCE_DRIVER0||(b).source==XBG_SOURCE_DRIVER2))))
-unsigned dyn_mode_for(bool compute,bool *no_ubo=nullptr){unsigned all=0,vary=0;
-    for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){all+=b.count;if(b.source==XBG_SOURCE_UNIFORM||b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2)vary+=b.count;}
-    if(no_ubo)*no_ubo=all==0;unsigned lim=properties.limits.maxDescriptorSetUniformBuffersDynamic;
+// [DOOM] DM_GFX_BONES_SSBO: a guest uniform block bound as a storage buffer (XBG_BIND_SSBO) stays a uniform block everywhere in the
+// engine (UBO_DYN, snapshots, memo keys) and only takes the Vulkan type STORAGE_BUFFER(_DYNAMIC) here; its dynamic count is checked
+// against maxDescriptorSetStorageBuffersDynamic (dyn_mode_for).
+inline bool bind_ssbo(const xbg_shader_binding &b){return b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && (b.flags&XBG_BIND_SSBO);}
+inline VkDescriptorType desc_type(unsigned mode,const xbg_shader_binding &b){const bool dyn=UBO_DYN(mode,b);
+    if(bind_ssbo(b))return dyn?VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    return dyn?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VkDescriptorType(b.type);}
+unsigned dyn_mode_for(bool compute,bool *no_ubo=nullptr){unsigned all=0,vary=0,ssbo=0;
+    for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){if(bind_ssbo(b)){ssbo+=b.count;continue;}all+=b.count;if(b.source==XBG_SOURCE_UNIFORM||b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2)vary+=b.count;}
+    if(no_ubo)*no_ubo=all+ssbo==0;unsigned lim=properties.limits.maxDescriptorSetUniformBuffersDynamic;
     if(!ubo_dynamic_on)return 0;   // [nonadreno] DM_GFX_UBO_DYNAMIC=0 / PowerVR: no dynamic uniform buffers (unused-dynamic-UBO overrun)
-    return all && all<=lim?1:(vary && vary<=lim && dyn_partial_enabled?2:0);}
+    if(ssbo>properties.limits.maxDescriptorSetStorageBuffersDynamic)return 0;   // [DOOM] bones as dynamic storage buffers (all are guest blocks: dynamic in modes 1 and 2)
+    return (all || ssbo) && all<=lim?1:((vary || ssbo) && vary<=lim && dyn_partial_enabled?2:0);}
 void memo_unpin_all(unsigned si){Slot &s=slots[si];for(auto &pn:memo_pinned[si])s.used_sets[pn.second.layout].push_back(pn.first);memo_pinned[si].clear();desc_memo_slot[si].clear();desc_memo_local[si]=0;++memo_mod_gen;}
 void memo_check_epoch(){unsigned si=slot_index;if(memo_slot_epoch[si]!=memo_epoch || memo_pinned[si].size()>8192){if(!desc_memo_slot[si].empty())++xmemo_drops;memo_unpin_all(si);memo_slot_epoch[si]=memo_epoch;}}
 // End of a submit for the recording slot: frame-local entries go (their snapshots are per submit); persistent ones stay.
@@ -4779,7 +4878,7 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){storage_image
                 for(unsigned element=0;element<b.count;element++){unsigned slot=b.slot+element;
                     switch(b.source){
                     case XBG_SOURCE_UNIFORM:case XBG_SOURCE_STORAGE:{if(slot>=16){ok=false;break;}auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];
-                        if(UBO_DYN(dmode,b) && b.source==XBG_SOURCE_UNIFORM && r.address && r.size){size_t copy=std::min<size_t>(r.size,b.bytes?b.bytes:65536);key.push_back(copy);if(tags)ktag.push_back(2);dyn_ubos.push_back({(uint64_t(b.binding)<<32)|element,r.address,copy});} // address only moves the dynamic offset
+                        if(UBO_DYN(dmode,b) && b.source==XBG_SOURCE_UNIFORM && r.address && r.size){size_t copy=std::min<size_t>(r.size,b.bytes?b.bytes:65536);key.push_back(copy);if(tags)ktag.push_back(2);dyn_ubos.push_back({(uint64_t(b.binding)<<32)|element,r.address,copy,bind_ssbo(b)});} // address only moves the dynamic offset
                         else{key.push_back(r.address);key.push_back(r.size);if(tags){ktag.push_back(b.source==XBG_SOURCE_UNIFORM?3:10);ktag.push_back(4);}}break;}
                     case XBG_SOURCE_SUPPORT:key.push_back((uint64_t(uint32_t(state.viewport.width))<<32)|uint32_t(state.viewport.height));key.push_back(state.color.alpha_func);if(tags){ktag.push_back(5);ktag.push_back(6);}break;
                     case XBG_SOURCE_C1:break;
@@ -4807,7 +4906,7 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){storage_image
                 prev=key;}
             DRAW_SUB(2);if(hit!=desc_memo.end()){DescMemo &m=hit->second;
                 static std::vector<std::pair<uint64_t,Buffer>> fresh;fresh.clear();
-                for(auto &u:dyn_ubos)fresh.push_back({u.order,uniform_snapshot(u.address,u.copy)});
+                for(auto &u:dyn_ubos)fresh.push_back({u.order,u.ssbo?ssbo_snapshot(u.address,u.copy):uniform_snapshot(u.address,u.copy)});
                 {auto by_order=[](const std::pair<uint64_t,Buffer> &a,const std::pair<uint64_t,Buffer> &b){return a.first<b.first;};   // [r4] uboview: most lists come in order
                  if(ubo_vc && !r4_off("uboview") && std::is_sorted(fresh.begin(),fresh.end(),by_order))++r4_uvc_sorted;else std::sort(fresh.begin(),fresh.end(),by_order);}
                 static std::vector<uint32_t> offsets;offsets.clear();bool same=true;size_t fi=0;
@@ -4904,7 +5003,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
     std::array<const void*,7> shader_key{};for(unsigned st=0;st<6;st++)if((st==5)==compute)shader_key[st]=state.shader[st];shader_key[6]=reinterpret_cast<const void*>(uintptr_t(compute));
     for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings){
         need(b.count && b.count<=128 && b.type<=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,"Unsupported descriptor array/type");
-        key.push_back(b.binding);key.push_back(UBO_DYN(dmode,b)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:b.type);key.push_back(b.count);key.push_back(1u<<st);
+        key.push_back(b.binding);key.push_back(desc_type(dmode,b));key.push_back(b.count);key.push_back(1u<<st);
         if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && (b.source==XBG_SOURCE_STORAGE || b.source==XBG_SOURCE_UNIFORM)){bool written=state.shader[st]->storage_writes.count(b.binding)!=0;for(unsigned i=0;i<b.count;i++){
             need(b.slot+i<16,"Storage descriptor slot out of bounds");auto r=b.source==XBG_SOURCE_STORAGE?state.sb[nvn_stage[st]][b.slot+i]:state.ub[nvn_stage[st]][b.slot+i];
             need(r.address && r.size && r.size<=properties.limits.maxStorageBufferRange && r.address+r.size>=r.address,"Invalid storage descriptor address/range");ranges.push_back({r.address,r.address+r.size,written});
@@ -4971,12 +5070,12 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
      buffer_infos.clear();image_infos.clear();texel_views.clear();writes.clear();dynamic_list.clear();buffer_infos.reserve(elements);image_infos.reserve(elements);texel_views.reserve(elements);writes.reserve(elements);}
     for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute){Shader &shader=*state.shader[st];unsigned ns=nvn_stage[st];
         for(auto &b:shader.bindings)for(unsigned element=0;element<b.count;element++){DESC_SCOPE(ElementRest);
-            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};write.dstSet=VK_NULL_HANDLE;write.dstBinding=b.binding;write.dstArrayElement=element;write.descriptorCount=1;write.descriptorType=UBO_DYN(dmode,b)?VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:VkDescriptorType(b.type);
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};write.dstSet=VK_NULL_HANDLE;write.dstBinding=b.binding;write.dstArrayElement=element;write.descriptorCount=1;write.descriptorType=desc_type(dmode,b);
             if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER){DESC_SCOPE(BufferBind);
                 Buffer *buffer=nullptr;bool is_storage=b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;uint32_t slot=b.slot+element;size_t n=0,buffer_offset=0;const void *data=nullptr;size_t copy=0;
                 if(b.source==XBG_SOURCE_UNIFORM || b.source==XBG_SOURCE_STORAGE){need(slot<16,"Buffer slot out of bounds");auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];need(r.address && r.size,"Required NVN buffer slot is unbound");data=reinterpret_cast<void*>(r.address);copy=r.size;
                     if(is_storage){n=copy;for(auto &v:out.storage)if(r.address>=v.first.first && r.address+r.size<=v.first.first+v.first.second){buffer=v.second;buffer_offset=r.address-v.first.first;if((gscull_mask()&32) && shader.storage_writes.count(b.binding))n=(n+3)&~size_t(3);break;}if(!buffer){{static unsigned dumped=0;if(dumped++<3){for(auto &v:out.storage)xbg_logf("NVN alias dump: out.storage %#llx+%llu",(unsigned long long)v.first.first,(unsigned long long)v.first.second);for(unsigned q=0;q<6;q++)if(state.shader[q] && (q==5)==compute)for(auto &bb:state.shader[q]->bindings)if(bb.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)for(unsigned i=0;i<bb.count;i++){auto rr=bb.source==XBG_SOURCE_UNIFORM?state.ub[nvn_stage[q]][bb.slot+i]:state.sb[nvn_stage[q]][bb.slot+i];xbg_logf("NVN alias dump: st=%u key=%s binding=%u slot=%u src=%d written=%d range=%#llx+%llu",q,state.shader[q]->key.c_str(),bb.binding,bb.slot+i,int(bb.source),int(state.shader[q]->storage_writes.count(bb.binding)),(unsigned long long)rr.address,(unsigned long long)rr.size);}xbg_logf("NVN alias dump: now st=%u key=%s binding=%u slot=%u ns=%u",st,shader.key.c_str(),b.binding,slot,ns);}}static unsigned told=0;if(told++<10)xbg_logf("NVN storage alias not found addr=%#llx+%llu storage_ranges=%zu (own buffer, written=%d)",(unsigned long long)r.address,(unsigned long long)r.size,out.storage.size(),int(shader.storage_writes.count(b.binding)));if(shader.storage_writes.count(b.binding)){cpu_access(r.address,r.size,3);buffer=out.keep(readback_buffer(size_t(r.size),reinterpret_cast<void*>(r.address),size_t(r.size)));out.storage.push_back({{r.address,r.size},buffer});out.written.push_back({{r.address,r.size},buffer});}else{snap_no_sync=true;buffer=out.keep(snapshot(r.address,size_t(r.size),properties.limits.minStorageBufferOffsetAlignment));snap_no_sync=false;}buffer_offset=0;}need(buffer_offset%properties.limits.minStorageBufferOffsetAlignment==0,"NVN storage offset violates Vulkan alignment");}
-                    else{copy=std::min<size_t>(copy,b.bytes?b.bytes:65536);n=uniform_range(copy);buffer=out.keep(uniform_snapshot(r.address,copy));}
+                    else{copy=std::min<size_t>(copy,b.bytes?b.bytes:65536);n=uniform_range(copy);buffer=out.keep(bind_ssbo(b)?ssbo_snapshot(r.address,copy):uniform_snapshot(r.address,copy));}
                 }else if(b.source==XBG_SOURCE_SUPPORT){n=1392;need(state.color.alpha_func==8,"Nontrivial NVN alpha test not translated");
                     Buffer &sb=support_block();data=sb.mapped;copy=n;buffer=out.keep(sb);}
                 else if(b.source==XBG_SOURCE_C1){
@@ -4987,7 +5086,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                     data=blk.mapped;copy=n;buffer=out.keep(blk);}
                 else xbg_fatalf("Unsupported shader buffer source %u",b.source);
                 need(n && n<=size_t(is_storage?properties.limits.maxStorageBufferRange:properties.limits.maxUniformBufferRange),"Descriptor range exceeds device limit");
-                if(write.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC){buffer_infos.push_back({buffer->buffer,0,n});if(desc_memo_recording)desc_memo_dyn.push_back({(uint64_t(b.binding)<<32)|element,buffer->buffer,uint32_t(buffer->offset+buffer_offset),b.source==XBG_SOURCE_UNIFORM,uint8_t(b.source),uint8_t(ns),uint8_t(b.source==XBG_SOURCE_DRIVER0?0:1)});dynamic_list.push_back({(uint64_t(b.binding)<<32)|element,uint32_t(buffer->offset+buffer_offset)});}
+                if(write.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || write.descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC){buffer_infos.push_back({buffer->buffer,0,n});if(desc_memo_recording)desc_memo_dyn.push_back({(uint64_t(b.binding)<<32)|element,buffer->buffer,uint32_t(buffer->offset+buffer_offset),b.source==XBG_SOURCE_UNIFORM,uint8_t(b.source),uint8_t(ns),uint8_t(b.source==XBG_SOURCE_DRIVER0?0:1)});dynamic_list.push_back({(uint64_t(b.binding)<<32)|element,uint32_t(buffer->offset+buffer_offset)});}
                 else buffer_infos.push_back({buffer->buffer,buffer->offset+buffer_offset,n});write.pBufferInfo=&buffer_infos.back();
                 if(capture.active){char label[100];snprintf(label,sizeof(label),"st%u-bind%u-el%u-buffer",st,b.binding,element);capture_log("BUFFER label=%s shader=%s nvnStage=%u sourceKind=%u slot=%u guest=%p copied=%zu descriptorBytes=%zu bufferOffset=%zu",label,shader.key.c_str(),ns,b.source,slot,data,copy,n,buffer_offset);capture_data(label,static_cast<const uint8_t*>(buffer->mapped)+buffer_offset,n);}
             }else{
@@ -7154,6 +7253,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      ubo_dynamic_on=xbg_env_or(getenv("DM_GFX_UBO_DYNAMIC"),xbg_ubo_dynamic_default(gpu_policy));noout_mask_on=xbg_env_or(getenv("DM_GFX_NOOUT_MASK"),xbg_noout_mask_default(gpu_policy));
      xbg_logf("NVN gpu policy: pipe_serial=%d pipe_guard=%d ubo_dynamic=%d noout_mask=%d zero-copy default=%d (DM_GFX_PIPE_SERIAL / PIPE_GUARD / UBO_DYNAMIC / NOOUT_MASK / ZEROCOPY)",
               int(gpguard::serial),int(gpguard::guard),int(ubo_dynamic_on),int(noout_mask_on),int(xbg_zero_copy_default(gpu_policy)));
+     bones_ssbo_decide();bones_ssbo_modules=0;bones_ssbo_realign=0;   // [DOOM] DM_GFX_BONES_SSBO, before the warm-up threads rewrite shaders
      // [tile] tile-based GPU paths (xbg_vendor_policy.h, docs/research/tile_gpu_impl.md); DM_GFX_NOLOAD is read with its marker below.
      tile_area_on=xbg_env_or(getenv("DM_GFX_TILE_AREA"),xbg_tile_area_default(gpu_policy));tile_barrier_on=xbg_env_or(getenv("DM_GFX_TILE_BARRIER"),xbg_tile_barrier_default(gpu_policy));
      chunk_mid_split=xbg_env_or(getenv("DM_GFX_CHUNK_MID_SPLIT"),xbg_chunk_mid_split_default(gpu_policy));tile_poison=xbg_env_or(getenv("DM_GFX_TILE_POISON"),false);

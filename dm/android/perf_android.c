@@ -16,6 +16,7 @@
 //   of the process that used the most CPU (tid:name % of a core, the CPU it last ran on; * = guest thread, B = DM_GUEST_BIGCORE thread) and
 //   "[perf] clocks 10s:" the cpufreq policies (current / average / range of 1 s samples / scaling_max_freq, MHz) with the kgsl GPU clock and
 //   busy % where readable. The guest threads get host names (hle_thread.c thr_host_name) so these lines and top can tell them apart.
+//   [DOOM] issue #21: "[perf] memory 60s:" the map count against vm.max_map_count, resident MB and the dirty tracker's mprotect failures.
 // - [r2] DM_GUEST_BIGCORE=<hex mask>: the busiest guest thread (the game's main thread) is kept on that host CPU mask (sched_setaffinity,
 //   re-checked every 2 s because HyperOS rewrites masks) and always belongs to the ADPF session.
 // - [DOOM] Guest threads by the CPU plan (cpu_topo.c): on one-big-cluster SoCs (SD680 4+4, Helio G99 2+6) every guest thread is kept off
@@ -57,6 +58,8 @@ __attribute__((weak)) int thr_guest_tids(int32_t *out, int max);    // host/hle_
 __attribute__((weak)) void thr_refresh_host_names(void);           // host/hle_thread.c: re-read the guest names into the host names
 __attribute__((weak)) unsigned dm_present_pin_mask(void);           // android/vulkan_present.cpp: the translation thread's pin (0 = none)
 __attribute__((weak)) int dm_present_pin_tid(void);                 // android/vulkan_present.cpp: the thread that pin is applied to
+__attribute__((weak)) void nvn_dirty_mp_fail(uint64_t *fails, uint64_t *unprot, uint64_t *prot, uint64_t *widened, int *last_errno);   // gfx/nvn/nvn_dirty.c [issue #21]
+__attribute__((weak)) void nvn_dirty_coalesce_stats(int *chunks, uint64_t *vmas, uint64_t *coalesces, uint64_t *aborts, uint64_t *ms);   // gfx/nvn/nvn_dirty.c [issue #21]
 
 static int64_t perf_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 
@@ -430,6 +433,22 @@ static void monitor_scan(int64_t now) {
         g_big_resets_w = 0;
     }
 }
+// [DOOM] issue #21: "[perf] memory 60s:" (first after 10 s, then once a minute) -- VMAs of the process against vm.max_map_count
+// (host/crash.c dm_maps_count), resident MB, and the dirty tracker's mprotect failures. The zero-copy pools are dma-buf mappings
+// whose VMAs never merge back, so every page the tracker protects or unprotects alone stays a VMA; at the limit splits fail with
+// ENOMEM (the "fault loop" crash of #21). One red line when the count passes 80% of the limit.
+static void mem_log(void) {
+    static int warned; long mx; int maps = dm_maps_count(&mx);
+    long rss = -1; { FILE *f = fopen("/proc/self/statm", "r"); long vs, rs; if (f) { if (fscanf(f, "%ld %ld", &vs, &rs) == 2) rss = rs * (sysconf(_SC_PAGESIZE) / 1024) / 1024; fclose(f); } }
+    uint64_t fl = 0, fu = 0, fp = 0, wd = 0; int er = 0; if (nvn_dirty_mp_fail) nvn_dirty_mp_fail(&fl, &fu, &fp, &wd, &er);
+    int zn = 0; uint64_t zv = 0, zc = 0, za = 0, zms = 0; if (nvn_dirty_coalesce_stats) nvn_dirty_coalesce_stats(&zn, &zv, &zc, &za, &zms);
+    LOG("[perf] memory 60s: maps=%d max_map_count=%ld (%.0f%%), rss %ld MB; zero-copy chunks %d with %llu VMAs (model), coalesced %llu (skipped %llu, %llu ms total); "
+        "dirty tracker mprotect failures %llu (unprotect %llu, protect %llu), widened %llu, last errno %d",
+        maps, mx, mx > 0 && maps >= 0 ? 100.0 * maps / mx : -1.0, rss, zn, (unsigned long long)zv, (unsigned long long)zc, (unsigned long long)za, (unsigned long long)zms,
+        (unsigned long long)fl, (unsigned long long)fu, (unsigned long long)fp, (unsigned long long)wd, er);
+    if (!warned && mx > 0 && maps > mx * 8 / 10) { warned = 1;
+        LOG("【红】[perf] memory map count %d is past 80%% of vm.max_map_count %ld: protection splits will start failing with ENOMEM (issue #21)", maps, mx); }
+}
 static void *perf_monitor(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "dm-perfmon");
     cfg(); clocks_init();
@@ -437,13 +456,14 @@ static void *perf_monitor(void *arg) {
     long ncpu = sysconf(_SC_NPROCESSORS_CONF); if (ncpu <= 0 || ncpu > 32) ncpu = 8;
     for (int c = 0; c < ncpu; c++) { g_all_set.b[0] |= 1ul << c; if (C.big_mask >> c & 1) g_big_set.b[0] |= 1ul << c; }
     if (C.big_mask) LOG("[perf] DM_GUEST_BIGCORE=%x: the %s guest thread is kept on these CPUs (checked every 2 s)", C.big_mask, C.big_present ? "presenting" : "busiest");
-    int64_t t0 = perf_now(), next_scan = t0 + 2000000000ll, next_big = t0 + 2000000000ll;
+    int64_t t0 = perf_now(), next_scan = t0 + 2000000000ll, next_big = t0 + 2000000000ll, next_mem = t0 + 10000000000ll;
     for (;;) {
         struct timespec s = {1, 0}; nanosleep(&s, NULL);
         int64_t now = perf_now();
         clocks_sample();
         if (now >= next_big) { if (C.big_mask) big_check(); guest_mask_check(); next_big = now + 2000000000ll; }
         if (now >= next_scan) { monitor_scan(now); next_scan = now + 10000000000ll; }
+        if (now >= next_mem) { mem_log(); next_mem = now + 60000000000ll; }
     }
     return NULL;
 }

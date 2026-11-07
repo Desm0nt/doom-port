@@ -781,6 +781,9 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     bool astc_hdr_ext=false;for(const auto &x:available)if(!strcmp(x.extensionName,VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME))astc_hdr_ext=true;
     if(astc_hdr_ext){VkPhysicalDeviceFeatures2 q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};q.pNext=&astc_hdr;vkGetPhysicalDeviceFeatures2(physical,&q);}
     const bool want_astc_hdr=astc_overlay_boot(features.features,astc_hdr_ext && astc_hdr.textureCompressionASTC_HDR);
+    // [DOOM] DM_VK_ROBUST=0: device without robustBufferAccess (diagnostic: out-of-range buffer reads read memory instead of 0;
+    // DM_GFX_BONES_SSBO on the stock Adreno 740 driver, BUGS_AND_FIXES 2.34).
+    {const char *e=getenv("DM_VK_ROBUST");if(e && *e && !atoi(e)){features.features.robustBufferAccess=VK_FALSE;__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","robustBufferAccess off (DM_VK_ROBUST=0)");}}
     std::vector<const char*> dext={VK_KHR_SWAPCHAIN_EXTENSION_NAME};if(mirror)dext.push_back(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
     if(want_astc_hdr){dext.push_back(VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME);astc_hdr.textureCompressionASTC_HDR=VK_TRUE;astc_hdr.pNext=draw.pNext;draw.pNext=&astc_hdr;}
     // NVN min/max reduction samplers (depth pyramids): extension only (the instance is Vulkan 1.1); without it reductions sample as average.
