@@ -1,0 +1,17 @@
+{
+  "_doc": [
+    "DOOM Mobile game-files version (BUGS_AND_FIXES 2.41): what setup makes on the PC (patched program dm/out, shaders dm/shaders, romfs, astc).",
+    "tools/setup_doom.py writes it into <game folder>/dm/setup-stamp.json when the folder is complete; the APK needs at least 'version'",
+    "(app/build.gradle -> BuildConfig.DM_GAME_FILES) and asks once to re-run setup when the phone has less (UpdateNotice.java).",
+    "Bump 'version' and the changed component ONLY when a new APK really needs new setup outputs (new patch_nso.py CUTS it relies on, a new",
+    "shader bundle format...), add a 'history' entry, and add the string gf_features_v<version> (13 languages, res/values*/update_notice.xml)",
+    "plus its id in DmActivity.GF_FEATURES. A component setup must redo also needs its *_ok() check to see the old output (Layout.stale).",
+    "No stamp (setup before 2.41) = version 1, or 0 when dm/out/build_src.sha256 names a patch_nso.py from before v0.4.5 (DmActivity.PRE_045_PATCHERS)."
+  ],
+  "version": 1,
+  "components": {"patches": 1, "shaders": 1, "romfs": 1, "astc": 1},
+  "history": [
+    {"version": 0, "setup": "up to v0.4.4", "note": "patches before round 6 (no light mode, 3D scale no-op with DRS off, DRS on the game's empty GPU timer)"},
+    {"version": 1, "setup": "v0.4.5", "components": ["patches"], "note": "round 6 patches: light mode, working 3D resolution scale, DRS on our GPU time (CUTS 0x1c06568.., 0x1c26ec4.., 0x1c5b27c)"}
+  ]
+}

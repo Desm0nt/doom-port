@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">Güncellemeler</string>
+    <string name="upd_version_line">Uygulama sürümü: %1$s</string>
+    <string name="upd_check_now">Güncellemeleri denetle</string>
+    <string name="upd_check_start">Açılışta yeni sürümleri denetle</string>
+    <string name="upd_checking">Güncellemeler denetleniyor…</string>
+    <string name="upd_title">Yeni sürüm %1$s</string>
+    <string name="upd_message">%1$s %2$s çıktı (sizdeki: %3$s).</string>
+    <string name="upd_whats_new">Yenilikler:</string>
+    <string name="upd_open">Sürüm sayfasını aç</string>
+    <string name="upd_close">Kapat</string>
+    <string name="upd_latest">En son sürüm sizde (%1$s).</string>
+    <string name="upd_failed">Güncellemeler denetlenemedi: %1$s</string>
+    <string name="upd_err_offline">bağlantı yok</string>
+    <string name="upd_err_limit">GitHub meşgul, daha sonra deneyin</string>
+    <string name="gf_title">PC\'de setup\'ı yeniden çalıştırın</string>
+    <string name="gf_message">Oyun dosyalarınız eski bir setup ile hazırlanmış. Şunları almak için PC\'de setup\'ı yeniden çalıştırın:</string>
+    <string name="gf_howto">GitHub sayfasından yeni setup ZIP\'ini indirin, eskisi gibi setup.bat (Windows) veya setup.sh (Linux / macOS) çalıştırın, sonra yeni DOOM Mobile/dm klasörünü telefona eskisinin üzerine kopyalayın.</string>
+    <string name="gf_note">O zamana kadar oyun eskisi gibi çalışır.</string>
+    <string name="gf_guide">Talimatlar</string>
+    <string name="gf_line_ok">Oyun dosyaları: sürüm %1$d (gereken: %2$d)</string>
+    <string name="gf_line_nostamp">Oyun dosyaları: eski setup, sürüm %1$d sayılır (gereken: %2$d)</string>
+    <string name="gf_line_old">Oyun dosyaları: sürüm %1$d, gereken: %2$d. PC\'de setup\'ı yeniden çalıştırın</string>
+    <string name="gf_line_none">Oyun dosyaları: bulunamadı</string>
+    <string name="gf_features_v1" formatted="false">• Zayıf telefonlar için hafif mod\n• Çalışan 3D çözünürlüğü %85 / %75 / %67\n• 30 / 45 / 60 fps hedefli dinamik çözünürlük</string>
+</resources>

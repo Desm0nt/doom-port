@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">Aggiornamenti</string>
+    <string name="upd_version_line">Versione dell\'app: %1$s</string>
+    <string name="upd_check_now">Cerca aggiornamenti</string>
+    <string name="upd_check_start">Cerca nuove versioni all\'avvio</string>
+    <string name="upd_checking">Ricerca aggiornamenti…</string>
+    <string name="upd_title">Nuova versione %1$s</string>
+    <string name="upd_message">È uscito %1$s %2$s (hai la %3$s).</string>
+    <string name="upd_whats_new">Novità:</string>
+    <string name="upd_open">Apri la pagina della versione</string>
+    <string name="upd_close">Chiudi</string>
+    <string name="upd_latest">Hai l\'ultima versione (%1$s).</string>
+    <string name="upd_failed">Impossibile cercare aggiornamenti: %1$s</string>
+    <string name="upd_err_offline">nessuna connessione</string>
+    <string name="upd_err_limit">GitHub è occupato, riprova più tardi</string>
+    <string name="gf_title">Riesegui il setup sul PC</string>
+    <string name="gf_message">I file di gioco sono stati creati da un setup vecchio. Riesegui il setup sul PC per avere:</string>
+    <string name="gf_howto">Scarica il nuovo ZIP del setup dalla pagina GitHub, avvia setup.bat (Windows) o setup.sh (Linux / macOS) come prima, poi copia la nuova cartella DOOM Mobile/dm sul telefono al posto di quella vecchia.</string>
+    <string name="gf_note">Nel frattempo il gioco funziona come prima.</string>
+    <string name="gf_guide">Istruzioni</string>
+    <string name="gf_line_ok">File di gioco: versione %1$d (richiesta: %2$d)</string>
+    <string name="gf_line_nostamp">File di gioco: setup vecchio, vale come versione %1$d (richiesta: %2$d)</string>
+    <string name="gf_line_old">File di gioco: versione %1$d, richiesta: %2$d. Riesegui il setup sul PC</string>
+    <string name="gf_line_none">File di gioco: non trovati</string>
+    <string name="gf_features_v1" formatted="false">• Modalità leggera per telefoni meno potenti\n• Risoluzione 3D 85 / 75 / 67 % funzionante\n• Risoluzione dinamica con obiettivo 30 / 45 / 60 fps</string>
+</resources>

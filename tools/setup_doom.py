@@ -11,7 +11,8 @@
       game and the update. Base and update are told apart by the title id in their content meta (CNMT), not by the name.
       Then: ExeFS -> offline patch (dm/tools/patch_nso.py, DM_TARGET=android) -> RomFS -> shader translation -> textures
       for phones without BC (tools/astc_overlay_doom.py: ASTC / EAC copies of the BC textures for Mali, PowerVR, Xclipse;
-      --no-astc skips it) -> the phone folder <work>/DOOM Mobile/{romfs, dm/out, dm/shaders, astc}. Every step is skipped
+      --no-astc skips it) -> the phone folder <work>/DOOM Mobile/{romfs, dm/out, dm/shaders, astc}, and last
+      dm/setup-stamp.json (the game-files version the app checks: dm/android/doom/game_files.json). Every step is skipped
       when its output is already complete (the texture step also when made by another tools/astc_overlay_doom.py);
       delete an output to redo its step. --dry-run identifies the inputs, checks the tools and the free space and prints
       the plan. --yes answers yes to every question (download .NET, copy to the phone).
@@ -31,7 +32,7 @@ missing, setup offers to install it into tools/.runtime/dotnet with Microsoft's 
 nothing system-wide). setup.bat / setup.sh provide Python and its packages the same way (tools/.runtime); the texture
 encoders of the last step (tools/requirements-astc.txt, ~20 MB from PyPI) are added to that Python the first time (asked first).
 """
-import argparse, os, re, shutil, struct, subprocess, sys, time
+import argparse, json, os, re, shutil, struct, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,6 +71,30 @@ ASTC_MODULES = (('astc-encoder-py', 'astc_encoder'), ('etcpak', 'etcpak'), ('tex
 
 class Fail(Exception):
     pass
+
+
+# Game-files version (BUGS_AND_FIXES 2.41): dm/android/doom/game_files.json is the one source for this setup (the stamp it writes last into
+# <phone>/dm/setup-stamp.json) and for the APK (BuildConfig.DM_GAME_FILES: the version it needs; less -> a one-time "re-run setup" notice).
+# Bump it there only when an APK needs new setup outputs, with the component that changed (a stale component is redone: Layout.stale).
+def _game_files():
+    for p in (ROOT / 'dm' / 'android' / 'doom' / 'game_files.json', ROOT / 'src' / 'dm' / 'android' / 'doom' / 'game_files.json'):
+        try:
+            g = json.loads(p.read_text(encoding='utf-8'))
+            return int(g['version']), {str(k): int(v) for k, v in g.get('components', {}).items()}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return 1, {'patches': 1, 'shaders': 1, 'romfs': 1, 'astc': 1}
+
+
+GAME_FILES, GAME_FILES_COMPONENTS = _game_files()
+STAMP_BASELINE = 1      # outputs without a stamp (setup v0.4.5 .. v0.4.21) count as version 1, as in the app (DmActivity.Updates)
+
+
+def setup_version():
+    for p in (ROOT / 'dm' / 'android' / 'doom' / 'VERSION', ROOT / 'src' / 'dm' / 'android' / 'doom' / 'VERSION'):
+        try: return p.read_text(encoding='utf-8').strip()
+        except OSError: continue
+    return 'unknown'
 
 
 def say(msg): print(f'== {msg}', flush=True)
@@ -121,6 +146,21 @@ class Layout:
         self.xlate = self.work / 'build' / 'dmsh_xlate_doom'
         self.romfs_manifest = self.work / 'romfs-manifest.json'
         self.astc = self.phone / 'astc'
+        self.stamp = self.phone / 'dm' / 'setup-stamp.json'
+
+    def stamp_data(self):
+        try:
+            s = json.loads(self.stamp.read_text(encoding='utf-8'))
+            return s if isinstance(s, dict) and isinstance(s.get('game_files'), int) else None
+        except (OSError, ValueError):
+            return None
+
+    def stale(self, component):
+        # made by an older setup than this one needs for this component (the stamp's component version, or the no-stamp baseline 1)
+        s = self.stamp_data()
+        comps = s.get('components') if s and isinstance(s.get('components'), dict) else {}
+        have = comps.get(component, STAMP_BASELINE)
+        return (have if isinstance(have, int) else STAMP_BASELINE) < GAME_FILES_COMPONENTS.get(component, 0)
 
     def exefs_ok(self):
         return build_id(self.exefs / 'main') == BUILD_ID and (self.exefs / 'sdk').is_file()
@@ -135,16 +175,16 @@ class Layout:
         for name in ('patch_nso.py', 'nso_code.py'):
             src = ROOT / 'dm' / 'tools' / name
             if src.is_file() and rec.get(name) != hashlib.sha256(src.read_bytes()).hexdigest(): return False
-        return True
+        return not self.stale('patches')
 
     def romfs_ok(self):
-        return self.romfs_manifest.is_file() and self.romfs.is_dir()
+        return self.romfs_manifest.is_file() and self.romfs.is_dir() and not self.stale('romfs')
 
     def shader_count(self):
         return len(list(self.shaders.glob('*.xgs'))) if self.shaders.is_dir() else 0
 
     def shaders_ok(self):
-        return (self.shaders / '_vk_build.json').is_file() and self.shader_count() > 0
+        return (self.shaders / '_vk_build.json').is_file() and self.shader_count() > 0 and not self.stale('shaders')
 
     def complete(self):
         return self.out_ok() and self.romfs_ok() and self.shaders_ok()
@@ -156,9 +196,25 @@ class Layout:
         import hashlib, json
         try: man = json.loads((self.astc / 'manifest.json').read_text())
         except (OSError, ValueError): return False
-        if man.get('format') != 'doom-astc-overlay' or not ASTC_TOOL.is_file(): return False
+        if man.get('format') != 'doom-astc-overlay' or not ASTC_TOOL.is_file() or self.stale('astc'): return False
         if man.get('tool_sha256') != hashlib.sha256(ASTC_TOOL.read_bytes()).hexdigest(): return False
         return all((self.astc / rel).is_file() and (self.astc / rel).stat().st_size == size for rel, size in man.get('files', {}).items())
+
+
+def write_stamp(L):
+    """<phone>/dm/setup-stamp.json: the game-files version this setup made (BUGS_AND_FIXES 2.41), read by the app. Written last and only for
+    a complete folder; astc is listed only when its overlay is complete."""
+    import datetime
+    comps = {k: v for k, v in GAME_FILES_COMPONENTS.items() if k != 'astc' or L.astc_ok()}
+    try: patcher = (L.out / 'build_src.sha256').read_text().split()[0]
+    except (OSError, IndexError): patcher = ''
+    data = {'format': 'dm-setup-stamp', 'schema': 1, 'game': 'doom', 'game_files': GAME_FILES, 'components': comps,
+            'setup': setup_version(), 'build_id': BUILD_ID, 'patcher_sha256': patcher,
+            'made': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
+    tmp = L.stamp.with_name(L.stamp.name + '.part')
+    tmp.write_text(json.dumps(data, indent=1) + '\n', encoding='utf-8')
+    tmp.replace(L.stamp)
+    print(f'  game-files stamp: {L.stamp} (version {GAME_FILES}, ' + ', '.join(f'{k} {v}' for k, v in comps.items()) + ')')
 
 
 def build_id(nso):
@@ -679,6 +735,11 @@ def push(L, serial):
             print(f'  {p.relative_to(L.phone).as_posix()} ({p.stat().st_size / 2**20:.1f} MB)', flush=True)
             if subprocess.run(adb + ['push', str(p), rp], capture_output=True).returncode:
                 raise Fail(f'adb push failed: {p} (run again to resume)')
+    if L.stamp.is_file():                       # last: an interrupted push never leaves a new stamp beside old files
+        subprocess.run(adb + ['shell', f"mkdir -p '{PHONE_DIR}/dm'"], check=True)
+        if subprocess.run(adb + ['push', str(L.stamp), f'{PHONE_DIR}/dm/{L.stamp.name}'], capture_output=True).returncode:
+            raise Fail(f'adb push failed: {L.stamp} (run again to resume)')
+        say(f'push dm/{L.stamp.name}: game files version {GAME_FILES}')
     if APP_ID in subprocess.run(adb + ['shell', 'pm', 'list', 'packages', APP_ID], capture_output=True, text=True).stdout:
         subprocess.run(adb + ['shell', 'appops', 'set', APP_ID, 'MANAGE_EXTERNAL_STORAGE', 'allow'])
         say(f'{APP_ID}: All files access granted')
@@ -760,6 +821,10 @@ def check(L, files):
     item(L.shaders_ok(), f'dm/shaders: {L.shader_count()} SPIR-V bundles', RUN_SETUP)
     print(f"  {'OK ' if L.astc_ok() else '.. '} astc: textures for phones without BC (Mali, PowerVR, Xclipse): " +
           ('made by this setup' if L.astc_ok() else 'missing or made by another setup (optional: run setup to make it, --no-astc skips it)'))
+    st = L.stamp_data()
+    if st: item(st['game_files'] >= GAME_FILES, f"dm/setup-stamp.json: game files version {st['game_files']} (this setup makes {GAME_FILES}), "
+                f"setup {st.get('setup', '?')}", RUN_SETUP)
+    else: print(f'  ..  dm/setup-stamp.json: not written yet (setup writes it when the folder is complete; game files version {GAME_FILES})')
     if L.nsp.is_dir(): print(f'  ..  temporary NSPs in {L.nsp} (removed after the RomFS step)')
     if nxt:
         say(f'Next: {nxt[0]}')
@@ -840,6 +905,7 @@ def prepare(a, L):
     elif step_astc(L, a.yes, a.jobs): print(f'  done in {took(t0)}')
     if not L.complete():
         say(f'finished the requested steps; the folder is not complete yet: {L.phone}'); return 0
+    write_stamp(L)
     if a.push:
         push(L, None if a.push == 'auto' else a.push); return 0
     next_steps(L, False, a.yes)

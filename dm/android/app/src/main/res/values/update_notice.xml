@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">Updates</string>
+    <string name="upd_version_line">App version: %1$s</string>
+    <string name="upd_check_now">Check for updates</string>
+    <string name="upd_check_start">Check for new versions at start</string>
+    <string name="upd_checking">Checking for updates…</string>
+    <string name="upd_title">New version %1$s</string>
+    <string name="upd_message">%1$s %2$s is out (you have %3$s).</string>
+    <string name="upd_whats_new">What\'s new:</string>
+    <string name="upd_open">Open the release page</string>
+    <string name="upd_close">Close</string>
+    <string name="upd_latest">You have the latest version (%1$s).</string>
+    <string name="upd_failed">Could not check for updates: %1$s</string>
+    <string name="upd_err_offline">no connection</string>
+    <string name="upd_err_limit">GitHub is busy, try again later</string>
+    <string name="gf_title">Re-run setup on your PC</string>
+    <string name="gf_message">Your game files were made by an older setup. Run setup again on your PC to get:</string>
+    <string name="gf_howto">Download the new setup ZIP from the GitHub page, run setup.bat (Windows) or setup.sh (Linux / macOS) as before, then copy the new DOOM Mobile/dm folder to the phone over the old one.</string>
+    <string name="gf_note">Until then the game works as before.</string>
+    <string name="gf_guide">Instructions</string>
+    <string name="gf_line_ok">Game files: version %1$d (needed: %2$d)</string>
+    <string name="gf_line_nostamp">Game files: older setup, counts as version %1$d (needed: %2$d)</string>
+    <string name="gf_line_old">Game files: version %1$d, needed: %2$d. Re-run setup on your PC</string>
+    <string name="gf_line_none">Game files: not found</string>
+    <string name="gf_features_v1" formatted="false">• Light mode for weaker phones\n• 3D resolution 85 / 75 / 67 % that works\n• Dynamic resolution with a 30 / 45 / 60 fps target</string>
+</resources>

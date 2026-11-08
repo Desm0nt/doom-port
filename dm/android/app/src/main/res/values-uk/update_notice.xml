@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">Оновлення</string>
+    <string name="upd_version_line">Версія застосунку: %1$s</string>
+    <string name="upd_check_now">Перевірити оновлення</string>
+    <string name="upd_check_start">Перевіряти нові версії під час запуску</string>
+    <string name="upd_checking">Перевіряю оновлення…</string>
+    <string name="upd_title">Нова версія %1$s</string>
+    <string name="upd_message">Вийшла нова версія: %1$s %2$s (у вас %3$s).</string>
+    <string name="upd_whats_new">Що нового:</string>
+    <string name="upd_open">Відкрити сторінку релізу</string>
+    <string name="upd_close">Закрити</string>
+    <string name="upd_latest">У вас остання версія (%1$s).</string>
+    <string name="upd_failed">Не вдалося перевірити оновлення: %1$s</string>
+    <string name="upd_err_offline">немає зв\'язку</string>
+    <string name="upd_err_limit">GitHub зайнятий, спробуйте пізніше</string>
+    <string name="gf_title">Запустіть setup на ПК ще раз</string>
+    <string name="gf_message">Файли гри зроблені старим setup. Запустіть setup на ПК ще раз, щоб отримати:</string>
+    <string name="gf_howto">Завантажте новий ZIP установки зі сторінки GitHub, запустіть setup.bat (Windows) або setup.sh (Linux / macOS) як раніше, потім скопіюйте нову теку DOOM Mobile/dm на телефон замість старої.</string>
+    <string name="gf_note">А поки гра працює як раніше.</string>
+    <string name="gf_guide">Інструкція</string>
+    <string name="gf_line_ok">Файли гри: версія %1$d (потрібна %2$d)</string>
+    <string name="gf_line_nostamp">Файли гри: старий setup, вважається версією %1$d (потрібна %2$d)</string>
+    <string name="gf_line_old">Файли гри: версія %1$d, потрібна %2$d. Запустіть setup на ПК ще раз</string>
+    <string name="gf_line_none">Файли гри: не знайдено</string>
+    <string name="gf_features_v1" formatted="false">• Легкий режим для слабких телефонів\n• Робоча роздільність 3D 85 / 75 / 67 %\n• Динамічна роздільність з ціллю 30 / 45 / 60 fps</string>
+</resources>

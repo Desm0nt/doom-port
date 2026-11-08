@@ -27,7 +27,7 @@ import java.util.Map;
 // graphics and audio suspended, see the port's hle_hold.c / nx2android's hold_sync), no input reaches the game, and on Resume everything goes on
 // without a jump. The rows:
 //   Resume · Game settings… (the port's own gear dialog) · Gamepad… (skin, opacity, size, layout, editor) · Edit layout · Mode (docked / handheld, when
-//   the game has one) · Export save · Import save… · Quit
+//   the game has one) · Export save · Import save… · Check for updates (when the port has an update check) · Quit
 final class FrontMenu implements PauseMenu.Listener {
     interface Owner { FrontMenu frontMenu(); }
     interface Host {
@@ -41,6 +41,8 @@ final class FrontMenu implements PauseMenu.Listener {
         Saves saves();                   // null: no save transfer in this port
         void quit();
         void immersive();
+        default boolean updates() { return false; }   // the port has an update check (UpdateNotice): the "Check for updates" row
+        default void checkUpdates() { }
     }
     static final int MODE_NONE = 0, MODE_OPMODE = 1, MODE_LIGHT = 2;   // OPMODE: Switch dock / handheld (dm_set_opmode); LIGHT: DOOM's handheld quality preset
     interface Saves { String export(); String[] list(); String requestImport(String name); String where(); }
@@ -56,7 +58,7 @@ final class FrontMenu implements PauseMenu.Listener {
     private final Activity act; private final Host host; private final Pad pad; private final PauseMenu menu;
     private boolean open, dialog;
     private int[] ids = new int[0];
-    static final int R_RESUME = 0, R_SETTINGS = 1, R_PAD = 2, R_EDIT = 3, R_MODE = 4, R_EXPORT = 5, R_IMPORT = 6, R_QUIT = 7;
+    static final int R_RESUME = 0, R_SETTINGS = 1, R_PAD = 2, R_EDIT = 3, R_MODE = 4, R_EXPORT = 5, R_IMPORT = 6, R_QUIT = 7, R_UPDATES = 8;
 
     FrontMenu(Activity a, Host h, Pad p, FrameLayout frame) {
         act = a; host = h; pad = p;
@@ -67,9 +69,9 @@ final class FrontMenu implements PauseMenu.Listener {
     private String t(String ru, String en) { return Ui.t(act, ru, en); }
 
     private void rebuild() {
-        int[] all = {R_RESUME, R_SETTINGS, R_PAD, R_EDIT, R_MODE, R_EXPORT, R_IMPORT, R_QUIT};
+        int[] all = {R_RESUME, R_SETTINGS, R_PAD, R_EDIT, R_MODE, R_EXPORT, R_IMPORT, R_UPDATES, R_QUIT};
         int n = 0; int[] use = new int[all.length];
-        for (int r : all) { if (r == R_MODE && host.modeKind() == MODE_NONE) continue; if ((r == R_EXPORT || r == R_IMPORT) && host.saves() == null) continue; if (r == R_EDIT && pad == null) continue; use[n++] = r; }
+        for (int r : all) { if (r == R_MODE && host.modeKind() == MODE_NONE) continue; if ((r == R_EXPORT || r == R_IMPORT) && host.saves() == null) continue; if (r == R_EDIT && pad == null) continue; if (r == R_UPDATES && !host.updates()) continue; use[n++] = r; }
         ids = java.util.Arrays.copyOf(use, n);
         String[] labels = new String[n]; int danger = -1;
         for (int i = 0; i < n; i++) { labels[i] = label(ids[i]); if (ids[i] == R_QUIT) danger = i; }
@@ -86,6 +88,7 @@ final class FrontMenu implements PauseMenu.Listener {
                 return d ? t("Режим Switch: док (TV)", "Switch mode: docked (TV)") : t("Режим Switch: портативный", "Switch mode: handheld"); }
             case R_EXPORT: return t("Экспорт сохранения", "Export save");
             case R_IMPORT: return t("Импорт сохранения…", "Import save…");
+            case R_UPDATES: return t("Проверить обновления", "Check for updates");
             default: return t("Выйти из игры", "Quit game");
         }
     }
@@ -121,6 +124,7 @@ final class FrontMenu implements PauseMenu.Listener {
                     ? t("Не вышло: ", "Failed: ") + (res.equals("!no save yet") ? t("сохранения ещё нет", "no save yet") : res.substring(1))
                     : t("Сохранено: saves/", "Saved: saves/") + res)); }, "front-export").start(); break; }
             case R_IMPORT: importSave(); break;
+            case R_UPDATES: host.checkUpdates(); break;
             case R_QUIT:
                 dialog(new AlertDialog.Builder(act).setMessage(t("Выйти из игры? Несохранённый прогресс пропадёт.", "Quit the game? Unsaved progress is lost."))
                     .setPositiveButton(t("Выйти", "Quit"), (d, w) -> host.quit()).setNegativeButton(t("Отмена", "Cancel"), null).create());

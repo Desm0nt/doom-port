@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">Aktualizacje</string>
+    <string name="upd_version_line">Wersja aplikacji: %1$s</string>
+    <string name="upd_check_now">Sprawdź aktualizacje</string>
+    <string name="upd_check_start">Sprawdzaj nowe wersje przy uruchomieniu</string>
+    <string name="upd_checking">Sprawdzam aktualizacje…</string>
+    <string name="upd_title">Nowa wersja %1$s</string>
+    <string name="upd_message">Wyszła nowa wersja: %1$s %2$s (masz %3$s).</string>
+    <string name="upd_whats_new">Co nowego:</string>
+    <string name="upd_open">Otwórz stronę wydania</string>
+    <string name="upd_close">Zamknij</string>
+    <string name="upd_latest">Masz najnowszą wersję (%1$s).</string>
+    <string name="upd_failed">Nie udało się sprawdzić aktualizacji: %1$s</string>
+    <string name="upd_err_offline">brak połączenia</string>
+    <string name="upd_err_limit">GitHub jest zajęty, spróbuj później</string>
+    <string name="gf_title">Uruchom setup na PC ponownie</string>
+    <string name="gf_message">Twoje pliki gry zrobił starszy setup. Uruchom setup na PC ponownie, aby dostać:</string>
+    <string name="gf_howto">Pobierz nowy ZIP setupu ze strony GitHub, uruchom setup.bat (Windows) lub setup.sh (Linux / macOS) jak wcześniej, a potem skopiuj nowy folder DOOM Mobile/dm na telefon w miejsce starego.</string>
+    <string name="gf_note">Do tego czasu gra działa jak dotąd.</string>
+    <string name="gf_guide">Instrukcja</string>
+    <string name="gf_line_ok">Pliki gry: wersja %1$d (wymagana: %2$d)</string>
+    <string name="gf_line_nostamp">Pliki gry: starszy setup, liczy się jako wersja %1$d (wymagana: %2$d)</string>
+    <string name="gf_line_old">Pliki gry: wersja %1$d, wymagana: %2$d. Uruchom setup na PC ponownie</string>
+    <string name="gf_line_none">Pliki gry: nie znaleziono</string>
+    <string name="gf_features_v1" formatted="false">• Lekki tryb dla słabszych telefonów\n• Działająca rozdzielczość 3D 85 / 75 / 67 %\n• Dynamiczna rozdzielczość z celem 30 / 45 / 60 fps</string>
+</resources>

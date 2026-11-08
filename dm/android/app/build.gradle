@@ -52,6 +52,10 @@ android {
         def doomNum = doomVer ? doomVer.tokenize('.').collect { it as int } : null
         versionCode doomNum ? 100000 + doomNum[0] * 10000 + doomNum[1] * 100 + doomNum[2] : 20001
         versionName((doomVer ?: '2.0.1') + (project.findProperty('dmDiag') == '1' ? '-diag' : ''))
+        // [DOOM] 2.41: the game-files version this APK needs (doom/game_files.json "version", the same file setup stamps from); UpdateNotice asks
+        // to re-run setup when <game folder>/dm/setup-stamp.json is older. 0 = no check (d2r)
+        def gameFiles = project.findProperty('dmGame') == 'doom' ? new groovy.json.JsonSlurper().parse(file('../doom/game_files.json')).version as int : 0
+        buildConfigField 'int', 'DM_GAME_FILES', "${gameFiles}"
         // [DOOM] -PdmDiag=1: the diagnostics APK (DmActivity: per-pass GPU profile on, boot.log copied to the game folder every minute)
         buildConfigField 'boolean', 'DM_DIAG', project.findProperty('dmDiag') == '1' ? 'true' : 'false'
         // -PdmDiagDriver=<package>: the diagnostics APK forces this bundled driver package (assets/drivers/<package>) on Adreno 6xx+

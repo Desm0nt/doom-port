@@ -72,7 +72,7 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     private static final float ABXY_FX = 0.885f, ABXY_FY = 0.36f, DPAD_FX = 0.21f, DPAD_FY = 0.74f, GAP = 50, STICK_R = 64;
     private static final float PHONE_ASPECT = 1.9f, MIN_MM = 10f, REACH_MIN = 0.045f, DRAG_SLOP = 0.02f;
     private final List<Ctl> ctls = new ArrayList<>();
-    private final Look look = new Look(), fireLook = new Look();
+    private final Look look = new Look(), fireLook = new Look(), wheelLook = new Look();
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG), line = new Paint(Paint.ANTI_ALIAS_FLAG), text = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final float dp, dpi;
     private final PadSkin skin;
@@ -80,6 +80,13 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     private float deadzone = 0f, lookGain = 1.0f, lookX, lookY, pendX, pendY;
     private float lookDx, lookDy;          // finger travel (dp) not yet handed over (flushLook)
     private static boolean hostLook = true;   // false when the native library lacks nativeLookDelta
+    // Weapon wheel (GitHub issue #34): DOOM opens it while R is held (nx_default.cfg: JOY6 "_changeWeapon") and picks the weapon with
+    // the right stick, which touch look never moves (it goes through the gyro channel). While the wheel key is held, look-finger travel
+    // steers the right stick instead: offset / WHEEL_R_DP, length capped at 1 (so turning back changes direction at once), kept after the
+    // finger lifts until the key is released. The finger that holds the key steers too (like a held FIRE turns the view), so one thumb
+    // presses R and slides toward the weapon. "wheel_key" (doom_controls): the keycode, 0 = off.
+    private static final float WHEEL_R_DP = 40;
+    private int wheelKey = KeyEvent.KEYCODE_E; private boolean wheelOn; private float wheelX, wheelY;
     private long lookNanos;
     private float opacity = 1, sizeK = 1; private boolean shown = true, lookOn = true;
     // "split" (doom_controls, the editor's Grouped / Separate button; GitHub issue #9): every button is placed on its own: the A/B/X/Y
@@ -191,6 +198,7 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     @Override public void reloadSettings() {
         SharedPreferences p = prefs();
         deadzone = p.getFloat("move_dz", 0f); showFps = p.getBoolean("fps", true); removeCallbacks(fpsTick); if (showFps) postDelayed(fpsTick, 500); lookGain = p.getFloat("look", 1.0f);
+        wheelKey = p.getInt("wheel_key", KeyEvent.KEYCODE_E);
         gearMode = p.getInt("gear_mode", GEAR_NORMAL) == GEAR_NORMAL ? GEAR_NORMAL : GEAR_FADED; gearAlpha = Math.max(1, Math.min(100, p.getInt("gear_alpha", GEAR_ALPHA_DEFAULT)));
         opacity = Math.max(5, Math.min(100, p.getInt("opacity", OPACITY_DEFAULT))) / 100f; sizeK = Math.max(60, Math.min(160, p.getInt("size", SIZE_DEFAULT))) / 100f;
         shown = p.getBoolean("shown", true); lookOn = p.getBoolean("look_on", true); tick = p.getBoolean("tick", false);
@@ -283,6 +291,12 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     // pending stick turn below.
     private void flushLook() {
         if (lookDx == 0 && lookDy == 0) return;
+        if (wheelOn) {   // the weapon wheel: the travel steers the right stick (see wheelKey)
+            wheelX += lookDx / WHEEL_R_DP; wheelY += lookDy / WHEEL_R_DP;
+            float m = (float) Math.sqrt(wheelX * wheelX + wheelY * wheelY);
+            if (m > 1) { wheelX /= m; wheelY /= m; }
+            lookDx = lookDy = 0; return;
+        }
         float k = lookGain / DP_PER_TILT_SECOND;
         boolean taken = false;
         if (hostLook) try { taken = DmActivity.nativeLookDelta(lookDx, lookDy, k); } catch (UnsatisfiedLinkError err) { hostLook = false; }
@@ -328,12 +342,20 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         updateLook();
         float lx = 0, ly = 0, rx = 0, ry = 0;
         for (Ctl c : ctls) if (c.kind == K_STICK) { float R = box(c)[2]; float[] v = shape(c.kx / R, c.ky / R); if (c.right) { rx = v[0]; ry = v[1]; } else { lx = v[0]; ly = v[1]; } }
+        if (wheelOn) { rx += wheelX; ry += wheelY; }
         DmActivity.nativePadAxes(PAD_DEVICE, lx, ly, Math.max(-1, Math.min(1, rx + lookX)), Math.max(-1, Math.min(1, ry + lookY)), 0, 0, 0, 0);
+    }
+    // The wheel key held by any control (a button or the d-pad never carries it): look-finger travel then goes to wheelX / wheelY.
+    private void updateWheel() {
+        boolean on = false;
+        if (wheelKey != 0) for (Ctl c : ctls) if (c.pointer >= 0 && c.kind == K_BUTTON && c.key == wheelKey) { on = true; break; }
+        if (on != wheelOn) { wheelOn = on; wheelX = wheelY = 0; lookDx = lookDy = 0; pendX = pendY = 0; }
     }
     // Every held key up, sticks centred, look stopped, zero axes (the pause menu, the editor, a controller taking over).
     @Override public void releaseAll() {
         for (Ctl c : ctls) { c.pointer = -1; c.kx = c.ky = 0; c.dirBits = 0; }
-        look.pointer = fireLook.pointer = -1; pendX = pendY = lookX = lookY = lookDx = lookDy = 0; lookNanos = 0; menuPtr = -1;
+        look.pointer = fireLook.pointer = wheelLook.pointer = -1; pendX = pendY = lookX = lookY = lookDx = lookDy = 0; lookNanos = 0; menuPtr = -1;
+        wheelOn = false; wheelX = wheelY = 0;
         for (Integer k : sent) key(k, false);
         sent.clear();
         if (!controllerMode) try { DmActivity.nativePadAxes(PAD_DEVICE, 0, 0, 0, 0, 0, 0, 0, 0); } catch (UnsatisfiedLinkError e) { /* not loaded yet */ }
@@ -356,7 +378,8 @@ public class DoomPadView extends View implements FrontMenu.Pad {
                 the active controller in front_android.c) */ }
             else if (c != null && c.kind == K_STICK && c.pointer < 0) grab(c, id, x, y);
             else if (c != null && c.kind == K_DPAD && c.pointer < 0) { c.pointer = id; dpadAt(c, x, y); }
-            else if (c != null && c.kind == K_BUTTON && c.pointer < 0) { c.pointer = id; if (c.look && fireLook.pointer < 0) lookStart(fireLook, id, x, y); }
+            else if (c != null && c.kind == K_BUTTON && c.pointer < 0) { c.pointer = id; if (c.look && fireLook.pointer < 0) lookStart(fireLook, id, x, y);
+                if (wheelKey != 0 && c.key == wheelKey && wheelLook.pointer < 0) lookStart(wheelLook, id, x, y); }
             else if (lookOn && look.pointer < 0) lookStart(look, id, x, y);   // any other free spot turns the view
             break;
         }
@@ -368,7 +391,7 @@ public class DoomPadView extends View implements FrontMenu.Pad {
                     else if (c.kind == K_DPAD) dpadAt(c, px, py);
                     else if (c.kind == K_MENU && pid == menuPtr) menuDrag(c, px, py);
                 }
-                Look l = pid == look.pointer ? look : pid == fireLook.pointer ? fireLook : null;
+                Look l = pid == look.pointer ? look : pid == fireLook.pointer ? fireLook : pid == wheelLook.pointer ? wheelLook : null;
                 if (l != null) {   // every batched sample (getHistoricalX/Y), then the current position
                     for (int h = 0, n = e.getHistorySize(); h < n; h++) lookMove(l, e.getHistoricalX(k, h), e.getHistoricalY(k, h));
                     lookMove(l, px, py);
@@ -385,10 +408,11 @@ public class DoomPadView extends View implements FrontMenu.Pad {
             }
             if (id == look.pointer || all) look.pointer = -1;
             if (id == fireLook.pointer || all) fireLook.pointer = -1;
+            if (id == wheelLook.pointer || all) wheelLook.pointer = -1;
             break;
         }
         }
-        if (!controllerMode) { sendKeys(); axes(); }
+        if (!controllerMode) { updateWheel(); sendKeys(); axes(); }
         invalidate();
         return true;
     }

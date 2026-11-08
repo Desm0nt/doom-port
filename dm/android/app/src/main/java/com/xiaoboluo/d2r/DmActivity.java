@@ -55,6 +55,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     private DoomPadView doomPad;
     static native int nativeStart(String filesDir, String extDir, String romfsSrc, String lang);
     static native void nativeSurface(Object surface, int w, int h);
+    static native void nativeDisplaySize(int w, int h);   // [DOOM] the display's real size: the aspect fallback while the view has none (screen off at start)
     static native void nativeRefresh(float hz);
     static native void nativeFrameStats(float[] out);   // [DOOM] {fps, mean ms, max ms, GPU ms} over the last 0.5 s
     static native void nativeTouch(int n, int[] ids, float[] xs, float[] ys);
@@ -119,6 +120,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             finish(); return;
         }
         current = new WeakReference<>(this);
+        if (DOOM) updates = new UpdateNotice(new Updates());   // [DOOM] 2.41: started from driverWatch at the first frames
         if (DOOM) checkLastRun();   // [DOOM] crash report of the last run, before anything of this one is written
         displays = getSystemService(DisplayManager.class);
         if (displays != null) displays.registerDisplayListener(this, null);
@@ -146,6 +148,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public boolean ready() { return started; }
     @Override public void hold(boolean on) { if (!libraryLoaded) return; try { nativeHold(on); } catch (UnsatisfiedLinkError e) { android.util.Log.e("dm", "nativeHold missing: the game is not paused (" + e.getMessage() + ")"); } }
     @Override public void gameSettings() { showDoomSettings(); }
+    @Override public boolean updates() { return updates != null; }   // [DOOM] 2.41: the pause menu's "Check for updates"
+    @Override public void checkUpdates() { if (updates != null) updates.checkNow(); }
     @Override public FrontMenu.Saves saves() {
         if (saves == null && DOOM) {   // [DOOM] issue #11: exports go to <game folder>/saves (GameFolder), with SaveTransfer.forGame's fallback
             File pub = GameFolder.writable(this, "saves"), ext = getExternalFilesDir(null);
@@ -1091,6 +1095,10 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             TextView folderT = new TextView(this); folderT.setText(folderLine()); box.addView(folderT);
             android.widget.Button folderB = new android.widget.Button(this); folderB.setText(R.string.folder_choose); box.addView(folderB);
             folderB.setOnClickListener(v -> showFolderDialog(() -> folderT.setText(folderLine())));
+            // [DOOM] 2.41: updates: this version and the game files' setup version, the check at start on / off ("Check for updates" is a pause-menu row)
+            heading(box, getString(R.string.upd_heading));
+            TextView updT = new TextView(this); updT.setText(updates != null ? updates.statusLine() : BuildConfig.VERSION_NAME); box.addView(updT);
+            CheckBox updStart = new CheckBox(this); updStart.setText(when(R.string.upd_check_start, false)); updStart.setChecked(updates == null || updates.startCheckOn()); box.addView(updStart);
             android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
             final AlertDialog[] gearDlg = new AlertDialog[1];
             editB.setOnClickListener(v -> { if (gearDlg[0] != null) gearDlg[0].dismiss(); if (front != null) front.edit(); else if (doomPad != null) doomPad.startEdit(null); });
@@ -1116,6 +1124,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                     cp.edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[picked(look, 3000, LOOK_GAINS.length)])
                         .putFloat("move_dz", DEADZONES[picked(dz, 4000, DEADZONES.length)]).putInt("gear_mode", gearPick).apply();
                     if (doomPad != null) doomPad.reloadSettings();
+                    if (updates != null) updates.setStartCheck(updStart.isChecked());   // [DOOM] 2.41
                     if (drsWas >= 0 && drs.isChecked() != (drsWas == 1)) {
                         boolean ok = false;
                         try { ok = nativeSetDrs(drs.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetDrs: " + t); }
@@ -1186,7 +1195,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             try { nativeFrameStats(guardStats); } catch (Throwable t) { guardStats[0] = 0; }
             if (guardStats[0] > 0 && !driverGuardDone) { driverGuard().delete(); driverGuardDone = true; android.util.Log.i("dm", "driver guard: first frames presented, guard cleared"); }
             if (guardStats[0] > 0 && !firstFrameDone) { firstFrameDone = true;
-                crumb(String.format(Locale.ROOT, "first frames presented %.1f s after the game started (%.0f fps, frame %.1f ms)", (android.os.SystemClock.uptimeMillis() - gameStartedAt) / 1000.0, guardStats[0], guardStats[1])); }
+                crumb(String.format(Locale.ROOT, "first frames presented %.1f s after the game started (%.0f fps, frame %.1f ms)", (android.os.SystemClock.uptimeMillis() - gameStartedAt) / 1000.0, guardStats[0], guardStats[1]));
+                if (updates != null) updates.start(); }   // [DOOM] 2.41: the update / game-files checks, their notices over the first screens
         }
         if (!(driverGuardDone && driverStatusDone && firstFrameDone)) view.postDelayed(this, 1000);
     } };
@@ -1251,6 +1261,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (!view.getHolder().getSurface().isValid() || view.getWidth() <= 0 || view.getHeight() <= 0) return;
         File ext = getExternalFilesDir(null);
         if (ext == null) { showStartError(getString(R.string.dmAndroidStorage)); return; }
+        if (DOOM) { android.view.Display d = display();   // the real display size first: a game started with the screen off has a 0x0 view
+            if (d != null) { android.graphics.Point p = new android.graphics.Point(); d.getRealSize(p); nativeDisplaySize(p.x, p.y); crumb("display " + p.x + "x" + p.y + ", view " + view.getWidth() + "x" + view.getHeight()); } }
         nativeSurface(view.getHolder().getSurface(), view.getWidth(), view.getHeight());
         updateRefresh();
         // 资源目录缺省 Download/S2X/D2R Mobile/data；没有这个目录、而早先的 Download/data 在时沿用早先的位置，已装好的手机不必搬数据。
@@ -1429,6 +1441,67 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         CrashLog.sessionEnd(this);   // not a crash
         if (libraryLoaded) CrashLog.mirrorBootLogs(this);
         startActivity(new Intent(this, DmRestart.class).putExtra("pid", android.os.Process.myPid()));
+    }
+
+    // ---- [DOOM] 2.41: "a new version is out" and "re-run setup" notices (UpdateNotice.java, the same file in frontend-common/java). Started once
+    // the game shows its first frames (driverWatch); the gear has the status line, "Check for updates" and "Check for new versions at start".
+    private UpdateNotice updates;
+    private static boolean baselineLogged;
+    static final String UPDATE_REPO = "Desm0nt/doom-port";
+    // patch_nso.py SHA-256s (LF and CRLF checkouts) of every public patcher before v0.4.5, the last patch-set change: dm/out/build_src.sha256
+    // naming one of them = game files from setup up to v0.4.4 = version 0 (game_files.json history); any other or none = version 1
+    static final java.util.Set<String> PRE_045_PATCHERS = new java.util.HashSet<>(java.util.Arrays.asList(
+        "68bccd226422ac8627da9d5a4be5091c2294fdf4e84b189fcf5e2cf61c340850", "ecc32011757987974214a7a044998b32b94296c6b3d30a8969fc12b3d8582a35",   // 1d41275 10-30
+        "0e9ee9d4bf6dfe9788c1a4220c8b859d7101eab9d7215da87f29e86596d5d030", "4fc54a159fe592af64b47454452d0853bf201267a1a7cf64ec6059f765fef12c",   // c48e3d8 10-30
+        "a645dfd9152f15046053286a7b344ddca91b988cfb3b8df4b249b5931bc5dd26", "fb6d73c43507933ec9651b34680e565dda46b77ca1dc0b9dd53e5e579a6391c9",   // df81554 10-30
+        "4d8fa0d0013ce438c77f493022689b9bd732cd5aded41f7c943e968fe20bff3d", "5e0d2df184e3253ac6c0863749f7dbad58a678693bbcb372adce94eafcdc8b4e",   // 4a27fdb 10-29
+        "df4229fc0c33f98c4c50ad45acc46bc9d9c9ecc173f29d60d752dba2a746a91b", "2b8b89f854e05b76421be7128292bc0839c9b9d8282ac298e0b5c6935ba89296")); // 7878bbb 10-29
+    // gf_features_v<N> per game-files version (index = version; 0 has none): what re-running setup brings
+    static final int[] GF_FEATURES = {0, R.string.gf_features_v1};
+    private static final String[] UPD_KEYS = {"upd_heading", "upd_version_line", "upd_check_now", "upd_check_start", "upd_checking", "upd_title", "upd_message",
+        "upd_whats_new", "upd_open", "upd_close", "upd_latest", "upd_failed", "upd_err_offline", "upd_err_limit", "gf_title", "gf_message", "gf_howto", "gf_note",
+        "gf_guide", "gf_line_ok", "gf_line_nostamp", "gf_line_old", "gf_line_none"};
+    private static final int[] UPD_IDS = {R.string.upd_heading, R.string.upd_version_line, R.string.upd_check_now, R.string.upd_check_start, R.string.upd_checking,
+        R.string.upd_title, R.string.upd_message, R.string.upd_whats_new, R.string.upd_open, R.string.upd_close, R.string.upd_latest, R.string.upd_failed,
+        R.string.upd_err_offline, R.string.upd_err_limit, R.string.gf_title, R.string.gf_message, R.string.gf_howto, R.string.gf_note, R.string.gf_guide,
+        R.string.gf_line_ok, R.string.gf_line_nostamp, R.string.gf_line_old, R.string.gf_line_none};
+    private final class Updates implements UpdateNotice.Host {
+        @Override public Activity activity() { return DmActivity.this; }
+        @Override public String appName() { return FRONT_DATA_DIR; }
+        @Override public String repoSlug() { return UPDATE_REPO; }
+        @Override public String currentVersion() { return BuildConfig.VERSION_NAME; }
+        @Override public int requiredGameFiles() { return BuildConfig.DM_GAME_FILES; }
+        @Override public File gameFilesStamp() { File d = GameFolder.dir(DmActivity.this); return d == null ? null : new File(GameFolder.runtime(DmActivity.this, d), "setup-stamp.json"); }
+        @Override public int gameFilesBaseline() {
+            File d = GameFolder.dir(DmActivity.this); if (d == null) return 1;
+            File f = new File(GameFolder.runtime(DmActivity.this, d), "out/build_src.sha256");
+            String s = readText(f), sha = s == null || s.trim().isEmpty() ? "" : s.trim().split("\\s+")[0].toLowerCase(Locale.ROOT);
+            boolean old = PRE_045_PATCHERS.contains(sha);
+            if (!baselineLogged) { baselineLogged = true; crumb("game files: no stamp; " + f + (sha.isEmpty() ? " missing" : " patch_nso.py " + sha.substring(0, Math.min(12, sha.length())) + "…")
+                + (old ? ": a patcher from before v0.4.5 -> version 0" : " -> version 1")); }   // once per process (the gear asks again)
+            return old ? 0 : 1;
+        }
+        @Override public String gameFilesFeatures(int have, int need) {
+            StringBuilder sb = new StringBuilder();
+            for (int v = Math.max(1, have + 1); v <= need && v < GF_FEATURES.length; v++) if (GF_FEATURES[v] != 0) sb.append(sb.length() > 0 ? "\n" : "").append(getString(GF_FEATURES[v]));
+            return sb.toString();
+        }
+        @Override public SharedPreferences prefs() { return getSharedPreferences(Ui.PREFS, MODE_PRIVATE); }
+        @Override public String text(String key, Object... args) {
+            for (int i = 0; i < UPD_KEYS.length; i++) if (UPD_KEYS[i].equals(key)) return args.length == 0 ? getString(UPD_IDS[i]) : getString(UPD_IDS[i], args);
+            return key;
+        }
+        @Override public void crumb(String line) { DmActivity.this.crumb(line); }
+        @Override public void immersive() { immersiveBars(); }
+        @Override public boolean canShowNotice() {
+            return resumed && started && !isFinishing() && hasWindowFocus() && inputDialog == null && folderDialog == null
+                && (front == null || !front.isOpen()) && (doomPad == null || !doomPad.editing());
+        }
+        @Override public boolean holdGame(boolean on) {
+            if (on) { if (front != null && front.isOpen()) return false; if (doomPad != null) doomPad.releaseAll(); }
+            hold(on); return true;
+        }
+        @Override public String setupGuideUrl() { return "https://github.com/" + UPDATE_REPO + "/blob/main/docs/" + (UpdateNotice.russianUi(language()) ? "INSTALL.ru.md#обновление" : "INSTALL.md#updating"); }
     }
 
     // 原生线程只投递主线程工作，不持有 Activity，也不直接操作视图。
@@ -1615,7 +1688,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override protected void onStop() { if (started) { nativeFocus(1); if (DOOM && bootFailure == 0) CrashLog.session(this, "bg"); }
         if (DOOM && libraryLoaded) { android.content.Context app = getApplicationContext(); new Thread(() -> CrashLog.mirrorBootLogs(app), "dm-logcopy").start(); }   // [DOOM] boot.log next to crash.txt
         com.xiaoboluo.d2r.widget.HeroWidgetProvider.requestUpdate(this); super.onStop(); }
-    @Override protected void onDestroy() { if (DOOM && isFinishing()) { crumb("activity finishing"); CrashLog.sessionEnd(this); } if (displays != null) displays.unregisterDisplayListener(this); if (inputs != null) inputs.unregisterInputDeviceListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
+    @Override protected void onDestroy() { if (updates != null) updates.dismiss(); if (DOOM && isFinishing()) { crumb("activity finishing"); CrashLog.sessionEnd(this); } if (displays != null) displays.unregisterDisplayListener(this); if (inputs != null) inputs.unregisterInputDeviceListener(this); if (inputDialog != null) inputDialog.dismiss(); if (current.get() == this) current.clear(); super.onDestroy(); }
     @Override public void onWindowFocusChanged(boolean f) { super.onWindowFocusChanged(f); if (f) immersiveBars(); else releaseTouches(); }
 
     @Override public void surfaceCreated(SurfaceHolder h) {}

@@ -46,6 +46,22 @@ Android-обёрткой (`jni_android.c`, `setenv(..., 0)` — не перек�
   происхождением, удаление (кроме встроенных), «Установить из файла» (zip через системный выбор файла), «Скачать…» из
   `drivers/sources.json` репозитория (релизы GitHub, SHA-256 из `digest`). Новые prefs `doom_graphics`: `driver_removed` (набор имён,
   удалённых в менеджере, — фоновое обновление по `manifest.json` их больше не качает). Новых переключателей env нет.
+- **Уведомления «вышла новая версия» и «запустите setup заново»** (BUGS_AND_FIXES §2.41, `UpdateNotice.java`): после первых кадров
+  APK в фоне спрашивает `api.github.com/repos/Desm0nt/doom-port/releases/latest` (кэш 6 ч) и читает `<папка игры>/dm/setup-stamp.json`;
+  каждое окно — один раз (prefs `front`: `upd_announced` = последний показанный тег, `gf_announced` = `"<есть>><нужно>"`). В ⚙ внизу —
+  «Обновления»: версия + строка файлов игры, «Проверить обновления» (сейчас, показывает и уже объявленную версию), галочка «Проверять
+  новые версии при запуске» (`upd_check`, по умолчанию вкл). Env (`dm/env` тоже действует — проверка идёт после `nativeStart`):
+
+  | Переключатель | По умолч. | Смысл |
+  |---|---|---|
+  | `DM_UPDATE_CHECK=0` | не задан = галочка ⚙ (вкл) | `0` — без проверки при запуске (кнопка ⚙ работает); `1` — проверять, даже если галочка снята; `always` — без кэша и без памяти о показанном (окно при каждом запуске, если релиз новее) |
+  | `DM_UPDATE_AS=<версия>` | не задан | считать, что запущена эта версия (`0.4.0` — окно о текущем релизе на любом APK); для проверки |
+  | `DM_GAME_FILES_CHECK=0` | не задан (вкл) | `0` — не проверять файлы игры; `always` — окно «запустите setup» при каждом запуске, если файлы старее |
+  | `DM_GAME_FILES_AS=<n>` | не задан | считать файлы игры версии n (`0` — окно «запустите setup» со списком новинок версии 1) |
+
+  Версия файлов: `dm/android/doom/game_files.json` (`version` → `BuildConfig.DM_GAME_FILES`; сейчас 1). Без штампа: 1, или 0, если
+  `dm/out/build_src.sha256` называет `patch_nso.py` до v0.4.5 (`DmActivity.PRE_045_PATCHERS`). Лог — строки `[java] update check: …` и
+  `[java] game files: …` в boot.log.
 - **cvar'ы игры** — через `DM_DOOM_ARGS="+set имя значение ..."` (через пробел, дописываются в конец командной строки
   после умолчаний ниже; итоговая строка видна в логе `命令行 | command line:`).
 
@@ -371,6 +387,8 @@ OBS-гейты (наблюдение без изменения логики) д�
 | `build_apk.ps1 [-Install <serial>] [-Validation]` | `cmake --build work/build-android --target dm` → `libdm.so`, хуки adrenotools (`main_hook`, `file_redirect_hook`, `gsl_alloc_hook`, `hook_impl`), Gradle (`-PdmGame=doom -PdmAppId=org.doom.port`), подпись ключом `DM_KEYSTORE` (по умолчанию `~/.android/debug.keystore`) → `work/DOOM-port-debug.apk`. `-Validation` кладёт `libVkLayer_khronos_validation.so` (work/vvl 1.4.363.0). Ошибки сборки — в `work/logs/native-dm.log`, `native-hooks.log`, `gradle-apk.log`. **После `-Install` проверять, что APK действительно обновился** (были тихие неудачи установки) |
 | (флаги, без переключателя) | с 02.11 (раунд mt S4, BUGS_AND_FIXES 3.20): движок `dm_vulkan_engine` собирается `-O3` (раньше `-O2` в опциях цели шёл после Release `-O3` и побеждал) и на Android `-mtune=cortex-x3` (только расписание инструкций, ISA та же armv8-a — идёт на любом arm64); `nvn_deswizzle.c` в `dmcore` — тоже `-O3 -mtune=cortex-x3` (остальной `dmcore` — `-O1`, как было). Откат — `dm/gfx/vulkan/CMakeLists.txt.bak_mt1`, `dm/android/CMakeLists.txt.bak_mt1` |
 | `gen_vk_tramp.py [names.txt]` | генерирует `vk_tramp.S` + `vk_tramp_names.h`: трамплин на каждый vk*-вход libdm.so через `dm_vk_table`, чтобы выбирать драйвер (системный/Turnip) во время выполнения |
+| `test_update_notice.py` | хост-тест `UpdateNotice.java` (§2.41): сравнение версий по числам (`0.4.9 < 0.4.10`, `-test1` раньше релиза, `-diag` не в счёт), раздел чейнджлога по языку (`## English` / `## Русский`, без `---` и SHA-256, преамбула сохраняется), лёгкий markdown (жирный, пункты, вложенные, `code`, ссылки текстом); javac + android.jar (`JAVA_HOME`, `ANDROID_HOME`) |
+| `setup_doom.py` (штамп) | с §2.41 последним шагом пишет `<work>/DOOM Mobile/dm/setup-stamp.json` (`game_files`, `components`, `setup`, `build_id`, `patcher_sha256`, `made`) из `dm/android/doom/game_files.json`; `push` копирует его последним; `check` показывает его; компонент старее нужного → шаг переделывается (`Layout.stale`) |
 | `test_doom_settings.py` | хост-тест моста ⚙ ↔ настроек контроллера игры (`hle_doom_settings.c`, BUGS_AND_FIXES §2.40): фальшивый main, ползунок ↔ GlobalScale, гейт сохранения, зеркало `save.ctl`, два «запуска»; gcc или WSL gcc, ASan/UBSan |
 | `dm/tools/patch_nso.py` | офлайн-патчер NSO (x18/TLS/svc/cntpct, CUTS, OBS); проверка `dm/verify/equiv.py` |
 

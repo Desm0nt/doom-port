@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">アップデート</string>
+    <string name="upd_version_line">アプリのバージョン：%1$s</string>
+    <string name="upd_check_now">アップデートを確認</string>
+    <string name="upd_check_start">起動時に新しいバージョンを確認</string>
+    <string name="upd_checking">アップデートを確認中…</string>
+    <string name="upd_title">新しいバージョン %1$s</string>
+    <string name="upd_message">%1$s %2$s が公開されました（現在 %3$s）。</string>
+    <string name="upd_whats_new">新機能：</string>
+    <string name="upd_open">リリースページを開く</string>
+    <string name="upd_close">閉じる</string>
+    <string name="upd_latest">最新バージョンです（%1$s）。</string>
+    <string name="upd_failed">アップデートを確認できませんでした：%1$s</string>
+    <string name="upd_err_offline">接続がありません</string>
+    <string name="upd_err_limit">GitHub が混み合っています。後でもう一度お試しください</string>
+    <string name="gf_title">PC で setup をもう一度実行してください</string>
+    <string name="gf_message">ゲームファイルは古い setup で作られています。PC で setup をもう一度実行すると、次のものが使えます：</string>
+    <string name="gf_howto">GitHub ページから新しい setup の ZIP をダウンロードし、以前と同じように setup.bat（Windows）または setup.sh（Linux / macOS）を実行してから、新しい DOOM Mobile/dm フォルダーをスマホの古いものに上書きコピーしてください。</string>
+    <string name="gf_note">それまではゲームはこれまで通り動きます。</string>
+    <string name="gf_guide">手順</string>
+    <string name="gf_line_ok">ゲームファイル：バージョン %1$d（必要：%2$d）</string>
+    <string name="gf_line_nostamp">ゲームファイル：古い setup、バージョン %1$d として扱います（必要：%2$d）</string>
+    <string name="gf_line_old">ゲームファイル：バージョン %1$d、必要：%2$d。PC で setup をもう一度実行してください</string>
+    <string name="gf_line_none">ゲームファイル：見つかりません</string>
+    <string name="gf_features_v1" formatted="false">• 性能の低いスマホ向けの軽量モード\n• 3D 解像度 85 / 75 / 67 % が有効に\n• 目標 30 / 45 / 60 fps の動的解像度</string>
+</resources>

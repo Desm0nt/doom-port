@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">업데이트</string>
+    <string name="upd_version_line">앱 버전: %1$s</string>
+    <string name="upd_check_now">업데이트 확인</string>
+    <string name="upd_check_start">시작할 때 새 버전 확인</string>
+    <string name="upd_checking">업데이트 확인 중…</string>
+    <string name="upd_title">새 버전 %1$s</string>
+    <string name="upd_message">%1$s %2$s 출시 (현재 %3$s).</string>
+    <string name="upd_whats_new">새로운 기능:</string>
+    <string name="upd_open">릴리스 페이지 열기</string>
+    <string name="upd_close">닫기</string>
+    <string name="upd_latest">최신 버전입니다 (%1$s).</string>
+    <string name="upd_failed">업데이트를 확인하지 못했습니다: %1$s</string>
+    <string name="upd_err_offline">연결 없음</string>
+    <string name="upd_err_limit">GitHub가 혼잡합니다. 나중에 다시 시도하세요</string>
+    <string name="gf_title">PC에서 setup을 다시 실행하세요</string>
+    <string name="gf_message">게임 파일이 이전 setup으로 만들어졌습니다. PC에서 setup을 다시 실행하면 다음을 사용할 수 있습니다:</string>
+    <string name="gf_howto">GitHub 페이지에서 새 setup ZIP을 내려받아 이전처럼 setup.bat(Windows) 또는 setup.sh(Linux / macOS)를 실행한 뒤, 새 DOOM Mobile/dm 폴더를 휴대폰의 이전 폴더 위에 복사하세요.</string>
+    <string name="gf_note">그때까지 게임은 이전처럼 작동합니다.</string>
+    <string name="gf_guide">안내</string>
+    <string name="gf_line_ok">게임 파일: 버전 %1$d (필요: %2$d)</string>
+    <string name="gf_line_nostamp">게임 파일: 이전 setup, 버전 %1$d로 간주 (필요: %2$d)</string>
+    <string name="gf_line_old">게임 파일: 버전 %1$d, 필요: %2$d. PC에서 setup을 다시 실행하세요</string>
+    <string name="gf_line_none">게임 파일: 없음</string>
+    <string name="gf_features_v1" formatted="false">• 성능이 낮은 휴대폰용 라이트 모드\n• 제대로 작동하는 3D 해상도 85 / 75 / 67 %\n• 30 / 45 / 60 fps 목표의 동적 해상도</string>
+</resources>

@@ -17,6 +17,14 @@
 static void *_Atomic g_window;      // ANativeWindow*；命令行形态为 NULL | ANativeWindow*; NULL in the command-line form
 static _Atomic int g_screen_w, g_screen_h;
 void front_android_set_window(void *win, int w, int h) { atomic_store(&g_window, win); atomic_store(&g_screen_w, w); atomic_store(&g_screen_h, h); }
+// [DOOM] The display's real size from Java before the game starts (DmActivity.nativeDisplaySize): used while the view has no size yet. A game
+// started with the screen off (or not laid out) got a 0x0 view, and the aspect choice "auto" fell back to 16:9 on a 20:9 phone (08.11).
+static _Atomic int g_hint_w, g_hint_h;
+void front_android_set_display_hint(int w, int h) { atomic_store(&g_hint_w, w); atomic_store(&g_hint_h, h); }
+static void screen_wh(int *w, int *h) {
+    *w = atomic_load(&g_screen_w); *h = atomic_load(&g_screen_h);
+    if (*w <= 0 || *h <= 0) { *w = atomic_load(&g_hint_w); *h = atomic_load(&g_hint_h); }
+}
 
 // UI 线程从当前 Display 读实际刷新率；0 表示未知，不冒充实测 60 Hz。
 // The UI thread reads the current Display refresh rate; 0 means unknown, not a measured 60 Hz.
@@ -53,7 +61,7 @@ void front_run(void (*guest)(void)) {
 uint64_t front_game_res(int docked) {
     unsigned w, h; const char *e = getenv("DM_GAME_RES");
     if (e && sscanf(e, "%ux%u", &w, &h) == 2) return docked ? (uint64_t)h << 32 | w : (uint64_t)(h * 4 / 5) << 32 | (w * 4 / 5 + 3) / 4 * 4;
-    int dm = atomic_load(&g_screen_w), sh = atomic_load(&g_screen_h);
+    int dm, sh; screen_wh(&dm, &sh);
     if (dm < sh) { int t = dm; dm = sh; sh = t; }   // [DOOM] the game is landscape only: a view still portrait at start (Mi 13, 06.11) gave 16:9 bars
     unsigned bh = docked ? 900 : 720;
     if (dm > 0 && sh > 0 && dm * 9 > sh * 16) {
@@ -65,7 +73,7 @@ uint64_t front_game_res(int docked) {
 // [DOOM] The game view's size as Java reported it (0 = not known yet): hle_args.c's aspect choice "auto" also follows screens
 // narrower than 16:9 (4:3 handhelds), which front_game_res above reports as 1280x720.
 int front_screen_size(int *w, int *h) {   // landscape, as front_game_res
-    *w = atomic_load(&g_screen_w); *h = atomic_load(&g_screen_h); if (*w < *h) { int t = *w; *w = *h; *h = t; } return *w > 0 && *h > 0; }
+    screen_wh(w, h); if (*w < *h) { int t = *w; *w = *h; *h = t; } return *w > 0 && *h > 0; }
 
 #ifdef DM_GAME_DOOM
 // ---------------- [DOOM] game controllers ----------------

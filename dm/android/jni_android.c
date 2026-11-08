@@ -39,6 +39,7 @@
 #include "cpu_topo.h"          // [DOOM] thread placement by core capacity: the [cpu] topology / plan lines at boot
 
 void front_android_set_window(void *win, int w, int h);
+void front_android_set_display_hint(int w, int h);
 void front_android_set_refresh(float hz);
 int dm_main(int argc, char **argv);
 void front_android_boot_failed(int code);
@@ -492,6 +493,11 @@ static ANativeWindow *g_win;
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeRefresh(JNIEnv *env, jclass cls, jfloat hz) {
     (void)env; (void)cls;
     front_android_set_refresh(hz);
+}
+// [DOOM] The display's real size, before nativeSurface (front_android.c: the fallback while the view has no size yet)
+JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeDisplaySize(JNIEnv *env, jclass cls, jint w, jint h) {
+    (void)env; (void)cls;
+    front_android_set_display_hint(w, h);
 }
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSurface(JNIEnv *env, jclass cls, jobject surface, jint w, jint h) {
     (void)cls;

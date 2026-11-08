@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- [DOOM] BUGS_AND_FIXES 2.41: the update and game-files notices (UpdateNotice.java via DmActivity.Updates.text) and their gear rows.
+     The generic keys (all but gf_features_v*) are also in frontend-common/i18n/gear_text.tsv. gf_features_v<N>: what game-files version N
+     brings (doom/game_files.json; DmActivity.GF_FEATURES). English is the default; values-xx follow the system locale. -->
+<resources>
+    <string name="upd_heading">更新</string>
+    <string name="upd_version_line">应用版本：%1$s</string>
+    <string name="upd_check_now">检查更新</string>
+    <string name="upd_check_start">启动时检查新版本</string>
+    <string name="upd_checking">正在检查更新…</string>
+    <string name="upd_title">新版本 %1$s</string>
+    <string name="upd_message">%1$s %2$s 已发布（当前为 %3$s）。</string>
+    <string name="upd_whats_new">更新内容：</string>
+    <string name="upd_open">打开发布页面</string>
+    <string name="upd_close">关闭</string>
+    <string name="upd_latest">已是最新版本（%1$s）。</string>
+    <string name="upd_failed">无法检查更新：%1$s</string>
+    <string name="upd_err_offline">无网络连接</string>
+    <string name="upd_err_limit">GitHub 繁忙，请稍后再试</string>
+    <string name="gf_title">请在电脑上重新运行 setup</string>
+    <string name="gf_message">你的游戏文件由旧版 setup 制作。在电脑上重新运行 setup 即可获得：</string>
+    <string name="gf_howto">从 GitHub 页面下载新的 setup ZIP，像以前一样运行 setup.bat（Windows）或 setup.sh（Linux / macOS），然后把新的 DOOM Mobile/dm 文件夹复制到手机上，覆盖旧的。</string>
+    <string name="gf_note">在此之前游戏照常运行。</string>
+    <string name="gf_guide">说明</string>
+    <string name="gf_line_ok">游戏文件：版本 %1$d（需要 %2$d）</string>
+    <string name="gf_line_nostamp">游戏文件：旧版 setup，视为版本 %1$d（需要 %2$d）</string>
+    <string name="gf_line_old">游戏文件：版本 %1$d，需要 %2$d。请在电脑上重新运行 setup</string>
+    <string name="gf_line_none">游戏文件：未找到</string>
+    <string name="gf_features_v1" formatted="false">• 适合较弱手机的轻量模式\n• 可用的 3D 分辨率 85 / 75 / 67 %\n• 目标 30 / 45 / 60 fps 的动态分辨率</string>
+</resources>
