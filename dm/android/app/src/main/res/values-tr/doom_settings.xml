@@ -85,4 +85,12 @@
     <string name="folder_why_romfs">romfs klasörü yok</string>
     <string name="folder_why_modules">yamalı oyun modülleri eksik (dm/out)</string>
     <string name="folder_why_shaders">gölgelendiriciler eksik (dm/shaders)</string>
+    <!-- [DOOM] the game's controller settings in the gear (hle_doom_settings.c, issue #31) -->
+    <string name="gear_aa_menu">Nişan yardımı açık (oyunun kendi anahtarı, kumanda ayarlarındaki gibi)</string>
+    <string name="gear_motion_aim">Hareketle nişan alma (jiroskop)</string>
+    <string name="gear_gyro_sens">Hareketle nişan alma hassasiyeti</string>
+    <string name="gear_gyro_sens_fmt" formatted="true">%1$s: %2$d / 100</string>
+    <string name="gear_game_unknown_fmt" formatted="true">%1$s: oyun profilini yükledikten sonra kullanılabilir (ya da oyun menüsünden değiştirin)</string>
+    <string name="gear_game_settings_note">Nişan yardımı, hareketle nişan alma ve hassasiyeti oyunun kendi ayarlarıdır (oyun menüsündeki kumanda ayarları): burada ya da orada yapılan değişiklik iki yerde de görünür ve oyun profiline kaydedilir.</string>
+    <string name="toast_game_setting_failed">Bir oyun ayarı burada değiştirilemedi; oyun menüsündeki kumanda ayarlarını kullanın</string>
 </resources>

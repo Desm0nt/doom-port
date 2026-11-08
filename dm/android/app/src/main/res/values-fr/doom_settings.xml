@@ -85,4 +85,12 @@
     <string name="folder_why_romfs">pas de dossier romfs</string>
     <string name="folder_why_modules">modules du jeu patchés absents (dm/out)</string>
     <string name="folder_why_shaders">shaders absents (dm/shaders)</string>
+    <!-- [DOOM] the game's controller settings in the gear (hle_doom_settings.c, issue #31) -->
+    <string name="gear_aa_menu">Aide à la visée activée (l\'interrupteur propre au jeu, comme dans ses réglages de manette)</string>
+    <string name="gear_motion_aim">Visée par mouvement (gyroscope)</string>
+    <string name="gear_gyro_sens">Sensibilité de la visée par mouvement</string>
+    <string name="gear_gyro_sens_fmt" formatted="true">%1$s : %2$d sur 100</string>
+    <string name="gear_game_unknown_fmt" formatted="true">%1$s : disponible une fois le profil du jeu chargé (ou modifiez-le dans le menu du jeu)</string>
+    <string name="gear_game_settings_note">L\'aide à la visée, la visée par mouvement et sa sensibilité sont des réglages du jeu lui-même (réglages de la manette dans le menu du jeu) : un changement ici ou là-bas apparaît aux deux endroits et est conservé dans le profil du jeu.</string>
+    <string name="toast_game_setting_failed">Impossible de modifier ce réglage du jeu ici ; utilisez les réglages de la manette dans le menu du jeu</string>
 </resources>

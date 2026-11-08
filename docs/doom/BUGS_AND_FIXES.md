@@ -52,6 +52,8 @@ Adreno 750), драйвер Qualcomm, если не сказано иное.
 | 40 | Issue #3: на POCO X7 Pro (Mali-G720) выбран PanVK, лог пишет `active=libvulkan_panfrost.so reason=ok`, а работает стоковый драйвер ARM | пакет `-EMULATOR` — glibc-сборка (NEEDED `libdrm.so.2`), хук adrenotools молча подставил системный HAL, а мы проверяли только «есть GPU» | проверка подмены (`/proc/self/maps` + `driverID`), фильтр пакетов по семейству GPU / glibc / недостающим либам в Java и нативе, причина в тосте; бандл-Turnip не дефолт без Adreno | собрано 05.11, на телефоне не проверено (§2.25) |
 | 41 | На Mali / PowerVR текстуры BC занимают в 4–8 раз больше VRAM (декод в несжатое, §2.24): атласы и пробы ≈ 2 ГБ вместо ≈ 0.4 | у GPU нет BC, а данные игры — только BC | «вариант A»: setup перекодирует BC файлов в ASTC 4x4 / ASTC 4x4 HDR / EAC того же размера блока (`tools/astc_overlay_doom.py`, оверлей `DOOM Mobile/astc`), движок создаёт образы в этих форматах без декода; `DM_GFX_ASTC_OVERLAY` (auto) | собрано 05.11, хост-тесты зелёные, на телефоне не проверено (§2.26) |
 | 42 | Mali (#7, #14, #25, #28): чёрные прямоугольники/полосы на 3D, расползаются («мерцание»), с v0.4.12, только с папкой `astc`; Adreno с оверлеем — белые свечения | нулевые (неписанные) блоки в атласе декалей BC7 → ASTC LDR: нулевой ASTC — ошибочный блок, GPU рисует цвет ошибки (нулевой BC7 — прозрачный чёрный); то же для BC6H → ASTC HDR (NaN) | `DM_GFX_ASTC_SANITIZE`=1 и для LDR: ошибочные/нулевые блоки → void extent прозрачного чёрного; BC6H по умолчанию на BC-пути (`DM_GFX_ASTC_HDR`=0, вариант `nohdr`) | исправлено 07.11 (частичные заливки — v0.4.19, полная заливка атласа — v0.4.20), проверено на Mi 14 Ultra с оверлеем и в модели Mali `DM_GFX_SIM_GPU=nobc`: свечений нет (бисекция `DM_GFX_ASTC_CPU`, §2.37); на Mali не проверено |
+| 43 | Только один Turnip в APK; PanVK / RADV игрок искал сам, фоновая загрузка качала Turnip и на Mali; управлять пакетами негде | — | все полезные пакеты в APK (4 Turnip, RADV-Xclipse 1.8.0, 2 PanVK), на телефон копируются только подходящие (+ `minApi`); менеджер драйверов в ⚙: список, удаление, установка zip, загрузка из релизов GitHub по `drivers/sources.json` (§2.39) | собрано 08.11, на телефоне не проверено |
+| 44 | Issue #31 (Samsung S23, v0.4.20): Motion Aiming и чувствительность гироскопа (и вообще все настройки меню) сбрасываются после выхода | профиль игры не сохранялся ни разу: запрос сохранения пропускается, пока `profile_requireSaveExplanation` = 1, а байт профиля `seenSaveExplanation` (+0x38) ставит экран-пояснение автосохранения, который пропускает CUT `0x1080118` | `+set profile_requireSaveExplanation 0` (`DM_DOOM_PROFILE_SAVE`, умолч. вкл) + в ⚙ «Прицеливание гироскопом», его чувствительность 0–100 и «Помощь в прицеливании» — двусторонне с меню игры, зеркало `files/save.ctl` (§2.40) | собрано 08.11, хост-тест зелёный, на телефоне не проверено |
 
 ---
 
@@ -2640,3 +2642,158 @@ to open port» и выходит, но `InitPort` возвращает false, и
 за пробуждение. Слив внутри раунда и так вычерпывает сокет (до 127 пакетов), период пробуждения 1 мс, проверка остановки
 (`0xcfaf8`, флаг `+0xd1`) и сам порт не меняются; новых ожиданий нет, так что зависнуть негде. Ожидаемо: у потока
 `DTLS port 27016` в дампе svc растёт ~2 тыс./с вместо ~9 тыс./с, CPU — в разы медленнее.
+
+### 2.39 Все пакеты драйверов в APK + менеджер драйверов в ⚙ (08.11; собрано, lint minSdk 29 без NewApi, на телефоне не проверено)
+
+Просьба хозяина: положить в APK все полезные пакеты драйверов (до ~200 МБ можно) и сделать отдельное подменю управления драйверами,
+как менеджер «contents» у Winlator Ludashi.
+
+- **Что в APK (`assets/drivers/<имя>/`, `tools/fetch_turnip.py`, URL и SHA-256 зашиты; zip-ы лежат в `work/drivers/`):**
+
+  | Папка | Пакет | zip, SHA-256 | Размер zip / .so | minApi |
+  |---|---|---|---|---|
+  | `turnip27` | Mesa Turnip v27.0.0-20261029 (The412Banner) | `Turnip-v27.0.0-20261029.zip`, `d413e41d…a352b1` | 2.6 / 12.9 МБ | 28 |
+  | `turnip27-a710` | то же, Adreno 710/720/722 | `…-710-720-Test.zip`, `4927023e…747615` | 2.6 / 12.9 МБ | 28 |
+  | `turnip27-a8xx` | то же, Adreno 8xx | `…-A8xx.zip`, `b1126d1a…df82a` | 2.7 / 13.0 МБ | 28 |
+  | `turnip27-8g2` | то же, Adreno 740 на новых прошивках (One UI) | `…-8G2-OneUI.zip`, `e7a9c8c1…56b3` | 2.6 / 12.9 МБ | 28 |
+  | `radv-xclipse-1.8.0` | RADV Xclipse (JimVulkan v1.8.0, Mesa 27.0.0-devel-269238e), с `NOTICE.txt` | `radv-xclipse-27.0.0-devel-269238e.zip`, `0545b1b2…9c223` | 4.2 / 17.2 МБ | **34** |
+  | `panvk-jim-1.6.0` | PanVK kbase (JimVulkan v1.6.0, Mesa 27.0.0-devel r10), с `NOTICE.txt` | `mali-panvk-27.0.0-devel-r10.zip`, `7e97db4d…49f1c` | 4.4 / 17.9 МБ | 31 |
+  | `panvk-zenith-26.3.1` | Mesa PanVK kbase Android (zenithblue-oss, 26.3.0-devel git-795ca7ff) | `Mesa-PanVK-Android-v26.3.1-795ca7ff-adrenotools.zip`, `7e2e9987…fad9e4` | 9.0 / 33.2 МБ | 29 |
+
+  Все три новых — Android-сборки (bionic): NEEDED только `libc.so` / `libm.so` / `libdl.so` / `liblog.so` / `libnativewindow.so` /
+  `libsync.so` (+ `libhardware.so`, `libc++.so` у JimVulkan, `libz.so` у zenith), без `libc.so.6`, `abi` glibc в meta.json нет.
+  SHA-256 совпадают с `digest` GitHub. APK вырос с ~14 до ~48 МБ (ассеты сжаты).
+- **Копирование на телефон (`DmActivity.extractBundledDrivers`):** только пакеты, которые здесь могут работать —
+  `packageProblem(имя, meta.json ассета)`: семейство GPU (`familyFits`: Turnip — KGSL + Adreno 6xx+, PanVK — `/dev/mali0`, RADV — ни
+  KGSL, ни Mali, ни PowerVR), glibc, **новое: `minApi` из meta.json выше Android телефона → `min-api N`** (RADV на Android 13 не
+  копируется и скрыт). На Adreno в `files/drivers` попадают 4 Turnip (~52 МБ), на Mali — PanVK, на Xclipse (Android 14+) — RADV.
+  Встроенная копия, которая этому телефону не подходит (например, `turnip27` от старого APK на Mali), удаляется; пакет игрока не трогается.
+  Повторное копирование — по метке `<пакет>/.dm_origin` = `bundled\t<versionName>/<lastUpdateTime>`: ассеты в APK сжаты, их размер
+  `openFd` не отдаёт, и старая проверка «файл есть и не пустой» **никогда не заменяла** пакет с тем же именем после обновления APK.
+  Теперь после каждой установки APK встроенные пакеты копируются заново (один раз, до загрузки `libdm.so`).
+- **Дефолты не менялись:** Adreno 6xx+ на KGSL → `turnip27` / вариант по `auto` из manifest / a710 / a8xx (`defaultDriver`);
+  Mali / Xclipse / PowerVR / неизвестный → системный. Отличие одно: `turnip27-a710` / `turnip27-a8xx` теперь есть и без сети, так что на
+  Adreno 710/720/722 и 8xx они дефолт сразу, а не после фоновой загрузки. RADV / PanVK — только ручной выбор в ⚙. Crash-guard §2.22
+  работает по имени пакета, для них так же.
+- **`manifest.json` стал семейным (`updateDriversInBackground`):** у записи поле `family` (adreno | mali | xclipse | powervr | any; без
+  него — слова семейства из `name` + `title`), запись не для этого GPU не качается; имена, удалённые игроком в менеджере
+  (`doom_graphics` `driver_removed`), — тоже. Новый `work/drivers/manifest.json` (те же 4 Turnip + `family`). **Пакеты других семейств в
+  manifest не добавлять:** APK до 0.4.20 включительно качают каждую запись на каждый телефон.
+- **Менеджер драйверов (`DriverManager.java`, кнопка «Драйверы… / Manage drivers…» под списком драйверов в ⚙):**
+  - сверху — телефон (`phoneFamily()`, Android, `hardwareSummary()`) и напоминание, что выбор — в списке ⚙ и со следующего запуска;
+  - «Установленные пакеты»: `meta.json` name / `driverVersion` / `packageVersion` / description, семейство, размер, происхождение
+    (`.dm_origin`: в составе APK / скачан автоматически / скачан `<repo> <tag>` / из файла / импорт из `<папка игры>/drivers`; у пакетов
+    до 2.39 угадывается по ассетам и manifest), «Не запустится здесь: …» (`driverProblem`). «Удалить» — у всех, кроме встроенных; если
+    это выбранный драйвер, pref `driver` удаляется (дефолт по GPU); импортированный вернётся при следующем старте, пока лежит в папке — это
+    сказано в подтверждении;
+  - «Установить из файла (zip)…»: `ACTION_OPEN_DOCUMENT` (`REQ_ZIP` 4712 → `onActivityResult` → `DriverManager.picked`), zip копируется в
+    `files/drivers/.install.zip`, `unzipDriver` в `.stage-<имя>`, `driverProblem` → не подходит (чужое семейство, glibc, нет библиотеки,
+    minApi) — пакет удаляется и показывается причина, иначе заменяет пакет с тем же именем. Имя папки — из имени zip (`[A-Za-z0-9._-]`,
+    до 64 символов; совпало со встроенным → `-user`);
+  - «Скачать…»: `drivers/sources.json` репозитория (кэш `files/drivers/.cache/sources.json` на 6 ч, без сети и кэша — копия в APK
+    `assets/driver-sources.json`), для источников семейства телефона (галочка «Показать для всех GPU» — все; поле `gpu` — ещё и regex по
+    `gpu_model`) — `https://api.github.com/repos/<repo>/releases?per_page=10` без токена (кэш `.cache/gh-<owner>_<repo>.json` на 6 ч;
+    403 с `X-RateLimit-Remaining: 0` / 429 → «GitHub временно ограничил запросы (до ЧЧ:ММ)» и сохранённый список), черновики пропускаются,
+    релизы с подходящими zip (`include` / `exclude`) показываются (тег, дата, пре-релиз; первый раскрыт), ассет — кнопка с размером, метками
+    (`tags`) и «установлен». Тап → подтверждение → загрузка потоком в `.download.zip` с прогрессом и отменой, SHA-256 сверяется с `digest`
+    (`sha256:…`), если GitHub его дал; дальше как установка из файла (origin `download\t<repo> <tag>`). URL ассета принимается только
+    `https://github.com/<repo>/releases/download/…`, редиректы — только https.
+  - После закрытия менеджера список драйверов в ⚙ пересобирается (выбор сохраняется, если пакет остался). Сеть и распаковка — в
+    фоновых потоках, диалоги — в UI-потоке; без сети список установленных и установка из файла работают. Тексты RU/EN через `Ui.t`.
+- **`drivers/sources.json` (`work/drivers/sources.json`, публикует главный агент):** `{"schema": 1, "sources": [{"repo": "owner/name",
+  "title", "family": "adreno|mali|xclipse|powervr|any", "include": regex, "exclude": regex, "gpu": regex (необяз.), "note", "tags":
+  [{"match": regex, "text"}]}]}`, regex — Java, `find()` по имени ассета (`include` по умолчанию `\.zip$`). Сейчас: The412Banner/Banners-Turnip
+  (без `-Linux` / `-Wayland` / `symbols`), K11MCH1/AdrenoToolsDrivers (Turnip-сборки и **проприетарные драйверы Qualcomm**
+  `Qualcomm_<версия>_adpkg.zip` / `8Elite*`, помечены; это пакеты adrenotools с `notgsl.so` и т. п., bionic, minApi 35 у 840),
+  JimVulkan/radv-xclipse (без `-wayland`), JimVulkan/mali-panvk, zenithblue-oss/panvk-kbase-android (только `*-adrenotools.zip`),
+  MineGraph-bilibili/panvk-Android (`Mesa.26.3.0-panvk.N.zip`: meta.json + `libvulkan_panfrost.so`, bionic, minApi 30).
+- **Проверить на телефонах:** (1) Adreno после установки: в logcat `bundled driver turnip27…: extracted`, в `files/drivers` 4 Turnip и
+  нет `radv-*` / `panvk-*`; игра на `turnip27` как раньше; второй запуск ничего не копирует. (2) Mali: `bundled driver turnip27: removed,
+  not for this phone (no-adreno)`, в ⚙ есть оба PanVK, дефолт системный; выбор PanVK → `[vk] driver choice: … family=mali verified=…`.
+  (3) ⚙ → «Драйверы…»: список, удаление скачанного, установка Mali-zip на Adreno → «не подходит: он только для Mali», «Скачать…» →
+  Turnip-релизы, загрузка с прогрессом, «совпадает с GitHub», пакет в списке ⚙ после закрытия. (4) Без сети: «Скачать…» показывает
+  ошибку и сохранённый / встроенный список источников.
+- **Риски:** PanVK JimVulkan требует `libc++.so` (системная, не NDK-шная) — если linker namespace adrenotools её не пустит,
+  `load-failed` и системный драйвер; первый запуск после обновления копирует ~52 МБ на Adreno (до загрузки библиотеки, порядка
+  секунды); проприетарные Qualcomm-пакеты сделаны под конкретный Adreno и могут не стартовать на других — их ловит crash-guard.
+
+### 2.40 Настройки меню не переживают перезапуск: профиль игры не сохранялся; гироскоп и помощь в прицеливании в ⚙ (issue #31, Samsung S23, v0.4.20; 08.11; собрано, хост-тест зелёный, на телефоне не проверено)
+
+**Симптом (issue #31).** «Motion aiming and sensitivity settings once customised are lost after game exit»: переключатель Motion
+Aiming и ползунок чувствительности гироскопа в настройках контроллера после перезапуска снова по умолчанию.
+
+**Причина — профиль не записывается вообще (а не гироскоп).** Разбор `work/exefs-update/main.raw` (update main, build id `2847991952b3d7ab`):
+- Все три места, где профиль просит сохраниться, — `main+0x1eeb7e0` (меню после настроек, наш DRS-мост) и две встроенные копии
+  `main+0x1eeb674` / `main+0x1eebb04` (в том числе после автосохранения), — делают одно и то же: выход, если состояние `+0x08` == 1 или
+  запрошено `+0x0c` != 0; **выход, если байт `+0x38` == 0 и cvar `profile_requireSaveExplanation` (GOT `0x48d9a40`, регистрация
+  `0x1f086c8`, по умолчанию `"1"`, описание «Turn off to allow profile save without save indicator explanation UI») != 0**; иначе
+  `vtable[+0x168](this, 3)`.
+- Байт `+0x38` — это `seenSaveExplanation` в JSON профиля. Его ставит экран-пояснение про индикатор автосохранения (TOS-экран в
+  `State_Transition_Initial_Screen`), а наш CUT `0x1080118` (`cbz w8 → nop`, «skip the TOS screen shown as the autosave notice», №9)
+  этот экран пропускает. Комментарий у CUT «profile+0x38 is in-memory only» неверен: байт сохраняется и гейтит все сохранения профиля.
+- Итог: профиль, созданный на порте, **ни разу не записывался**. На свежей установке нет `PROFILE/save.dat` вообще: в бэкапах Mi 13
+  (`work/save_backups/mi13_save_*.tar`, 04.11–07.11) есть только `GAME-AUTOSAVE0` и `save.drs`; в логах Mi 13 / 8 Gen 2 (`r1_a`,
+  `run_g2_*`, `z1_fast`) автосохранения пишутся (`[save] open for writing savedir:/GAME-AUTOSAVE0/…`), а `[drs] game profile … state
+  0 -> 1` и запись `PROFILE` — ни разу; в `r6_drs` (Mi 13) после ⚙ — `save requested (state 0, requested 0)`: запрос молча отброшен.
+  На Mi 14 профиль перенесён с Switch (`seenSaveExplanation: true`, `joy_sixAxisGlobalScale "25.799999"`) — там после автосохранения
+  `state 0 -> 1 (requested 3)`, `open for writing savedir:/PROFILE/save.dat.tmp`, `state 1 -> 0`, статистика в файле меняется.
+- Значит, терялись **все** настройки из профиля (Motion Aiming, чувствительности, инверсия, Aim Assist, FOV, громкость, гамма,
+  динамическое разрешение — это и было «diag45» в §2.14, — флаг EULA; №9, видимо, та же причина — его закрыли CUT-ом автопринятия).
+- Проверены и отброшены другие версии: (b) touch look (§4.8) открывает гейты только через поля значения `+0x30/+0x34`, а
+  сериализатор профиля (`main+0x10d899c` AimToggle, `main+0x10d8a00` GlobalScale, `main+0x1106c00`) пишет **строку значения**
+  `+0x10`, которую мы не трогаем; восстановление после касания тоже из строки, так что поправка меню посреди касания не теряется.
+  (c) `CurrentSensitivity 0.150` в логе — это `joy_sixAxisDefaultSensitivityOverride` оружия, она умножается на `GlobalScale`
+  (ползунок), а не заменяет его: ползунок работает.
+
+**Какие настройки у меню (idMenuDataSource_ControllerSettings, update: LoadData `0xfe8780…`, SetField `0xfe91a0…0xfe9798`):**
+
+| Поле | Пункт | Где живёт | Чтение / запись меню | Ключ профиля |
+|---|---|---|---|---|
+| 6 | Aim Assist | байт профиля `+0x4698` (ConstructDefaults `0x10d086c` = 1; читает `idPlayerAimAssist::Update` `0x2a6064`) | `ldrb` `0xfe8ac4` / `strb` `0xfe91a4` | `useAimAssist` |
+| 7 | (motion swing) | `joy_sixAxisSwingToggle` | `0x10e7d50` | `joy_sixAxisSwingToggle` |
+| 8 | Motion Aiming | `joy_sixAxisAimToggle` (GOT `0x488cb78`) | геттер `0x10e7d10` (int `+0x30`), сеттер `0x10e7d30` = `idCVar::SetBool(cv, v, 1)` `0x120650` | `joy_sixAxisAimToggle` |
+| 9 | чувствительность гироскопа | `joy_sixAxisGlobalScale` (GOT `0x4895828`, по умолч. `"30"`) | ползунок = round(GS / 60 × 100), **0…100 шаг 1** (`0xfe8b28`); запись GS = clamp(n × 0.01 × 60, 0, 60) → сеттер `0x10ecc90` = `SetFloat(cv, 1, v)` `0x1206f0` | `joy_sixAxisGlobalScale` |
+
+`g_setting_aim_assist` меню не трогает (это глобальный cvar игры, его держит `DM_AIM_ASSIST_FORCE`); «сила» ассиста — наша (`DM_AA_STRENGTH`, радио в ⚙ не менялось).
+
+**Исправление.**
+1. `hle_args.c`: `+set profile_requireSaveExplanation 0` — собственный выключатель игры именно для этого случая, в профиле не
+   хранится. `DM_DOOM_PROFILE_SAVE=0` — оставить гейт игры. `patch_nso.py` не менялся (его хеш проверяет setup), повторный setup не нужен.
+   `hle_doom_settings.c` после каждой загрузки профиля проверяет ещё раз (если cvar всё ещё 1 и `seenSaveExplanation` 0 — ставит 0
+   через `SetBool` игры) и пишет `[gyro] profile save gate: profile_requireSaveExplanation 0, seenSaveExplanation N -> profile saves allowed`.
+2. **⚙ ↔ меню игры** (`host/hle_doom_settings.c`, по образцу DRS §2.14): три контрола — «Помощь в прицеливании включена» (поле 6),
+   «Прицеливание гироскопом» (поле 8) и ползунок «Чувствительность прицеливания гироскопом: N из 100» (поле 9). Правда — значение
+   игры: ⚙ читает его при открытии диалога (`nativeGetGameSetting`, −1 → контрол выключен с подписью «доступно, когда игра загрузит
+   профиль»), своё значение в SharedPreferences **не хранит**. По «Сохранить» уходят только изменённые в диалоге (`nativeSetGameSetting`),
+   запись — на главном потоке игры между кадрами (гейт 30, вход `idCommonLocal::Frame`) теми же сеттерами, что у меню (`0x10e7d30`,
+   `0x10ecc90`; для Aim Assist — тот же `strb` в `+0x4698`), затем запрос сохранения профиля `0x1eeb7e0` (общий механизм
+   `hle_doom_drs.c`, до ~600 кадров ждёт, пока профиль свободен). Перед первым вызовом сверяются слова сеттеров; не совпали — контролы только для чтения.
+   Правда для Motion Aiming / ползунка читается из **строки значения**, а не из int — открытый touch look гейт в ⚙ не виден.
+3. **Изменения в меню игры** видны мосту каждый кадр (после загрузки профиля, пока он не занят): `[gyro] … a -> b by the player
+   (game menu)`, запрос сохранения профиля через ~1.5 с после последнего шага ползунка (меню пишет каждый шаг сразу).
+4. **Страховка-зеркало `files/save.ctl`** (`aim=`, `sens=`, `aa=` + `*_dirty=`): изменение игрока (меню или ⚙) помечается «грязным»,
+   пока после него не завершится сохранение профиля (`state 1 -> 0` на гейте 34) — тогда `[gyro] profile saved: … (mirror clean)`.
+   При следующей загрузке профиля возвращается **только грязное** значение, которого в профиле нет (`profile loaded … but the last
+   choice … was not saved in the profile yet: restoring it`); чистое зеркало профиль не перебивает (импортированный профиль сохраняет
+   свои значения). Если профиль сохраняется (ожидаемо после п. 1), зеркало ничего не делает.
+- Хост-тест `tools/test_doom_settings.py` (gcc / WSL gcc, ASan+UBSan): модуль с фальшивым main (GOT → idCVar с раскладкой update,
+  слова сеттеров на месте), ползунок ↔ GlobalScale для 0…100 (43 ↔ 25.8, 50 ↔ 30), «не известно» до загрузки, открытие гейта
+  сохранения, изменение в меню → грязное зеркало и один отложенный запрос, ⚙ → сеттер + запрос, сохранение профиля чистит зеркало,
+  «второй запуск» восстанавливает только несохранённое; правда из строки при открытом int-гейте. Зелёный. Сборка `tools/build_apk.ps1` — ОК.
+
+**Проверить на телефоне** (лучше начать с бэкапа `files/save` — профиль впервые начнёт записываться):
+1. Запуск: в командной строке `+set profile_requireSaveExplanation 0`; после загрузки — `[gyro] profile save gate: … -> profile saves
+   allowed`, `[gyro] profile loaded: motion aiming … 0`, `… sensitivity … 50`, `… Aim Assist … 1`.
+2. Меню игры → контроллер: включить Motion Aiming, ползунок на 70 → `[gyro] motion aiming … 0 -> 1 by the player (game menu)`,
+   `… sensitivity … 50 -> 70 by the player`, затем `[drs] profile …: save requested`, `[drs] game profile … state 0 -> 1 (requested 3)`,
+   `[save] open for writing savedir:/PROFILE/save.dat.tmp`, `state 1 -> 0`, `[gyro] profile saved: aim 1 sens 70 … (mirror clean)`.
+   Открыть ⚙ — галочка и 70 совпадают. Перезапуск → в меню и в ⚙ те же значения, в логе `profile loaded: … 1 (mirror clean)`.
+3. ⚙: выключить «Помощь в прицеливании», ползунок 40, «Сохранить» → `[gyro] gear: … queued`, `[gyro] gear: … 1 -> 0; requesting a
+   profile save`, `… 70 -> 40 (joy_sixAxisGlobalScale "24…")`; в меню игры пункты сразу показывают новые значения; перезапуск → те же.
+4. Touch look: с Motion Aiming выкл. и вкл. повести пальцем (в логе `touch look: opened gates 0x2` при выкл.), потом выйти и
+   перезапустить — значения не изменились, строк `[gyro] … by the player` от касаний нет.
+5. Свежая установка (или без `PROFILE`): после первого сохранения появляется `files/save/PROFILE/save.dat`; EULA/яркость не
+   спрашиваются повторно (CUT-ы №9 остались).
+- **Риски:** сохранение профиля, ни разу не созданного на диске, раньше не ходило — если после `save requested` нет `state 0 -> 1`,
+  смотреть `saveGame_enable` / `Waiting for non developer profile` в `0x1dfc5f0`; зеркало при этом держит выбор. Байт Aim Assist
+  пишется в объект профиля из гейта 34 — это тот же объект, что у меню (те же `+0x38`, `+0x4698`, `+0x470d`), сверка 0/1 перед записью.

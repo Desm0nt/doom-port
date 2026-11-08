@@ -1,0 +1,63 @@
+{
+  "comment": "Driver sources the DOOM Mobile driver manager lists under Download (DriverManager.java, BUGS_AND_FIXES 2.39). The app fetches this file (cached for 6 h; the APK carries a copy for offline use), then for each source whose family fits the phone (all of them with 'Show all GPUs') the GitHub releases API https://api.github.com/repos/<repo>/releases?per_page=10. repo = owner/name; family = adreno | mali | xclipse | powervr | any; include / exclude = Java regexes (find) over the release asset names (include defaults to names ending in .zip); gpu = optional Java regex over /sys/class/kgsl/kgsl-3d0/gpu_model (e.g. Adreno750v2): when set, the source is listed only on matching GPUs unless 'Show all' is ticked; note = a line under the title; tags = [{match: regex over the asset name, text: label shown beside it}]. Only Android (bionic) adrenotools packages (meta.json + driver .so) work; the app checks every download (GPU family, glibc build, missing libraries, meta.json minApi) and removes it when it cannot run on the phone.",
+  "schema": 1,
+  "sources": [
+    {
+      "repo": "The412Banner/Banners-Turnip",
+      "title": "Mesa Turnip (The412Banner)",
+      "family": "adreno",
+      "include": "(?i)\\.zip$",
+      "exclude": "(?i)(-linux|-wayland|-emulator|glibc|symbols)",
+      "note": "Mesa Turnip for Adreno 6xx/7xx; -A8xx = Adreno 8xx (Snapdragon 8 Elite), -710-720-Test = Adreno 710/720/722, -8G2-OneUI = Adreno 740 on newer firmware, Banners-AIO = all in one.",
+      "tags": [
+        {"match": "(?i)-A8xx", "text": "Adreno 8xx"},
+        {"match": "(?i)710-720", "text": "Adreno 710/720/722"},
+        {"match": "(?i)8G2", "text": "Adreno 740, One UI"}
+      ]
+    },
+    {
+      "repo": "K11MCH1/AdrenoToolsDrivers",
+      "title": "AdrenoToolsDrivers (K11MCH1): Turnip builds + Qualcomm drivers",
+      "family": "adreno",
+      "include": "(?i)\\.zip$",
+      "exclude": "(?i)(-linux|-wayland|-emulator|glibc)",
+      "note": "Turnip_* = Mesa Turnip builds; Qualcomm_<version>_adpkg / 8Elite* = Qualcomm's own proprietary driver extracted from a device (closed source, for recent Adreno only; meta.json minApi is checked).",
+      "tags": [
+        {"match": "(?i)^(qualcomm|8elite)", "text": "Qualcomm proprietary"},
+        {"match": "(?i)^turnip", "text": "Mesa Turnip"}
+      ]
+    },
+    {
+      "repo": "JimVulkan/radv-xclipse",
+      "title": "RADV Xclipse (JimVulkan)",
+      "family": "xclipse",
+      "include": "(?i)\\.zip$",
+      "exclude": "(?i)(wayland|linux|emulator|glibc)",
+      "note": "Mesa RADV for Samsung Exynos Xclipse 920 / 940 / 950; Android 14+. Experimental."
+    },
+    {
+      "repo": "JimVulkan/mali-panvk",
+      "title": "PanVK Mali kbase (JimVulkan)",
+      "family": "mali",
+      "include": "(?i)\\.zip$",
+      "exclude": "(?i)(wayland|linux|emulator|glibc)",
+      "note": "Mesa PanVK for Mali Bifrost / Valhall on the stock kbase kernel driver. Experimental."
+    },
+    {
+      "repo": "zenithblue-oss/panvk-kbase-android",
+      "title": "PanVK kbase Android (zenithblue-oss)",
+      "family": "mali",
+      "include": "(?i)-adrenotools\\.zip$",
+      "exclude": "(?i)(emulator|glibc)",
+      "note": "Mesa PanVK for Mali on mali_kbase; only the -adrenotools zips (the -EMULATOR ones are Linux glibc builds). Experimental."
+    },
+    {
+      "repo": "MineGraph-bilibili/panvk-Android",
+      "title": "PanVK Android (MineGraph-bilibili)",
+      "family": "mali",
+      "include": "(?i)\\.zip$",
+      "exclude": "(?i)(emulator|glibc|linux|wayland)",
+      "note": "Mesa 26.3 PanVK for Mali (kbase). Experimental."
+    }
+  ]
+}

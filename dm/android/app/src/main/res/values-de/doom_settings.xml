@@ -85,4 +85,12 @@
     <string name="folder_why_romfs">kein Ordner romfs</string>
     <string name="folder_why_modules">gepatchte Spielmodule fehlen (dm/out)</string>
     <string name="folder_why_shaders">Shader fehlen (dm/shaders)</string>
+    <!-- [DOOM] the game's controller settings in the gear (hle_doom_settings.c, issue #31) -->
+    <string name="gear_aa_menu">Zielhilfe an (der eigene Schalter des Spiels, wie in seinen Controller-Einstellungen)</string>
+    <string name="gear_motion_aim">Bewegungszielen (Gyroskop)</string>
+    <string name="gear_gyro_sens">Empfindlichkeit des Bewegungszielens</string>
+    <string name="gear_gyro_sens_fmt" formatted="true">%1$s: %2$d von 100</string>
+    <string name="gear_game_unknown_fmt" formatted="true">%1$s: verfügbar, sobald das Spiel sein Profil geladen hat (oder im Spielmenü ändern)</string>
+    <string name="gear_game_settings_note">Zielhilfe, Bewegungszielen und seine Empfindlichkeit sind Einstellungen des Spiels selbst (Controller-Einstellungen im Spielmenü): Eine Änderung hier oder dort zeigt sich an beiden Stellen und wird im Spielprofil gespeichert.</string>
+    <string name="toast_game_setting_failed">Eine Spieleinstellung konnte hier nicht geändert werden; nutze die Controller-Einstellungen im Spielmenü</string>
 </resources>

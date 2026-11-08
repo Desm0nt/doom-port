@@ -23,6 +23,23 @@ and keeps the original copyright line.
 Only the parts that DOOM uses were ported: its main imports, its SDK 6.4 code paths, its NVN calls, its shaders and its audio
 renderer, on an Adreno 750 target. Everything new is behind `DM_GAME_DOOM`, except where noted.
 
+## Vulkan driver packages bundled in the APK (`assets/drivers/<name>/`, docs/doom/BUGS_AND_FIXES.md §2.39)
+
+Unmodified adrenotools packages (prebuilt Mesa drivers), fetched by `tools/fetch_turnip.py` from the pinned release assets below
+and checked against their SHA-256. A package's own text files (e.g. `NOTICE.txt` with the licence texts of everything compiled
+into it) are bundled and copied with it. The app copies to the phone only the packages for its GPU.
+
+| Package (folder) | License / copyright | Source |
+|---|---|---|
+| Mesa Turnip v27.0.0-20261029 (`turnip27`, `turnip27-a710`, `turnip27-a8xx`, `turnip27-8g2`) | Mesa 3D (Turnip / freedreno): MIT, Copyright the Mesa authors; build repository licence GPL-3.0 (its scripts and patches) | https://github.com/The412Banner/Banners-Turnip release `v27.0.0-20261029` |
+| RADV Xclipse 1.8.0 (`radv-xclipse-1.8.0`, Mesa 27.0.0-devel-269238e) | MIT, Copyright the Mesa authors, Copyright 2026 JimVulkan; bundled libraries (libdrm etc.) as listed in its `NOTICE.txt` | https://github.com/JimVulkan/radv-xclipse release `v1.8.0`, asset `radv-xclipse-27.0.0-devel-269238e.zip` |
+| PanVK Mali kbase 1.6.0 (`panvk-jim-1.6.0`, Mesa 27.0.0-devel r10) | MIT, Copyright the Mesa authors, Copyright 2026 JimVulkan; bundled libraries as listed in its `NOTICE.txt` | https://github.com/JimVulkan/mali-panvk release `v1.6.0`, asset `mali-panvk-27.0.0-devel-r10.zip` |
+| Mesa PanVK kbase Android 26.3.1 (`panvk-zenith-26.3.1`, Mesa 26.3.0-devel git-795ca7ff3e) | Mesa 3D (PanVK): MIT, Copyright the Mesa authors; the build repository declares no licence and the zip carries no notice file | https://github.com/zenithblue-oss/panvk-kbase-android release `panvk-kbase-v26.3.1`, asset `Mesa-PanVK-Android-v26.3.1-795ca7ff-adrenotools.zip` |
+
+Packages the player downloads in the app's driver manager (`drivers/sources.json`: the repositories above, K11MCH1/AdrenoToolsDrivers,
+MineGraph-bilibili/panvk-Android) are fetched from those projects' GitHub releases on the phone and are not distributed by us; the
+Qualcomm proprietary drivers among them (`Qualcomm_*_adpkg.zip`) are closed source.
+
 ## Setup-time Python packages (PC only, not in the app; `tools/requirements-astc.txt`, pip-installed by setup into `tools/.runtime`)
 
 Used by `tools/astc_overlay_doom.py` (ASTC / EAC texture overlay for GPUs without BC, docs/doom/BUGS_AND_FIXES.md §2.26). Nothing

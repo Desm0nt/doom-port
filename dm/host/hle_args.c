@@ -16,6 +16,7 @@
 //   DM_DOOM_ADAPTIVE_TICK=0  keep the fixed 30 Hz game tic (default: adaptive tick, game time follows real frame time).
 //   DM_DOOM_TICK_MIN / DM_DOOM_TICK_MAX  adaptive tick Hz range (default 30 / 60; the gear's frame rate limit sets MAX = the limit,
 //                          together with DM_PRESENT_MAX_HZ, so game time keeps real time at the capped present rate).
+//   DM_DOOM_PROFILE_SAVE=0 keep the game's profile save gate (profile_requireSaveExplanation 1; default: +set ... 0, see build()).
 //   DM_DOOM_ARGS="..."     extra arguments, space separated, appended verbatim (e.g. "+set rs_showResolutionChanges 1").
 #include "hle.h"
 #include <stdlib.h>
@@ -292,6 +293,14 @@ static void build(void) {
     // weapon's SP aim assist data (docs/research/aim_assist.md section 8). DM_AA_STRENGTH=0 keeps the game's (weak) MP-method assist.
     const char *aas = getenv("DM_AA_STRENGTH");
     if (!(aas && atof(aas) <= 0)) { add("+set"); add("aa_DESIGN_override"); add("1"); }
+    // Profile saves (BUGS_AND_FIXES 2.40, issue #31): every idPlayerProfile save request (main+0x1eeb7e0 and its inline copies, the
+    // autosave's included) returns without saving while profile_requireSaveExplanation (default "1") is set and the profile's
+    // seenSaveExplanation byte (+0x38) is 0 -- that byte is set by the save explanation screen, which CUTS 0x1080118 skips. So a profile
+    // made on this port was never written: menu settings (motion aiming, sensitivities, aim assist, dynamic resolution...) were lost on
+    // every restart. The cvar is the game's own switch for exactly this ("allow profile save without save indicator explanation UI");
+    // the profile does not store it. DM_DOOM_PROFILE_SAVE=0 keeps the game's gate (hle_doom_settings.c logs "[gyro] profile save gate").
+    const char *ps = getenv("DM_DOOM_PROFILE_SAVE");
+    if (!(ps && *ps == '0')) { add("+set"); add("profile_requireSaveExplanation"); add("0"); }
     const char *extra = getenv("DM_DOOM_ARGS");
     if (extra && *extra) {
         char *copy = strdup(extra), *save = NULL;

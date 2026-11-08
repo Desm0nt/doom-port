@@ -590,6 +590,14 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeGetDrs(JNIEnv *en
 JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetDrs(JNIEnv *env, jclass cls, jboolean on) {
     (void)env; (void)cls; return dm_doom_drs_set(on ? 1 : 0) ? JNI_TRUE : JNI_FALSE;
 }
+// [DOOM] Gear <-> the game's controller settings (hle_doom_settings.c, BUGS_AND_FIXES 2.40): id 0 Motion Aiming (0 / 1), 1 its
+// sensitivity slider (0..100), 2 Aim Assist (0 / 1). get: -1 = not known yet (profile not loaded); set: false = cannot be written here.
+int dm_doom_game_setting_get(int id);
+int dm_doom_game_setting_set(int id, int v);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeGetGameSetting(JNIEnv *env, jclass cls, jint id) { (void)env; (void)cls; return dm_doom_game_setting_get(id); }
+JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetGameSetting(JNIEnv *env, jclass cls, jint id, jint v) {
+    (void)env; (void)cls; return dm_doom_game_setting_set(id, v) ? JNI_TRUE : JNI_FALSE;
+}
 // [DOOM] r6 (BUGS_AND_FIXES 2.18, hle_doom_drs.c): light mode (the game's handheld quality preset) live; false = the loaded main lacks
 // the light-mode patch. DRS target fps (30 / 45 / 60) for rs_drop/raiseMilliseconds while dynamic resolution is on.
 int dm_doom_light_set(int on);

@@ -85,4 +85,12 @@
     <string name="folder_why_romfs">sem a pasta romfs</string>
     <string name="folder_why_modules">faltam os módulos do jogo com patch (dm/out)</string>
     <string name="folder_why_shaders">faltam os shaders (dm/shaders)</string>
+    <!-- [DOOM] the game's controller settings in the gear (hle_doom_settings.c, issue #31) -->
+    <string name="gear_aa_menu">Assistência de mira ligada (o interruptor do próprio jogo, como nas configurações do controle)</string>
+    <string name="gear_motion_aim">Mira por movimento (giroscópio)</string>
+    <string name="gear_gyro_sens">Sensibilidade da mira por movimento</string>
+    <string name="gear_gyro_sens_fmt" formatted="true">%1$s: %2$d de 100</string>
+    <string name="gear_game_unknown_fmt" formatted="true">%1$s: disponível quando o jogo carregar o perfil (ou altere no menu do jogo)</string>
+    <string name="gear_game_settings_note">A assistência de mira, a mira por movimento e a sua sensibilidade são configurações do próprio jogo (configurações do controle no menu do jogo): uma alteração aqui ou lá aparece nos dois lugares e fica salva no perfil do jogo.</string>
+    <string name="toast_game_setting_failed">Não foi possível alterar aqui uma configuração do jogo; use as configurações do controle no menu do jogo</string>
 </resources>

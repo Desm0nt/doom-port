@@ -97,6 +97,8 @@ static _Atomic int g_loading = 0;          // the profile is loading (state 2): 
 static _Atomic int g_loaded_once = 0;      // a profile load has finished (or the fallback timeout passed): changes are the player's
 static _Atomic int g_known = -1;           // the value the player chose last (mirror), -1 = not read yet
 
+void doom_settings_frame(int player, int loaded);     // hle_doom_settings.c (motion aiming / its sensitivity / Aim Assist, issue #31)
+void doom_settings_profile_state(int from, int to);
 static void drs_profile_obs(const uint64_t *r) {   // idPlayerProfile::SetState(profile = x0, state = x1), before the store
     if (ptr_ok(r[0]) && in_main(*(const uint64_t *)(uintptr_t)r[0])) {
         uint8_t *p = (uint8_t *)(uintptr_t)r[0];
@@ -106,6 +108,7 @@ static void drs_profile_obs(const uint64_t *r) {   // idPlayerProfile::SetState(
             LOG("[drs] game profile %p state %d -> %d (requested %d)  [0 idle, 1 saving, 2 loading]", (void *)p, from, to, *(const int32_t *)(p + 0xc));
         if (to == 2) atomic_store(&g_loading, 1);
         else if (from == 2) { atomic_store(&g_loading, 0); atomic_store(&g_load_done, 5); }
+        if (from != to) doom_settings_profile_state(from, to);
     }
     if (g_next_profile) g_next_profile(r);
 }
@@ -473,9 +476,9 @@ static void drs_frame_obs(const uint64_t *r) {     // idCommonLocal::Frame entry
         if (!atomic_load(&g_loaded_once) && ++frames == 3600 && !atomic_load(&g_loading) && !atomic_load(&g_load_done)) {
             atomic_store(&g_load_done, 1); LOG("[drs] no profile load seen: applying the last choice now");
         }
-        int ld = atomic_load(&g_load_done);
+        int ld = atomic_load(&g_load_done), loaded = 0;
         if (ld > 0 && atomic_compare_exchange_strong(&g_load_done, &ld, ld - 1) && ld == 1) {   // a profile load finished a few frames ago
-            atomic_store(&g_loaded_once, 1);
+            atomic_store(&g_loaded_once, 1); loaded = 1;
             int want = atomic_load(&g_known), cur = *(volatile int32_t *)(cv + 0x30) != 0;
             if (cur != want && fns_ok()) drs_write(cv, want, "profile loaded with another value, restoring the last choice");
             else LOG("[drs] profile loaded: rs_enable %d = last choice", cur);
@@ -487,6 +490,8 @@ static void drs_frame_obs(const uint64_t *r) {     // idCommonLocal::Frame entry
             if (atomic_load(&g_known) != v) { atomic_store(&g_known, v); mirror_write(v); }
             last = *(volatile int32_t *)(cv + 0x30);
         }
+        // the controller settings (hle_doom_settings.c) on the same load tracking; their save requests are served just below
+        doom_settings_frame(atomic_load(&g_loaded_once) && !atomic_load(&g_loading) && atomic_load(&g_load_done) == 0, loaded);
         if (g_save_tries > 0) {
             uint8_t *p = profile_ok();
             if (p && *(const int32_t *)(p + 8) == 0 && *(const int32_t *)(p + 0xc) == 0) {
@@ -507,6 +512,10 @@ static void drs_frame_obs(const uint64_t *r) {     // idCommonLocal::Frame entry
     if (g_next_frame) g_next_frame(r);
 }
 
+// hle_doom_settings.c: the profile seen at gate 34 (NULL before) and a profile save request, served between frames above (the menu's
+// call main+0x1eeb7e0; skipped while the profile is busy, retried for ~600 frames).
+uint8_t *doom_profile(void) { return profile_ok(); }
+void doom_profile_save_request(void) { if (fns_ok()) g_save_tries = PROFILE_SAVE_TRIES; }
 // hle_hid.c (DM_INPUT_OBS=1) hands its own callbacks for gates 30 / 34 here, so both run.
 void doom_drs_obs_chain(int id, void (*fn)(const uint64_t *)) {
     if (id == OBS_DOOM_FRAME) g_next_frame = fn; else if (id == OBS_DOOM_PROFILE_STATE) g_next_profile = fn;

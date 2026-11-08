@@ -85,4 +85,12 @@
     <string name="folder_why_romfs">romfs フォルダがありません</string>
     <string name="folder_why_modules">パッチ済みのゲームモジュールがありません（dm/out）</string>
     <string name="folder_why_shaders">シェーダーがありません（dm/shaders）</string>
+    <!-- [DOOM] the game's controller settings in the gear (hle_doom_settings.c, issue #31) -->
+    <string name="gear_aa_menu">エイムアシスト オン（ゲーム自身のスイッチ。ゲームのコントローラー設定と同じ）</string>
+    <string name="gear_motion_aim">モーションエイム（ジャイロ）</string>
+    <string name="gear_gyro_sens">モーションエイムの感度</string>
+    <string name="gear_gyro_sens_fmt" formatted="true">%1$s：%2$d / 100</string>
+    <string name="gear_game_unknown_fmt" formatted="true">%1$s：ゲームがプロフィールを読み込むと使用できます（ゲームメニューでも変更できます）</string>
+    <string name="gear_game_settings_note">エイムアシスト、モーションエイムとその感度はゲーム自身の設定です（ゲームメニューのコントローラー設定）。ここで変えてもゲーム内で変えても両方に反映され、ゲームのプロフィールに保存されます。</string>
+    <string name="toast_game_setting_failed">ここではゲームの設定を変更できませんでした。ゲームメニューのコントローラー設定を使ってください</string>
 </resources>

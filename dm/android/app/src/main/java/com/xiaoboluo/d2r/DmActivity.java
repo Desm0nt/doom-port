@@ -82,6 +82,10 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native boolean nativeSetDrs(boolean on);     // [DOOM] queue a live rs_enable change + profile save; false = cannot be written here
     static native boolean nativeSetLight(boolean on);   // [DOOM] r6 light mode (handheld quality preset) live; false = the game build lacks the patch
     static native void nativeSetDrsFps(int fps);        // [DOOM] r6 dynamic resolution target fps (hle_doom_drs.c)
+    // [DOOM] the game's controller settings (hle_doom_settings.c, issue #31): GS_* ids; get -1 = not known yet; set false = not writable here
+    static native int nativeGetGameSetting(int id);
+    static native boolean nativeSetGameSetting(int id, int value);
+    static final int GS_MOTION_AIM = 0, GS_GYRO_SENS = 1, GS_AIM_ASSIST = 2;
     static native String nativeDriverStatus();          // [DOOM] "<requested>\t<active>\t<reason>" (vk_driver.c), "" before the driver loads
     static native void nativeLog(String text);          // [DOOM] a "[java] ..." breadcrumb line into boot.log (jni_android.c)
     static native String nativeLogPath();               // [DOOM] this run's boot.log ("" before nativeStart)
@@ -346,7 +350,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
 
     private interface Copied { void bytes(long n); }
 
-    private static long treeSize(File f) {
+    static long treeSize(File f) {
         if (!f.isDirectory()) return f.length();
         long n = 0; File[] list = f.listFiles();
         if (list != null) for (File c : list) n += treeSize(c);
@@ -422,7 +426,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static final int FPS_LIMIT_DEFAULT = 60;
     static int nearest(float[] v, float x) { int b = 0; for (int i = 1; i < v.length; i++) if (Math.abs(v[i] - x) < Math.abs(v[b] - x)) b = i; return b; }
 
-    private SharedPreferences doomPrefs() { return getSharedPreferences("doom_graphics", MODE_PRIVATE); }
+    SharedPreferences doomPrefs() { return getSharedPreferences("doom_graphics", MODE_PRIVATE); }
 
     private android.view.Display display() {
         android.view.Display d = null;
@@ -567,8 +571,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // [DOOM] Default Vulkan driver per GPU (docs/research/non_adreno_drivers.md 4.1); the player's choice (pref "driver") always wins.
     // This is the hook for vendor rules: it returns a package name under files/drivers/ or "" = the system driver.
     //   Adreno 6xx / 7xx            -> turnip27 (bundled)
-    //   Adreno 710 / 720 / 722      -> turnip27-a710 when downloaded, else system
-    //   Adreno 8xx                  -> turnip27-a8xx when downloaded, else system
+    //   Adreno 710 / 720 / 722      -> turnip27-a710 when present (bundled since 2.39, or downloaded), else system
+    //   Adreno 8xx                  -> turnip27-a8xx when present (bundled since 2.39, or downloaded), else system
     //   Adreno 5xx and older        -> system (Turnip does not support a5xx)
     //   Mali / PowerVR / Xclipse / Maleoon (no kgsl gpu_model) -> system; their optional packages (PanVK, RADV-Xclipse) stay
     //                                  selectable in the dialog when the player supplies them
@@ -623,17 +627,42 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (s.contains("turnip") || s.contains("freedreno") || s.contains("adreno")) return "adreno";
         return "";
     }
-    private org.json.JSONObject driverMeta(String name) {
+    org.json.JSONObject driverMeta(String name) {
         try { return new org.json.JSONObject(readSmall(new File(new File(new File(getFilesDir(), "drivers"), name), "meta.json"))); }
         catch (Exception e) { return null; }
     }
-    String driverFamily(String name) {
-        String f = familyWord(name); if (!f.isEmpty()) return f;
-        org.json.JSONObject o = driverMeta(name); if (o == null) return "";
+    String driverFamily(String name) { return familyOf(name, driverMeta(name)); }
+    static String familyOf(String name, org.json.JSONObject o) {
+        String f = familyWord(name); if (!f.isEmpty() || o == null) return f;
         f = familyWord(o.optString("name", "")); if (!f.isEmpty()) return f;
         f = familyWord(o.optString("description", "")); if (!f.isEmpty()) return f;
         return familyWord(o.optString("libraryName", ""));
     }
+    // [DOOM] 2.39: can a driver of this family run on this phone (the device nodes driverProblem / vk_driver.c check); "" = unknown = anywhere
+    static boolean familyFits(String fam) {
+        switch (fam) {
+            case "adreno": return turnipPossible();
+            case "mali": return mali();
+            case "xclipse": return !(kgsl() || mali() || powervr());
+            case "powervr": return powervr();
+            default: return true;
+        }
+    }
+    // This phone's family for the driver lists (the manifest, the driver manager): any KGSL GPU = adreno, then mali / powervr; none of
+    // these nodes = xclipse (Samsung Xclipse, or a GPU nobody ships packages for)
+    static String phoneFamily() { return kgsl() ? "adreno" : mali() ? "mali" : powervr() ? "powervr" : "xclipse"; }
+    // [DOOM] 2.39: the checks that need only the folder name and meta.json (also for the APK's assets before they are copied): another GPU
+    // family, a glibc build, or a meta.json minApi above this Android (RADV-Xclipse says 34); null = may run here
+    static String packageProblem(String name, org.json.JSONObject meta) {
+        String fam = familyOf(name, meta);
+        if (!familyFits(fam)) return "no-" + fam;
+        if (meta != null && meta.optString("abi", "").toLowerCase(Locale.ROOT).contains("glibc")) return "glibc-build";
+        int min = meta != null ? meta.optInt("minApi", 0) : 0;
+        if (min > android.os.Build.VERSION.SDK_INT) return "min-api " + min;
+        return null;
+    }
+    // API level -> the Android version players know (34 -> "14")
+    static String androidName(int api) { return api >= 33 ? String.valueOf(api - 20) : api == 32 ? "12L" : api >= 28 ? String.valueOf(api - 19) : "API " + api; }
     static boolean mali() { return new File("/dev/mali0").exists(); }
     static boolean powervr() { return new File("/dev/pvrsrvkm").exists(); }
     // The package's driver library: meta.json libraryName, else its first .so (a *vulkan* one preferred), as vk_driver.c picks it.
@@ -673,15 +702,11 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // on KGSL / no-mali / no-xclipse / no-powervr), a Linux glibc build (glibc-build: the "-EMULATOR" PanVK zips are for Winlator-style glibc
     // containers; issue #3 picked one and it needed libdrm.so.2), or a versioned library it needs and does not ship (missing-lib). vk_driver.c
     // repeats these checks natively (DM_VK_DRIVER_FORCE=1 skips them there).
+    // [DOOM] 2.39: also a meta.json minApi above this Android (min-api N), via packageProblem.
     String driverProblem(String name) {
-        String fam = driverFamily(name);
-        if (fam.equals("adreno") && !turnipPossible()) return "no-adreno";
-        if (fam.equals("mali") && !mali()) return "no-mali";
-        if (fam.equals("xclipse") && (kgsl() || mali() || powervr())) return "no-xclipse";
-        if (fam.equals("powervr") && !powervr()) return "no-powervr";
         File dir = new File(new File(getFilesDir(), "drivers"), name);
         org.json.JSONObject meta = driverMeta(name);
-        if (meta != null && meta.optString("abi", "").toLowerCase(Locale.ROOT).contains("glibc")) return "glibc-build";
+        String why = packageProblem(name, meta); if (why != null) return why;
         File lib = driverLib(dir, meta);
         if (lib != null) for (String n : elfNeeded(lib)) {
             if (n.equals("libc.so.6") || n.equals("libm.so.6") || n.equals("libpthread.so.0") || n.equals("libdl.so.2") || n.contains("ld-linux")) return "glibc-build";
@@ -705,6 +730,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             case "no-library": return Ui.t(this, "в пакете нет библиотеки драйвера", "the package has no driver library");
             default:
                 if (r.startsWith("missing-lib")) return Ui.t(this, "в пакете не хватает библиотеки", "the package lacks a library") + r.substring(11);
+                if (r.startsWith("min-api")) { int api = 0; try { api = Integer.parseInt(r.substring(7).trim()); } catch (NumberFormatException e) { /* shown as is */ }
+                    String need = androidName(api), have = androidName(android.os.Build.VERSION.SDK_INT);
+                    return Ui.t(this, "нужен Android " + need + " или новее, а здесь Android " + have, "it needs Android " + need + " or newer, this phone has Android " + have); }
                 return r;
         }
     }
@@ -732,15 +760,32 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         return null;
     }
     static boolean hasDriverLib(File d) { File[] fs = d.listFiles(); if (fs != null) for (File f : fs) if (f.getName().endsWith(".so")) return true; return false; }
-    static String readSmall(File f) throws java.io.IOException {
-        try (java.io.InputStream in = new java.io.FileInputStream(f)) { java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[8192]; int n; while ((n = in.read(buf)) > 0) b.write(buf, 0, n); return b.toString("UTF-8"); }
+    static String readSmall(File f) throws java.io.IOException { try (java.io.InputStream in = new java.io.FileInputStream(f)) { return readStream(in); } }
+    static String readStream(java.io.InputStream in) throws java.io.IOException {
+        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[8192]; int n; while ((n = in.read(buf)) > 0) b.write(buf, 0, n); return b.toString("UTF-8");
+    }
+    // [DOOM] 2.39: where a package under files/drivers came from: <package>/.dm_origin = "<kind>\t<detail>", kind bundled (detail: the APK
+    // install that copied it, bundleStamp), download (manifest / "<repo> <tag>"), file (the picked zip's name) or import (<game folder>/drivers/...).
+    // The driver manager shows it and lets the player delete all but the bundled ones. Packages from before 2.39 have none (DriverManager.origin guesses).
+    static final String ORIGIN = ".dm_origin";
+    static void writeOrigin(File dir, String kind, String detail) {
+        try (OutputStream os = new FileOutputStream(new File(dir, ORIGIN))) { os.write((kind + "\t" + detail.replace('\n', ' ') + "\n").getBytes(StandardCharsets.UTF_8)); }
+        catch (IOException e) { android.util.Log.e("dm", "driver origin " + dir.getName() + ": " + e); }
+    }
+    static String[] readOrigin(File dir) {
+        String s = readText(new File(dir, ORIGIN)); if (s == null || s.trim().isEmpty()) return null;
+        String[] f = s.trim().split("\t", 2); return f.length == 2 ? f : new String[] {f[0], ""};
     }
     // [DOOM] Driver packages from the internet (when there is a connection): the repository's drivers/manifest.json lists
     // adrenotools packages (name, url, sha256, optional "auto" GPU regex). Missing ones are downloaded in the background, checked
     // against their SHA-256 and unpacked to <dir>/<name>/; they show up in the settings and, when "auto" matches this GPU, are
     // used by default from the next launch. Offline nothing happens and the bundled Turnip / system driver are used.
+    // [DOOM] 2.39: family-aware: an entry's "family" (else the family words of its name + title) must fit this phone (familyFits), so a
+    // Mali phone no longer downloads the Turnip builds; a package the player deleted in the driver manager (pref driver_removed) is not
+    // downloaded again. Other drivers come from the driver manager (DriverManager.java, drivers/sources.json).
     static final String DRIVER_MANIFEST_URL = "https://raw.githubusercontent.com/Desm0nt/doom-port/main/drivers/manifest.json";
     private void updateDriversInBackground(final File dir) {
+        final java.util.Set<String> removed = new java.util.HashSet<>(doomPrefs().getStringSet("driver_removed", java.util.Collections.emptySet()));
         new Thread(() -> {
             try {
                 byte[] man = httpGet(DRIVER_MANIFEST_URL, 1 << 20);
@@ -748,11 +793,14 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 dir.mkdirs(); try (java.io.FileOutputStream os = new java.io.FileOutputStream(new File(dir, "manifest.json"))) { os.write(man); }
                 for (int i = 0; i < pk.length(); i++) {
                     org.json.JSONObject o = pk.getJSONObject(i); String name = o.getString("name");
-                    if (!name.matches("[A-Za-z0-9._-]+") || hasDriverLib(new File(dir, name))) continue;
+                    if (!name.matches("[A-Za-z0-9._-]+") || name.startsWith(".") || hasDriverLib(new File(dir, name)) || removed.contains(name)) continue;
+                    String fam = o.optString("family", ""); if (fam.isEmpty()) fam = familyWord(name + " " + o.optString("title", ""));
+                    if (!familyFits(fam)) { android.util.Log.i("dm", "driver " + name + ": for " + fam + ", not this GPU (" + phoneFamily() + "), not downloaded"); continue; }
                     byte[] zip = httpGet(o.getString("url"), 64 << 20);
                     String got = sha256(zip);
                     if (!got.equalsIgnoreCase(o.getString("sha256"))) { android.util.Log.e("dm", "driver " + name + ": SHA-256 mismatch " + got + ", skipped"); continue; }
                     unzipDriver(new java.io.ByteArrayInputStream(zip), new File(dir, name));
+                    writeOrigin(new File(dir, name), "download", "manifest");
                     android.util.Log.i("dm", "driver " + name + ": downloaded (" + zip.length + " bytes)");
                 }
             } catch (Exception e) { android.util.Log.i("dm", "driver update skipped: " + e); }
@@ -794,35 +842,56 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         deleteDriverTree(out); if (!tmp.renameTo(out)) throw new java.io.IOException("rename failed: " + out);
     }
     static void deleteDriverTree(File f) { File[] fs = f.listFiles(); if (fs != null) for (File c : fs) deleteDriverTree(c); f.delete(); }
-    // Copy assets/drivers/<name>/* to <dst>/<name>/ when missing or of another size.
+    // Copy assets/drivers/<name>/* to <dst>/<name>/.
+    // [DOOM] 2.39: the APK carries the Turnip builds and, as experimental options, RADV-Xclipse and two PanVK builds (tools/fetch_turnip.py);
+    // only the packages that can run on this phone are copied (packageProblem over the asset's folder name + meta.json: GPU family, glibc,
+    // minApi), so an Adreno phone does not get ~70 MB of Mali / Xclipse libraries in its private storage. A package is copied again when this
+    // is another APK install than the one that copied it (<name>/.dm_origin "bundled\t<bundleStamp>"): the assets are stored compressed, so
+    // their size is unknown and the old size check never replaced a same-name package an update brought. A bundled copy that does not fit
+    // this phone (turnip27 an older APK put on a Mali phone) is removed; a package of the player's own (origin file / import) is left alone.
     private void extractBundledDrivers(File dst) {
+        String stamp = bundleStamp();
         try {
             String[] names = getAssets().list("drivers"); if (names == null) return;
             for (String n : names) {
                 String[] files = getAssets().list("drivers/" + n); if (files == null || files.length == 0) continue;
-                File out = new File(dst, n); out.mkdirs();
+                File out = new File(dst, n); String[] org = readOrigin(out);
+                org.json.JSONObject meta = null;
+                try (java.io.InputStream in = getAssets().open("drivers/" + n + "/meta.json")) { meta = new org.json.JSONObject(readStream(in)); } catch (Exception e) { /* no meta.json: the folder name decides */ }
+                String why = packageProblem(n, meta);
+                if (why != null) {
+                    if (out.isDirectory() && (org == null || "bundled".equals(org[0]))) { deleteDriverTree(out); android.util.Log.i("dm", "bundled driver " + n + ": removed, not for this phone (" + why + ")"); }
+                    continue;
+                }
+                if (org != null && "bundled".equals(org[0]) && stamp.equals(org[1]) && hasDriverLib(out)) continue;
+                out.mkdirs(); new File(out, ORIGIN).delete();   // a copy cut short is copied again at the next start
                 for (String f : files) {
-                    File o = new File(out, f);
-                    try (java.io.InputStream in = getAssets().open("drivers/" + n + "/" + f)) {
-                        long size = -1; try (android.content.res.AssetFileDescriptor fd = getAssets().openFd("drivers/" + n + "/" + f)) { size = fd.getLength(); } catch (java.io.IOException e) { /* compressed asset: size unknown */ }
-                        if (o.isFile() && (size < 0 ? o.length() > 0 : o.length() == size)) continue;
-                        try (java.io.OutputStream os = new java.io.FileOutputStream(o)) { byte[] buf = new byte[1 << 16]; int k; while ((k = in.read(buf)) > 0) os.write(buf, 0, k); }
-                        android.util.Log.i("dm", "bundled driver " + n + ": " + f + " extracted");
+                    try (java.io.InputStream in = getAssets().open("drivers/" + n + "/" + f); java.io.OutputStream os = new java.io.FileOutputStream(new File(out, f))) {
+                        byte[] buf = new byte[1 << 16]; int k; while ((k = in.read(buf)) > 0) os.write(buf, 0, k);
                     }
                 }
+                writeOrigin(out, "bundled", stamp);
+                android.util.Log.i("dm", "bundled driver " + n + ": extracted (" + files.length + " files)");
             }
         } catch (java.io.IOException e) { android.util.Log.e("dm", "bundled drivers: " + e); }
     }
+    // This APK install: versionName + install / update time (a reinstall of the same version copies the bundled drivers again too).
+    @SuppressWarnings("deprecation")
+    private String bundleStamp() {
+        try { android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0); return pi.versionName + "/" + pi.lastUpdateTime; }
+        catch (Exception e) { return BuildConfig.VERSION_NAME; }
+    }
 
     // Driver packages in private storage (imported at launch from <game folder>/drivers, by default Download/DOOM Mobile/drivers), sorted by folder name.
-    private String[] driverPackages() {
+    // [DOOM] 2.39: not the driver manager's own folders (".cache", ".stage-*") nor a half-unpacked "<name>.tmp".
+    String[] driverPackages() {
         File[] dirs = new File(getFilesDir(), "drivers").listFiles(); java.util.ArrayList<String> out = new java.util.ArrayList<>();
-        if (dirs != null) for (File d : dirs) { File[] fs = d.isDirectory() ? d.listFiles() : null; if (fs == null) continue;
+        if (dirs != null) for (File d : dirs) { File[] fs = d.isDirectory() && !d.getName().startsWith(".") && !d.getName().endsWith(".tmp") ? d.listFiles() : null; if (fs == null) continue;
             for (File f : fs) if (f.getName().endsWith(".so")) { out.add(d.getName()); break; } }
         java.util.Collections.sort(out); return out.toArray(new String[0]);
     }
     // "<meta.json name> (<folder>)", or just the folder name when there is no readable meta.json.
-    private String driverLabel(String name) {
+    String driverLabel(String name) {
         File m = new File(new File(new File(getFilesDir(), "drivers"), name), "meta.json");
         try (java.io.FileInputStream in = new java.io.FileInputStream(m)) {
             byte[] b = new byte[(int) Math.min(m.length(), 65536)]; int n = in.read(b);
@@ -838,20 +907,22 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         for (File d : dirs) {
             if (d.isFile() && d.getName().endsWith(".zip")) {   // a package zip dropped as is: unpack to <dst>/<zip name>/ once
                 String name = d.getName().substring(0, d.getName().length() - 4); File out = new File(dst, name);
-                if (!hasDriverLib(out)) try (java.io.InputStream in = new java.io.FileInputStream(d)) { unzipDriver(in, out); android.util.Log.i("dm", "driver package " + name + ": unpacked from zip"); }
+                if (!hasDriverLib(out)) try (java.io.InputStream in = new java.io.FileInputStream(d)) { unzipDriver(in, out); writeOrigin(out, "import", d.getPath()); android.util.Log.i("dm", "driver package " + name + ": unpacked from zip"); }
                 catch (java.io.IOException e) { android.util.Log.e("dm", "driver package " + d.getName() + ": " + e); }
                 continue;
             }
             File[] files = d.isDirectory() ? d.listFiles() : null; if (files == null) continue;
             File out = new File(dst, d.getName()); out.mkdirs();
+            boolean copied = false;
             for (File f : files) {
                 File o = new File(out, f.getName());
-                if (o.length() == f.length()) continue;
+                if (o.length() == f.length() || f.getName().equals(ORIGIN)) continue;
                 try (java.io.InputStream in = new java.io.FileInputStream(f); java.io.OutputStream os = new java.io.FileOutputStream(o)) {
                     byte[] buf = new byte[1 << 16]; int n; while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
-                    android.util.Log.i("dm", "driver package " + d.getName() + ": " + f.getName() + " copied");
+                    android.util.Log.i("dm", "driver package " + d.getName() + ": " + f.getName() + " copied"); copied = true;
                 } catch (java.io.IOException e) { android.util.Log.e("dm", "driver package " + d.getName() + ": " + e); }
             }
+            if (copied || readOrigin(out) == null) writeOrigin(out, "import", d.getPath());   // [DOOM] 2.39: the driver manager shows where it came from
         }
     }
 
@@ -920,16 +991,24 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             // Download/DOOM Mobile/drivers), labelled with the name from its meta.json; below it, what the running game actually uses.
             heading(box, when(R.string.gear_driver, false));
             // [DOOM] packages that cannot run here (driverProblem: another GPU family, a glibc build, a missing library) are not offered;
-            // a line lists them with the reason
-            java.util.ArrayList<String> offered = new java.util.ArrayList<>(); StringBuilder hiddenWhy = new StringBuilder();
-            for (String n : driverPackages()) { String why = driverProblem(n); if (why == null) offered.add(n); else hiddenWhy.append("\n- ").append(driverLabel(n)).append(": ").append(driverReasonText(why)); }
-            final String[] drvNames = offered.toArray(new String[0]);
-            if (hiddenWhy.length() > 0) { TextView hn = new TextView(this); hn.setText(Ui.t(this, "Скрыты (не подходят этому телефону, " + hardwareSummary() + "):",
-                "Hidden (cannot run on this phone, " + hardwareSummary() + "):") + hiddenWhy); box.addView(hn); }
-            String[] drvLabels = new String[drvNames.length + 1]; drvLabels[0] = getString(R.string.gear_driver_system);
-            for (int i = 0; i < drvNames.length; i++) drvLabels[i + 1] = driverLabel(drvNames[i]);
-            int drvAt = 0; { String cur = p.getString("driver", defaultDriver()); for (int i = 0; i < drvNames.length; i++) if (drvNames[i].equals(cur)) drvAt = i + 1; }
-            RadioGroup drvG = radios(box, drvLabels, 7000, drvAt, false);
+            // a line lists them with the reason. [DOOM] 2.39: the list is rebuilt when the driver manager closes (a package installed or
+            // deleted there shows up here at once), keeping the choice when it still exists
+            final LinearLayout drvBox = new LinearLayout(this); drvBox.setOrientation(LinearLayout.VERTICAL); box.addView(drvBox);
+            final String[][] drvNamesH = {new String[0]}; final RadioGroup[] drvGH = {null};
+            final java.util.function.Consumer<String> drvFill = want -> {
+                drvBox.removeAllViews();
+                java.util.ArrayList<String> offered = new java.util.ArrayList<>(); StringBuilder hiddenWhy = new StringBuilder();
+                for (String n : driverPackages()) { String why = driverProblem(n); if (why == null) offered.add(n); else hiddenWhy.append("\n- ").append(driverLabel(n)).append(": ").append(driverReasonText(why)); }
+                final String[] drvNames = offered.toArray(new String[0]); drvNamesH[0] = drvNames;
+                if (hiddenWhy.length() > 0) { TextView hn = new TextView(this); hn.setText(Ui.t(this, "Скрыты (не подходят этому телефону, " + hardwareSummary() + "):",
+                    "Hidden (cannot run on this phone, " + hardwareSummary() + "):") + hiddenWhy); drvBox.addView(hn); }
+                String[] drvLabels = new String[drvNames.length + 1]; drvLabels[0] = getString(R.string.gear_driver_system);
+                for (int i = 0; i < drvNames.length; i++) drvLabels[i + 1] = driverLabel(drvNames[i]);
+                String cur = want != null && (want.isEmpty() || offered.contains(want)) ? want : p.getString("driver", defaultDriver());
+                int drvAt = 0; for (int i = 0; i < drvNames.length; i++) if (drvNames[i].equals(cur)) drvAt = i + 1;
+                drvGH[0] = radios(drvBox, drvLabels, 7000, drvAt, false);
+            };
+            drvFill.accept(null);
             String[] st = driverStatus();
             if (st != null) {
                 boolean fell = !st[0].isEmpty() && "system".equals(st[1]);
@@ -941,13 +1020,41 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 if (fell || (st.length > 3 && !st[0].isEmpty())) { TextView w = new TextView(this);
                     w.setText((fell ? driverReasonText(st[2]) + (st.length > 3 ? "; " : "") : "") + (st.length > 3 ? st[3] : "")); box.addView(w); }
             }
+            // [DOOM] 2.39: the driver manager (installed packages, install from a file, download from GitHub releases: DriverManager.java)
+            android.widget.Button drvMgrB = new android.widget.Button(this); drvMgrB.setText(Ui.t(this, "Драйверы…", "Manage drivers…")); box.addView(drvMgrB);
+            drvMgrB.setOnClickListener(v -> new DriverManager(this, () -> {
+                int k = picked(drvGH[0], 7000, drvNamesH[0].length + 1); drvFill.accept(k > 0 ? drvNamesH[0][k - 1] : "");
+            }).show());
             heading(box, when(R.string.gear_lang, false));
             String[] langLabels = LANG_LABELS.clone(); langLabels[0] = getString(R.string.gear_lang_system);
             int langAt = 0; { String cur = p.getString("lang", ""); for (int i = 0; i < LANG_CODES.length; i++) if (LANG_CODES[i].equals(cur)) langAt = i; }
             RadioGroup langG = radios(box, langLabels, 5000, langAt, true);
+            // [DOOM] issue #31: the game's own Aim Assist / Motion Aiming / motion sensitivity (controller settings menu), read now from the
+            // game and written live through its setters on Save; not kept in our preferences (the game profile keeps them).
+            final int[] gsWas = new int[3];
+            for (int i = 0; i < 3; i++) { gsWas[i] = -1; try { if (libraryLoaded) gsWas[i] = nativeGetGameSetting(i); } catch (Throwable t) { android.util.Log.e("dm", "nativeGetGameSetting: " + t); } }
+            CheckBox aaMenu = new CheckBox(this), motionAim = new CheckBox(this);
+            if (gsWas[GS_AIM_ASSIST] >= 0) { aaMenu.setText(when(R.string.gear_aa_menu, true)); aaMenu.setChecked(gsWas[GS_AIM_ASSIST] == 1); }
+            else { aaMenu.setText(getString(R.string.gear_game_unknown_fmt, getString(R.string.gear_aa_menu))); aaMenu.setEnabled(false); }
+            box.addView(aaMenu);
             heading(box, when(R.string.gear_aa, false));
             String[] aaLabels = AA_LABELS.clone(); aaLabels[0] = getString(R.string.gear_aa_switch);
             RadioGroup aaG = radios(box, aaLabels, 6000, nearest(AA_STRENGTHS, p.getFloat("aa", 1.0f)), true);
+            if (gsWas[GS_MOTION_AIM] >= 0) { motionAim.setText(when(R.string.gear_motion_aim, true)); motionAim.setChecked(gsWas[GS_MOTION_AIM] == 1); }
+            else { motionAim.setText(getString(R.string.gear_game_unknown_fmt, getString(R.string.gear_motion_aim))); motionAim.setEnabled(false); }
+            box.addView(motionAim);
+            // the game's slider: 0..100 in steps of 1 (joy_sixAxisGlobalScale = value x 0.6)
+            final TextView gyroT = new TextView(this); box.addView(gyroT);
+            final android.widget.SeekBar gyroS = new android.widget.SeekBar(this); gyroS.setMax(100); box.addView(gyroS);
+            if (gsWas[GS_GYRO_SENS] >= 0) {
+                gyroS.setProgress(gsWas[GS_GYRO_SENS]); gyroT.setText(getString(R.string.gear_gyro_sens_fmt, when(R.string.gear_gyro_sens, true), gsWas[GS_GYRO_SENS]));
+                gyroS.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
+                    public void onProgressChanged(android.widget.SeekBar sb, int v, boolean user) { gyroT.setText(getString(R.string.gear_gyro_sens_fmt, when(R.string.gear_gyro_sens, true), v)); }
+                    public void onStartTrackingTouch(android.widget.SeekBar sb) {}
+                    public void onStopTrackingTouch(android.widget.SeekBar sb) {}
+                });
+            } else { gyroT.setText(getString(R.string.gear_game_unknown_fmt, getString(R.string.gear_gyro_sens))); gyroS.setEnabled(false); }
+            TextView gsNote = new TextView(this); gsNote.setText(R.string.gear_game_settings_note); box.addView(gsNote);
             CheckBox rumble = new CheckBox(this); rumble.setText(when(R.string.gear_rumble, false)); rumble.setChecked(p.getBoolean("rumble", false)); box.addView(rumble);
             heading(box, when(R.string.gear_look, true));
             RadioGroup look = radios(box, LOOK_LABELS, 3000, nearest(LOOK_GAINS, cp.getFloat("look", 1.0f)), true);
@@ -990,8 +1097,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             gearDlg[0] = new AlertDialog.Builder(this).setTitle(R.string.gear_title).setView(scroll)
                 .setPositiveButton(R.string.gear_save, (d, w) -> {
                     final int aspPick = picked(aspG, 9700, ASPECT_ENV.length);
-                    int drvPick = picked(drvG, 7000, drvNames.length + 1);
-                    p.edit().putString("driver", drvPick > 0 ? drvNames[drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putInt("aspect", aspPick)
+                    int drvPick = picked(drvGH[0], 7000, drvNamesH[0].length + 1);
+                    p.edit().putString("driver", drvPick > 0 ? drvNamesH[0][drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putInt("aspect", aspPick)
                         .putFloat("aa", AA_STRENGTHS[picked(aaG, 6000, AA_STRENGTHS.length)]).putString("lang", LANG_CODES[picked(langG, 5000, LANG_CODES.length)])
                         .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length)).putBoolean("upscale", upscale.isChecked())
                         .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size())))
@@ -1014,6 +1121,15 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                         try { ok = nativeSetDrs(drs.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetDrs: " + t); }
                         if (!ok) android.widget.Toast.makeText(this, R.string.toast_drs_failed, android.widget.Toast.LENGTH_LONG).show();
                     }
+                    // [DOOM] issue #31: only what was changed in this dialog goes to the game (a change made in the game menu stays)
+                    int[] gsNow = {motionAim.isChecked() ? 1 : 0, gyroS.getProgress(), aaMenu.isChecked() ? 1 : 0};
+                    boolean gsFailed = false;
+                    for (int i = 0; i < 3; i++) if (gsWas[i] >= 0 && gsNow[i] != gsWas[i]) {
+                        boolean ok = false;
+                        try { ok = nativeSetGameSetting(i, gsNow[i]); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetGameSetting: " + t); }
+                        gsFailed |= !ok;
+                    }
+                    if (gsFailed) android.widget.Toast.makeText(this, R.string.toast_game_setting_failed, android.widget.Toast.LENGTH_LONG).show();
                     if (aspPick != aspWas) {   // [DOOM] BUGS_AND_FIXES 2.12: native answers whether it switched live (needs DM_DOOM_WIDE_LIVE=1)
                         boolean live = false;   // [4:3] only auto <-> 16:9 on a screen wider than 16:9 (a presenter crop); 4:3 needs a restart
                         if (aspPick != 2 && aspWas != 2)
@@ -1270,6 +1386,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @SuppressWarnings("deprecation")
     @Override protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == DriverManager.REQ_ZIP) { DriverManager.picked(this, result == RESULT_OK && data != null ? data.getData() : null); return; }   // [DOOM] 2.39
         if (request != REQ_FOLDER) return;
         Uri u = result == RESULT_OK && data != null ? data.getData() : null;
         if (u == null) { crumb("game folder picker: cancelled"); return; }

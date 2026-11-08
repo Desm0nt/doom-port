@@ -85,4 +85,12 @@
     <string name="folder_why_romfs">没有 romfs 文件夹</string>
     <string name="folder_why_modules">缺少打过补丁的游戏模块（dm/out）</string>
     <string name="folder_why_shaders">缺少着色器（dm/shaders）</string>
+    <!-- [DOOM] the game's controller settings in the gear (hle_doom_settings.c, issue #31) -->
+    <string name="gear_aa_menu">瞄准辅助开启（游戏自身的开关，与游戏的控制器设置相同）</string>
+    <string name="gear_motion_aim">体感瞄准（陀螺仪）</string>
+    <string name="gear_gyro_sens">体感瞄准灵敏度</string>
+    <string name="gear_gyro_sens_fmt" formatted="true">%1$s：%2$d / 100</string>
+    <string name="gear_game_unknown_fmt" formatted="true">%1$s：游戏载入玩家配置后可用（也可在游戏菜单中更改）</string>
+    <string name="gear_game_settings_note">瞄准辅助、体感瞄准及其灵敏度是游戏自身的设置（游戏菜单中的控制器设置）：在这里或在游戏里更改，两边都会显示，并保存在游戏的玩家配置中。</string>
+    <string name="toast_game_setting_failed">无法在此更改游戏设置；请使用游戏菜单中的控制器设置</string>
 </resources>

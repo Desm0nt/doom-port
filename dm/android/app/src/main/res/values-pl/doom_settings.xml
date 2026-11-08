@@ -85,4 +85,12 @@
     <string name="folder_why_romfs">brak folderu romfs</string>
     <string name="folder_why_modules">brak spatchowanych modułów gry (dm/out)</string>
     <string name="folder_why_shaders">brak shaderów (dm/shaders)</string>
+    <!-- [DOOM] the game's controller settings in the gear (hle_doom_settings.c, issue #31) -->
+    <string name="gear_aa_menu">Wspomaganie celowania włączone (własny przełącznik gry, jak w jej ustawieniach kontrolera)</string>
+    <string name="gear_motion_aim">Celowanie ruchem (żyroskop)</string>
+    <string name="gear_gyro_sens">Czułość celowania ruchem</string>
+    <string name="gear_gyro_sens_fmt" formatted="true">%1$s: %2$d ze 100</string>
+    <string name="gear_game_unknown_fmt" formatted="true">%1$s: dostępne, gdy gra wczyta swój profil (albo zmień w menu gry)</string>
+    <string name="gear_game_settings_note">Wspomaganie celowania, celowanie ruchem i jego czułość to ustawienia samej gry (ustawienia kontrolera w menu gry): zmiana tu lub tam jest widoczna w obu miejscach i zapisywana w profilu gry.</string>
+    <string name="toast_game_setting_failed">Nie udało się tu zmienić ustawienia gry; użyj ustawień kontrolera w menu gry</string>
 </resources>
