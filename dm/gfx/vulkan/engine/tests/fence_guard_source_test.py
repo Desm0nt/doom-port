@@ -27,16 +27,16 @@ def inside(pos,blocks):return any(a<=pos<b for a,b in blocks)
 bad=[code.count('\n',0,m.start())+1 for m in re.finditer(r'\bvkGetFenceStatus\s*\(', code) if not inside(m.start(),fg)]
 assert not bad, 'raw vkGetFenceStatus outside fguard near lines %s'%bad
 
-# 2. vkWaitForFences: fguard, the Mali retry wrapper (dm_wait_for_fences) and the self-test's private kat_fence only.
+# 2. vkWaitForFences: fguard, the Mali retry wrapper (dm_wait_for_fences) and the self-tests' private kat_fence / zt_fence only.
 for m in re.finditer(r'\bvkWaitForFences\s*\(([^;]*)', code):
     line=code.count('\n',0,m.start())+1;args=m.group(1)
-    ok=inside(m.start(),fg) or 'kat_fence' in args or args.replace(' ','')=='d,n,f,all,timeout)'   # the last: dm_wait_for_fences itself
+    ok=inside(m.start(),fg) or 'kat_fence' in args or 'zt_fence' in args or args.replace(' ','')=='d,n,f,all,timeout)'   # the last: dm_wait_for_fences itself
     assert ok, 'raw vkWaitForFences near line %d: %s'%(line,args[:80])
 
 # 3. vkResetFences: no slot fence outside fguard.
 for m in re.finditer(r'\bvkResetFences\s*\(([^;]*)', code):
     if inside(m.start(),fg):continue
-    assert 'fence' not in m.group(1).replace('kat_fence','').replace('wfence',''), 'raw vkResetFences of a slot fence near line %d'%(code.count('\n',0,m.start())+1)
+    assert 'fence' not in m.group(1).replace('kat_fence','').replace('zt_fence','').replace('wfence',''), 'raw vkResetFences of a slot fence near line %d'%(code.count('\n',0,m.start())+1)
 
 # 4. Every vkQueueSubmit that passes a slot fence (s.fence / q.fence) runs inside a { fguard::Lock g; ... } scope.
 subs=list(re.finditer(r'\bvkQueueSubmit\s*\(\s*cfg\.queue\s*,\s*1\s*,\s*&si\s*,\s*(s|q)\.fence\s*\)', code))

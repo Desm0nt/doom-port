@@ -516,7 +516,9 @@ static int translation_layer(void) {
     if (off) LOG("[perf] performance hints off (ARM translation layer detected)");
     return off;
 }
+void dm_stall_present(void);   // [DOOM] 2.45 stall_android.c: the frame stall watch's present clock (before the translation-layer return)
 void dm_aperf_present(ANativeWindow *w, float marker_vote) {
+    dm_stall_present();
     if (translation_layer()) return;
     cfg();
     double period = dm_present_period();

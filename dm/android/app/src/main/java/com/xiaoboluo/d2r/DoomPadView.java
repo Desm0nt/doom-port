@@ -40,7 +40,7 @@ import java.util.Set;
 // one or all, Reset, Cancel, Save; places per preset in "pos_<game|phone|tablet>_<control>" = x;y;scale, x and y in fractions of the view - the
 // same keys as Xenoblade 3's PadView). The gear (menu button) opens the pause menu on a tap (FrontMenu) and moves where it is dragged; its look
 // (normal / faded to "gear_alpha" %) stays the gear dialog's.
-public class DoomPadView extends View implements FrontMenu.Pad {
+public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Painter {
     static final int PAD_DEVICE = 0x7d00;
     static final int SETTINGS = -1;   // not a key: the menu button
     static final String PREFS = "doom_controls", PRESET_GAME = "game", PRESET_SWITCH = "switch";
@@ -85,8 +85,11 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     // steers the right stick instead: offset / WHEEL_R_DP, length capped at 1 (so turning back changes direction at once), kept after the
     // finger lifts until the key is released. The finger that holds the key steers too (like a held FIRE turns the view), so one thumb
     // presses R and slides toward the weapon. "wheel_key" (doom_controls): the keycode, 0 = off.
+    // [front] Off unless the port opts in: wheelDefault (the constructor's wheelKeyDefault) is the key without a saved "wheel_key"; DOOM 2016
+    // passes KEYCODE_E (its R, BUGS_AND_FIXES 2.42), every other port 0 (the old constructors) - their R keeps turning the view as before.
     private static final float WHEEL_R_DP = 40;
-    private int wheelKey = KeyEvent.KEYCODE_E; private boolean wheelOn; private float wheelX, wheelY;
+    private final int wheelDefault;
+    private int wheelKey; private boolean wheelOn; private float wheelX, wheelY;
     private long lookNanos;
     private float opacity = 1, sizeK = 1; private boolean shown = true, lookOn = true;
     // "split" (doom_controls, the editor's Grouped / Separate button; GitHub issue #9): every button is placed on its own: the A/B/X/Y
@@ -95,13 +98,39 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     private String preset = PRESET_GAME; private int builtFor = -2;   // the layout the controls were built for (-1 game, 0 tablet, 1 phone)
     private final Set<Integer> sent = new HashSet<>();   // keys held down in the game
     private Runnable editDone;
+    // [front] With a PadSurface (attachSurface, DOOM Eternal's anrfix b1b9a60, docs/port-kb APP-01) the pad is drawn on that surface's own thread,
+    // not on the window: the UI thread never waits for HWUI / the GPU (PadSurface.java has the ANR this fixes). Every change of what the pad shows
+    // happens under `lock` (UI thread) and the draw thread paints under it; redraw() replaces invalidate(). Touches are still handled here, on the
+    // UI thread, exactly as before. Without a surface (a port that never calls attachSurface, or detachSurface: DOOM 2016's DM_PAD_SURFACE=0 /
+    // dmPadHwui) it is the old View, drawn on the window, unchanged.
+    private final Object lock = new Object();
+    private PadSurface surface;
+    // The pad's surface, to add to the game's frame right under this view (above the game's SurfaceView); the same one on every call.
+    PadSurface attachSurface() {
+        if (surface == null) { surface = new PadSurface(getContext(), this); surface.setVisibility(getVisibility()); setWillNotDraw(true); }
+        return surface;
+    }
+    // Back to drawing on the window (UI thread): the surface is taken out of its parent and its thread ends.
+    void detachSurface() {
+        PadSurface s;
+        synchronized (lock) { s = surface; surface = null; }
+        if (s == null) return;
+        if (s.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) s.getParent()).removeView(s);
+        setWillNotDraw(false); invalidate();
+        android.util.Log.i("dm", "[java] pad drawn on the window again (HWUI)");
+    }
+    boolean drawsOnSurface() { return surface != null; }
+    private void redraw() { PadSurface s = surface; if (s != null) s.request(); else invalidate(); }
+    @Override public void setVisibility(int v) { super.setVisibility(v); PadSurface s = surface; if (s != null) s.setVisibility(v); }
 
-    // defaultPreset: PRESET_GAME (DOOM, Eternal, XC2) or PRESET_SWITCH (XC3); defaultSkin: PadSkin.CLASSIC or a pack
-    public DoomPadView(Context c) { this(c, PRESET_GAME, PadSkin.CLASSIC); }
-    public DoomPadView(Context c, String defaultPreset, String defaultSkin) {
+    // defaultPreset: PRESET_GAME (DOOM, Eternal, XC2) or PRESET_SWITCH (XC3); defaultSkin: PadSkin.CLASSIC or a pack; wheelKeyDefault: the weapon
+    // wheel key without a saved "wheel_key" (0 = no wheel: the two shorter constructors; DOOM 2016: KeyEvent.KEYCODE_E)
+    public DoomPadView(Context c) { this(c, PRESET_GAME, PadSkin.CLASSIC, 0); }
+    public DoomPadView(Context c, String defaultPreset, String defaultSkin) { this(c, defaultPreset, defaultSkin, 0); }
+    public DoomPadView(Context c, String defaultPreset, String defaultSkin, int wheelKeyDefault) {
         super(c);
         dp = c.getResources().getDisplayMetrics().density; dpi = c.getResources().getDisplayMetrics().ydpi;
-        defPreset = defaultPreset; defSkin = defaultSkin;
+        defPreset = defaultPreset; defSkin = defaultSkin; wheelDefault = wheelKeyDefault;
         skin = new PadSkin(c);
         line.setStyle(Paint.Style.STROKE); line.setStrokeWidth(2 * dp);
         text.setTextAlign(Paint.Align.CENTER); text.setTextSize(15 * dp);
@@ -157,7 +186,7 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         }
     }
     private int wantLayout() { return PRESET_SWITCH.equals(preset) && skin.theme != null && getHeight() > 0 ? (getWidth() >= PHONE_ASPECT * getHeight() ? 1 : 0) : -1; }
-    private void ensureBuilt() { int l = wantLayout(); if (l != builtFor) { releaseAll(); build(l); } }
+    private void ensureBuilt() { int l = wantLayout(); if (l != builtFor) { releaseAllLocked(); build(l); } }
     private String placeKey(Ctl c) { return "pos_" + (builtFor < 0 ? "game" : PadTheme.LAYOUT_NAMES[builtFor]) + "_" + c.name; }
     private SharedPreferences prefs() { return getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE); }
     private void loadPlaces() {
@@ -176,7 +205,7 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     private int gearMode = GEAR_NORMAL, gearAlpha = GEAR_ALPHA_DEFAULT;
     // Frame counter (gear dialog): fps, mean / max frame time and GPU time of the last 0.5 s, redrawn twice a second.
     private boolean showFps; private final float[] fstats = new float[4];
-    private final Runnable fpsTick = new Runnable() { public void run() { if (!showFps) return; try { DmActivity.nativeFrameStats(fstats); } catch (UnsatisfiedLinkError e) { fstats[0] = 0; } invalidate(); postDelayed(this, 500); } };
+    private final Runnable fpsTick = new Runnable() { public void run() { if (!showFps) return; synchronized (lock) { try { DmActivity.nativeFrameStats(fstats); } catch (UnsatisfiedLinkError e) { fstats[0] = 0; } } redraw(); postDelayed(this, 500); } };
     private void drawFps(Canvas c) {
         if (!showFps || fstats[0] <= 0) return;
         String t = String.format(Locale.ROOT, "%.0f fps  %.1f ms (max %.0f)%s", fstats[0], fstats[1], fstats[2],
@@ -188,25 +217,28 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         c.drawText(t, x, y, text);
     }
     void setControllerMode(boolean on) {
-        if (on == controllerMode) return;
-        controllerMode = on;
-        if (on) releaseAll();
-        invalidate();
+        synchronized (lock) {
+            if (on == controllerMode) return;
+            controllerMode = on;
+            if (on) releaseAllLocked();
+        }
+        redraw();
     }
     boolean controllerMode() { return controllerMode; }
 
-    @Override public void reloadSettings() {
+    @Override public void reloadSettings() { synchronized (lock) { reloadSettingsLocked(); } redraw(); }
+    private void reloadSettingsLocked() {
         SharedPreferences p = prefs();
         deadzone = p.getFloat("move_dz", 0f); showFps = p.getBoolean("fps", true); removeCallbacks(fpsTick); if (showFps) postDelayed(fpsTick, 500); lookGain = p.getFloat("look", 1.0f);
-        wheelKey = p.getInt("wheel_key", KeyEvent.KEYCODE_E);
+        wheelKey = p.getInt("wheel_key", wheelDefault);
         gearMode = p.getInt("gear_mode", GEAR_NORMAL) == GEAR_NORMAL ? GEAR_NORMAL : GEAR_FADED; gearAlpha = Math.max(1, Math.min(100, p.getInt("gear_alpha", GEAR_ALPHA_DEFAULT)));
         opacity = Math.max(5, Math.min(100, p.getInt("opacity", OPACITY_DEFAULT))) / 100f; sizeK = Math.max(60, Math.min(160, p.getInt("size", SIZE_DEFAULT))) / 100f;
         shown = p.getBoolean("shown", true); lookOn = p.getBoolean("look_on", true); tick = p.getBoolean("tick", false);
-        boolean sp = p.getBoolean("split", false); if (sp != split) { split = sp; if (builtFor != -2) { releaseAll(); builtFor = -2; } }
+        boolean sp = p.getBoolean("split", false); if (sp != split) { split = sp; if (builtFor != -2) { releaseAllLocked(); builtFor = -2; } }
         String pr = p.getString("preset", defPreset); if (!pr.equals(preset)) { preset = pr; builtFor = -2; }
         if (builtFor != -2) loadPlaces();
         skinPack = p.getString("skin", defSkin);
-        invalidate();
+        if (surface != null && getHeight() > 0) ensureBuilt();   // [front] the draw thread does not build the controls
     }
     private String skinPack = PadSkin.CLASSIC;
     @Override public String prefsName() { return PREFS; }
@@ -352,22 +384,23 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         if (on != wheelOn) { wheelOn = on; wheelX = wheelY = 0; lookDx = lookDy = 0; pendX = pendY = 0; }
     }
     // Every held key up, sticks centred, look stopped, zero axes (the pause menu, the editor, a controller taking over).
-    @Override public void releaseAll() {
+    @Override public void releaseAll() { synchronized (lock) { releaseAllLocked(); } redraw(); }
+    private void releaseAllLocked() {
         for (Ctl c : ctls) { c.pointer = -1; c.kx = c.ky = 0; c.dirBits = 0; }
         look.pointer = fireLook.pointer = wheelLook.pointer = -1; pendX = pendY = lookX = lookY = lookDx = lookDy = 0; lookNanos = 0; menuPtr = -1;
         wheelOn = false; wheelX = wheelY = 0;
         for (Integer k : sent) key(k, false);
         sent.clear();
         if (!controllerMode) try { DmActivity.nativePadAxes(PAD_DEVICE, 0, 0, 0, 0, 0, 0, 0, 0); } catch (UnsatisfiedLinkError e) { /* not loaded yet */ }
-        invalidate();
     }
     private void openMenu() { if (getContext() instanceof FrontMenu.Owner) { FrontMenu m = ((FrontMenu.Owner) getContext()).frontMenu(); if (m != null) m.open(); } }
 
     // ---- touches
     private int menuPtr = -1; private boolean menuMoved; private float menuX0, menuY0, menuGX, menuGY;
-    @Override public boolean onTouchEvent(MotionEvent e) {
+    @Override public boolean onTouchEvent(MotionEvent e) { synchronized (lock) { touch(e); kickPlayout(); } redraw(); return true; }
+    private void touch(MotionEvent e) {
         ensureBuilt();
-        if (edit) { editTouch(e); return true; }
+        if (edit) { editTouch(e); return; }
         int a = e.getActionMasked(), i = e.getActionIndex(), id = e.getPointerId(i);
         float x = e.getX(i), y = e.getY(i);
         switch (a) {
@@ -413,8 +446,6 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         }
         }
         if (!controllerMode) { updateWheel(); sendKeys(); axes(); }
-        invalidate();
-        return true;
     }
     private void menuDrag(Ctl c, float x, float y) {
         if (!menuMoved && Math.hypot(x - menuX0, y - menuY0) < DRAG_SLOP * getHeight()) return;
@@ -424,20 +455,25 @@ public class DoomPadView extends View implements FrontMenu.Pad {
     // ---- the layout editor (from Xenoblade 3's front end)
     private boolean edit; private Ctl edSel; private int edPtr = -1, edPtr2 = -1, edBtnDown = -1; private float edGX, edGY, edD0, edS0; private float[][] edSaved;
     @Override public void startEdit(Runnable done) {
-        ensureBuilt(); releaseAll(); edit = true; edSel = null; edPtr = edPtr2 = -1; editDone = done;
+        synchronized (lock) {
+        ensureBuilt(); releaseAllLocked(); edit = true; edSel = null; edPtr = edPtr2 = -1; editDone = done;
         edSaved = new float[ctls.size()][]; for (int i = 0; i < ctls.size(); i++) { Ctl c = ctls.get(i); edSaved[i] = new float[] {c.px, c.py, c.ps}; }
         android.util.Log.i("dm", "[java] layout editor open (" + preset + ")");
-        invalidate();
+        }
+        redraw();
     }
     @Override public boolean editing() { return edit; }
     @Override public void endEdit(boolean save) {
+        synchronized (lock) {
         if (!edit) return;
         if (save) savePlaces(); else for (int i = 0; i < ctls.size() && i < edSaved.length; i++) { Ctl c = ctls.get(i); c.px = edSaved[i][0]; c.py = edSaved[i][1]; c.ps = edSaved[i][2]; }
-        edit = false; edSel = null; invalidate();
+        edit = false; edSel = null;
+        }
+        redraw();
         android.util.Log.i("dm", "[java] layout editor " + (save ? "saved" : "cancelled"));
         Runnable d = editDone; editDone = null; if (d != null) d.run();
     }
-    @Override public void resetLayout() { ensureBuilt(); for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; } savePlaces(); invalidate(); }
+    @Override public void resetLayout() { synchronized (lock) { ensureBuilt(); for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; } savePlaces(); } redraw(); }
     private static final int ED_BUTTONS = 6;
     private RectF edButton(int k) {   // the toolbar at the top middle: - + Grouped/Separate Reset Cancel Save
         float H = getHeight(), bw = H * 0.17f, bh = H * 0.085f, gap = H * 0.02f, total = ED_BUTTONS * bw + (ED_BUTTONS - 1) * gap, x0 = (getWidth() - total) / 2, y0 = H * 0.035f;
@@ -472,7 +508,7 @@ public class DoomPadView extends View implements FrontMenu.Pad {
         if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_POINTER_DOWN) {
             int id = e.getPointerId(ai); float x = e.getX(ai), y = e.getY(ai);
             int bt = edButtonAt(x, y);
-            if (bt >= 0 && edPtr < 0) { edBtnDown = bt; edPtr = id; invalidate(); return; }
+            if (bt >= 0 && edPtr < 0) { edBtnDown = bt; edPtr = id; redraw(); return; }
             if (edPtr >= 0 && edSel != null && edPtr2 < 0 && edBtnDown < 0) {   // a second finger pinches the chosen control
                 int k = e.findPointerIndex(edPtr); if (k >= 0) { edD0 = (float) Math.hypot(x - e.getX(k), y - e.getY(k)); edPtr2 = id; edS0 = edSel.ps; edGrab(edSel); }
                 return;
@@ -480,13 +516,13 @@ public class DoomPadView extends View implements FrontMenu.Pad {
             if (edPtr >= 0) return;
             Ctl c = hit(x, y, true); edSel = c; edPtr = c != null ? id : -1; edBtnDown = -1;
             if (c != null) { float[] b = box(c); edGX = b[0] - x; edGY = b[1] - y; edGrab(c); }
-            invalidate();
+            redraw();
         } else if (a == MotionEvent.ACTION_MOVE) {
             if (edPtr < 0 || edBtnDown >= 0 || edSel == null) return;
             int k1 = e.findPointerIndex(edPtr), k2 = edPtr2 >= 0 ? e.findPointerIndex(edPtr2) : -1;
             if (k1 >= 0 && k2 >= 0 && edD0 > 1) edScaleGroup((float) Math.hypot(e.getX(k1) - e.getX(k2), e.getY(k1) - e.getY(k2)) / edD0);
             else if (k1 >= 0) { int s = edGroup.indexOf(edSel); if (s >= 0) edMoveGroup(e.getX(k1) + edGX - edStart[s][0], e.getY(k1) + edGY - edStart[s][1]); }
-            invalidate();
+            redraw();
         } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_POINTER_UP || a == MotionEvent.ACTION_CANCEL) {
             int id = e.getPointerId(ai);
             if (id == edPtr2) { edPtr2 = -1; if (edSel != null) { edGrab(edSel); int k = e.findPointerIndex(edPtr); int s = edGroup.indexOf(edSel); if (k >= 0 && s >= 0) { edGX = edStart[s][0] - e.getX(k); edGY = edStart[s][1] - e.getY(k); } } return; }
@@ -499,16 +535,49 @@ public class DoomPadView extends View implements FrontMenu.Pad {
                 else if (bt == 4) { endEdit(false); return; }
                 else { endEdit(true); return; }
             }
-            invalidate();
+            redraw();
         }
     }
 
     // ---- drawing
     @Override protected void onDraw(Canvas c) {
         super.onDraw(c);
+        if (surface != null) return;   // [front] drawn by PadSurface's thread
         ensureBuilt();
         // tick every frame while a pending turn is being played out
         if (pendX != 0 || pendY != 0 || lookX != 0 || lookY != 0) { axes(); postInvalidateOnAnimation(); }
+        drawPad(c);
+    }
+    // [front] With a PadSurface the pending stick turn (DM_TOUCH_LOOK=stick) is played out by a Choreographer callback on the UI thread, which draws nothing.
+    private boolean playoutPosted;
+    private final Runnable playout = () -> { synchronized (lock) { playoutPosted = false; if (pendX != 0 || pendY != 0 || lookX != 0 || lookY != 0) { axes(); kickPlayout(); } } };
+    private void kickPlayout() { if (surface != null && !playoutPosted && (pendX != 0 || pendY != 0 || lookX != 0 || lookY != 0)) { playoutPosted = true; postOnAnimation(playout); } }
+    @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
+        super.onSizeChanged(w, h, ow, oh);
+        if (surface != null) { synchronized (lock) { ensureBuilt(); } redraw(); }
+    }
+    // ---- [front] PadSurface.Painter: the draw thread, under lock
+    @Override public Object paintLock() { return lock; }
+    @Override public long paintSignature() {
+        int w = getWidth(), ht = getHeight();
+        if (w <= 0 || ht <= 0) return PadSurface.NOT_READY;
+        if (builtFor != wantLayout()) { post(() -> { synchronized (lock) { ensureBuilt(); } redraw(); }); return PadSurface.NOT_READY; }   // the controls are built on the UI thread
+        long s = 17;
+        s = s * 31 + w; s = s * 31 + ht; s = s * 31 + builtFor; s = s * 31 + ctls.size();
+        s = s * 31 + ((edit ? 1 : 0) | (controllerMode ? 2 : 0) | (shown ? 4 : 0) | (showFps ? 8 : 0) | (split ? 16 : 0) | gearMode << 5);
+        s = s * 31 + Float.floatToIntBits(opacity); s = s * 31 + Float.floatToIntBits(sizeK); s = s * 31 + gearAlpha;
+        s = s * 31 + skinPack.hashCode(); s = s * 31 + preset.hashCode();
+        s = s * 31 + (edSel == null ? -1 : ctls.indexOf(edSel)); s = s * 31 + edBtnDown;
+        if (showFps && !edit) for (float f : fstats) s = s * 31 + Float.floatToIntBits(f);
+        for (Ctl k : ctls) {
+            s = s * 31 + (k.pointer >= 0 ? 1 : 0); s = s * 31 + k.dirBits;
+            s = s * 31 + Float.floatToIntBits(k.kx); s = s * 31 + Float.floatToIntBits(k.ky);
+            s = s * 31 + Float.floatToIntBits(k.px); s = s * 31 + Float.floatToIntBits(k.py); s = s * 31 + Float.floatToIntBits(k.ps);
+        }
+        return s == PadSurface.NOT_READY ? s + 1 : s;
+    }
+    @Override public void paint(Canvas c) { drawPad(c); }
+    private void drawPad(Canvas c) {
         if (!edit) drawFps(c);
         skin.select(skinPack, PadSkin.layoutFor(getWidth(), getHeight()));
         if (edit) c.drawColor(0x55000000);

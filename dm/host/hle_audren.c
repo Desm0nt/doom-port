@@ -26,6 +26,10 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <errno.h>
+#include <sys/resource.h>
+#endif
 
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
 void dm_guest_thread_join(void *tt);
@@ -103,14 +107,40 @@ static pthread_mutex_t g_cq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_
 static void cq_popped(void) { pthread_mutex_lock(&g_cq_mu); pthread_cond_broadcast(&g_cq_cv); pthread_mutex_unlock(&g_cq_mu); }
 
 typedef struct { void *ptr; uint64_t cap, size; } gbuf;       // same as the front of hle_audio.c's AudioOutBuffer
+// [DOOM] issue #32 (Samsung S23, 8 Gen 2: crackling during the startup Bink movies, whose sound is the only thing this renderer carries;
+// Wwise has its own AudioOut). On the Switch this renderer runs on the audio DSP / the audio system process (core 3, top priority), never
+// behind the game's threads. Here it is one host thread that renders a 5 ms frame each time the output hands a buffer back, and the
+// output plays zeros when the queue runs dry: with 4 buffers in flight a render thread late by more than ~15-20 ms was an audible gap.
+// It ran at the nice every guest thread gets (-10, hle_thread.c thread_main), level with the Bink decoders, the game's main thread and
+// its workers, all busy during the movies. Two Switch-like defaults:
+//   DM_AUDREN_NBUF=<2..16>  buffers in flight (default 8 = 40 ms; 4 = the old 20 ms). Audio heard later than rendered by that much more,
+//                           far inside lip-sync tolerance for audio after picture (~125 ms).
+//   DM_AUDREN_NICE=<-20..0> host nice of the render thread (default -16 = Android THREAD_PRIORITY_AUDIO, above the guests' -10 and the
+//                           translator's -8; 0 = leave it at the guest default, the old behaviour).
+// Diagnostics: every 10 s (2000 frames) "audren: output last 10.0 s: queued low-water …" (0 = the output ran dry: this thread was late),
+// longest gap between two frames and short silent gaps inside the mix (1-8 silent frames between loud ones: the game's voices ran out,
+// i.e. the guest side was late, not this thread). DM_AUDREN_FAKE_STALL=<ms>: once a second this thread sleeps that long before rendering
+// (reproduces a starved render thread on any phone: with DM_AUDREN_NBUF=4 a 30 ms stall crackles once a second, with 8 it does not).
+enum { NBUF_MAX = 16 };
+static int ar_env(const char *n, int def, int lo, int hi) { const char *e = getenv(n); int v = e && *e ? atoi(e) : def; return v < lo ? lo : v > hi ? hi : v; }
+static _Atomic uint64_t g_gaps;   // short silent gaps inside the mix (capture)
 static void render_main(void *arg) {
     (void)arg;
     void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
+    const int nbuf = ar_env("DM_AUDREN_NBUF", 8, 2, NBUF_MAX), want_nice = ar_env("DM_AUDREN_NICE", -16, -20, 0), fake_ms = ar_env("DM_AUDREN_FAKE_STALL", 0, 0, 1000);
+    int nice_rc = 0, nice_got = 0;
+#ifdef __linux__
+    if (want_nice) { nice_rc = setpriority(PRIO_PROCESS, (id_t)gettid(), want_nice) ? errno : 0; errno = 0; nice_got = getpriority(PRIO_PROCESS, (id_t)gettid()); }
+    else nice_got = getpriority(PRIO_PROCESS, (id_t)gettid());
+#endif
     void *out = dm_pcmout_open(2);
-    static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
-    for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+    static int16_t data[NBUF_MAX][FRAME_MAX * 2]; static gbuf bufs[NBUF_MAX]; gbuf *free_list[NBUF_MAX]; int nfree = nbuf;
+    for (int i = 0; i < nbuf; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
     dm_pcmout_start(out);
-    LOG("audren: render thread started (%d buffers in flight, paced by the output)", NBUF);
+    LOG("audren: render thread started (%d buffers = %d ms in flight, DM_AUDREN_NBUF; host nice %d%s, DM_AUDREN_NICE=%d), paced by the output", nbuf, nbuf * 5, nice_got,
+        nice_rc ? " [RED] could not be raised" : "", want_nice);
+    if (fake_ms) LOG("[RED] audren: DM_AUDREN_FAKE_STALL=%d: the render thread sleeps %d ms once a second (diagnostic)", fake_ms, fake_ms);
+    uint64_t n_app = 0, t_app = 0, gap_max = 0, gaps0 = 0; int low = nbuf;
     while (atomic_load(&g_open)) {
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
             gbuf *b = dm_pcmout_released(out);
@@ -119,6 +149,7 @@ static void render_main(void *arg) {
             if (!atomic_load(&g_open)) break;
         }
         if (!nfree) break;
+        if (fake_ms && n_app && n_app % 200 == 0) usleep((useconds_t)fake_ms * 1000);
         const int16_t *src; int got;
         uint32_t h = atomic_load(&g_cq_head);
         if (h != atomic_load(&g_cq_tail)) { src = g_cq[h % CQ]; got = g_cq_n[h % CQ]; atomic_store(&g_cq_head, h + 1); cq_popped(); }   // play queued catch-up output first
@@ -127,7 +158,18 @@ static void render_main(void *arg) {
         gbuf *b = free_list[--nfree];
         if (got) memcpy(b->ptr, src, (size_t)n * 4); else memset(b->ptr, 0, (size_t)n * 4);
         b->size = (uint64_t)n * 4;
+        // issue #32 diagnostic: buffers still queued in the output when this one goes in (low-water; 0 = it had run dry) and the longest gap
+        // between two appends. The first nbuf appends fill the queue and are not counted
+        uint64_t t = now_ns();
+        if (n_app >= (uint64_t)nbuf) { int queued = nbuf - nfree - 1; if (queued < low) low = queued; if (t - t_app > gap_max) gap_max = t - t_app; }
+        t_app = t;
         if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
+        if (++n_app % 2000 == 0) {
+            uint64_t gp = atomic_load(&g_gaps);
+            LOG("audren: output last 10.0 s: queued low-water %d of %d buffers (0 = the output ran dry: render thread late), longest gap between frames %.1f ms (%d ms in flight), short silent gaps in the mix %llu (game voices ran out)",
+                low, nbuf, gap_max / 1e6, nbuf * 5, (unsigned long long)(gp - gaps0));
+            low = nbuf; gap_max = 0; gaps0 = gp;
+        }
     }
     dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
     cq_popped();   // an update waiting for queue space (catch-up pacing) sees g_open cleared
@@ -178,6 +220,10 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
     if (atomic_load(&g_open)) { LOG("[RED] audren: a second renderer (the host drives only one)"); return r; }
     g_handle[0] = handle[0]; g_handle[1] = handle[1]; atomic_store(&g_open, 1);
     g_render_tt = dm_guest_thread_spawn(render_main, NULL, 9, 0x10000);
+    {   // issue #32: a guest name, so the host thread name (hle_thread.c thr_host_name) and "[perf] threads 10s:" show this thread as dm-audren
+        void (*setname)(void *, const char *) = guest_sym("_ZN2nn2os13SetThreadNameEPNS0_10ThreadTypeEPKc");
+        if (setname && g_render_tt) setname(g_render_tt, "dm-audren");
+    }
     return r;
 }
 HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm", "open the renderer (with event): CPU rendering + manual execution, the host starts a render thread",
@@ -313,6 +359,11 @@ static int capture(const uint8_t *cl, size_t len, int16_t *dst) {
                 dst[s] = (int16_t)v; loud |= (uint64_t)v;
             }
             atomic_fetch_add(&g_frames, 1); if (loud) atomic_fetch_add(&g_nonsilent, 1);
+            {   // issue #32: a run of 1-8 exactly silent frames (5-40 ms) between loud ones = the game's voices ran out of data (a guest-side gap)
+                static int quiet = -1;   // silent frames since the last loud one; -1 = no loud frame yet
+                if (loud) { if (quiet >= 1 && quiet <= 8) atomic_fetch_add(&g_gaps, 1); quiet = 0; }
+                else if (quiet >= 0 && quiet < 1000) quiet++;
+            }
             uint64_t f = atomic_load(&g_frames); if (f == 200 || f % 12000 == 0) LOG("audren: rendered %llu frames, %llu of them not silent", (unsigned long long)f, (unsigned long long)atomic_load(&g_nonsilent));
             return (int)nout;
         }

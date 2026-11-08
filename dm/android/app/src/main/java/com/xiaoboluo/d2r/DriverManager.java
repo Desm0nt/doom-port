@@ -28,35 +28,38 @@ import java.util.regex.Pattern;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-// [DOOM] The Vulkan driver manager (BUGS_AND_FIXES 2.39), "Manage drivers…" under the gear dialog's driver list, after Winlator Ludashi's
-// driver ("contents") manager:
+// [front] The Vulkan driver manager, shared by every port (frontend-common; DOOM 2016's BUGS_AND_FIXES 2.39, moved from its port with
+// DmActivity's driver helpers -> VkDrivers and DmActivity -> GearHost), "Manage drivers…" under the gear dialog's driver list
+// (GearPages.driver), after Winlator Ludashi's driver ("contents") manager:
 //   - the installed packages (files/drivers/<name>/: bundled with the APK, downloaded, installed from a file or imported from
-//     <game folder>/drivers) with meta.json name / version / description, GPU family, size, origin (<name>/.dm_origin, DmActivity.writeOrigin)
-//     and why one cannot run here (DmActivity.driverProblem). All but the bundled ones can be deleted (the next start copies those again);
-//   - "Install from file": the system file picker (ACTION_OPEN_DOCUMENT) -> a zip -> DmActivity.unzipDriver -> the same checks; a package
+//     GearHost.driverImportDir) with meta.json name / version / description, GPU family, size, origin (<name>/.dm_origin, VkDrivers.writeOrigin)
+//     and why one cannot run here (VkDrivers.problem). All but the bundled ones can be deleted (the next start copies those again);
+//   - "Install from file": the system file picker (ACTION_OPEN_DOCUMENT) -> a zip -> VkDrivers.unzipDriver -> the same checks; a package
 //     that cannot run on this phone (another GPU family, a glibc build, a missing library, meta.json minApi) is removed again with the reason;
-//   - "Download": drivers/sources.json of the repository (cached 6 h, the APK carries a copy: assets/driver-sources.json) lists GitHub
+//   - "Download": GearHost.driverSourcesUrl (the DOOM 2016 repository's drivers/sources.json; cached 6 h, the APK carries a copy:
+//     assets/driver-sources.json, frontend-common/tools/drivers/sources.json; null = no Download button) lists GitHub
 //     repositories; for the ones of this phone's GPU family (all with "Show all GPUs") the unauthenticated releases API gives the zips
 //     (cached 6 h, a rate limit falls back to the cache); a tap downloads one (progress, cancel), checks the SHA-256 GitHub gives in the
 //     asset's "digest" when it gives one, unpacks and checks it like a file install.
 // The gear dialog rebuilds its driver list when this closes (the changed callback). Network and unpacking run on background threads,
-// the dialogs on the UI thread; offline the installed list and file installs still work. The crash guard (DmActivity.DRIVER_GUARD_STRIKES)
+// the dialogs on the UI thread; offline the installed list and file installs still work. The crash guard (VkDrivers.GUARD_STRIKES)
 // treats these packages like any other: two launches that die before their first frame switch back to the system driver.
+// The port's onActivityResult hands the file pick back: if (request == driverZipRequest()) DriverManager.picked(this, uri).
 final class DriverManager {
-    static final String SOURCES_URL = "https://raw.githubusercontent.com/Desm0nt/doom-port/main/drivers/sources.json";
-    static final int REQ_ZIP = 4712;                    // DmActivity.onActivityResult -> picked()
+    static final int REQ_ZIP = 4712;                    // the port's onActivityResult -> picked() (GearHost.driverZipRequest)
     static final long CACHE_MS = 6L * 3600 * 1000;      // sources.json and the releases lists
     static final int MAX_ZIP = 256 << 20;
     private static WeakReference<DriverManager> waiting = new WeakReference<>(null);   // the manager a file pick returns to
 
-    private final DmActivity a;
+    private final VkDrivers vk; private final GearHost host; private final android.app.Activity a;
     private final Runnable changed;
     private LinearLayout list;
     private boolean dirty;
     private Runnable dlRefresh;   // re-renders the Download dialog (the "installed" marks) while it is open
 
-    DriverManager(DmActivity a, Runnable changed) { this.a = a; this.changed = changed; }
-    private File dir() { return new File(a.getFilesDir(), "drivers"); }
+    DriverManager(VkDrivers d, Runnable changed) { this.vk = d; this.host = d.host; this.a = d.host.activity(); this.changed = changed; }
+    private File dir() { return vk.dir(); }
+    private String ua() { return host.dataDirName().replace(' ', '-') + "-driver-manager"; }   // DOOM 2016: "DOOM-Mobile-driver-manager"
     private File cacheDir() { File c = new File(dir(), ".cache"); c.mkdirs(); return c; }
     private String t(String ru, String en) { return Ui.t(a, ru, en); }
     private LinearLayout vbox() { LinearLayout b = new LinearLayout(a); b.setOrientation(LinearLayout.VERTICAL); return b; }
@@ -82,10 +85,10 @@ final class DriverManager {
     }
     // {kind, detail} of a package; before 2.39 there was no origin file: a bundled name, a manifest name or else an import.
     private String[] origin(String name, Set<String> bundled) {
-        String[] o = DmActivity.readOrigin(new File(dir(), name)); if (o != null) return o;
+        String[] o = VkDrivers.readOrigin(new File(dir(), name)); if (o != null) return o;
         if (bundled.contains(name)) return new String[] {"bundled", ""};
         try {
-            JSONArray pk = new JSONObject(DmActivity.readSmall(new File(dir(), "manifest.json"))).getJSONArray("packages");
+            JSONArray pk = new JSONObject(VkDrivers.readSmall(new File(dir(), "manifest.json"))).getJSONArray("packages");
             for (int i = 0; i < pk.length(); i++) if (name.equals(pk.getJSONObject(i).optString("name"))) return new String[] {"download", "manifest"};
         } catch (Exception e) { /* no manifest */ }
         return new String[] {"import", ""};
@@ -102,17 +105,17 @@ final class DriverManager {
     // ---- the manager dialog
     void show() {
         LinearLayout box = vbox(); box.setPadding(48, 24, 48, 0);
-        text(box, t("Этот телефон: ", "This phone: ") + familyName(DmActivity.phoneFamily()) + ", Android " + android.os.Build.VERSION.RELEASE
-            + " (API " + android.os.Build.VERSION.SDK_INT + ")\n" + DmActivity.hardwareSummary() + "\n"
+        text(box, t("Этот телефон: ", "This phone: ") + familyName(VkDrivers.phoneFamily()) + ", Android " + android.os.Build.VERSION.RELEASE
+            + " (API " + android.os.Build.VERSION.SDK_INT + ")\n" + VkDrivers.hardwareSummary() + "\n"
             + t("Выбор драйвера — в списке «Драйвер Vulkan» в настройках, действует со следующего запуска. Драйверы не для Adreno — экспериментальные; если игра с драйвером дважды не дойдёт до первого кадра, включится системный.",
                 "Pick the driver in the settings' \"Vulkan driver\" list; it applies on the next launch. Drivers for GPUs other than Adreno are experimental; if the game fails to reach its first frame twice with one, the system driver is used again."));
         Button file = button(box, t("Установить из файла (zip)…", "Install from file (zip)…"));
-        Button dl = button(box, t("Скачать…", "Download…"));
+        Button dl = button(box, t("Скачать…", "Download…")); if (host.driverSourcesUrl() == null) dl.setVisibility(android.view.View.GONE);
         heading(box, t("Установленные пакеты", "Installed packages"));
         list = vbox(); box.addView(list); fill();
         ScrollView sc = new ScrollView(a); sc.addView(box);
         AlertDialog d = new AlertDialog.Builder(a).setTitle(t("Драйверы Vulkan", "Vulkan drivers")).setView(sc).setNegativeButton(t("Закрыть", "Close"), null).create();
-        d.setOnDismissListener(x -> { a.immersive(); if (dirty && changed != null) changed.run(); });
+        d.setOnDismissListener(x -> { host.immersive(); if (dirty && changed != null) changed.run(); });
         file.setOnClickListener(v -> pickFile());
         dl.setOnClickListener(v -> showDownloads());
         d.show();
@@ -120,39 +123,39 @@ final class DriverManager {
     private void fill() {
         if (list == null) return;
         list.removeAllViews();
-        Set<String> bundled = bundledNames(); String cur = a.doomPrefs().getString("driver", null);
-        String[] names = a.driverPackages();
+        Set<String> bundled = bundledNames(); String cur = host.gamePrefs().getString("driver", null);
+        String[] names = vk.packages();
         if (names.length == 0) text(list, t("Пакетов нет: работает системный драйвер.", "No packages: the system driver is used."));
         for (String n : names) {
-            File d = new File(dir(), n); JSONObject m = a.driverMeta(n); String[] org = origin(n, bundled); String why = a.driverProblem(n);
-            StringBuilder sb = new StringBuilder(a.driverLabel(n));
+            File d = new File(dir(), n); JSONObject m = vk.meta(n); String[] org = origin(n, bundled); String why = vk.problem(n);
+            StringBuilder sb = new StringBuilder(vk.label(n));
             if (n.equals(cur)) sb.append(t(" — выбран", " — selected"));
             ArrayList<String> parts = new ArrayList<>();
             String ver = m != null ? m.optString("driverVersion", "") : "", pv = m != null ? m.optString("packageVersion", "") : "";
             if (!ver.isEmpty()) parts.add(ver);
             if (!pv.isEmpty()) parts.add(t("пакет ", "package ") + pv);
-            parts.add(familyName(a.driverFamily(n))); parts.add(mb(DmActivity.treeSize(d))); parts.add(originText(org));
+            parts.add(familyName(vk.family(n))); parts.add(mb(VkDrivers.treeSize(d))); parts.add(originText(org));
             sb.append('\n').append(android.text.TextUtils.join(" · ", parts));
             String desc = m != null ? m.optString("description", "").trim() : "";
             if (!desc.isEmpty()) sb.append('\n').append(desc.length() > 220 ? desc.substring(0, 217) + "..." : desc);
-            if (why != null) sb.append('\n').append(t("Не запустится здесь: ", "Cannot run here: ")).append(a.driverReasonText(why));
+            if (why != null) sb.append('\n').append(t("Не запустится здесь: ", "Cannot run here: ")).append(vk.reasonText(why));
             TextView v = text(list, sb.toString()); v.setPadding(0, 16, 0, 0);
             if (!"bundled".equals(org[0])) { Button del = button(list, t("Удалить ", "Delete ") + n); del.setOnClickListener(x -> confirmDelete(n, org)); }
         }
     }
     private void confirmDelete(String n, String[] org) {
-        String msg = t("Удалить пакет ", "Delete the package ") + a.driverLabel(n) + "?";
+        String msg = t("Удалить пакет ", "Delete the package ") + vk.label(n) + "?";
         if ("import".equals(org[0])) msg += "\n\n" + t("Он снова появится при следующем запуске, пока лежит в ", "It comes back at the next start while it is in ")
-            + (org[1].isEmpty() ? GameFolder.dir(a).getAbsolutePath() + "/drivers" : org[1]) + ".";
+            + (org[1].isEmpty() ? String.valueOf(host.driverImportDir()) : org[1]) + ".";
         new AlertDialog.Builder(a).setMessage(msg).setPositiveButton(t("Удалить", "Delete"), (x, w) -> delete(n)).setNegativeButton(t("Отмена", "Cancel"), null).show();
     }
     private void delete(String n) {
-        DmActivity.deleteDriverTree(new File(dir(), n));
-        SharedPreferences p = a.doomPrefs(); SharedPreferences.Editor e = p.edit();
+        VkDrivers.deleteDriverTree(new File(dir(), n));
+        SharedPreferences p = host.gamePrefs(); SharedPreferences.Editor e = p.edit();
         if (n.equals(p.getString("driver", null))) e.remove("driver");   // back to this GPU's default
         Set<String> rm = new HashSet<>(p.getStringSet("driver_removed", Collections.emptySet())); rm.add(n);
         e.putStringSet("driver_removed", rm).apply();   // the manifest updater does not fetch it again
-        a.crumb("driver manager: " + n + " deleted");
+        host.crumb("driver manager: " + n + " deleted");
         dirty = true; fill(); if (dlRefresh != null) dlRefresh.run();
     }
 
@@ -161,14 +164,14 @@ final class DriverManager {
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT); i.addCategory(Intent.CATEGORY_OPENABLE); i.setType("*/*");
         i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"application/zip", "application/x-zip-compressed", "application/octet-stream"});
         waiting = new WeakReference<>(this);
-        try { a.startActivityForResult(i, REQ_ZIP); }
-        catch (android.content.ActivityNotFoundException e) { a.crumb("driver manager: no file picker"); android.widget.Toast.makeText(a, R.string.folder_no_picker, android.widget.Toast.LENGTH_LONG).show(); }
+        try { a.startActivityForResult(i, host.driverZipRequest()); }
+        catch (android.content.ActivityNotFoundException e) { host.crumb("driver manager: no file picker"); android.widget.Toast.makeText(a, GearText.s(a, "folder_no_picker"), android.widget.Toast.LENGTH_LONG).show(); }
     }
-    // DmActivity.onActivityResult: the zip the player picked (null = cancelled)
-    static void picked(DmActivity a, Uri u) {
+    // The port's onActivityResult: the zip the player picked (null = cancelled)
+    static void picked(GearHost h, Uri u) {
         DriverManager m = waiting.get(); waiting = new WeakReference<>(null);
-        if (u == null) { a.crumb("driver manager: file pick cancelled"); return; }
-        if (m == null || m.a != a) m = new DriverManager(a, null);   // the activity was recreated meanwhile: install without the dialogs behind
+        if (u == null) { h.crumb("driver manager: file pick cancelled"); return; }
+        if (m == null || m.host != h) { if (h.drivers() == null) return; m = new DriverManager(h.drivers(), null); }   // the activity was recreated meanwhile: install without the dialogs behind
         m.installUri(u);
     }
     private String displayName(Uri u) {
@@ -179,7 +182,7 @@ final class DriverManager {
     }
     private void installUri(Uri u) {
         final String name = displayName(u);
-        a.crumb("driver manager: installing " + name + " from " + u);
+        host.crumb("driver manager: installing " + name + " from " + u);
         final Progress pg = progress(t("Установка ", "Installing ") + name, false);
         new Thread(() -> {
             Result r; File tmp = new File(dir(), ".install.zip");
@@ -213,26 +216,26 @@ final class DriverManager {
         String name = folderName(zipName);
         if (bundledNames().contains(name)) name += "-user";   // never over a bundled package (the next start would copy it back)
         File stage = new File(dir(), ".stage-" + name), out = new File(dir(), name);
-        try (InputStream in = new FileInputStream(zip)) { DmActivity.unzipDriver(in, stage); }
-        catch (IOException e) { DmActivity.deleteDriverTree(stage); return Result.fail(t("это не пакет драйвера adrenotools (", "this is not an adrenotools driver package (") + e.getMessage() + ")"); }
+        try (InputStream in = new FileInputStream(zip)) { VkDrivers.unzipDriver(in, stage); }
+        catch (IOException e) { VkDrivers.deleteDriverTree(stage); return Result.fail(t("это не пакет драйвера adrenotools (", "this is not an adrenotools driver package (") + e.getMessage() + ")"); }
         // checked while staged (".stage-" adds no family word, so the folder name counts as at every start); an installed package of the
         // same name is replaced only by one that can run here
-        String why = a.driverProblem(stage.getName());
-        if (why != null) { DmActivity.deleteDriverTree(stage); return Result.fail(t("не подходит этому телефону: ", "it cannot run on this phone: ") + a.driverReasonText(why)); }
-        DmActivity.writeOrigin(stage, kind, detail);
-        DmActivity.deleteDriverTree(out);
-        if (!stage.renameTo(out)) { DmActivity.deleteDriverTree(stage); return Result.fail("rename failed: " + out); }
-        SharedPreferences p = a.doomPrefs(); Set<String> rm = new HashSet<>(p.getStringSet("driver_removed", Collections.emptySet()));
+        String why = vk.problem(stage.getName());
+        if (why != null) { VkDrivers.deleteDriverTree(stage); return Result.fail(t("не подходит этому телефону: ", "it cannot run on this phone: ") + vk.reasonText(why)); }
+        VkDrivers.writeOrigin(stage, kind, detail);
+        VkDrivers.deleteDriverTree(out);
+        if (!stage.renameTo(out)) { VkDrivers.deleteDriverTree(stage); return Result.fail("rename failed: " + out); }
+        SharedPreferences p = host.gamePrefs(); Set<String> rm = new HashSet<>(p.getStringSet("driver_removed", Collections.emptySet()));
         if (rm.remove(name)) p.edit().putStringSet("driver_removed", rm).apply();
         Result r = new Result(); r.name = name; return r;
     }
     private void done(Result r, String what) {
-        if (r.cancelled) { a.crumb("driver manager: " + what + " cancelled"); return; }
-        a.crumb("driver manager: " + what + (r.name != null ? " installed as " + r.name : " not installed: " + r.error) + (r.sha != null ? " sha256 " + r.sha + (r.verified ? " (matches GitHub)" : " (no digest)") : ""));
+        if (r.cancelled) { host.crumb("driver manager: " + what + " cancelled"); return; }
+        host.crumb("driver manager: " + what + (r.name != null ? " installed as " + r.name : " not installed: " + r.error) + (r.sha != null ? " sha256 " + r.sha + (r.verified ? " (matches GitHub)" : " (no digest)") : ""));
         if (r.name != null) { dirty = true; fill(); if (dlRefresh != null) dlRefresh.run(); }
         if (gone()) return;
         String msg = r.name != null
-            ? t("Установлен: ", "Installed: ") + a.driverLabel(r.name) + "\n\n" + t("Выберите его в списке «Драйвер Vulkan» в настройках (действует со следующего запуска).",
+            ? t("Установлен: ", "Installed: ") + vk.label(r.name) + "\n\n" + t("Выберите его в списке «Драйвер Vulkan» в настройках (действует со следующего запуска).",
                 "Pick it in the settings' \"Vulkan driver\" list (applies on the next launch).")
             : t("Не установлено: ", "Not installed: ") + r.error;
         if (r.sha != null) msg += "\n\nSHA-256 " + r.sha + "\n" + (r.verified ? t("совпадает с GitHub", "matches GitHub") : t("GitHub не дал контрольной суммы для сверки", "GitHub gave no checksum to compare with"));
@@ -291,12 +294,12 @@ final class DriverManager {
         return e.getMessage() == null ? e.toString() : e.getMessage();
     }
     // An https connection that answered 200, redirects followed by hand (release assets redirect to another host).
-    static java.net.HttpURLConnection connect(String url, boolean api) throws IOException {
+    static java.net.HttpURLConnection connect(String url, boolean api, String ua) throws IOException {
         for (int hop = 0; hop < 6; hop++) {
             if (!url.startsWith("https://")) throw new IOException("not https: " + url);
             java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
             c.setConnectTimeout(10000); c.setReadTimeout(30000); c.setInstanceFollowRedirects(false);
-            c.setRequestProperty("User-Agent", "DOOM-Mobile-driver-manager");
+            c.setRequestProperty("User-Agent", ua);
             if (api) { c.setRequestProperty("Accept", "application/vnd.github+json"); c.setRequestProperty("X-GitHub-Api-Version", "2022-11-28"); }
             int code = c.getResponseCode();
             if (code / 100 == 3) { String loc = c.getHeaderField("Location"); c.disconnect(); if (loc == null) break; url = new java.net.URL(new java.net.URL(url), loc).toString(); continue; }
@@ -308,8 +311,8 @@ final class DriverManager {
         }
         throw new IOException("too many redirects");
     }
-    static byte[] get(String url, int max, boolean api) throws IOException {
-        java.net.HttpURLConnection c = connect(url, api);
+    static byte[] get(String url, int max, boolean api, String ua) throws IOException {
+        java.net.HttpURLConnection c = connect(url, api, ua);
         try (InputStream in = c.getInputStream()) {
             java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[1 << 16]; int n;
             while ((n = in.read(buf)) > 0) { b.write(buf, 0, n); if (b.size() > max) throw new IOException("too large: " + url); }
@@ -320,28 +323,28 @@ final class DriverManager {
     // error in err; null when there is neither.
     private String cached(String url, String file, boolean force, boolean api, StringBuilder err) {
         File c = new File(cacheDir(), file);
-        if (!force && c.isFile() && System.currentTimeMillis() - c.lastModified() < CACHE_MS) try { return DmActivity.readSmall(c); } catch (IOException e) { /* fetch again */ }
+        if (!force && c.isFile() && System.currentTimeMillis() - c.lastModified() < CACHE_MS) try { return VkDrivers.readSmall(c); } catch (IOException e) { /* fetch again */ }
         try {
-            byte[] b = get(url, 8 << 20, api);
+            byte[] b = get(url, 8 << 20, api, ua());
             File tmp = new File(c.getPath() + ".part");
             try (OutputStream os = new FileOutputStream(tmp)) { os.write(b); }
             if (!tmp.renameTo(c)) tmp.delete();
             return new String(b, StandardCharsets.UTF_8);
         } catch (IOException e) {
             err.append(describe(e));
-            try { return c.isFile() ? DmActivity.readSmall(c) : null; } catch (IOException x) { return null; }
+            try { return c.isFile() ? VkDrivers.readSmall(c) : null; } catch (IOException x) { return null; }
         }
     }
     private static Pattern regex(String s, String def) { try { return Pattern.compile(s == null || s.isEmpty() ? def : s); } catch (RuntimeException e) { return Pattern.compile(def); } }
     // Background: sources.json (network / cache / the APK's copy), then the releases of every source shown (this phone's family, or all).
     private List<Src> load(boolean all, boolean force, StringBuilder note) {
         StringBuilder err = new StringBuilder();
-        String js = cached(SOURCES_URL, "sources.json", force, false, err);
-        if (js == null) try (InputStream in = a.getAssets().open("driver-sources.json")) { js = DmActivity.readStream(in); } catch (IOException e) { /* none */ }
+        String js = host.driverSourcesUrl() == null ? null : cached(host.driverSourcesUrl(), "sources.json", force, false, err);
+        if (js == null) try (InputStream in = a.getAssets().open("driver-sources.json")) { js = VkDrivers.readStream(in); } catch (IOException e) { /* none */ }
         if (err.length() > 0) note.append(t("Список источников: ", "Source list: ")).append(err).append(js != null ? t(" (показан сохранённый)", " (the saved one is shown)") : "").append('\n');
         List<Src> out = new ArrayList<>();
         if (js == null) return out;
-        String fam = DmActivity.phoneFamily(), gpu = DmActivity.gpuModel();
+        String fam = VkDrivers.phoneFamily(), gpu = VkDrivers.gpuModel();
         try {
             JSONArray sa = new JSONObject(js).getJSONArray("sources");
             for (int i = 0; i < sa.length(); i++) {
@@ -411,13 +414,13 @@ final class DriverManager {
         all.setOnCheckedChangeListener((b, c) -> loader.accept(c, false));
         refresh.setOnClickListener(v -> loader.accept(all.isChecked(), true));
         dlRefresh = () -> { if (shown[0] != null) render(rel, shown[0]); };
-        d.setOnDismissListener(x -> { dlRefresh = null; gen[0]++; a.immersive(); });
+        d.setOnDismissListener(x -> { dlRefresh = null; gen[0]++; host.immersive(); });
         d.show();
         loader.accept(false, false);
     }
     private void render(LinearLayout rel, List<Src> srcs) {
         rel.removeAllViews();
-        Set<String> inst = new HashSet<>(); Collections.addAll(inst, a.driverPackages());
+        Set<String> inst = new HashSet<>(); Collections.addAll(inst, vk.packages());
         for (Src s : srcs) {
             heading(rel, s.title + " — " + familyName(s.family));
             if (!s.note.isEmpty()) text(rel, s.note);
@@ -449,7 +452,7 @@ final class DriverManager {
             .setPositiveButton(t("Скачать", "Download"), (d, w) -> download(s, r, x)).setNegativeButton(t("Отмена", "Cancel"), null).show();
     }
     private void download(Src s, Release r, Asset x) {
-        a.crumb("driver manager: downloading " + x.url);
+        host.crumb("driver manager: downloading " + x.url);
         final Progress pg = progress(x.name, true);
         new Thread(() -> {
             Result res; File tmp = new File(dir(), ".download.zip");
@@ -473,7 +476,7 @@ final class DriverManager {
     private String fetch(String url, File out, long size, Progress pg) throws IOException {
         java.security.MessageDigest md;
         try { md = java.security.MessageDigest.getInstance("SHA-256"); } catch (java.security.NoSuchAlgorithmException e) { throw new IOException(e); }
-        java.net.HttpURLConnection c = connect(url, false);
+        java.net.HttpURLConnection c = connect(url, false, ua());
         long total = c.getContentLengthLong() > 0 ? c.getContentLengthLong() : size, done = 0, shownAt = 0;
         try (InputStream in = c.getInputStream(); OutputStream os = new FileOutputStream(out)) {
             byte[] buf = new byte[1 << 16]; int n;

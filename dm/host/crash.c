@@ -228,6 +228,7 @@ static int crash_read_words(const uint64_t *src, uint64_t *dst, int n) {
 // it), phase 1 last before _exit waits for the log pump to put the lines into boot.log and fsyncs it (the Java side builds
 // Download/DOOM Mobile/logs/crash.txt from them at the next start).
 static void (*g_report_hook)(int phase, int sig, uint64_t addr, uint64_t pc);
+extern const char *xbg_crash_rec_op(void) __attribute__((weak));   // [pvr] xbg_game.cpp: the dm-record packet being executed, or NULL
 void crash_set_report_hook(void (*fn)(int phase, int sig, uint64_t addr, uint64_t pc)) { g_report_hook = fn; }
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
@@ -245,6 +246,17 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     off("addr", (uint64_t)si->si_addr); off("pc", UC_PC(uc)); off("lr", strip_pac(UC_LR(uc)));
     fprintf(stderr, " sp=%#llx\n", UC_SP(uc));
     if (g_report_hook) g_report_hook(0, sig, (uint64_t)(uintptr_t)si->si_addr, UC_PC(uc));
+    {   // [pvr] BUGS_AND_FIXES 2.47: which thread died (v0.4.19 PowerVR SIGBUS had to be placed on dm-record from return-address
+        // offsets), and the Vulkan call the record thread was in (xbg_game.cpp vkrec, weak: other builds have none). Signal-safe.
+        char tn[32] = "?";
+#if defined(__linux__)
+        prctl(PR_GET_NAME, tn, 0, 0, 0); tn[sizeof tn - 1] = 0;
+#else
+        pthread_getname_np(pthread_self(), tn, sizeof tn);
+#endif
+        const char *rec = xbg_crash_rec_op ? xbg_crash_rec_op() : 0;
+        fprintf(stderr, "[dm] crash thread %s tid=%d; dm-record in %s\n", tn, fault_tid(), rec ? rec : "(no packet)");
+    }
     // [DOOM] issues #12/#20: a fault in the page of sp or up to 64 KiB below it is the thread running off its stack into the guard
     // page (sp itself may already point there). Said plainly, and the stack scan below, which reads upward from sp, is skipped:
     // it faulted again inside this handler, so the report ended at the bt line

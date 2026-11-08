@@ -50,7 +50,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Locale;
 
-public class DmActivity extends Activity implements SurfaceHolder.Callback, DisplayManager.DisplayListener, InputManager.InputDeviceListener, FrontMenu.Host, FrontMenu.Owner {
+public class DmActivity extends Activity implements SurfaceHolder.Callback, DisplayManager.DisplayListener, InputManager.InputDeviceListener, FrontMenu.Host, FrontMenu.Owner, GearHost {
     static final boolean DOOM = "doom".equals(BuildConfig.DM_GAME);
     private DoomPadView doomPad;
     static native int nativeStart(String filesDir, String extDir, String romfsSrc, String lang);
@@ -82,6 +82,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native int nativeGetDrs();                   // [DOOM] the game's rs_enable (hle_doom_drs.c): -1 not known yet, 0 off, 1 on
     static native boolean nativeSetDrs(boolean on);     // [DOOM] queue a live rs_enable change + profile save; false = cannot be written here
     static native boolean nativeSetLight(boolean on);   // [DOOM] r6 light mode (handheld quality preset) live; false = the game build lacks the patch
+    static native int nativeR6Patches();                // [DOOM] 2.45: the loaded main has the v0.4.5 (r6) patches: 1 yes, 0 no (old game files), -1 not known yet
     static native void nativeSetDrsFps(int fps);        // [DOOM] r6 dynamic resolution target fps (hle_doom_drs.c)
     // [DOOM] the game's controller settings (hle_doom_settings.c, issue #31): GS_* ids; get -1 = not known yet; set false = not writable here
     static native int nativeGetGameSetting(int id);
@@ -120,7 +121,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             finish(); return;
         }
         current = new WeakReference<>(this);
-        if (DOOM) updates = new UpdateNotice(new Updates());   // [DOOM] 2.41: started from driverWatch at the first frames
+        if (DOOM) updates = new UpdateNotice(new Updates());   // [DOOM] 2.41: started at the first frames (VkDrivers.gameStarted callback)
         if (DOOM) checkLastRun();   // [DOOM] crash report of the last run, before anything of this one is written
         displays = getSystemService(DisplayManager.class);
         if (displays != null) displays.registerDisplayListener(this, null);
@@ -130,7 +131,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         // [DOOM] Android 10 (the minSdk 29 build) has no ALWAYS: SHORT_EDGES is the same in landscape
         getWindow().getAttributes().layoutInDisplayCutoutMode = android.os.Build.VERSION.SDK_INT >= 30
             ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-        if (DOOM) applyDisplayMode();   // [DOOM] frame rate limit above 60: ask for a display mode at a multiple of it
+        drivers = new VkDrivers(this);   // [front] the Vulkan driver choice, crash guard and the gear's driver list (frontend-common)
+        if (DOOM) GearDisplay.applyDisplayMode(this, doomPrefs());   // [DOOM] frame rate limit above 60: ask for a display mode at a multiple of it
         view = new SurfaceView(this);
         view.getHolder().addCallback(this);
         gameFrame = new FrameLayout(this);
@@ -184,9 +186,36 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         return ok;
     }
 
+    // ---- [front] GearHost: the shared gear dialog (frontend-common GearSettings / GearPages / VkDrivers / DriverManager, docs/FRONTEND_UNIFIED.md
+    // "Gear", BUGS_AND_FIXES 2.44); DOOM's own rows and the order are DoomGear.java. The pause menu's "Game settings…" (gameSettings) still calls
+    // showDoomSettings. gearUsesPortResources: every text is DOOM's own string resource in the system locale, as before the move.
+    private VkDrivers drivers;   // made in onCreate (drivers = new VkDrivers(this)): the start's driver choice, the crash guard, the gear's list
+    private final float[] gearStats = new float[4];
+    @Override public android.app.Activity activity() { return this; }
+    @Override public String dataDirName() { return FRONT_DATA_DIR; }
+    @Override public SharedPreferences gamePrefs() { return doomPrefs(); }
+    @Override public FrontMenu.Pad pad() { return doomPad; }
+    @Override public FrontMenu front() { return front; }
+    @Override public boolean libraryLoaded() { return libraryLoaded; }
+    @Override public boolean started() { return started; }
+    @Override public VkDrivers drivers() { return drivers; }
+    @Override public java.util.List<GearSettings.Section> gearSections(GearSettings g) { return DoomGear.sections(this, g); }
+    @Override public boolean gearUsesPortResources() { return true; }
+    @Override public String driverStatus() { return nativeDriverStatus(); }
+    @Override public float[] frameStats() { try { nativeFrameStats(gearStats); } catch (Throwable t) { gearStats[0] = 0; } return gearStats; }
+    @Override public File driverImportDir() { return new File(GameFolder.dir(this), "drivers"); }   // [DOOM] <game folder>/drivers (issue #11)
+    // [DOOM] diagnostics APK with -PdmDiagDriver=<pkg> (diag3/4): always that driver on an Adreno 6xx+, whatever was saved or the crash guard decided
+    // before (VkDrivers.choose drops the guard file). Without it (diag6, owner 06.11) the saved choice and the crash guard work as in a release build.
+    @Override public String forcedDriver() { return BuildConfig.DM_DIAG && !BuildConfig.DM_DIAG_DRIVER.isEmpty() && VkDrivers.turnipPossible() ? BuildConfig.DM_DIAG_DRIVER : null; }
+    void showDoomSettings() { new GearSettings(this).show(); }
+    UpdateNotice updateNotice() { return updates; }   // [DOOM] 2.41: the gear's "Updates" rows (GearPages.updates)
+    // CrashLog.java's helpers, now VkDrivers'
+    static String hardwareSummary() { return VkDrivers.hardwareSummary(); }
+    static String readSmall(File f) throws IOException { return VkDrivers.readSmall(f); }
+
     // ---- [DOOM] crash logs and breadcrumbs (CrashLog.java, BUGS_AND_FIXES 2.22)
     // A "[java] ..." line in boot.log (and logcat); kept until the native log exists (nativeStart opens it).
-    void crumb(String s) {
+    @Override public void crumb(String s) {
         if (nativeLogReady) { try { nativeLog(s); return; } catch (Throwable t) { /* an older library */ } }
         android.util.Log.i("dm", "[java] " + s);
         if (!nativeLogReady && pendingCrumbs.size() < 64) pendingCrumbs.add(s);
@@ -383,822 +412,19 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     }
 
 
-    // [DOOM] Gear (settings) dialog on the on-screen pad. Texts are string resources (res/values*/doom_settings.xml: English default,
-    // ru uk de fr es pt it pl tr zh ja ko by the system locale). Two kinds of options, each labelled with when it applies:
-    //   next launch: kept in SharedPreferences "doom_graphics" and handed to the native host as environment variables before the
-    //     library loads (hle_args.c turns them into the game's +set arguments; vulkan_present.cpp, vk_driver.c, haptics_android.c,
-    //     hle_hid.c, hle_nvn.c read them once at start) -- 3D resolution, sharpening, frame rate limit, aspect ratio (auto <-> 16:9 live when the
-    //     switch DM_DOOM_WIDE_LIVE=1 is on), Vulkan driver, game language, aim assist, vibration;
-    //   immediately: the controls in "doom_controls" (DoomPadView.reloadSettings: look sensitivity, dead zone, FPS counter, settings button look) and
-    //     dynamic resolution, which is the game's own rs_enable cvar shared with Video -> Dynamic Resolution in the game menu
-    //     (nativeGetDrs / nativeSetDrs, hle_doom_drs.c; saved in the game profile, not here).
-    //   [r6] both (saved here, handed over as DM_DOOM_LIGHT / DM_DOOM_DRS_FPS at start and switched live through JNI): light mode =
-    //     the game's Switch handheld quality preset (nativeSetLight), dynamic resolution target fps (nativeSetDrsFps, shown while the
-    //     dynamic resolution box is ticked). BUGS_AND_FIXES 2.18.
-    static final float[] RES_FRACTIONS = {1.0f, 0.85f, 0.75f, 0.67f};
-    static final String[] RES_LABELS = {"100% (720p)", "85% (612p)", "75% (540p)", "67% (480p)"};
-    static final int[] DRS_FPS = {30, 45, 60};   // [r6] dynamic resolution target: rs_dropMilliseconds = 1000 / fps (hle_doom_drs.c)
-    static final int DRS_FPS_DEFAULT = 60;
-    static final String[] SHARPEN_STOPS = {"", "1.0", "0.5", "0.2"};
-    static final int[] SHARPEN_LABELS = {R.string.gear_off, R.string.gear_low, R.string.gear_medium, R.string.gear_high};
-    static final float[] AA_STRENGTHS = {0f, 0.5f, 1.0f, 1.5f, 2.0f};
-    static final String[] AA_LABELS = {null /* gear_aa_switch */, "0.5", "1", "1.5", "2"};
-    static final String[] LANG_CODES = {"", "ru", "en-US"};
-    static final String[] LANG_LABELS = {null /* gear_lang_system */, "Русский", "English"};   // game languages keep their own names
-    static final float[] LOOK_GAINS = {0.6f, 0.8f, 1.0f, 1.3f, 1.7f};
-    static final String[] LOOK_LABELS = {"0.6", "0.8", "1.0", "1.3", "1.7"};
-    static final float[] DEADZONES = {0f, 0.08f, 0.15f, 0.25f};
-    static final int[] DEADZONE_LABELS = {R.string.gear_none, R.string.gear_small, R.string.gear_medium_dz, R.string.gear_large};
-    static final int[] GEAR_LABELS = {R.string.gear_button_normal, R.string.gear_button_faded};   // DoomPadView.GEAR_*
-    // [4:3] Aspect ratio (next launch; hle_args.c DM_DOOM_ASPECT, BUGS_AND_FIXES 2.20): 0 = auto (the screen's: wider -> Hor+ W x 720,
-    // narrower -> down to 960x720), 1 = 16:9 (the original 1280x720), 2 = 4:3 (960x720). Replaces the "wide" checkbox: wide=false -> 16:9.
-    static final String[] ASPECT_ENV = {"auto", "16:9", "4:3"};
-    static final String[] ASPECT_LABELS = {null /* gear_aspect_auto */, "16:9", "4:3"};
-    static int aspectPref(SharedPreferences p) {
-        if (!p.contains("aspect")) {   // migrate the old checkbox once
-            int a = p.getBoolean("wide", true) ? 0 : 1;
-            p.edit().putInt("aspect", a).remove("wide").apply();
-            return a;
-        }
-        return Math.min(Math.max(0, p.getInt("aspect", 0)), ASPECT_ENV.length - 1);
-    }
-    // Frame rate limit (next launch): DM_PRESENT_MAX_HZ caps the present pacing (hle_nvn.c: the largest integer fraction of the refresh
-    // rate not above it) and DM_DOOM_TICK_MAX the game's adaptive tick (hle_args.c) to the same value, so game time stays real time.
-    // 90 / 120 are offered only when the display has a mode at a multiple of that rate; the window then asks for that mode
-    // (applyDisplayMode) and the surface votes for it (vulkan_present.cpp). Above 60 is untested (frame-counted UI logic risk).
-    static final int[] FPS_LIMITS = {30, 60, 90, 120};
-    static final int FPS_LIMIT_DEFAULT = 60;
-    static int nearest(float[] v, float x) { int b = 0; for (int i = 1; i < v.length; i++) if (Math.abs(v[i] - x) < Math.abs(v[b] - x)) b = i; return b; }
-
+    // [front] The gear (settings) dialog is the shared one (frontend-common GearSettings, docs/FRONTEND_UNIFIED.md "Gear"): the generic rows
+    // are GearPages (frame rate limit, sharpening, upscale, Vulkan driver + DriverManager, game language, vibration, look, dead zone, FPS
+    // counter, menu button, on-screen controls), the display modes GearDisplay, the driver choice / crash guard VkDrivers; DOOM's own rows
+    // (dynamic resolution, light mode, aspect ratio, aim assist + the game's controller settings, game folder) and the order are DoomGear.java.
     SharedPreferences doomPrefs() { return getSharedPreferences("doom_graphics", MODE_PRIVATE); }
 
-    private android.view.Display display() {
-        android.view.Display d = null;
-        if (android.os.Build.VERSION.SDK_INT >= 30) try { d = getDisplay(); } catch (RuntimeException e) { /* not attached yet */ }
-        if (d == null && displays != null) d = displays.getDisplay(android.view.Display.DEFAULT_DISPLAY);
-        return d;
-    }
-    // A display mode whose refresh rate is an integer multiple of hz (within 1 Hz), preferring the current resolution, then the
-    // lowest such rate; null = the display has none.
-    private android.view.Display.Mode modeFor(int hz) {
-        android.view.Display d = display(); if (d == null) return null;
-        android.view.Display.Mode cur = d.getMode(), best = null; boolean bestSame = false;
-        for (android.view.Display.Mode m : d.getSupportedModes()) {
-            float r = m.getRefreshRate(); int k = Math.round(r / hz);
-            if (k < 1 || Math.abs(r - k * hz) > 1.0f) continue;
-            boolean same = cur != null && m.getPhysicalWidth() == cur.getPhysicalWidth() && m.getPhysicalHeight() == cur.getPhysicalHeight();
-            if (best == null || (same && !bestSame) || (same == bestSame && r < best.getRefreshRate())) { best = m; bestSame = same; }
-        }
-        return best;
-    }
-    private boolean fpsLimitAvailable(int hz) { return hz <= 60 || modeFor(hz) != null; }
-    // The saved limit, lowered to the highest one this display supports (another screen / the system's refresh setting changed).
-    // No display yet (or no mode list): keep the saved limit; the native pacer clamps it to an integer fraction of the real refresh
-    // rate anyway (hle_nvn.c nvn_pace_cap_hz). The choice is logged ("fps limit ...") because a silent drop to 60 went unnoticed.
-    private int fpsLimit() {
-        int want = doomPrefs().getInt("fps_limit", FPS_LIMIT_DEFAULT);
-        if (want <= 60) return want == 30 ? 30 : 60;
-        android.view.Display d = display();
-        if (d == null) { android.util.Log.i("dm", "fps limit " + want + ": no display yet, kept"); return want; }
-        int got = 60; for (int l : FPS_LIMITS) if (l > got && l <= want && fpsLimitAvailable(l)) got = l;
-        StringBuilder modes = new StringBuilder();
-        for (android.view.Display.Mode m : d.getSupportedModes()) modes.append(' ').append(m.getModeId()).append('@').append(m.getRefreshRate());
-        android.util.Log.i("dm", "fps limit " + want + " -> " + got + " (modes" + modes + ", current " + d.getMode().getModeId() + ")");
-        return got;
-    }
-    // Above 60 the window asks the system for a display mode at a multiple of the limit (e.g. 90 Hz for 90, 120 Hz for 120); at 30 / 60
-    // nothing is requested (the surface's own 120 Hz vote and the system decide, as before).
-    private void applyDisplayMode() {
-        int lim = fpsLimit(); if (lim <= 60) return;
-        android.view.Display.Mode m = modeFor(lim); if (m == null) return;
-        WindowManager.LayoutParams lp = getWindow().getAttributes(); lp.preferredDisplayModeId = m.getModeId(); getWindow().setAttributes(lp);
-        android.util.Log.i("dm", "frame rate limit " + lim + ": display mode " + m.getModeId() + " " + m.getPhysicalWidth() + "x" + m.getPhysicalHeight() + " @ " + m.getRefreshRate() + " Hz");
-    }
-
-    // [DOOM] Driver crash guard: before a non-system driver is loaded its name goes to files/driver-trying ("<name>\n<failed launches>");
-    // the file is removed once the game has presented a frame or the native side reports it fell back to the system driver
-    // (driverWatch). A file left over means the last launch died before its first frame with that driver: after DRIVER_GUARD_STRIKES
-    // such launches in a row the system driver is chosen (saved in the settings, so the player sees it and can pick the package again)
-    // and a message says why. Two strikes, not one: a launch killed by hand (or by a debug script) before its first frame is not a crash.
-    static final int DRIVER_GUARD_STRIKES = 2;
-    private String driverNotice;   // shown once the game view is up
-    private File driverGuard() { return new File(getFilesDir(), "driver-trying"); }
-
-    private void applyDoomSettings() {
-        SharedPreferences p = doomPrefs();
-        try {
-            // Dynamic resolution is the game's own setting now (hle_doom_drs.c); the old gear preference is dropped.
-            if (p.contains("drs")) p.edit().remove("drs").apply();
-            int lim = fpsLimit();
-            Os.setenv("DM_PRESENT_MAX_HZ", String.valueOf(lim), true);
-            Os.setenv("DM_DOOM_TICK_MAX", String.valueOf(lim), true);
-            int res = p.getInt("res", 0);
-            if (res > 0 && res < RES_FRACTIONS.length) Os.setenv("DM_DOOM_RES", String.valueOf(RES_FRACTIONS[res]), true); else Os.unsetenv("DM_DOOM_RES");
-            // [r6] light mode (off: unset = the game is not touched) and the dynamic resolution target (used only while DRS is on)
-            if (p.getBoolean("light", false)) Os.setenv("DM_DOOM_LIGHT", "1", true); else Os.unsetenv("DM_DOOM_LIGHT");
-            Os.setenv("DM_DOOM_DRS_FPS", String.valueOf(p.getInt("drs_fps", DRS_FPS_DEFAULT)), true);
-            int sh = p.getInt("sharpen", 0);
-            if (sh > 0 && sh < SHARPEN_STOPS.length) Os.setenv("DM_GFX_SHARPEN", SHARPEN_STOPS[sh], true); else Os.unsetenv("DM_GFX_SHARPEN");
-            // Upscale to the screen resolution (vulkan_present.cpp DM_GFX_UPSCALE): the swapchain at the window size + a GSR pass; off by default.
-            if (p.getBoolean("upscale", false)) Os.setenv("DM_GFX_UPSCALE", "gsr", true); else Os.unsetenv("DM_GFX_UPSCALE");
-            // Vulkan driver (vk_driver.c): adrenotools packages under <data>/drivers/<name>/ (meta.json + the library) are copied to
-            // private storage (a driver must be loaded from there); the package chosen in the dialog sets DM_VK_DRIVER, which dm/env
-            // can also set (DM_VK_DRIVER=<name>). The hooks adrenotools loads live in nativeLibraryDir.
-            Os.setenv("DM_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir, true);
-            File drivers = new File(getFilesDir(), "drivers");
-            Os.setenv("DM_DRIVERS_DIR", drivers.getAbsolutePath(), true);
-            extractBundledDrivers(drivers);   // the APK's default driver (Turnip, assets/drivers/<name>/)
-            importDrivers(new File(GameFolder.dir(this), "drivers"), drivers);   // [DOOM] <game folder>/drivers (issue #11)
-            updateDriversInBackground(drivers);   // other packages from the repository's drivers/manifest.json when online
-            // Game language (DOOM takes it from the system like on the Switch: hle_oe.c GetDesiredLanguage reads DM_LANG; jni sets
-            // DM_LANG from the phone locale only when it is unset). "" = follow the phone.
-            // Aim assist strength (hle_hid.c DM_AA_STRENGTH: the game's single-player assist scaled; 0 = the game's weak MP-method assist)
-            Os.setenv("DM_AA_STRENGTH", String.valueOf(p.getFloat("aa", 1.0f)), true);
-            // Rumble (haptics_android.c): off by default since 28.10 (owner: it only drains the battery); DM_RUMBLE=0 hides the vibration devices.
-            Os.setenv("DM_RUMBLE", p.getBoolean("rumble", false) ? "1" : "0", true);
-            // Aspect ratio (hle_args.c dm_doom_wide_w): auto by default = the screen aspect (e.g. 1600x720 Hor+ on a 20:9 phone, 960x720
-            // on a 4:3 screen); DM_DOOM_WIDE mirrors it for the presenter's old crop rule and older tools.
-            int asp = aspectPref(p);
-            Os.setenv("DM_DOOM_ASPECT", ASPECT_ENV[asp], true);
-            Os.setenv("DM_DOOM_WIDE", asp == 0 ? "1" : "0", true);
-            // [DOOM] the diagnostics APK (-PdmDiag=1, for testers who cannot edit dm/env): per-pass GPU timestamps (NVN GPASS) and the
-            // whole NVN PERF block in boot.log; dm/env still wins (not overwritten)
-            // DM_LOG_TIME=1: every boot.log line starts with the wall-clock time it was written (jni_android.c log_file_line);
-            // DM_GFX_PERF_SAMPLE=4: the NVN PERF parts timed every frame (windows of 60)
-            if (BuildConfig.DM_DIAG) { Os.setenv("DM_GFX_PASS_PROF", "1", false); Os.setenv("DM_GFX_PERF_VERBOSE", "1", false);
-                Os.setenv("DM_LOG_TIME", "1", false); Os.setenv("DM_GFX_PERF_SAMPLE", "4", false);
-                if (!BuildConfig.DM_DIAG_TU_DEBUG.isEmpty()) Os.setenv("TU_DEBUG", BuildConfig.DM_DIAG_TU_DEBUG, true); }   // vk_driver.c keeps a set TU_DEBUG
-            String lang = p.getString("lang", "");
-            if (!lang.isEmpty()) Os.setenv("DM_LANG", lang, true);
-            // [DOOM] diagnostics APK with -PdmDiagDriver=<pkg> (diag3/4): always that driver on an Adreno 6xx+, whatever was saved or the
-            // crash guard decided before; the guard file is dropped so its strikes cannot switch it back. Without it (diag6, owner 06.11:
-            // "не надо принудительно, пусть фоллбэкается на сток") the saved choice and the crash guard work as in a release build.
-            final boolean diagForced = BuildConfig.DM_DIAG && !BuildConfig.DM_DIAG_DRIVER.isEmpty() && turnipPossible();
-            String drv = diagForced ? BuildConfig.DM_DIAG_DRIVER : p.getString("driver", defaultDriver());
-            if (diagForced) driverGuard().delete();
-            // [DOOM] hardware check at every start (BUGS_AND_FIXES 2.22, 2.25): Turnip needs a Qualcomm Adreno 6xx+ (KGSL), PanVK a Mali
-            // (/dev/mali0), RADV-Xclipse a Samsung Xclipse, and a Linux glibc build (the "-EMULATOR" zips) runs nowhere in an Android app
-            // (driverProblem). Such a saved choice (settings imported / restored from another phone, or picked before this check existed)
-            // gets the system driver; the choice is reset so the dialog and the next starts agree, and the player is told once why.
-            boolean turnipOk = turnipPossible();
-            String problem = drv.isEmpty() ? null : driverProblem(drv);
-            if (problem != null) {
-                crumb("driver: saved choice " + drv + " cannot run here (" + problem + "), this phone has " + hardwareSummary() + ": the system driver is used and the choice reset");
-                p.edit().putString("driver", "").apply();
-                driverNotice = Ui.t(this, "Драйвер Vulkan " + driverLabel(drv) + " не подходит: " + driverReasonText(problem) + ". Используется системный драйвер.",
-                    "Vulkan driver " + driverLabel(drv) + " cannot run here: " + driverReasonText(problem) + ". The system driver is used.");
-                drv = "";
-            }
-            crumb("driver: " + (drv.isEmpty() ? "system" : drv) + " (saved " + (p.contains("driver") ? "\"" + p.getString("driver", "") + "\"" : "none, default " + defaultDriver())
-                + "), turnip possible " + turnipOk + ", " + hardwareSummary());
-            File guard = driverGuard(); String left = readText(guard);
-            int strikes = 0;
-            if (left != null) {
-                String[] g = left.split("\n"); String name = g[0].trim();
-                try { strikes = g.length > 1 ? Integer.parseInt(g[1].trim()) : 1; } catch (NumberFormatException e) { strikes = 1; }
-                if (!name.equals(drv)) strikes = 0;   // about another driver: the player changed it since
-                android.util.Log.w("dm", "driver guard: last launch with " + name + " ended before its first frame (" + strikes + " in a row)");
-                if (strikes >= DRIVER_GUARD_STRIKES) {
-                    p.edit().putString("driver", "").apply(); drv = ""; strikes = 0;
-                    driverNotice = getString(R.string.toast_driver_crashed, driverLabel(name));
-                }
-                guard.delete();
-            }
-            if (!drv.isEmpty()) {
-                try (OutputStream os = new FileOutputStream(guard)) { os.write((drv + "\n" + (strikes + 1) + "\n").getBytes(StandardCharsets.UTF_8)); }
-                catch (IOException e) { android.util.Log.e("dm", "driver guard: " + e); }
-            }
-            if (!drv.isEmpty()) Os.setenv("DM_VK_DRIVER", drv, true); else Os.unsetenv("DM_VK_DRIVER");
-        } catch (ErrnoException e) { android.util.Log.e("dm", "doom settings: " + e); }
-    }
-
-    // [DOOM] Default Vulkan driver per GPU (docs/research/non_adreno_drivers.md 4.1); the player's choice (pref "driver") always wins.
-    // This is the hook for vendor rules: it returns a package name under files/drivers/ or "" = the system driver.
-    //   Adreno 6xx / 7xx            -> turnip27 (bundled)
-    //   Adreno 710 / 720 / 722      -> turnip27-a710 when present (bundled since 2.39, or downloaded), else system
-    //   Adreno 8xx                  -> turnip27-a8xx when present (bundled since 2.39, or downloaded), else system
-    //   Adreno 5xx and older        -> system (Turnip does not support a5xx)
-    //   Mali / PowerVR / Xclipse / Maleoon (no kgsl gpu_model) -> system; their optional packages (PanVK, RADV-Xclipse) stay
-    //                                  selectable in the dialog when the player supplies them
-    // A manifest entry with an "auto" regex that matches this Adreno (drivers/manifest.json) still comes first for Adreno >= 600.
-    // When gpu_model is unreadable on a Qualcomm SoC, turnip27 is tried (vk_driver.c falls back to the system driver without a GPU).
-    static final String DEFAULT_DRIVER = "turnip27", DRIVER_A710 = "turnip27-a710", DRIVER_A8XX = "turnip27-a8xx";
-    private String defaultDriver() {
-        if (!turnipPossible()) return "";   // [DOOM] 2.25: non-Adreno (Mali / Xclipse / PowerVR / Maleoon): the bundled Turnip is never the default
-        File dir = new File(getFilesDir(), "drivers");
-        int m = adrenoModel(gpuModel());
-        if (m == 0) return qualcommSoc() ? pkgIfPresent(dir, DEFAULT_DRIVER) : "";
-        if (m < 600) return "";
-        String auto = autoDriverForGpu(dir); if (auto != null) return auto;
-        if (m == 710 || m == 720 || m == 722) return pkgIfPresent(dir, DRIVER_A710);
-        if (m >= 800 && m < 900) return pkgIfPresent(dir, DRIVER_A8XX);
-        return pkgIfPresent(dir, DEFAULT_DRIVER);
-    }
-    private static String pkgIfPresent(File dir, String name) { return hasDriverLib(new File(dir, name)) ? name : ""; }
-    // "Adreno750v2" -> 750; 0 = no readable model; -1 = a model that is not an Adreno.
-    static int adrenoModel(String gpu) {
-        if (gpu == null || gpu.isEmpty()) return 0;
-        String g = gpu.toLowerCase(Locale.ROOT); int at = g.indexOf("adreno"); if (at < 0) return -1;
-        int i = at + 6, v = 0, n = 0;
-        while (i < g.length() && !Character.isDigit(g.charAt(i)) && n == 0 && i < at + 12) i++;
-        while (i < g.length() && Character.isDigit(g.charAt(i)) && n < 4) { v = v * 10 + (g.charAt(i++) - '0'); n++; }
-        return n > 0 ? v : -1;
-    }
-    // [DOOM] Can Turnip (Mesa freedreno, Adreno only) work on this phone at all? It drives the GPU through Qualcomm's kernel driver KGSL,
-    // so the device node (or its sysfs class) must exist, and the GPU must be an Adreno 6xx or newer (a readable gpu_model), or, when the
-    // model is unreadable, the SoC must be a Qualcomm one (the same rule defaultDriver used before). vk_driver.c repeats the KGSL check.
-    static boolean kgsl() { return new File("/dev/kgsl-3d0").exists() || new File("/sys/class/kgsl/kgsl-3d0").exists(); }
-    static boolean turnipPossible() {
-        if (!kgsl()) return false;
-        int m = adrenoModel(gpuModel());
-        return m == 0 ? qualcommSoc() : m >= 600;
-    }
-    // "gpu_model=Adreno750v2 kgsl=true mali=false SoC=QTI SM8650" (logs, crash reports, the driver notice)
-    static String hardwareSummary() {
-        String g = gpuModel();
-        return "gpu_model=" + (g.isEmpty() ? "-" : g) + " kgsl=" + kgsl() + " mali=" + new File("/dev/mali0").exists() + " SoC="
-            + (android.os.Build.VERSION.SDK_INT >= 31 ? android.os.Build.SOC_MANUFACTURER + " " + android.os.Build.SOC_MODEL : android.os.Build.HARDWARE);
-    }
-    // [DOOM] (BUGS_AND_FIXES 2.25) The GPU family a driver package is for: "mali" (PanVK / panfrost), "xclipse" (RADV), "powervr",
-    // "adreno" (Turnip / freedreno) or "" (unknown: offered everywhere; vk_driver.c verifies what really runs). The folder name and meta.json
-    // "name" decide first, description / libraryName only when they say nothing (the GameHub PanVK zip ships libvulkan_freedreno.so and
-    // says so in its description). vk_driver.c family_of uses the same words.
-    static String familyWord(String s) {
-        s = s.toLowerCase(Locale.ROOT);
-        if (s.contains("panvk") || s.contains("panfrost") || s.contains("mali")) return "mali";
-        if (s.contains("radv") || s.contains("radeon") || s.contains("xclipse")) return "xclipse";
-        if (s.contains("powervr") || s.contains("imagination") || s.contains("mesa-pvr")) return "powervr";
-        if (s.contains("turnip") || s.contains("freedreno") || s.contains("adreno")) return "adreno";
-        return "";
-    }
-    org.json.JSONObject driverMeta(String name) {
-        try { return new org.json.JSONObject(readSmall(new File(new File(new File(getFilesDir(), "drivers"), name), "meta.json"))); }
-        catch (Exception e) { return null; }
-    }
-    String driverFamily(String name) { return familyOf(name, driverMeta(name)); }
-    static String familyOf(String name, org.json.JSONObject o) {
-        String f = familyWord(name); if (!f.isEmpty() || o == null) return f;
-        f = familyWord(o.optString("name", "")); if (!f.isEmpty()) return f;
-        f = familyWord(o.optString("description", "")); if (!f.isEmpty()) return f;
-        return familyWord(o.optString("libraryName", ""));
-    }
-    // [DOOM] 2.39: can a driver of this family run on this phone (the device nodes driverProblem / vk_driver.c check); "" = unknown = anywhere
-    static boolean familyFits(String fam) {
-        switch (fam) {
-            case "adreno": return turnipPossible();
-            case "mali": return mali();
-            case "xclipse": return !(kgsl() || mali() || powervr());
-            case "powervr": return powervr();
-            default: return true;
-        }
-    }
-    // This phone's family for the driver lists (the manifest, the driver manager): any KGSL GPU = adreno, then mali / powervr; none of
-    // these nodes = xclipse (Samsung Xclipse, or a GPU nobody ships packages for)
-    static String phoneFamily() { return kgsl() ? "adreno" : mali() ? "mali" : powervr() ? "powervr" : "xclipse"; }
-    // [DOOM] 2.39: the checks that need only the folder name and meta.json (also for the APK's assets before they are copied): another GPU
-    // family, a glibc build, or a meta.json minApi above this Android (RADV-Xclipse says 34); null = may run here
-    static String packageProblem(String name, org.json.JSONObject meta) {
-        String fam = familyOf(name, meta);
-        if (!familyFits(fam)) return "no-" + fam;
-        if (meta != null && meta.optString("abi", "").toLowerCase(Locale.ROOT).contains("glibc")) return "glibc-build";
-        int min = meta != null ? meta.optInt("minApi", 0) : 0;
-        if (min > android.os.Build.VERSION.SDK_INT) return "min-api " + min;
-        return null;
-    }
-    // API level -> the Android version players know (34 -> "14")
-    static String androidName(int api) { return api >= 33 ? String.valueOf(api - 20) : api == 32 ? "12L" : api >= 28 ? String.valueOf(api - 19) : "API " + api; }
-    static boolean mali() { return new File("/dev/mali0").exists(); }
-    static boolean powervr() { return new File("/dev/pvrsrvkm").exists(); }
-    // The package's driver library: meta.json libraryName, else its first .so (a *vulkan* one preferred), as vk_driver.c picks it.
-    static File driverLib(File dir, org.json.JSONObject meta) {
-        String ln = meta != null ? meta.optString("libraryName", "") : "";
-        if (!ln.isEmpty() && !ln.contains("/")) { File f = new File(dir, ln); if (f.isFile()) return f; }
-        File[] fs = dir.listFiles(); File pick = null;
-        if (fs != null) for (File f : fs) if (f.getName().endsWith(".so") && (pick == null || (f.getName().contains("vulkan") && !pick.getName().contains("vulkan")))) pick = f;
-        return pick;
-    }
-    // DT_NEEDED of an ELF64 library (empty on any parse problem); vk_driver.c elf_check reads it the same way.
-    static java.util.List<String> elfNeeded(File f) {
-        java.util.ArrayList<String> out = new java.util.ArrayList<>();
-        try (java.io.RandomAccessFile r = new java.io.RandomAccessFile(f, "r")) {
-            byte[] eh = new byte[64]; r.readFully(eh);
-            if (eh[0] != 0x7f || eh[1] != 'E' || eh[2] != 'L' || eh[3] != 'F' || eh[4] != 2) return out;
-            java.nio.ByteBuffer e = java.nio.ByteBuffer.wrap(eh).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            long phoff = e.getLong(32); int phent = e.getShort(54) & 0xffff, phnum = e.getShort(56) & 0xffff;
-            if (phent != 56 || phnum == 0 || phnum > 64) return out;
-            byte[] phb = new byte[phent * phnum]; r.seek(phoff); r.readFully(phb);
-            java.nio.ByteBuffer ph = java.nio.ByteBuffer.wrap(phb).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            long dynOff = -1, dynSz = 0;
-            for (int i = 0; i < phnum; i++) if (ph.getInt(i * 56) == 2) { dynOff = ph.getLong(i * 56 + 8); dynSz = ph.getLong(i * 56 + 32); }   // PT_DYNAMIC
-            if (dynOff < 0) return out;
-            int n = (int) Math.min(dynSz, 512 * 16); byte[] db = new byte[n]; r.seek(dynOff); r.readFully(db);
-            java.nio.ByteBuffer d = java.nio.ByteBuffer.wrap(db).order(java.nio.ByteOrder.LITTLE_ENDIAN);
-            long strtab = 0, strsz = 0; java.util.ArrayList<Long> need = new java.util.ArrayList<>();
-            for (int i = 0; i + 16 <= n; i += 16) { long tag = d.getLong(i), val = d.getLong(i + 8); if (tag == 0) break; if (tag == 5) strtab = val; else if (tag == 10) strsz = val; else if (tag == 1) need.add(val); }
-            long stroff = -1;   // DT_STRTAB is a virtual address: the PT_LOAD that holds it gives its file offset
-            for (int i = 0; i < phnum; i++) { int b = i * 56; if (ph.getInt(b) == 1) { long off = ph.getLong(b + 8), va = ph.getLong(b + 16), fsz = ph.getLong(b + 32); if (strtab >= va && strtab < va + fsz) stroff = strtab - va + off; } }
-            if (stroff < 0) return out;
-            for (long v : need) { if (v >= strsz) continue; r.seek(stroff + v); StringBuilder sb = new StringBuilder(); int c; while ((c = r.read()) > 0 && sb.length() < 128) sb.append((char) c); out.add(sb.toString()); }
-        } catch (Exception ex) { /* not an ELF we can read: no verdict */ }
-        return out;
-    }
-    // [DOOM] Why a driver package cannot run on this phone, or null: a package for another GPU family (no-adreno: Turnip needs an Adreno 6xx+
-    // on KGSL / no-mali / no-xclipse / no-powervr), a Linux glibc build (glibc-build: the "-EMULATOR" PanVK zips are for Winlator-style glibc
-    // containers; issue #3 picked one and it needed libdrm.so.2), or a versioned library it needs and does not ship (missing-lib). vk_driver.c
-    // repeats these checks natively (DM_VK_DRIVER_FORCE=1 skips them there).
-    // [DOOM] 2.39: also a meta.json minApi above this Android (min-api N), via packageProblem.
-    String driverProblem(String name) {
-        File dir = new File(new File(getFilesDir(), "drivers"), name);
-        org.json.JSONObject meta = driverMeta(name);
-        String why = packageProblem(name, meta); if (why != null) return why;
-        File lib = driverLib(dir, meta);
-        if (lib != null) for (String n : elfNeeded(lib)) {
-            if (n.equals("libc.so.6") || n.equals("libm.so.6") || n.equals("libpthread.so.0") || n.equals("libdl.so.2") || n.contains("ld-linux")) return "glibc-build";
-            if (n.matches(".*\\.so\\.[0-9].*") && !new File(dir, n).exists()) return "missing-lib " + n;
-        }
-        return null;
-    }
-    // The player's words for a driverProblem / vk_driver.c status reason.
-    String driverReasonText(String r) {
-        if (r == null || r.isEmpty()) return "";
-        switch (r) {
-            case "no-adreno": return Ui.t(this, "он только для Adreno 6xx+ (Snapdragon)", "it is for Adreno 6xx+ (Snapdragon) GPUs only");
-            case "no-mali": return Ui.t(this, "он только для Mali", "it is for Mali GPUs only");
-            case "no-xclipse": return Ui.t(this, "он только для Samsung Xclipse", "it is for Samsung Xclipse GPUs only");
-            case "no-powervr": return Ui.t(this, "он только для PowerVR", "it is for PowerVR GPUs only");
-            case "glibc-build": return Ui.t(this, "это сборка для Linux/glibc (эмуляторы вроде Winlator glibc), нужен Android-пакет этого драйвера (например …-adrenotools.zip)",
-                "this is a Linux glibc build (for Winlator-style glibc containers); use the Android package of this driver (e.g. …-adrenotools.zip)");
-            case "not-taken-over": return Ui.t(this, "драйвер не загрузился, вместо него работал системный (подробности в логе)", "the driver did not load and the system driver ran instead (details in the log)");
-            case "no-gpu": return Ui.t(this, "драйвер не видит GPU этого телефона", "the driver sees no GPU on this phone");
-            case "load-failed": return Ui.t(this, "драйвер не открылся", "the driver could not be opened");
-            case "no-library": return Ui.t(this, "в пакете нет библиотеки драйвера", "the package has no driver library");
-            default:
-                if (r.startsWith("missing-lib")) return Ui.t(this, "в пакете не хватает библиотеки", "the package lacks a library") + r.substring(11);
-                if (r.startsWith("min-api")) { int api = 0; try { api = Integer.parseInt(r.substring(7).trim()); } catch (NumberFormatException e) { /* shown as is */ }
-                    String need = androidName(api), have = androidName(android.os.Build.VERSION.SDK_INT);
-                    return Ui.t(this, "нужен Android " + need + " или новее, а здесь Android " + have, "it needs Android " + need + " or newer, this phone has Android " + have); }
-                return r;
-        }
-    }
-    static boolean qualcommSoc() {
-        String s = ((android.os.Build.VERSION.SDK_INT >= 31 ? android.os.Build.SOC_MANUFACTURER + " " : "") + android.os.Build.HARDWARE).toLowerCase(Locale.ROOT);
-        return s.contains("qti") || s.contains("qualcomm") || s.contains("qcom");
-    }
-    // The GPU model as the kernel reports it, e.g. "Adreno750v2" (empty when unreadable or not an Adreno).
-    static String gpuModel() {
-        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader("/sys/class/kgsl/kgsl-3d0/gpu_model"))) {
-            String l = r.readLine(); return l == null ? "" : l.trim();
-        } catch (java.io.IOException e) { return ""; }
-    }
-    // A downloaded package whose manifest entry has an "auto" regex matching this GPU (drivers/manifest.json in the repository,
-    // cached as <dir>/manifest.json), e.g. the A710/A720 Turnip on an Adreno 720; null when none applies.
-    private static String autoDriverForGpu(File dir) {
-        String gpu = gpuModel(); if (gpu.isEmpty()) return null;
-        try {
-            org.json.JSONArray pk = new org.json.JSONObject(readSmall(new File(dir, "manifest.json"))).getJSONArray("packages");
-            for (int i = 0; i < pk.length(); i++) {
-                org.json.JSONObject o = pk.getJSONObject(i); String re = o.optString("auto", ""), name = o.getString("name");
-                if (!re.isEmpty() && java.util.regex.Pattern.compile(re).matcher(gpu).find() && hasDriverLib(new File(dir, name))) return name;
-            }
-        } catch (Exception e) { /* no manifest yet */ }
-        return null;
-    }
-    static boolean hasDriverLib(File d) { File[] fs = d.listFiles(); if (fs != null) for (File f : fs) if (f.getName().endsWith(".so")) return true; return false; }
-    static String readSmall(File f) throws java.io.IOException { try (java.io.InputStream in = new java.io.FileInputStream(f)) { return readStream(in); } }
-    static String readStream(java.io.InputStream in) throws java.io.IOException {
-        java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[8192]; int n; while ((n = in.read(buf)) > 0) b.write(buf, 0, n); return b.toString("UTF-8");
-    }
-    // [DOOM] 2.39: where a package under files/drivers came from: <package>/.dm_origin = "<kind>\t<detail>", kind bundled (detail: the APK
-    // install that copied it, bundleStamp), download (manifest / "<repo> <tag>"), file (the picked zip's name) or import (<game folder>/drivers/...).
-    // The driver manager shows it and lets the player delete all but the bundled ones. Packages from before 2.39 have none (DriverManager.origin guesses).
-    static final String ORIGIN = ".dm_origin";
-    static void writeOrigin(File dir, String kind, String detail) {
-        try (OutputStream os = new FileOutputStream(new File(dir, ORIGIN))) { os.write((kind + "\t" + detail.replace('\n', ' ') + "\n").getBytes(StandardCharsets.UTF_8)); }
-        catch (IOException e) { android.util.Log.e("dm", "driver origin " + dir.getName() + ": " + e); }
-    }
-    static String[] readOrigin(File dir) {
-        String s = readText(new File(dir, ORIGIN)); if (s == null || s.trim().isEmpty()) return null;
-        String[] f = s.trim().split("\t", 2); return f.length == 2 ? f : new String[] {f[0], ""};
-    }
-    // [DOOM] Driver packages from the internet (when there is a connection): the repository's drivers/manifest.json lists
-    // adrenotools packages (name, url, sha256, optional "auto" GPU regex). Missing ones are downloaded in the background, checked
-    // against their SHA-256 and unpacked to <dir>/<name>/; they show up in the settings and, when "auto" matches this GPU, are
-    // used by default from the next launch. Offline nothing happens and the bundled Turnip / system driver are used.
-    // [DOOM] 2.39: family-aware: an entry's "family" (else the family words of its name + title) must fit this phone (familyFits), so a
-    // Mali phone no longer downloads the Turnip builds; a package the player deleted in the driver manager (pref driver_removed) is not
-    // downloaded again. Other drivers come from the driver manager (DriverManager.java, drivers/sources.json).
-    static final String DRIVER_MANIFEST_URL = "https://raw.githubusercontent.com/Desm0nt/doom-port/main/drivers/manifest.json";
-    private void updateDriversInBackground(final File dir) {
-        final java.util.Set<String> removed = new java.util.HashSet<>(doomPrefs().getStringSet("driver_removed", java.util.Collections.emptySet()));
-        new Thread(() -> {
-            try {
-                byte[] man = httpGet(DRIVER_MANIFEST_URL, 1 << 20);
-                org.json.JSONArray pk = new org.json.JSONObject(new String(man, "UTF-8")).getJSONArray("packages");
-                dir.mkdirs(); try (java.io.FileOutputStream os = new java.io.FileOutputStream(new File(dir, "manifest.json"))) { os.write(man); }
-                for (int i = 0; i < pk.length(); i++) {
-                    org.json.JSONObject o = pk.getJSONObject(i); String name = o.getString("name");
-                    if (!name.matches("[A-Za-z0-9._-]+") || name.startsWith(".") || hasDriverLib(new File(dir, name)) || removed.contains(name)) continue;
-                    String fam = o.optString("family", ""); if (fam.isEmpty()) fam = familyWord(name + " " + o.optString("title", ""));
-                    if (!familyFits(fam)) { android.util.Log.i("dm", "driver " + name + ": for " + fam + ", not this GPU (" + phoneFamily() + "), not downloaded"); continue; }
-                    byte[] zip = httpGet(o.getString("url"), 64 << 20);
-                    String got = sha256(zip);
-                    if (!got.equalsIgnoreCase(o.getString("sha256"))) { android.util.Log.e("dm", "driver " + name + ": SHA-256 mismatch " + got + ", skipped"); continue; }
-                    unzipDriver(new java.io.ByteArrayInputStream(zip), new File(dir, name));
-                    writeOrigin(new File(dir, name), "download", "manifest");
-                    android.util.Log.i("dm", "driver " + name + ": downloaded (" + zip.length + " bytes)");
-                }
-            } catch (Exception e) { android.util.Log.i("dm", "driver update skipped: " + e); }
-        }, "dm-driver-update").start();
-    }
-    static byte[] httpGet(String url, int max) throws java.io.IOException {
-        for (int hop = 0; hop < 5; hop++) {   // GitHub release assets redirect to another host
-            java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
-            c.setConnectTimeout(10000); c.setReadTimeout(30000); c.setInstanceFollowRedirects(false);
-            int code = c.getResponseCode();
-            if (code / 100 == 3) { url = c.getHeaderField("Location"); c.disconnect(); if (url == null) break; continue; }
-            if (code != 200) { c.disconnect(); throw new java.io.IOException("HTTP " + code + " " + url); }
-            try (java.io.InputStream in = c.getInputStream()) {
-                java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream(); byte[] buf = new byte[1 << 16]; int n;
-                while ((n = in.read(buf)) > 0) { b.write(buf, 0, n); if (b.size() > max) throw new java.io.IOException("too large: " + url); }
-                return b.toByteArray();
-            } finally { c.disconnect(); }
-        }
-        throw new java.io.IOException("too many redirects");
-    }
-    static String sha256(byte[] d) {
-        try { byte[] h = java.security.MessageDigest.getInstance("SHA-256").digest(d); StringBuilder sb = new StringBuilder(); for (byte x : h) sb.append(String.format("%02x", x)); return sb.toString(); }
-        catch (java.security.NoSuchAlgorithmException e) { return ""; }
-    }
-    // Unpack an adrenotools package zip (meta.json + the driver library and anything it ships, at the zip root or in one folder) into out/.
-    static void unzipDriver(java.io.InputStream src, File out) throws java.io.IOException {
-        File tmp = new File(out.getPath() + ".tmp"); deleteDriverTree(tmp); tmp.mkdirs();
-        try (java.util.zip.ZipInputStream z = new java.util.zip.ZipInputStream(src)) {
-            java.util.zip.ZipEntry e; byte[] buf = new byte[1 << 16];
-            while ((e = z.getNextEntry()) != null) {
-                if (e.isDirectory()) continue;
-                // [DOOM] 2.25: also the helper libraries a driver may ship next to it (versioned lib*.so.N) and its json / text files
-                String n = new File(e.getName()).getName();
-                if (!(n.endsWith(".so") || n.matches(".+\\.so\\.[0-9][0-9.]*") || n.endsWith(".json") || n.endsWith(".txt"))) continue;
-                try (java.io.OutputStream os = new java.io.FileOutputStream(new File(tmp, n))) { int k; while ((k = z.read(buf)) > 0) os.write(buf, 0, k); }
-            }
-        }
-        if (!hasDriverLib(tmp)) { deleteDriverTree(tmp); throw new java.io.IOException("no driver library in the package"); }
-        deleteDriverTree(out); if (!tmp.renameTo(out)) throw new java.io.IOException("rename failed: " + out);
-    }
-    static void deleteDriverTree(File f) { File[] fs = f.listFiles(); if (fs != null) for (File c : fs) deleteDriverTree(c); f.delete(); }
-    // Copy assets/drivers/<name>/* to <dst>/<name>/.
-    // [DOOM] 2.39: the APK carries the Turnip builds and, as experimental options, RADV-Xclipse and two PanVK builds (tools/fetch_turnip.py);
-    // only the packages that can run on this phone are copied (packageProblem over the asset's folder name + meta.json: GPU family, glibc,
-    // minApi), so an Adreno phone does not get ~70 MB of Mali / Xclipse libraries in its private storage. A package is copied again when this
-    // is another APK install than the one that copied it (<name>/.dm_origin "bundled\t<bundleStamp>"): the assets are stored compressed, so
-    // their size is unknown and the old size check never replaced a same-name package an update brought. A bundled copy that does not fit
-    // this phone (turnip27 an older APK put on a Mali phone) is removed; a package of the player's own (origin file / import) is left alone.
-    private void extractBundledDrivers(File dst) {
-        String stamp = bundleStamp();
-        try {
-            String[] names = getAssets().list("drivers"); if (names == null) return;
-            for (String n : names) {
-                String[] files = getAssets().list("drivers/" + n); if (files == null || files.length == 0) continue;
-                File out = new File(dst, n); String[] org = readOrigin(out);
-                org.json.JSONObject meta = null;
-                try (java.io.InputStream in = getAssets().open("drivers/" + n + "/meta.json")) { meta = new org.json.JSONObject(readStream(in)); } catch (Exception e) { /* no meta.json: the folder name decides */ }
-                String why = packageProblem(n, meta);
-                if (why != null) {
-                    if (out.isDirectory() && (org == null || "bundled".equals(org[0]))) { deleteDriverTree(out); android.util.Log.i("dm", "bundled driver " + n + ": removed, not for this phone (" + why + ")"); }
-                    continue;
-                }
-                if (org != null && "bundled".equals(org[0]) && stamp.equals(org[1]) && hasDriverLib(out)) continue;
-                out.mkdirs(); new File(out, ORIGIN).delete();   // a copy cut short is copied again at the next start
-                for (String f : files) {
-                    try (java.io.InputStream in = getAssets().open("drivers/" + n + "/" + f); java.io.OutputStream os = new java.io.FileOutputStream(new File(out, f))) {
-                        byte[] buf = new byte[1 << 16]; int k; while ((k = in.read(buf)) > 0) os.write(buf, 0, k);
-                    }
-                }
-                writeOrigin(out, "bundled", stamp);
-                android.util.Log.i("dm", "bundled driver " + n + ": extracted (" + files.length + " files)");
-            }
-        } catch (java.io.IOException e) { android.util.Log.e("dm", "bundled drivers: " + e); }
-    }
-    // This APK install: versionName + install / update time (a reinstall of the same version copies the bundled drivers again too).
-    @SuppressWarnings("deprecation")
-    private String bundleStamp() {
-        try { android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0); return pi.versionName + "/" + pi.lastUpdateTime; }
-        catch (Exception e) { return BuildConfig.VERSION_NAME; }
-    }
-
-    // Driver packages in private storage (imported at launch from <game folder>/drivers, by default Download/DOOM Mobile/drivers), sorted by folder name.
-    // [DOOM] 2.39: not the driver manager's own folders (".cache", ".stage-*") nor a half-unpacked "<name>.tmp".
-    String[] driverPackages() {
-        File[] dirs = new File(getFilesDir(), "drivers").listFiles(); java.util.ArrayList<String> out = new java.util.ArrayList<>();
-        if (dirs != null) for (File d : dirs) { File[] fs = d.isDirectory() && !d.getName().startsWith(".") && !d.getName().endsWith(".tmp") ? d.listFiles() : null; if (fs == null) continue;
-            for (File f : fs) if (f.getName().endsWith(".so")) { out.add(d.getName()); break; } }
-        java.util.Collections.sort(out); return out.toArray(new String[0]);
-    }
-    // "<meta.json name> (<folder>)", or just the folder name when there is no readable meta.json.
-    String driverLabel(String name) {
-        File m = new File(new File(new File(getFilesDir(), "drivers"), name), "meta.json");
-        try (java.io.FileInputStream in = new java.io.FileInputStream(m)) {
-            byte[] b = new byte[(int) Math.min(m.length(), 65536)]; int n = in.read(b);
-            String t = new org.json.JSONObject(new String(b, 0, Math.max(n, 0), "UTF-8")).optString("name", "");
-            if (!t.isEmpty()) return t + " (" + name + ")";
-        } catch (Exception e) { /* no or unreadable meta.json */ }
-        return name;
-    }
-
-    // Copy every driver package <src>/<name>/{meta.json, library} into <dst>/<name>/ when missing or of another size.
-    private static void importDrivers(File src, File dst) {
-        File[] dirs = src.listFiles(); if (dirs == null) return;
-        for (File d : dirs) {
-            if (d.isFile() && d.getName().endsWith(".zip")) {   // a package zip dropped as is: unpack to <dst>/<zip name>/ once
-                String name = d.getName().substring(0, d.getName().length() - 4); File out = new File(dst, name);
-                if (!hasDriverLib(out)) try (java.io.InputStream in = new java.io.FileInputStream(d)) { unzipDriver(in, out); writeOrigin(out, "import", d.getPath()); android.util.Log.i("dm", "driver package " + name + ": unpacked from zip"); }
-                catch (java.io.IOException e) { android.util.Log.e("dm", "driver package " + d.getName() + ": " + e); }
-                continue;
-            }
-            File[] files = d.isDirectory() ? d.listFiles() : null; if (files == null) continue;
-            File out = new File(dst, d.getName()); out.mkdirs();
-            boolean copied = false;
-            for (File f : files) {
-                File o = new File(out, f.getName());
-                if (o.length() == f.length() || f.getName().equals(ORIGIN)) continue;
-                try (java.io.InputStream in = new java.io.FileInputStream(f); java.io.OutputStream os = new java.io.FileOutputStream(o)) {
-                    byte[] buf = new byte[1 << 16]; int n; while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
-                    android.util.Log.i("dm", "driver package " + d.getName() + ": " + f.getName() + " copied"); copied = true;
-                } catch (java.io.IOException e) { android.util.Log.e("dm", "driver package " + d.getName() + ": " + e); }
-            }
-            if (copied || readOrigin(out) == null) writeOrigin(out, "import", d.getPath());   // [DOOM] 2.39: the driver manager shows where it came from
-        }
-    }
-
-    // "<label> (applies immediately)" / "<label> (applies on next launch)", in the locale's own punctuation (gear_label_fmt).
-    private String when(int label, boolean now) {
-        return getString(R.string.gear_label_fmt, getString(label), getString(now ? R.string.gear_when_now : R.string.gear_when_next));
-    }
-    private TextView heading(LinearLayout box, String text) {
-        TextView t = new TextView(this); t.setText(text); t.setPadding(0, 24, 0, 0); box.addView(t); return t;
-    }
-    private RadioGroup radios(LinearLayout box, String[] labels, int idBase, int checked, boolean horizontal) {
-        RadioGroup g = new RadioGroup(this); g.setOrientation(horizontal ? RadioGroup.HORIZONTAL : RadioGroup.VERTICAL);
-        for (int i = 0; i < labels.length; i++) { RadioButton r = new RadioButton(this); r.setText(labels[i]); r.setId(idBase + i); g.addView(r); }
-        g.check(idBase + checked); box.addView(g); return g;
-    }
-    private String[] texts(int[] ids) { String[] s = new String[ids.length]; for (int i = 0; i < ids.length; i++) s[i] = getString(ids[i]); return s; }
-    private static int picked(RadioGroup g, int idBase, int n) { return Math.min(Math.max(0, g.getCheckedRadioButtonId() - idBase), n - 1); }
-    // "<requested>\t<active>\t<reason>" from vk_driver.c, or null before the driver is loaded.
-    private String[] driverStatus() {
-        if (!libraryLoaded) return null;
-        String s; try { s = nativeDriverStatus(); } catch (Throwable t) { return null; }
-        String[] f = s == null ? new String[0] : s.split("\t", -1);
-        return f.length >= 3 ? f : null;
-    }
-
-    void showDoomSettings() {
-        runOnUiThread(() -> {
-            SharedPreferences p = doomPrefs(), cp = getSharedPreferences("doom_controls", MODE_PRIVATE);
-            LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(48, 24, 48, 0);
-            // Dynamic resolution: the game's rs_enable, read now and written live (the Video menu's "Dynamic Resolution" is the same state).
-            int drsNow = -1; try { if (libraryLoaded) drsNow = nativeGetDrs(); } catch (Throwable t) { android.util.Log.e("dm", "nativeGetDrs: " + t); }
-            final int drsWas = drsNow;
-            CheckBox drs = new CheckBox(this);
-            if (drsNow >= 0) { drs.setText(when(R.string.gear_drs, true)); drs.setChecked(drsNow == 1); }
-            else { drs.setText(R.string.gear_drs_unknown); drs.setEnabled(false); }
-            box.addView(drs);
-            // [r6] DRS target fps, shown while the dynamic resolution box is ticked
-            TextView drsFpsH = heading(box, when(R.string.gear_drs_target, true));
-            String[] drsFpsLabels = new String[DRS_FPS.length]; int drsFpsAt = DRS_FPS.length - 1;
-            for (int i = 0; i < DRS_FPS.length; i++) { drsFpsLabels[i] = String.valueOf(DRS_FPS[i]); if (DRS_FPS[i] == p.getInt("drs_fps", DRS_FPS_DEFAULT)) drsFpsAt = i; }
-            RadioGroup drsFps = radios(box, drsFpsLabels, 9500, drsFpsAt, true);
-            Runnable drsFpsShow = () -> { int v = drs.isChecked() ? android.view.View.VISIBLE : android.view.View.GONE; drsFpsH.setVisibility(v); drsFps.setVisibility(v); };
-            drsFpsShow.run(); drs.setOnCheckedChangeListener((b, c) -> drsFpsShow.run());
-            heading(box, when(R.string.gear_res, false));
-            RadioGroup res = radios(box, RES_LABELS, 1000, Math.min(Math.max(0, p.getInt("res", 0)), RES_LABELS.length - 1), false);
-            TextView resNote = new TextView(this); resNote.setText(R.string.gear_res_drs_note); box.addView(resNote);
-            final boolean lightWas = p.getBoolean("light", false);
-            CheckBox light = new CheckBox(this); light.setText(when(R.string.gear_light, true)); light.setChecked(lightWas); box.addView(light);
-            heading(box, when(R.string.gear_sharpen, false));
-            RadioGroup sh = radios(box, texts(SHARPEN_LABELS), 2000, Math.min(Math.max(0, p.getInt("sharpen", 0)), SHARPEN_LABELS.length - 1), true);
-            CheckBox upscale = new CheckBox(this); upscale.setText(when(R.string.gear_upscale, false)); upscale.setChecked(p.getBoolean("upscale", false)); box.addView(upscale);
-            // Frame rate limit: only the values this display can show evenly.
-            java.util.ArrayList<Integer> lims = new java.util.ArrayList<>();
-            for (int l : FPS_LIMITS) if (fpsLimitAvailable(l)) lims.add(l);
-            String[] limLabels = new String[lims.size()]; int limAt = 0, limCur = fpsLimit();
-            for (int i = 0; i < limLabels.length; i++) { limLabels[i] = String.valueOf(lims.get(i)); if (lims.get(i) == limCur) limAt = i; }
-            heading(box, when(R.string.gear_fps_limit, false));
-            RadioGroup fpsLim = radios(box, limLabels, 8000, limAt, true);
-            if (lims.get(lims.size() - 1) > 60) { TextView n = new TextView(this); n.setText(R.string.gear_fps_note); box.addView(n); }
-            heading(box, when(R.string.gear_aspect, false));
-            final int aspWas = aspectPref(p);
-            String[] aspLabels = ASPECT_LABELS.clone(); aspLabels[0] = getString(R.string.gear_aspect_auto);
-            RadioGroup aspG = radios(box, aspLabels, 9700, aspWas, true);
-            TextView aspNote = new TextView(this); aspNote.setText(R.string.gear_aspect_note); box.addView(aspNote);
-            // Vulkan driver: the system one, or any adrenotools package under files/drivers/<name>/ (bundled, downloaded or imported from
-            // Download/DOOM Mobile/drivers), labelled with the name from its meta.json; below it, what the running game actually uses.
-            heading(box, when(R.string.gear_driver, false));
-            // [DOOM] packages that cannot run here (driverProblem: another GPU family, a glibc build, a missing library) are not offered;
-            // a line lists them with the reason. [DOOM] 2.39: the list is rebuilt when the driver manager closes (a package installed or
-            // deleted there shows up here at once), keeping the choice when it still exists
-            final LinearLayout drvBox = new LinearLayout(this); drvBox.setOrientation(LinearLayout.VERTICAL); box.addView(drvBox);
-            final String[][] drvNamesH = {new String[0]}; final RadioGroup[] drvGH = {null};
-            final java.util.function.Consumer<String> drvFill = want -> {
-                drvBox.removeAllViews();
-                java.util.ArrayList<String> offered = new java.util.ArrayList<>(); StringBuilder hiddenWhy = new StringBuilder();
-                for (String n : driverPackages()) { String why = driverProblem(n); if (why == null) offered.add(n); else hiddenWhy.append("\n- ").append(driverLabel(n)).append(": ").append(driverReasonText(why)); }
-                final String[] drvNames = offered.toArray(new String[0]); drvNamesH[0] = drvNames;
-                if (hiddenWhy.length() > 0) { TextView hn = new TextView(this); hn.setText(Ui.t(this, "Скрыты (не подходят этому телефону, " + hardwareSummary() + "):",
-                    "Hidden (cannot run on this phone, " + hardwareSummary() + "):") + hiddenWhy); drvBox.addView(hn); }
-                String[] drvLabels = new String[drvNames.length + 1]; drvLabels[0] = getString(R.string.gear_driver_system);
-                for (int i = 0; i < drvNames.length; i++) drvLabels[i + 1] = driverLabel(drvNames[i]);
-                String cur = want != null && (want.isEmpty() || offered.contains(want)) ? want : p.getString("driver", defaultDriver());
-                int drvAt = 0; for (int i = 0; i < drvNames.length; i++) if (drvNames[i].equals(cur)) drvAt = i + 1;
-                drvGH[0] = radios(drvBox, drvLabels, 7000, drvAt, false);
-            };
-            drvFill.accept(null);
-            String[] st = driverStatus();
-            if (st != null) {
-                boolean fell = !st[0].isEmpty() && "system".equals(st[1]);
-                TextView a = new TextView(this);
-                a.setText(fell ? getString(R.string.gear_driver_active_fallback, driverLabel(st[0]))
-                               : getString(R.string.gear_driver_active, st[0].isEmpty() || "system".equals(st[1]) ? getString(R.string.gear_driver_system_short) : driverLabel(st[0])));
-                box.addView(a);
-                // [DOOM] 2.25: why it fell back, or what the GPU reports for the custom driver (vk_driver.c verified it)
-                if (fell || (st.length > 3 && !st[0].isEmpty())) { TextView w = new TextView(this);
-                    w.setText((fell ? driverReasonText(st[2]) + (st.length > 3 ? "; " : "") : "") + (st.length > 3 ? st[3] : "")); box.addView(w); }
-            }
-            // [DOOM] 2.39: the driver manager (installed packages, install from a file, download from GitHub releases: DriverManager.java)
-            android.widget.Button drvMgrB = new android.widget.Button(this); drvMgrB.setText(Ui.t(this, "Драйверы…", "Manage drivers…")); box.addView(drvMgrB);
-            drvMgrB.setOnClickListener(v -> new DriverManager(this, () -> {
-                int k = picked(drvGH[0], 7000, drvNamesH[0].length + 1); drvFill.accept(k > 0 ? drvNamesH[0][k - 1] : "");
-            }).show());
-            heading(box, when(R.string.gear_lang, false));
-            String[] langLabels = LANG_LABELS.clone(); langLabels[0] = getString(R.string.gear_lang_system);
-            int langAt = 0; { String cur = p.getString("lang", ""); for (int i = 0; i < LANG_CODES.length; i++) if (LANG_CODES[i].equals(cur)) langAt = i; }
-            RadioGroup langG = radios(box, langLabels, 5000, langAt, true);
-            // [DOOM] issue #31: the game's own Aim Assist / Motion Aiming / motion sensitivity (controller settings menu), read now from the
-            // game and written live through its setters on Save; not kept in our preferences (the game profile keeps them).
-            final int[] gsWas = new int[3];
-            for (int i = 0; i < 3; i++) { gsWas[i] = -1; try { if (libraryLoaded) gsWas[i] = nativeGetGameSetting(i); } catch (Throwable t) { android.util.Log.e("dm", "nativeGetGameSetting: " + t); } }
-            CheckBox aaMenu = new CheckBox(this), motionAim = new CheckBox(this);
-            if (gsWas[GS_AIM_ASSIST] >= 0) { aaMenu.setText(when(R.string.gear_aa_menu, true)); aaMenu.setChecked(gsWas[GS_AIM_ASSIST] == 1); }
-            else { aaMenu.setText(getString(R.string.gear_game_unknown_fmt, getString(R.string.gear_aa_menu))); aaMenu.setEnabled(false); }
-            box.addView(aaMenu);
-            heading(box, when(R.string.gear_aa, false));
-            String[] aaLabels = AA_LABELS.clone(); aaLabels[0] = getString(R.string.gear_aa_switch);
-            RadioGroup aaG = radios(box, aaLabels, 6000, nearest(AA_STRENGTHS, p.getFloat("aa", 1.0f)), true);
-            if (gsWas[GS_MOTION_AIM] >= 0) { motionAim.setText(when(R.string.gear_motion_aim, true)); motionAim.setChecked(gsWas[GS_MOTION_AIM] == 1); }
-            else { motionAim.setText(getString(R.string.gear_game_unknown_fmt, getString(R.string.gear_motion_aim))); motionAim.setEnabled(false); }
-            box.addView(motionAim);
-            // the game's slider: 0..100 in steps of 1 (joy_sixAxisGlobalScale = value x 0.6)
-            final TextView gyroT = new TextView(this); box.addView(gyroT);
-            final android.widget.SeekBar gyroS = new android.widget.SeekBar(this); gyroS.setMax(100); box.addView(gyroS);
-            if (gsWas[GS_GYRO_SENS] >= 0) {
-                gyroS.setProgress(gsWas[GS_GYRO_SENS]); gyroT.setText(getString(R.string.gear_gyro_sens_fmt, when(R.string.gear_gyro_sens, true), gsWas[GS_GYRO_SENS]));
-                gyroS.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
-                    public void onProgressChanged(android.widget.SeekBar sb, int v, boolean user) { gyroT.setText(getString(R.string.gear_gyro_sens_fmt, when(R.string.gear_gyro_sens, true), v)); }
-                    public void onStartTrackingTouch(android.widget.SeekBar sb) {}
-                    public void onStopTrackingTouch(android.widget.SeekBar sb) {}
-                });
-            } else { gyroT.setText(getString(R.string.gear_game_unknown_fmt, getString(R.string.gear_gyro_sens))); gyroS.setEnabled(false); }
-            TextView gsNote = new TextView(this); gsNote.setText(R.string.gear_game_settings_note); box.addView(gsNote);
-            CheckBox rumble = new CheckBox(this); rumble.setText(when(R.string.gear_rumble, false)); rumble.setChecked(p.getBoolean("rumble", false)); box.addView(rumble);
-            heading(box, when(R.string.gear_look, true));
-            RadioGroup look = radios(box, LOOK_LABELS, 3000, nearest(LOOK_GAINS, cp.getFloat("look", 1.0f)), true);
-            heading(box, when(R.string.gear_deadzone, true));
-            RadioGroup dz = radios(box, texts(DEADZONE_LABELS), 4000, nearest(DEADZONES, cp.getFloat("move_dz", 0f)), true);
-            CheckBox fps = new CheckBox(this); fps.setText(when(R.string.gear_fps_counter, true)); fps.setChecked(cp.getBoolean("fps", true)); box.addView(fps);
-            // Settings button (DoomPadView.GEAR_*): normal / faded, with the faded opacity slider below.
-            heading(box, when(R.string.gear_button, true));
-            final int gearWas = Math.min(Math.max(0, cp.getInt("gear_mode", DoomPadView.GEAR_NORMAL)), GEAR_LABELS.length - 1);
-            RadioGroup gearG = radios(box, texts(GEAR_LABELS), 9000, gearWas, true);
-            TextView gearNote = new TextView(this); gearNote.setText(R.string.gear_button_note); box.addView(gearNote);
-            // Faded opacity, 1..100 % of the usual alpha; saved and shown on the pad while sliding (the pad is visible behind the dialog).
-            final int alphaWas = Math.max(1, Math.min(100, cp.getInt("gear_alpha", DoomPadView.GEAR_ALPHA_DEFAULT)));
-            final TextView alphaT = new TextView(this); alphaT.setText(getString(R.string.gear_button_alpha, alphaWas)); box.addView(alphaT);
-            android.widget.SeekBar alphaS = new android.widget.SeekBar(this); alphaS.setMax(99); alphaS.setProgress(alphaWas - 1); box.addView(alphaS);
-            alphaS.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
-                public void onProgressChanged(android.widget.SeekBar sb, int v, boolean user) {
-                    alphaT.setText(getString(R.string.gear_button_alpha, v + 1)); cp.edit().putInt("gear_alpha", v + 1).apply();
-                    if (doomPad != null) doomPad.reloadSettings();
-                }
-                public void onStartTrackingTouch(android.widget.SeekBar sb) {}
-                public void onStopTrackingTouch(android.widget.SeekBar sb) {}
-            });
-            // [front] the on-screen controls, as in Diablo III's gear dialog: opacity and size (live, the pad shows them behind the dialog), the layout
-            // editor (the ABXY diamond moves as one) and its reset; the same settings as the pause menu's "Gamepad…"
-            heading(box, Ui.t(this, "Экранные контролы", "On-screen controls"));
-            padSlider(box, cp, Ui.t(this, "Прозрачность контролов: %d%%", "Controls' opacity: %d%%"), "opacity", 5, 100, DoomPadView.OPACITY_DEFAULT);
-            padSlider(box, cp, Ui.t(this, "Размер контролов: %d%%", "Controls' size: %d%%"), "size", 60, 160, DoomPadView.SIZE_DEFAULT);
-            android.widget.Button editB = new android.widget.Button(this); editB.setText(Ui.t(this, "Изменить раскладку…", "Edit the layout…")); box.addView(editB);
-            android.widget.Button resetB = new android.widget.Button(this); resetB.setText(Ui.t(this, "Сбросить раскладку", "Reset the layout")); box.addView(resetB);
-            resetB.setOnClickListener(v -> { if (doomPad != null) { doomPad.resetLayout(); android.widget.Toast.makeText(this, Ui.t(this, "Раскладка сброшена", "Layout reset"), android.widget.Toast.LENGTH_SHORT).show(); } });
-            // [DOOM] issue #11: the game folder this run uses, and "Choose…" (the chooser saves at once; the running game keeps its folder)
-            heading(box, when(R.string.gear_folder, false));
-            TextView folderT = new TextView(this); folderT.setText(folderLine()); box.addView(folderT);
-            android.widget.Button folderB = new android.widget.Button(this); folderB.setText(R.string.folder_choose); box.addView(folderB);
-            folderB.setOnClickListener(v -> showFolderDialog(() -> folderT.setText(folderLine())));
-            // [DOOM] 2.41: updates: this version and the game files' setup version, the check at start on / off ("Check for updates" is a pause-menu row)
-            heading(box, getString(R.string.upd_heading));
-            TextView updT = new TextView(this); updT.setText(updates != null ? updates.statusLine() : BuildConfig.VERSION_NAME); box.addView(updT);
-            CheckBox updStart = new CheckBox(this); updStart.setText(when(R.string.upd_check_start, false)); updStart.setChecked(updates == null || updates.startCheckOn()); box.addView(updStart);
-            android.widget.ScrollView scroll = new android.widget.ScrollView(this); scroll.addView(box);
-            final AlertDialog[] gearDlg = new AlertDialog[1];
-            editB.setOnClickListener(v -> { if (gearDlg[0] != null) gearDlg[0].dismiss(); if (front != null) front.edit(); else if (doomPad != null) doomPad.startEdit(null); });
-            gearDlg[0] = new AlertDialog.Builder(this).setTitle(R.string.gear_title).setView(scroll)
-                .setPositiveButton(R.string.gear_save, (d, w) -> {
-                    final int aspPick = picked(aspG, 9700, ASPECT_ENV.length);
-                    int drvPick = picked(drvGH[0], 7000, drvNamesH[0].length + 1);
-                    p.edit().putString("driver", drvPick > 0 ? drvNamesH[0][drvPick - 1] : "").putBoolean("rumble", rumble.isChecked()).putInt("aspect", aspPick)
-                        .putFloat("aa", AA_STRENGTHS[picked(aaG, 6000, AA_STRENGTHS.length)]).putString("lang", LANG_CODES[picked(langG, 5000, LANG_CODES.length)])
-                        .putInt("res", picked(res, 1000, RES_LABELS.length)).putInt("sharpen", picked(sh, 2000, SHARPEN_LABELS.length)).putBoolean("upscale", upscale.isChecked())
-                        .putInt("fps_limit", lims.get(picked(fpsLim, 8000, lims.size())))
-                        .putBoolean("light", light.isChecked()).putInt("drs_fps", DRS_FPS[picked(drsFps, 9500, DRS_FPS.length)]).apply();
-                    // [r6] live: light mode (the game's own dock / undock preset switch) and the DRS target; also set at the next start
-                    if (libraryLoaded) {
-                        try { nativeSetDrsFps(DRS_FPS[picked(drsFps, 9500, DRS_FPS.length)]); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetDrsFps: " + t); }
-                        if (light.isChecked() != lightWas) {
-                            boolean ok = false;
-                            try { ok = nativeSetLight(light.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetLight: " + t); }
-                            if (!ok) android.widget.Toast.makeText(this, R.string.toast_light_failed, android.widget.Toast.LENGTH_LONG).show();
-                        }
-                    }
-                    int gearPick = picked(gearG, 9000, GEAR_LABELS.length);
-                    cp.edit().putBoolean("fps", fps.isChecked()).putFloat("look", LOOK_GAINS[picked(look, 3000, LOOK_GAINS.length)])
-                        .putFloat("move_dz", DEADZONES[picked(dz, 4000, DEADZONES.length)]).putInt("gear_mode", gearPick).apply();
-                    if (doomPad != null) doomPad.reloadSettings();
-                    if (updates != null) updates.setStartCheck(updStart.isChecked());   // [DOOM] 2.41
-                    if (drsWas >= 0 && drs.isChecked() != (drsWas == 1)) {
-                        boolean ok = false;
-                        try { ok = nativeSetDrs(drs.isChecked()); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetDrs: " + t); }
-                        if (!ok) android.widget.Toast.makeText(this, R.string.toast_drs_failed, android.widget.Toast.LENGTH_LONG).show();
-                    }
-                    // [DOOM] issue #31: only what was changed in this dialog goes to the game (a change made in the game menu stays)
-                    int[] gsNow = {motionAim.isChecked() ? 1 : 0, gyroS.getProgress(), aaMenu.isChecked() ? 1 : 0};
-                    boolean gsFailed = false;
-                    for (int i = 0; i < 3; i++) if (gsWas[i] >= 0 && gsNow[i] != gsWas[i]) {
-                        boolean ok = false;
-                        try { ok = nativeSetGameSetting(i, gsNow[i]); } catch (Throwable t) { android.util.Log.e("dm", "nativeSetGameSetting: " + t); }
-                        gsFailed |= !ok;
-                    }
-                    if (gsFailed) android.widget.Toast.makeText(this, R.string.toast_game_setting_failed, android.widget.Toast.LENGTH_LONG).show();
-                    if (aspPick != aspWas) {   // [DOOM] BUGS_AND_FIXES 2.12: native answers whether it switched live (needs DM_DOOM_WIDE_LIVE=1)
-                        boolean live = false;   // [4:3] only auto <-> 16:9 on a screen wider than 16:9 (a presenter crop); 4:3 needs a restart
-                        if (aspPick != 2 && aspWas != 2)
-                            try { live = libraryLoaded && nativeWideLive(aspPick == 0); } catch (Throwable t) { android.util.Log.e("dm", "nativeWideLive: " + t); }
-                        android.widget.Toast.makeText(this, live ? R.string.toast_wide_now : R.string.toast_wide_next, android.widget.Toast.LENGTH_SHORT).show();
-                    }
-                })
-                .setNegativeButton(R.string.gear_cancel, null).show();
-        });
-    }
-    // [front] a live slider for one of the pad's int prefs (min..max %), saved at once and shown on the pad behind the dialog
-    private void padSlider(android.widget.LinearLayout box, android.content.SharedPreferences cp, String fmt, String key, int min, int max, int def) {
-        final int was = Math.max(min, Math.min(max, cp.getInt(key, def)));
-        final TextView label = new TextView(this); label.setText(String.format(java.util.Locale.ROOT, fmt, was)); box.addView(label);
-        android.widget.SeekBar s = new android.widget.SeekBar(this); s.setMax(max - min); s.setProgress(was - min); box.addView(s);
-        s.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
-            public void onProgressChanged(android.widget.SeekBar sb, int v, boolean user) {
-                label.setText(String.format(java.util.Locale.ROOT, fmt, v + min)); cp.edit().putInt(key, v + min).apply();
-                if (doomPad != null) doomPad.reloadSettings();
-            }
-            public void onStartTrackingTouch(android.widget.SeekBar sb) {}
-            public void onStopTrackingTouch(android.widget.SeekBar sb) {}
-        });
-    }
-
-
-    // [DOOM] After the game starts: removes the driver crash guard once a frame was presented, and tells the player once when the
-    // chosen driver did not start and the native side fell back to the system driver (vk_driver.c status). Polls every second until
-    // both are settled.
     private static boolean diagWiped;   // [DOOM] diagnostics APK: CrashLog.wipeForDiag looked at this process already
-    private boolean driverGuardDone, driverStatusDone, firstFrameDone;   // firstFrameDone: [DOOM] breadcrumb "first frames presented"
-    private long gameStartedAt;
-    private final float[] guardStats = new float[4];
     // [DOOM] the diagnostics APK: boot.log copied to <game folder>/logs every minute while the game runs (a hard kill or a hang keeps the
     // last minute of the log reachable without adb), on a background thread
     private final Runnable diagMirror = new Runnable() { @Override public void run() {
         if (!started || isFinishing()) return;
         android.content.Context app = getApplicationContext(); new Thread(() -> CrashLog.mirrorBootLogs(app), "dm-logcopy").start();
         view.postDelayed(this, 60_000);
-    } };
-    private final Runnable driverWatch = new Runnable() { @Override public void run() {
-        if (!started || isDestroyed()) return;
-        String[] st = driverStatus();
-        if (!driverStatusDone && st != null) {
-            driverStatusDone = true;
-            crumb("Vulkan driver status: requested \"" + st[0] + "\" active " + st[1] + " reason " + st[2] + (st.length > 3 ? " " + st[3] : ""));
-            if (!st[0].isEmpty() && "system".equals(st[1])) {
-                android.util.Log.w("dm", "driver " + st[0] + " did not start (" + st[2] + "): system driver");
-                android.widget.Toast.makeText(DmActivity.this, getString(R.string.toast_driver_fallback, driverLabel(st[0]), driverReasonText(st[2])), android.widget.Toast.LENGTH_LONG).show();
-                driverGuard().delete(); driverGuardDone = true;   // not a crash: the native side already chose the system driver
-            }
-        }
-        if (!driverGuardDone || !firstFrameDone) {
-            try { nativeFrameStats(guardStats); } catch (Throwable t) { guardStats[0] = 0; }
-            if (guardStats[0] > 0 && !driverGuardDone) { driverGuard().delete(); driverGuardDone = true; android.util.Log.i("dm", "driver guard: first frames presented, guard cleared"); }
-            if (guardStats[0] > 0 && !firstFrameDone) { firstFrameDone = true;
-                crumb(String.format(Locale.ROOT, "first frames presented %.1f s after the game started (%.0f fps, frame %.1f ms)", (android.os.SystemClock.uptimeMillis() - gameStartedAt) / 1000.0, guardStats[0], guardStats[1]));
-                if (updates != null) updates.start(); }   // [DOOM] 2.41: the update / game-files checks, their notices over the first screens
-        }
-        if (!(driverGuardDone && driverStatusDone && firstFrameDone)) view.postDelayed(this, 1000);
     } };
 
     private void startHost() {
@@ -1225,7 +451,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             File ext = getExternalFilesDir(null), internal = new File(getFilesDir(), "dm");
             File runtime = new File(internal, "out/main.patched.bin").canRead() || ext == null ? internal : new File(ext, "dm");
             try { Os.setenv("DM_DERIVED", new File(runtime, "derived.tsv").getAbsolutePath(), true); } catch (ErrnoException e) { showStartError(getString(R.string.dmAndroidStorage)); return; }
-            if (DOOM) { applyPendingImport(); applyDoomSettings(); }   // [front] a requested save import first
+            if (DOOM) { applyPendingImport(); GearSettings.applyEnv(this); }   // [front] a requested save import first
             try {   // [DOOM] the app version for boot.log's first lines (jni_android.c log_header)
                 android.content.pm.PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
                 Os.setenv("DM_APP_VERSION", getPackageName() + " " + pi.versionName + " (" + pi.getLongVersionCode() + ")" + (BuildConfig.DEBUG ? " debug" : ""), true);
@@ -1234,7 +460,17 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             catch (UnsatisfiedLinkError error) { showStartError(getString(R.string.dmAndroidLibrary)); return; }
             nativeContext(getApplicationContext());
         }
-        if (DOOM && doomPad == null) { doomPad = new DoomPadView(this); gameFrame.addView(doomPad, new FrameLayout.LayoutParams(-1, -1)); updatePadVisibility();   // [DOOM] on-screen controller
+        if (DOOM && doomPad == null) { doomPad = new DoomPadView(this, DoomPadView.PRESET_GAME, PadSkin.CLASSIC, KeyEvent.KEYCODE_E);
+            // [DOOM] 2.45 (from Eternal's anrfix, docs/port-kb APP-01): the pad is drawn on its own surface and thread (frontend-common PadSurface.java),
+            // above the game's surface and below the window; the UI thread then draws nothing while the game runs and cannot be held by HWUI waiting
+            // for a GPU our Vulkan work occupies (ANR "Input dispatching timed out"). Touches still go to doomPad on the window, as before.
+            // Old drawing on the window: DM_PAD_SURFACE=0 in dm/env (applied after nativeStart, padSurfaceEnv) or --ez dmPadHwui true;
+            // test: --ei dmPadStallMs N / DM_PAD_STALL_MS=N = the pad's draw thread sleeps N ms holding a buffer (at most every 15 s).
+            boolean hwui = getIntent().getBooleanExtra("dmPadHwui", false);
+            PadSurface.stallMs = Math.max(0, getIntent().getIntExtra("dmPadStallMs", 0));
+            if (!hwui) gameFrame.addView(doomPad.attachSurface(), new FrameLayout.LayoutParams(-1, -1));
+            crumb("pad drawn " + (hwui ? "on the window (HWUI, dmPadHwui)" : "on its own surface (draw thread dm-pad-draw)") + (PadSurface.stallMs > 0 ? ", test stall " + PadSurface.stallMs + " ms" : ""));
+            gameFrame.addView(doomPad, new FrameLayout.LayoutParams(-1, -1)); updatePadVisibility();   // [DOOM] on-screen controller
             front = new FrontMenu(this, this, doomPad, gameFrame); }   // [front] the pause menu over it (the gear button opens it)
         if (touchOverlay == null && !DOOM) {   // [DOOM] the D2R touch layout does not apply; a DOOM layout comes later
             int[] gameIds = {R.string.dmAndroidAttack, R.string.dmAndroidSkill1, R.string.dmAndroidSkill2, R.string.dmAndroidSkill3, R.string.dmAndroidSkill4,
@@ -1261,7 +497,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (!view.getHolder().getSurface().isValid() || view.getWidth() <= 0 || view.getHeight() <= 0) return;
         File ext = getExternalFilesDir(null);
         if (ext == null) { showStartError(getString(R.string.dmAndroidStorage)); return; }
-        if (DOOM) { android.view.Display d = display();   // the real display size first: a game started with the screen off has a 0x0 view
+        if (DOOM) { android.view.Display d = GearDisplay.display(this);   // the real display size first: a game started with the screen off has a 0x0 view
             if (d != null) { android.graphics.Point p = new android.graphics.Point(); d.getRealSize(p); nativeDisplaySize(p.x, p.y); crumb("display " + p.x + "x" + p.y + ", view " + view.getWidth() + "x" + view.getHeight()); } }
         nativeSurface(view.getHolder().getSurface(), view.getWidth(), view.getHeight());
         updateRefresh();
@@ -1275,7 +511,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         String src = DOOM ? GameFolder.dir(this).getAbsolutePath() : data.getAbsolutePath();   // [DOOM] <game folder>/{romfs,dm} (GameFolder, issue #11)
         if (DOOM) CrashLog.session(this, "fg");   // [DOOM] the game runs from here: a leftover marker at the next start = it did not end cleanly
         int result = nativeStart(getFilesDir().getAbsolutePath(), ext.getAbsolutePath(), src, Locale.getDefault().toLanguageTag());
-        if (DOOM) { nativeLogReady = true; gameStartedAt = android.os.SystemClock.uptimeMillis(); flushCrumbs(); crumb("nativeStart " + result); }
+        if (DOOM) { nativeLogReady = true; flushCrumbs(); crumb("nativeStart " + result); }
         if (result < 0) {
             int resource = switch (result) {
                 // [DOOM] its own texts: the shared ones name d2r's Download/S2X/D2R Mobile and d2rm_android.py
@@ -1292,10 +528,10 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             showStartError(resource == 0 ? getString(R.string.dmAndroidStartFailed, result) : getString(resource)); return;
         }
         started = true;
+        if (DOOM) padSurfaceEnv();   // [DOOM] 2.45: dm/env is read by nativeStart, so its pad switches apply from here
         if (touchOverlay != null) touchOverlay.setInputEnabled(true);
-        if (DOOM) {   // [DOOM] driver crash guard / fallback message (driverWatch), and the notice from the guard at this launch
-            if (driverNotice != null) { android.widget.Toast.makeText(this, driverNotice, android.widget.Toast.LENGTH_LONG).show(); driverNotice = null; }
-            view.postDelayed(driverWatch, 1000);
+        if (DOOM) {   // [front] the driver notice from the start, then the crash guard / fallback / first frames watch (VkDrivers.gameStarted)
+            drivers.gameStarted(view, () -> { if (updates != null) updates.start(); });   // [DOOM] 2.41: the update / game-files checks at the first frames
             if (BuildConfig.DM_DIAG) view.postDelayed(diagMirror, 60_000);
         }
         nativeFocus(3);
@@ -1346,7 +582,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         showStartError(sb.toString(), true);
     }
     // "<path> (found automatically / your choice)" and, when another folder was chosen for the next launch, a second line
-    private String folderLine() {
+    String folderLine() {
         GameFolder.Result r = GameFolder.last(); String saved = GameFolder.saved(this);
         String line = r == null || r.dir == null ? getString(R.string.folder_none)
             : getString(r.how.equals("saved choice") ? R.string.folder_custom_fmt : R.string.folder_auto_fmt, r.dir.getAbsolutePath());
@@ -1444,7 +680,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     }
 
     // ---- [DOOM] 2.41: "a new version is out" and "re-run setup" notices (UpdateNotice.java, the same file in frontend-common/java). Started once
-    // the game shows its first frames (driverWatch); the gear has the status line, "Check for updates" and "Check for new versions at start".
+    // the game shows its first frames (VkDrivers.gameStarted's callback in startHost); the gear has the status line and "Check for new versions
+    // at start" (GearPages.updates); "Check for updates" is the pause menu's row (FrontMenu.R_UPDATES).
     private UpdateNotice updates;
     private static boolean baselineLogged;
     static final String UPDATE_REPO = "Desm0nt/doom-port";
@@ -1476,9 +713,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             File d = GameFolder.dir(DmActivity.this); if (d == null) return 1;
             File f = new File(GameFolder.runtime(DmActivity.this, d), "out/build_src.sha256");
             String s = readText(f), sha = s == null || s.trim().isEmpty() ? "" : s.trim().split("\\s+")[0].toLowerCase(Locale.ROOT);
-            boolean old = PRE_045_PATCHERS.contains(sha);
+            // [DOOM] 2.45: what the loaded game really has wins over the patcher hash (an unpublished patcher, e.g. a dev build, is in no list)
+            int r6 = -1; try { r6 = nativeR6Patches(); } catch (UnsatisfiedLinkError e) { /* an older library */ }
+            boolean old = r6 == 0 || (r6 < 0 && PRE_045_PATCHERS.contains(sha));
             if (!baselineLogged) { baselineLogged = true; crumb("game files: no stamp; " + f + (sha.isEmpty() ? " missing" : " patch_nso.py " + sha.substring(0, Math.min(12, sha.length())) + "…")
-                + (old ? ": a patcher from before v0.4.5 -> version 0" : " -> version 1")); }   // once per process (the gear asks again)
+                + (r6 == 0 ? ": the loaded main lacks the v0.4.5 patches -> version 0" : r6 > 0 ? ": the v0.4.5 patches are in the loaded main -> version 1"
+                : old ? ": a patcher from before v0.4.5 -> version 0" : " -> version 1")); }   // once per process (the gear asks again)
             return old ? 0 : 1;
         }
         @Override public String gameFilesFeatures(int have, int need) {
@@ -1664,6 +904,15 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         boolean buttons = k[0] && k[1] && (k[2] || k[3]);
         boolean stick = d.getMotionRange(MotionEvent.AXIS_X, InputDevice.SOURCE_JOYSTICK) != null && d.getMotionRange(MotionEvent.AXIS_Y, InputDevice.SOURCE_JOYSTICK) != null;
         return d.isExternal() ? buttons || stick : buttons && stick;
+    }
+    // [DOOM] 2.45 the pad's surface switches from dm/env (set into the environment by nativeStart): DM_PAD_SURFACE=0 = back to drawing on the window
+    // (HWUI, before 2.45), DM_PAD_STALL_MS=N = the draw thread's test stall (PadSurface.stallMs).
+    private void padSurfaceEnv() {
+        if (doomPad == null) return;
+        String on = "", st = "";
+        try { String v = Os.getenv("DM_PAD_SURFACE"); on = v == null ? "" : v.trim(); v = Os.getenv("DM_PAD_STALL_MS"); st = v == null ? "" : v.trim(); } catch (Throwable t) { return; }
+        if ("0".equals(on) && doomPad.drawsOnSurface()) { doomPad.detachSurface(); crumb("pad drawn on the window (HWUI, DM_PAD_SURFACE=0)"); }
+        if (!st.isEmpty()) try { PadSurface.stallMs = Math.max(0, Integer.parseInt(st)); crumb("pad draw thread test stall " + PadSurface.stallMs + " ms (DM_PAD_STALL_MS)"); } catch (NumberFormatException e) { /* ignored */ }
     }
     private String lastInputDevices;
     void updatePadVisibility() {

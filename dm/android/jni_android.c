@@ -43,6 +43,7 @@ void front_android_set_display_hint(int w, int h);
 void front_android_set_refresh(float hz);
 int dm_main(int argc, char **argv);
 void front_android_boot_failed(int code);
+void dm_stall_watch_start(void); void dm_stall_quiet(int bit, int on);   // [DOOM] 2.45 stall_android.c: the frame stall watch (from Eternal's anrfix)
 
 static char g_files[1024], g_ext[1024], g_src[1024], g_runtime[1100];
 static FILE *g_logf;
@@ -484,7 +485,7 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     dm_haptics_android_start();   // rumble thread, after the env file (DM_RUMBLE...) and before the game asks for vibration devices
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
     pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);
-    if (!rc) { started = 1; pthread_detach(th); }
+    if (!rc) { started = 1; pthread_detach(th); dm_stall_watch_start(); }   // [DOOM] 2.45 stall_android.c: 【红】 thread report when a frame takes > 2 s
     LOG("boot: host thread %s", rc ? "NOT started" : "started");
     return rc ? -1 : n;
 }
@@ -509,6 +510,18 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSurface(JNIEnv *e
     LOG("前端：画面 %s %dx%d", g_win ? "就绪" : "收回", w, h);
 }
 
+// [DOOM] 2.45 (Eternal anrfix b1b9a60) PadSurface (frontend-common: the on-screen pad's own surface, drawn on its own thread): a second Java Surface
+// over the same native window. The draw thread locks this one; SurfaceView's own Surface object, whose Java lock the UI thread takes on surface
+// changes, is never held by a draw that waits for a buffer while the GPU / compositor is stalled.
+JNIEXPORT jobject JNICALL Java_com_xiaoboluo_d2r_PadSurface_nativeWrap(JNIEnv *env, jclass cls, jobject surface) {
+    (void)cls;
+    ANativeWindow *w = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
+    if (!w) return NULL;
+    jobject out = ANativeWindow_toSurface(env, w);   // holds its own reference
+    ANativeWindow_release(w);
+    return out;
+}
+
 // 触点：Java 按手指槽号（最小空槽，抬起前不变）交整组归一化坐标，n = 0 = 全抬起
 // Touch points: Java hands over the whole set of normalized coordinates by finger slot number (lowest free slot, unchanged until lifted), n = 0 = all lifted
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeTouch(JNIEnv *env, jclass cls, jint n, jintArray ids, jfloatArray xs, jfloatArray ys) {
@@ -527,6 +540,7 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeFocus(JNIEnv *env
     { static const char *const names[] = {"unfocused (onPause)", "background (onStop)", "foreground (onStart)", "active (onResume)"};
       LOG("[life] %s", ev >= 0 && ev <= 3 ? names[ev] : "?"); }   // [DOOM] breadcrumb
     dm_android_touch_focus(ev == 2 || ev == 3);
+    dm_stall_quiet(2, ev <= 1);                         // [DOOM] 2.45 no stall reports while unfocused / in the background
     front_android_sensors(ev == 2 || ev == 3);          // motion sensors only while in front
     dm_haptics_android_foreground(ev == 2 || ev == 3);  // no rumble left running in the background
     if (lifecycle_ready()) {
@@ -611,6 +625,8 @@ void dm_doom_drs_fps_set(int fps);
 JNIEXPORT jboolean JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetLight(JNIEnv *env, jclass cls, jboolean on) {
     (void)env; (void)cls; return dm_doom_light_set(on ? 1 : 0) ? JNI_TRUE : JNI_FALSE;
 }
+int dm_doom_r6_patches(void);
+JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeR6Patches(JNIEnv *env, jclass cls) { (void)env; (void)cls; return dm_doom_r6_patches(); }
 JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetDrsFps(JNIEnv *env, jclass cls, jint fps) {
     (void)env; (void)cls; dm_doom_drs_fps_set(fps);
 }
@@ -629,6 +645,7 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeHold(JNIEnv *env,
     (void)env; (void)cls;
     dm_haptics_android_foreground(on ? 0 : 1);   // no rumble left running under the menu
     dm_hold_menu(on ? 1 : 0);
+    dm_stall_quiet(1, on);                       // [DOOM] 2.45 the held game presents nothing: not a stall
 }
 // [DOOM] Java breadcrumbs into boot.log (DmActivity.crumb: trim memory, driver decision, first frame, crash report written) and the log
 // file's path for CrashLog.java (the same rule as here; "" before nativeStart).

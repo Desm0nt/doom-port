@@ -147,6 +147,9 @@ __attribute__((weak)) uint64_t xbg_gpu_busy_total_ns(void) { return 0; }   // we
 static int word_is(uint32_t off, uint32_t w) { uint32_t v; if (!find_main() || g_size < off + 4) return 0; memcpy(&v, g_base + off, 4); return v == w; }
 static int cut_light(void) { if (g_cut_light < 0) g_cut_light = word_is(CUT_LIGHT, 0x7a400924u); return g_cut_light; }
 static int cut_res(void) { if (g_cut_res < 0) g_cut_res = word_is(CUT_RES, 0x3400242eu); return g_cut_res; }
+// JNI (DmActivity's game-files check, BUGS_AND_FIXES 2.45): the r6 patches (v0.4.5: light mode + fixed 3D scale) in the loaded main:
+// 1 both, 0 one missing (game files from an older setup), -1 not checked yet (only the values the [r6] start line computed, never a fresh read).
+int dm_doom_r6_patches(void) { return g_cut_light < 0 || g_cut_res < 0 ? -1 : g_cut_light && g_cut_res; }
 static int set_ok(void) {   // idCVar internal Set(cvar, const char *, force) = the string path of SetInteger (main+0x1206a0 calls it)
     if (g_set_ok >= 0) return g_set_ok;
     static const uint32_t w[4] = {0xa9bc5ffcu, 0xa90157f6u, 0xa9024ff4u, 0xa9037bfdu};

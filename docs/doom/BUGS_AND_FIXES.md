@@ -57,6 +57,13 @@ Adreno 750), драйвер Qualcomm, если не сказано иное.
 | 45 | Игрок не знает, что вышла новая версия, и что после неё (иногда) нужно заново прогнать setup на ПК — это есть только в заметках к релизу | — | одно окно «вышла vX» с чейнджлогом на языке приложения (GitHub `releases/latest`, кэш 6 ч, тихо без сети) + кнопка ⚙ «Проверить обновления»; setup пишет штамп `dm/setup-stamp.json`, APK требует версию файлов из `doom/game_files.json` и один раз просит запустить setup со списком новинок; без штампа — версия 1 (0 для патчера до v0.4.5), то есть сейчас никого не тревожит (§2.41) | проверено на Mi 14 Ultra 08.11: оба окна, кнопка; «Проверить обновления» перенесена в меню паузы (FrontMenu `R_UPDATES`) |
 | 46 | Issue #34: колесо оружия (зажать R) открывается, но выбрать оружие нельзя | колесо выбирает правым стиком, а тач-обзор идёт через канал гироскопа — правый стик всегда в центре | `DoomPadView`: пока зажата кнопка колеса (`wheel_key`, по умолчанию R = `JOY6 _changeWeapon`), ход пальца, держащего R, и свободного пальца ведёт правый стик (§2.42) | проверено на Mi 14 Ultra 08.11 |
 | 47 | «Авто» соотношение дало 16:9 на телефоне 20:9 | игра запущена при погасшем экране: окно на старте 0x0, выбор соотношения взял запасные 16:9 | Java до старта передаёт реальный размер дисплея (`nativeDisplaySize`), он используется, пока у окна нет размера (§2.43) | проверено на Mi 14 Ultra 08.11 (запуск при погасшем экране → 1600x720) |
+| 48 | — (внутреннее: ⚙ DOOM жил в своём `DmActivity`, другие порты копировали его код по кускам) | — | ⚙ переехал на общий frontend-common: `DoomGear.java` (строки DOOM и порядок) + `GearPages` / `GearSettings` / `VkDrivers` / `DriverManager`; тексты — ресурсы DOOM (`gearUsesPortResources`), колесо оружия в общем `DoomPadView` выкл. по умолчанию, DOOM передаёт `KEYCODE_E`; таблица паритета `frontend-common/migration/doom-parity.md`: окно + 41 строка ⚙ + старт + менеджер драйверов + пад — все равны, ключи pref совпадают (§2.44) | собрано 08.11, javac / сборка APK / `check_frontend.sh` / `doom_prefs_check.py` / `doom_text_check.py` зелёные; на телефоне не проверено |
+| 49 | ANR-kill «Input dispatching timed out» при долгой GPU-работе (найдено в Eternal nrec4-b1; у DOOM тот же пад) | пад рисовал UI-поток: каждый `invalidate()` (касание, тик FPS) ждал HWUI RenderThread, а тот — GPU, занятый нашим Vulkan | пад на своём SurfaceView и потоке `dm-pad-draw` (frontend-common `PadSurface`, opt-in `attachSurface`), касания как раньше на UI-потоке; `DM_PAD_SURFACE=0` — старое рисование; сторож `stall_android.c` (`DM_STALL_WATCH_MS` 2000) пишет `【红】[stall]` с потоками (§2.45) | собрано 08.11, сборка APK / `check_frontend.sh` зелёные; на телефоне не проверено |
+| 50 | Issue #32 (Samsung S23, 8 Gen 2, v0.4.16–17): треск звука во вступительных роликах Bink | звук роликов идёт только через audren: поток рендера кладёт 5-мс кадры в очередь из 4 буферов (20 мс) и сидел на nice гостей (−10) наравне с декодерами Bink; опоздал больше чем на ~15–20 мс — выход играет нули. Плюс у S23 буфер MMAP-потока 768/1536 (16 мс) против 1536/1536 на Mi 14 | `DM_AUDREN_NBUF` (**8** = 40 мс), `DM_AUDREN_NICE` (**−16**), `DM_AUDIO_BUFFER_MS` (**32**); диагностика раз в 10 с | собрано, хост-тест зелёный, на телефоне не проверено (§2.46) |
+| 51 | PowerVR (moto g64 5G, BXM-8-256 1.15), v0.4.19: меню работает, при старте кампании — fatal `NVN sampler anisotropy … result=-5` или SIGBUS в `PVRUniFlexCompileToHw` | у GPU нет `samplerAnisotropy`, а игра ставит aniso 4 сама; компилятор IMG не потокобезопасен и работает ещё в `vkCreateShaderModule` и внутри `vkCmd*` потока `dm-record`, а замок был только на `vkCreate*Pipelines` | `DM_GFX_ANISO_FALLBACK` (**1**), `DM_GFX_COMPILE_LOCK` (**1** PowerVR, 0 остальные); строка `crash thread … dm-record in …` при падении; sim `powervr` + `noaniso` | собрано, хост-тесты зелёные, на телефоне не проверено (§2.47) |
+| 52 | Шейдер навсегда в `gfx-pipe-skip` / `gfx-lone-lane` после одной смерти процесса (MIUI-kill, force-stop) во время сборки; бан действует на любом драйвере и после обновлений | списки pipeguard v1 без версии, общие для всех драйверов, suspect не сбрасывался; затравки Adreno 750 (одна — ключ D2R) писались и на Turnip | pipeguard v2 (`DM_PIPEGUARD`=2): списки по реально загруженному драйверу, заголовок `# pipeguard v2 …` (иначе `.stale`), записи по spv, две смерти подряд; v1-списки → `.stale`; `DM_PIPEGUARD=1` — v1 | собрано 08.11, хост-тест `pipeguard_test` зелёный, на телефоне не проверено (§2.48) |
+| 53 | (валидация) VUID-vkCmdDispatch-viewType-07752: частицы `cec755c4` сэмплируют 3D через 2D view | тип view брался из target текстуры / view NVN, а не из Dim шейдера | `DM_GFX_DIM_FIX`=1: 3D view для 3D-образа, иначе null нужной формы | собрано 08.11, на телефоне не проверено (§2.49) |
+| 54 | — (внутреннее: перф-приёмы DOOM Eternal, KB PERF-E02/E04/E09/E13) | ретайр отчётов эпохи × отчёты; full barrier вокруг каждой dispatch; тяжёлые зависимости проходов; обход карт снапшотов и таблицы zero-copy; census-диагностика на каждой загрузке | `DM_GFX_REPORT_FAST`=1, `DM_GFX_CPU_FIX`=0x5, `DM_GFX_FAST_LOOKUPS`=1, `DM_GFX_DIAG`=auto; `DM_GFX_DISPATCH_RUNS`=0, `DM_GFX_RP_DEPS`=0 (§3.22) | собрано 08.11, хост-тесты зелёные, на телефоне не проверено |
 
 ---
 
@@ -2437,6 +2444,62 @@ CPU трансляции при 1800 draw. Без переключателя п�
   без изменений (`fixed-tic frames` 0, speed 1.00x); анимации меню / паузы на глаз как при `DM_PRESENT_MENU_HZ=30`;
   `DM_DOOM_MENU_REALTIME=0` — снова 2×.
 
+### 3.22 Перенос CPU/GPU-приёмов DOOM Eternal (KB PERF-E02, E04, E09, E13; 08.11; собрано, хост-тесты зелёные, на телефоне не проверено)
+
+- **Зачем:** у Eternal эти приёмы дали измеренный выигрыш, они не зависят от драйвера. У DOOM ~370–800 draw/кадр,
+  трансляция 2.8–4.3 мс/кадр на Mi 14 Ultra, строка DRS пишет `bound=cpu`. Сначала проверено, есть ли в DOOM то, на что
+  приём действует (логи `work/logs/t050`, `play/umbra0`, `play/b_ab`; ~41 тыс. окон `NVN PERF`).
+- **`DM_GFX_REPORT_FAST`** (по умолч. **1**, `2` — проверка, `0` — как было; A/B-цель `repfast`). Ретайр сворачивал эпохи
+  счётчика парами «каждая эпоха × каждый отложенный отчёт», и так дважды. Теперь это один merge-обход: отчёты упорядочены по
+  эпохе и счёту (`xbg_report_fast.h`, из ETR `526920b`/`d74cfb0`). **В DOOM почти не на что действовать:** почти во всех окнах
+  `ops=…/0.0/0.0 pending=0`, то есть 13–19 сбросов на кадр и ни одного отчёта. Отчёты samples (5–44 на кадр) видны только в
+  54 окнах из 41 тыс. Перенесено ради общего кода и verify. Хост-тест `tests/report_fast_test.cpp` (ASan/UBSan) сравнивает его
+  со старой свёрткой на 34 тыс. случайных ретайров.
+- **`DM_GFX_DISPATCH_RUNS`** (по умолч. **0**, A/B `disprun`; `xbg_gsync.h`, из ETR `a2ca20f`/`e24b901`/`96cf24c`). Две
+  соседние dispatch без гостевого барьера между ними идут без двух наших full barrier. Закрывающий барьер откладывается до
+  следующей операции. Результаты попадают в ленивый учёт storage, а цепочка на месте поверх них получает барьер
+  (`cs_unbarriered`; в DOOM он сбрасывается любым full barrier). Не трогаются indirect-dispatch и dispatch таблицы
+  `DM_GFX_BRIGHT`. **В DOOM 3–21 dispatch/кадр** (у ETR — сотни), поэтому ожидаемо ≤0.1–0.2 мс GPU. Сколько соседних,
+  покажет `NVN PERF gpu-sync … adjacent= guest_between=`.
+- **`DM_GFX_RP_DEPS`** (по умолч. **0**, boot, биты; ETR гонял 3). `0x1` — облегчённая стартовая зависимость прохода
+  (`lean_pre` ставит full barrier, если draw писал storage image во вложение). `0x2` — без конечной зависимости; проход с
+  depth тогда инвалидирует чтения шейдеров на старте. Ключ пайплайна не меняется. **Своё для DOOM:** с любым битом работает
+  WAR-страж `DM_GFX_TILE_BARRIER`: draw, чей VS/GS пишет storage (culling-GS), после закрытия прохода получает full barrier
+  (`passes_since_full`, счётчик `war=`). Облегчённые зависимости иначе не упорядочивают эту запись после чтений прошлых
+  проходов. `CLEAR_OUTSIDE` не перенесён: выигрыша не было, было мерцание. Twins (lazy-clear, store-op, noload) создаются
+  с теми же зависимостями (`LazyInfo::ndep`).
+- **`DM_GFX_CPU_FIX`** (по умолч. **0x5**, A/B `cpufix`; из ETR `a363503`):
+  - `0x1` — `snapshot_invalidate` идёт от `address − (самый длинный малый снапшот < 64 КБ)`, большие снапшоты
+    проверяются по списку (256). Раньше один большой view заставлял каждую CPU-запись обходить все записи карты под ним.
+    Счётчики `NVN PERF snapfront walked= big_checks=`.
+  - `0x2` не перенесён: `gscull_key` в DOOM зовётся только под диагностическими битами `DM_GFX_GSCULL_FIX` 0x100/0x400.
+  - `0x4` — таймстемпы отчётов читаются одним `vkGetQueryPoolResults` на пул; поиск эпохи кэшируется на прогоне refs
+    слота (`NVN PERF reports … ts_reads bulk= single=`).
+- **`DM_GFX_FAST_LOOKUPS`** (по умолч. **1**, `2` — сверка с обходом, A/B `fastlook`; из ETR `4a7043d`). `zc::find`/`tail`
+  ищут по отсортированной копии таблицы чанков + последнему попаданию, а не обходом ~26 чанков. Это ~11.6 тыс. поисков на
+  кадр (`NVN PERF zerocopy hits=`). Если чанки перекрываются, индекс выключается сам. Хеш образов и снимок пулов ETR не
+  перенесены: у DOOM ~250 образов (front 1024 попадает), сканов `guest_ok` нет. Хост-тест `tests/fast_lookup_test.cpp`.
+  **`DM_GFX_SNAP_FAST` не перенесён:** страничный индекс окупался на ~3100 инвалидациях/кадр ETR; у DOOM их 40–80, а
+  разметка страниц на ~4000 снапшотов/кадр стоила бы больше.
+- **`DM_GFX_DIAG`** (по умолч. **auto**). В горячем пути DOOM у игроков уже нет crumbs/verify (кроме PowerVR), но на каждой
+  загрузке с оверлеем ASTC без переключателя работали census ASTC/EAC и BC (§2.37), `DM_GFX_ASTC_DIAG` (умолч. было 1), а
+  на каждый storage-draw строилась строка `last_writer`. В auto всё это выключено, явно заданные диагностические
+  переключатели работают. `1` возвращает всё как было (наши прогоны). `0` — смысл ETR: выключены и `DM_GFX_CRUMBS` (в том
+  числе умолчание PowerVR), `VT_DIAG`, `ASTC_DIAG`, `BC_VERIFY`, `DRAWPROBE`, `ALIAS_LOG`, `ZC_RACE`. Замеры (`NVN PERF`,
+  `CHUNK_DIAG`, `PERF_SAMPLE`, `PASS_PROF`) остаются.
+- **Счётчики** (раз в окно): `NVN PERF gpu-sync per_frame full_barriers= merged= drains= pass_begins= same_fb_restarts=
+  lean_pre= war= dispatches= adjacent= guest_between= runs skipped= flushed= | rp_deps= passes_made= lean= runs=`;
+  `NVN PERF reports fast= ab= per_frame resolves= written= pending_avg= epochs_avg= ts_reads bulk= single= verify checks= bad=`
+  (только если были ретайры); `NVN PERF cleanup_ms_per_frame … | writebacks: slot_wb= reports= publish=`;
+  `NVN PERF snapfront … walked= big_checks= cpu_fix=`; `NVN PERF fastlook mode= ab= chunks= index_ok= mru_hits= searches=
+  rebuilds= overlaps= verify checks= bad=`. Время CPU по частям — как раньше, `parts_ms_per_frame` при
+  `DM_GFX_PERF_SAMPLE>0` (`descriptor=`, `snapshot=`, `cleanup=`).
+- **Риск:** `RP_DEPS` и `DISPATCH_RUNS` снимают синхронизацию. Ошибка выглядит как мерцание теней/света, мусорные или
+  пропавшие треугольники culling-GS, редкие «дыры». Включать по одному, сначала `RP_DEPS=1`, потом `3`. Остальное не меняет
+  картинку: verify `=2` должен давать `bad=0`.
+- **Файлы:** `xbg_gsync.h`, `xbg_report_fast.h`, `xbg_fast_lookup.h` (новые), `xbg_game.cpp` (резервная копия
+  `xbg_game.cpp.bak_etrperf`), тесты `tests/report_fast_test.cpp`, `tests/fast_lookup_test.cpp`.
+
 ## 4. Управление и ввод
 
 ### 4.1 Экранный пад
@@ -2917,3 +2980,201 @@ Aiming и ползунок чувствительности гироскопа �
 - Фикс: `DmActivity` до `nativeSurface` передаёт `Display.getRealSize` (`nativeDisplaySize`, лог `[java] display WxH, view WxH`);
   `front_android.c` берёт его, пока у окна нет размера (`screen_wh`). Повтор: экран погашен `input keyevent KEYCODE_SLEEP`, запуск →
   `output 1600x720`.
+
+### 2.44 ⚙ на общем фронтенде frontend-common с доказанным паритетом (08.11; собрано, на телефоне не проверено)
+- Зачем: новый порт берёт свежий ⚙ из `frontend-common` (рядом с портами), а не выискивает код DOOM. Для игроков ничего не меняется: те же
+  строки, порядок, тексты 13 языков, дефолты, ключи pref и поведение; сохранённые настройки читаются как есть (данные не мигрируются).
+- Что сделано: `migration/doom_apply.py` (обновлён под v0.4.22) убрал из `DmActivity` ~800 строк ⚙ (диалог, env, драйверы, crash guard,
+  `driverWatch`) и вставил блок `GearHost`; `DoomGear.java` (новый, в порту) — строки DOOM (DRS + цель, лёгкий режим, формат, Aim Assist /
+  Motion Aiming / гиро §2.40, папка игры, «Обновления» §2.41, diag-env) и порядок; `sync_frontend.sh` принёс `Gear*`, `VkDrivers`, общий
+  `DriverManager`, `UpdateNotice`, `DoomPadView`.
+- Паритет (что пришлось доделать в общем коде, всё выключено для других портов): `GearHost.gearUsesPortResources()` — тексты ⚙ из ресурсов
+  порта (`getString` по имени ключа, выбор локали Android) и без `front/ui_lang` для ресурсов (раньше ⚙ DOOM всегда шёл по языку системы);
+  `GearPages.updates` без кнопки «Проверить обновления» (она в меню паузы, `FrontMenu.R_UPDATES`), «проверять при запуске» — в `after()`;
+  `VkDrivers.gameStarted(view, firstFrames)` — `updates.start()` сразу после `first frames presented`, `nativeFrameStats` раз в тик, как
+  `driverWatch`; колесо §2.42 в общем `DoomPadView` через `wheelKeyDefault` (DOOM: `new DoomPadView(this, PRESET_GAME, PadSkin.CLASSIC,
+  KeyEvent.KEYCODE_E)`); §2.43 `display()` → `GearDisplay.display(this)`; live-вызовы «Сохранить» в старом порядке (`DoomGear.live`).
+- Проверка (без телефона): таблица `frontend-common/migration/doom-parity.md` (до = v0.4.22, `DmActivity.java.bak_gearmig`);
+  `python -I frontend-common/migration/doom_prefs_check.py <до> <после>` → `pref keys: IDENTICAL (file, key, type)`;
+  `python -I frontend-common/migration/doom_text_check.py dm/android/app/src/main/res` → 897 пар ключ×язык = TSV; javac пробной копии
+  `work/mig/gearmig` с настоящим `R.jar`, `tools/build_apk.ps1` → `work/DOOM-port-debug.apk` (отличие от v0.4.22 — только `classes3.dex`),
+  `frontend-common/tools/check_frontend.sh` → `javac OK`. Бэкапы — `*.bak_gearmig`.
+- Проверить на телефоне: поставить поверх v0.4.22 с настройками → ничего не сброшено (драйвер, лимит fps, формат, кнопка, раскладка);
+  ⚙: те же строки в том же порядке на языке системы (и при выбранном «Языке меню» в «Экранный геймпад…»), «Сохранить» с DRS / лёгким режимом /
+  форматом / гиро — те же тосты; «Драйверы…», «Изменить раскладку…», «Выбрать…»; колесо оружия на R; в boot.log `[java] driver: …`,
+  `fps limit …`, `Vulkan driver status: …`, `first frames presented …`, затем `update check: …`.
+
+### 2.45 Экранный пад на своём Surface и потоке (против ANR) + сторож зависших кадров — из Eternal (08.11; собрано, на телефоне не проверено)
+- **Сценарий ANR (найден в Eternal, nrec4-b1, anrfix `b1b9a60`; у DOOM тот же пад):** каждый `invalidate()` `DoomPadView` (каждое касание,
+  тик счётчика FPS раз в 0.5 с) заставлял UI-поток рисовать окно: `Choreographer.doFrame → performDraw → HardwareRenderer.nSyncAndDrawFrame`
+  ждёт RenderThread HWUI, а тот рисует окно через системный GL на том же GPU и ждёт fence своего прошлого кадра, пока наш Vulkan держит GPU
+  секунды (`Throttling EGL Production: fence didn't signal in 3000 ms`, `QueueBuffer time out`). UI-поток не разбирает ввод → через 5 с
+  «Input dispatching timed out» → система убивает игру. JNI-ввод (`nativePadKey`/`nativePadAxes`/`nativeLookDelta`) не виноват.
+- **Было:** пад рисовал UI-поток (onDraw на окне, HWUI). **Стало:** `frontend-common/java/PadSurface.java` — SurfaceView
+  `setZOrderMediaOverlay` (порядок: игра < пад < меню паузы / диалоги), свой поток `dm-pad-draw` (THREAD_PRIORITY_DISPLAY), CPU canvas
+  (`lockCanvas` на второй Java-Surface поверх того же ANativeWindow — `PadSurface.nativeWrap` в `jni_android.c`, чтобы ждущий буфера поток
+  не держал lock Surface'а SurfaceView). UI-поток только меняет состояние под `lock` пада и просит кадр; кадр рисуется, только если изменилось
+  то, что пад показывает (`paintSignature`: обзор пальцем не рисует ничего). Ждёт буфер только поток пада: при stall картинка пада
+  замирает, касания и ввод игры — нет.
+- **Ввод не изменился:** касания по-прежнему ловит `DoomPadView` на окне, на UI-потоке, тот же код (`touch()` = старый `onTouchEvent`),
+  натив вызывается сразу; добавлен только `synchronized (lock)` (поток пада держит его лишь на время рисования, лог
+  `[java] pad paint took N ms under the pad lock`, если ≥ 8 мс). Колесо оружия (§2.42), обзор через гиро-канал, редактор (перетаскивание,
+  pinch, Grouped/Separate), скины, прозрачность/размер, кнопка ⚙ (полупрозрачная), controllerMode, меню паузы — тот же код рисования
+  (`drawPad`). Стик-режим обзора (`DM_TOUCH_LOOK=stick`) доигрывает поворот из Choreographer-callback'а без рисования.
+- **Общий код:** в `DoomPadView` (frontend-common) — `attachSurface()` / `detachSurface()` / `drawsOnSurface()`; без `attachSurface()` пад
+  рисуется по-старому, поэтому другие порты не меняются (opt-in). `PadSurface` переживает отсоединение окна (DOOM меняет content view на
+  экраны папки/ошибки и обратно): поток пересоздаётся в `onAttachedToWindow`. `sync_frontend.sh` теперь носит `PadSurface.java` всем
+  (зависимость компиляции `DoomPadView`).
+- **DOOM:** `DmActivity` добавляет `doomPad.attachSurface()` в `gameFrame` под пад; `padSurfaceEnv()` после `nativeStart`.
+  Выключатели: `DM_PAD_SURFACE=0` (`dm/env`; старое рисование на окне) / `--ez dmPadHwui true`; тест `DM_PAD_STALL_MS=N` /
+  `--ei dmPadStallMs N` (поток пада спит N мс с буфером, не чаще раза в 15 с). Крошки boot.log: `[java] pad drawn on its own surface
+  (draw thread dm-pad-draw)`; logcat `dm`: `[java] pad surface WxH (draw thread dm-pad-draw)`, `pad surface: first frame in N ms (paint M ms)`,
+  `pad draw thread waited N ms for a buffer …`.
+- **Сторож зависших кадров** (`android/stall_android.c` из Eternal `72421d5`, код без изменений): нет present > `DM_STALL_WATCH_MS` (2000,
+  0 = выкл) в фокусе и не на паузе → `【红】[stall] no frame presented for N s …` + строка на каждый native-поток (состояние, CPU, syscall:
+  futex с адресом как module+offset, ioctl с файлом, напр. `/dev/kgsl-3d0`, pc); повторы через 2 с ×5, потом раз в 10 с; `【红】[stall] over:
+  … that frame took N s`. Только отчёт. `DM_STALL_SIGQUIT=1` — дамп стеков ART; тест `DM_TEST_STALL_MS` (+ `_AFTER_S` 30, `_EVERY_S`).
+  Хуки: `dm_stall_present()` первой строкой `dm_aperf_present` (`perf_android.c`, до выхода под транслятором), `dm_stall_watch_start()` после
+  старта хост-потока, `dm_stall_quiet()` в `nativeHold` (меню паузы, окно обновления) и `nativeFocus` (≤ 1 = фон).
+- **Проверка (без телефона):** `tools/build_apk.ps1` → `work/DOOM-port-debug.apk` (в libdm.so есть `Java_com_xiaoboluo_d2r_PadSurface_nativeWrap`,
+  `dm_stall_*`; dex — `PadSurface`, `padSurfaceEnv`), `frontend-common/tools/check_frontend.sh` → `javac OK`. Бэкапы — `*.bak_padsurf`.
+- **Проверить на телефоне:** (1) обычная игра: пад выглядит как раньше (classic и скин, прозрачность, полупрозрачная ⚙), отклик касаний тот же,
+  редактор раскладки тащит/масштабирует, меню паузы над падом, колесо оружия на R; (2) `DM_TEST_STALL_MS=8000` → `【红】[stall]` отчёты,
+  `[stall] over: … 8.0 s`, ANR нет, меню паузы по ⚙ открывается после stall; (3) `--ei dmPadStallMs 8000` → пад замирает на 8 с, обзор/стрельба
+  в игре работают, ANR нет; (4) `DM_PAD_SURFACE=0` → `pad drawn on the window again (HWUI)`, всё как в v0.4.22.
+- **Риски:** CPU canvas полноэкранного пада (первый кадр / смена скина — время в логе); заметно медленный paint задержит касание на время
+  рисования (лог ≥ 8 мс); +1 SurfaceView (~3 буфера экрана, ~18 МБ на 3200×1440); на прошивках со своими правилами z-order SurfaceView
+  (`setZOrderMediaOverlay`) пад может оказаться под игрой — тогда `DM_PAD_SURFACE=0`.
+
+### 2.46 Треск звука во вступительных роликах Bink (issue #32, Samsung S23 SM-S911B, 8 Gen 2, Android 17; 08.11; собрано, хост-тест зелёный, на телефоне не проверено)
+- **Что в логах игрока** (boot.log и crash.txt — оба от **v0.4.16**, отчёт о падении написан 0.4.17; до роликов ни один прогон не дожил:
+  первый ушёл в фон (`audio 暂停`), второй — старое падение §2.33 `CRASH sig=11 … pc=libc.so+0x8ac44`, стек `svc_dispatch → gate_dispatch`,
+  07:44:40.470). Строк `audren: last 10.0 s` / `render time` в них нет — 10 с не прошло.
+- **Доказано логами.** Три AAudio-потока (`HostPcmOut` 2 к = audren, Wwise 2 к и 6 к) все `got MMAP … perf = LL, burst = 96`
+  (07:44:38.114 / .120 / .322), `每次回调 96 帧，缓冲 768 / 1536 帧`. У Mi 14 Ultra (t0421) те же потоки `192 帧，缓冲 1536 / 1536 帧`.
+  Звук роликов — только audren (у Wwise свой AudioOut): на Mi 14 `rendered 12000 frames, 2514 of them not silent` ровно за вступление.
+- **Причина (по коду; гипотеза до лога с новой диагностикой).** `hle_audren.c render_main` рендерит кадр 5 мс, когда выход вернул
+  буфер; в полёте было 4 буфера = 20 мс, при пустой очереди callback отдаёт нули (щелчок). Поток — гостевой, `thread_main` даёт всем
+  гостям nice −10 (QoS interactive), то есть он конкурирует на равных с `BinkDecode*`, `main_thread`, `WorkerThread_*`, занятыми во время
+  роликов. На Switch этот рендерер крутится в DSP / аудио-процессе системы (ядро 3, высший приоритет) и игру не ждёт. Даже на Mi 14
+  `render time max 5.9 ms` — поток бывает задержан; 15–20 мс на 8 Gen 2 под Bink — уже дыра. Второе отличие — буфер устройства 16 мс.
+- **Исправление (`dm/host/hle_audren.c`, `hle_audio.c`):**
+  `DM_AUDREN_NBUF` (по умолч. **8** = 40 мс, было 4; звук позже картинки на +20 мс — в пределах ~125 мс для «звук позже»);
+  `DM_AUDREN_NICE` (по умолч. **−16** = Android `THREAD_PRIORITY_AUDIO`, выше гостей −10 и транслятора −8; `0` — как было);
+  `DM_AUDIO_BUFFER_MS` (по умолч. **32**: буфер AAudio-потока меньше 32 мс поднимается до min(32 мс, capacity) — S23 получает 1536/1536 как Mi 14;
+  `0` — размер системы). Поток назван `dm-audren` (`nn::os::SetThreadName`) — виден в `[perf] threads 10s`.
+- **Диагностика (всегда, дёшево).** Раз в 10 с `audren: output last 10.0 s: queued low-water N of M buffers (0 = the output ran dry…),
+  longest gap between frames X ms, short silent gaps in the mix K` — `low-water 0` = опоздал наш поток; `K > 0` при `low-water ≥ 1` =
+  кончились данные у голосов игры (опоздал гость / Bink). `dm-audio-keep` раз в 10 с (при нулях — раз в минуту): `audio: <выход> Nch last 10.0 s:
+  C callbacks, D found the queue empty (producer late), U device underruns (callback late); buffer B / Cap, burst, perf`.
+  `DM_AUDREN_FAKE_STALL=<мс>` — раз в секунду поток рендера спит столько (воспроизводит голодание на любом телефоне).
+- **Проверено без устройства:** `t_audio_aa.c` (mock дополнен `setBufferSizeInFrames` / `getXRunCount`) — все проверки зелёные, в логе
+  `audio: AAudio buffer 192 -> 384 frames (floor 32 ms…)`; `tools/build_apk.ps1` — собрано. Бэкапы `*.bak_i32`.
+- **Проверить на Mi 14 Ultra.** (1) Обычный запуск: `render thread started (8 buffers = 40 ms…; host nice -16…)`, во вступлении
+  `low-water ≥ 1`, `found the queue empty` 0–1 (старт), `device underruns 0`. (2) Условия S23 + голодание:
+  `DM_AUDREN_NBUF=4 DM_AUDREN_NICE=0 DM_AUDIO_BUFFER_MS=0 DM_AUDREN_FAKE_STALL=30` → треск раз в секунду, `low-water 0`, у `HostPcmOut`
+  `found the queue empty` > 0; затем только `DM_AUDREN_FAKE_STALL=30` (новые умолчания) → чисто, `low-water ≥ 1`. (3) У игрока S23 — новый boot.log.
+
+---
+
+### 2.47 PowerVR (moto g64 5G, BXM-8-256, драйвер 1.15), v0.4.19: меню работает, падение при старте кампании — fatal анизотропии сэмплера и SIGBUS в компиляторе драйвера на потоке `dm-record` (08.11; собрано, хост-тесты зелёные, на телефоне не проверено)
+- **Логи игрока** (тот же телефон, что в §2.38; zip с Google Drive, issue на GitHub не найдено): `boot.log`, `boot.prev.log`, `crash.txt`,
+  `crash.prev.txt`, `OLDERcrash.txt`; все прогоны `org.doom.port 0.4.19 (100419)`, Android 15, `PowerVR BXM-8-256 … 1.15@6133110`, Vulkan 1.1.170.
+- **Fence guard v0.4.19 (§2.38) сработал.** `NVN fence policy: guard=2 recover=1 crumbs default=1`; в каждом окне PERF
+  `early=0 early_recovered=0 pool_recovered=0` при `unsubmitted=` до 2703 (опросы неотправленных fence, которые раньше шли в драйвер), в logcat
+  ни одного `IMGSRV`. Ложного «GPU hang» больше нет: меню за 6–7 с (`first frames presented 6.0 s … 53 fps`), прогоны по ~50 с.
+- **Прогон 02:07 (`OLDERcrash.txt`), доказано.** ~48.8 с — Bink-ролик (`COPYT2T converting blit 0x25 -> 0x3f` ×8, `game profile state 0 -> 2
+  (loading)`), затем текстура `serial=1848 fmt=0x50 8192x4096` (BC6H; GPU-декодер BC6H на PowerVR провалил самопроверку `bad=1261` → CPU,
+  `vk=123` E5B9G9R9) и `FATAL: NVN sampler anisotropy unsupported/disabled/out of range result=-5 … aniso=4 … texture=1848` → abort.
+  У устройства `anisotropy=0` (`NVN caps features … anisotropy=0`, `NVN fallbacks … no-anisotropy`); NVN сообщил игре максимум 1
+  (`NVN_DEVICE_INFO_MAX_TEXTURE_ANISOTROPY`), но игра для этого сэмплера ставит 4 сама. На Switch (Maxwell) анизотропия есть всегда.
+- **Прогон 02:35 (`crash.txt` = `boot.prev.log`), доказано / вывод.** Меню, на 48.38 с первый `COPYT2T converting blit 0x25 -> 0x3f` и сразу
+  `CRASH sig=7 addr=0xb56113d175a56a pc=0xffb56113d175a56a lr=PVRUniFlexCompileToHw+0x58`, `bt: vulkan.mtk.so+0x39898 +0x3f1ec +0x5dee0
+  libdm.so+0x1a93b4 libdm.so+0x1a8cec libdm.so+0x14ca9c libc.so+0xa866c` — переход по мусорному указателю (x8, с PAC-битами) в начале
+  компиляции шейдера драйвером. Поток трансляции после этого ещё пишет `COPYT2T src=6` → умер не он. Сборки 0.4.19 с символами нет;
+  по текущей: `libdm+0x14ca9c` = возврат из `__thread_proxy<void(*)()>` (сдвиг 0x37dc), `0x1a8cec` = возврат из `vkrec::loop` в `run_avail`
+  (`loop+0x22c`; длина `loop` 0x6c0 против 0x6c8 между кадрами) → **упал поток `dm-record`, внутри `vkCmd*` пакета**; при той же раскладке
+  `run_avail+0x234` — ровно возврат из `vkCmdEndRenderPass` (вывод по смещениям, не доказательство). Т. е. драйвер компилирует свои программы
+  (render pass load/store / transfer / clear) внутри `vkCmd*`, а одновременно поток трансляции создавал модули (`NVN shader 4489…/7967…/
+  270b… loaded … module=7.92` перед падением; на этом драйвере `vkCreateShaderModule` занимает 2–56 мс, т. е. тоже компиляция) и пайплайны.
+  Тот же blit в прогоне 02:07 прошёл 8 раз → недетерминированно, гонка. `DM_GFX_PIPE_SERIAL` (§2.23) закрывал только `vkCreate*Pipelines`;
+  компилятор IMG не потокобезопасен (KB PVR-02). Прогон 02:05 — тоже SIGBUS с мусорным pc `0x3c04343e` (лога нет). `crash.prev.txt` —
+  запуск без папки игры (02:34), не баг. `boot.log` (02:38) — меню 19 с, ушёл в фон (сбор логов).
+- **Сделано.**
+  1. **`DM_GFX_ANISO_FALLBACK`** (по умолчанию 1; правило по возможности, не по семейству; действует только там, где раньше был fatal):
+     без `samplerAnisotropy` сэмплер без анизотропии, выше `maxSamplerAnisotropy` — до лимита (`xbg_aniso_allowed`, `sampler_slow`); лог
+     `NVN sampler anisotropy 4 -> 1 (samplerAnisotropy=0 …)`. `=0` — старый fatal.
+  2. **`DM_GFX_COMPILE_LOCK`** (по умолчанию **1 на PowerVR** через `xbg_compile_lock_default`, 0 остальные): `drvc::mu` — единственный замок
+     компилятора; `gpguard::create_mu` теперь он же. Под ним: все `vkCreateShaderModule` движка, пакеты `dm-record` begin/end, render pass,
+     copy (buf/img/b2i/i2b), blit, resolve, clear, fill (и их прямые вызовы при выключенном record thread / fallback), blit / clear / пайплайны
+     потока present (`xbg_drvc_lock`). `2` — все пакеты, кроме submit / present (они ждут поток present, который берёт замок). На Adreno/Mali
+     поведение прежнее (уровень 0: ветки без замка).
+  3. **Диагностика падений (все GPU):** после `CRASH` строка `[dm] crash thread <имя> tid=…; dm-record in <vkCmd…>` (`prctl`, `drvc::cur_op`,
+     `xbg_crash_rec_op`) — следующий лог сразу назовёт поток и вызов. На старте: `NVN compile lock=`.
+  4. `DM_GFX_SIM_GPU=powervr` теперь включает `noaniso` (как у реального BXM 1.15) — fatal №1 воспроизводится на Adreno.
+- **Код.** `xbg_game.cpp` ns `drvc`, `vkrec::compile_locked` / `exec` / `VKREC_DIRECT` / `DRVC_CALL`, `gpguard::Lock`, `sampler_slow`; `xbg_vendor_policy.h`
+  (`xbg_compile_lock_default`, `xbg_aniso_allowed`, профиль PowerVR); `android/vulkan_present.cpp` (`DrvcLock`); `host/crash.c`. Бэкапы `*.bak_pvr`.
+- **Тесты.** `vendor_policy_test` (lock только PowerVR + sim, профиль с noaniso, `xbg_aniso_allowed` 4→1 / 16→8 / без изменений с фичей) —
+  зелёный; `gfx/tests/t_vkrec`: при уровнях 1 и 2 трасса совпадает с прямой, пока «компилятор» на другом потоке держит `drvc::mu`, и
+  `0 locked commands inside one` (без замка тот же прогон ловит ~3000 пересечений); новый `engine/tests/compile_lock_source_test.py`
+  (каждый `vkCreateShaderModule` / `vkCreate*Pipelines` движка под замком; exec / fallback / present берут его); `fence_guard_source_test`,
+  `source_structure_test` — зелёные (`pipeline_memo_source_test` падал и до правки). `tools/build_apk.ps1` — собрано без новых предупреждений.
+- **Проверить на Mi 14 Ultra.** (1) `DM_GFX_SIM_GPU=powervr` → новая игра: строка `NVN sampler anisotropy 4 -> 1`, без fatal; с
+  `DM_GFX_ANISO_FALLBACK=0` — fatal как у игрока (модель №1). (2) Там же `NVN compile lock=1`: меню → ролик → уровень без зависаний,
+  FPS как без sim; затем `DM_GFX_COMPILE_LOCK=2`. Сам SIGBUS на Adreno не воспроизвести (компилятор Qualcomm потокобезопасен) — модели нет.
+  (3) Игрок: новая игра на APK с фиксом; если снова упадёт — строки `crash thread … dm-record in …` и `NVN compile lock=`; следующий шаг —
+  `DM_GFX_COMPILE_LOCK=2`, затем `DM_GFX_RECORD_THREAD=0` семейной политикой PowerVR.
+
+---
+
+### 2.48 Pipeguard v2: одна смерть процесса больше не банит шейдер навсегда (KB SH-06, из Eternal; 08.11; собрано, хост-тест зелёный, на телефоне не проверено)
+- **Было (v1).** Перед сборкой compute-пайплайна ключ шейдера писался в `gfx-pipe-inflight`; если процесс умирал, следующая загрузка
+  клала ключ в `gfx-lone-lane`, а при повторе — в `gfx-pipe-skip` **навсегда**. Правило двух смертей для compute уже было
+  (`gfx-pipe-suspect`), но: списки без версии и общие для всех драйверов (бан, полученный на Qualcomm, действует на Turnip и после
+  обновления драйвера / пака шейдеров), suspect не сбрасывался чистой загрузкой («две смерти» не обязательно подряд), а затравки
+  Adreno 750 писались в списки на любом драйвере с vendor 0x5143 (Turnip тоже). На тестовом телефоне в `/sdcard/Download/DOOM Mobile/dm/`:
+  `gfx-pipe-skip` = `098a126f92bf533a` (ключ D2R, флюиды; в паке DOOM такого бандла нет — затравка из d2r-mobile), `gfx-lone-lane` =
+  `cec755c4e27678b5` (частицы, ballot + shuffle). Инцидент §2.1: pipeguard однажды записал `cec755` после kill приложения.
+- **Стало (`DM_PIPEGUARD`, по умолч. 2), как ETR `745950b` / `da700ae`** (логика файлов — `engine/xbg_pipeguard.h`, движок — `pgv2` /
+  `pipeguard` / `gpguard` в `xbg_game.cpp`):
+  - списки по драйверу: суффикс `-<пакет>` у `gfx-pipe-skip` / `gfx-lone-lane` / `gfx-pipe-inflight` / `gfx-pipe-suspect` и у графических
+    `gfx-gpipe-skip` / `-suspect` / `-inflight.<n>` (`DM_FILES_DIR`); без суффикса — системный драйвер. Драйвер — **реально загруженный**
+    (статус `vk_driver.c`, поле active; пакет, который не перехватил загрузку, = system), а не запрошенный `DM_VK_DRIVER` (баг XC2).
+    `DM_PIPEGUARD_DRIVER=<имя>` переопределяет; хвост `-occ` отрезается;
+  - первая строка списка — `# pipeguard v2 driver=<пакет|system> driverVersion=<hex> cache=<pipelineCacheUUID> translator=<sha16
+    shaders/_chain.json | ->`; список под другим заголовком → `<имя>.stale`, лог, не применяется;
+  - строка `key \t причина \t unix-время \t spv`, spv = первые 16 hex SHA-256 SPIR-V бандла (после spv-override, до рантайм-рерайтов);
+    запись действует, пока spv шейдера тот же (исправленный пак — повтор); маркеры и suspect — `key \t spv`;
+  - бан только после **двух смертей подряд** на том же key + spv: загрузка без маркера сбрасывает suspect (`[pipeguard] suspect … cleared`);
+    смерть на другом SPIR-V не считается;
+  - затравки: `098a126f…` (D2R) убрана; `cec755c4…` → lone-lane только на драйвере Qualcomm (driverID 8) и Adreno 750–799, в памяти, в файл
+    не пишется (падал `libllvm-qgl.so`, у Turnip другой компилятор; при subgroup ≠ 32 его и так переписывает `DM_GFX_WARP_MODE`, §3.10).
+  - 190059b (gpipe-skip пропускает и compute) к DOOM не относится: прогрев DOOM строит только графические пайплайны.
+- **Миграция v1.** Список без заголовка = v1: переименовывается в `.stale`, одна строка `[pipeguard] legacy: … is a v1 list without a header
+  (N entries: …): moved to .stale …, not applied; these shaders get a fresh chance …`; при кастомном драйвере то же делается с
+  несуффиксным файлом (v2-файл системного драйвера не трогается). Оба бана телефона получают новый шанс; v1-маркеры (без spv) не считаются.
+- **Логи** (все `[pipeguard]`): `v2: lists of driver … header '…'`, `legacy:` / `stale:`, `entry not applied` (spv сменился), `first death:`,
+  `death not counted:`, `ban (lone-lane):` / `ban (skip):` / `ban: graphics pipeline …`, `built-in:`, `loaded: compute skip=N lone-lane=M`,
+  `dispatch of compute shader … skipped`.
+- **Откат.** `DM_PIPEGUARD=1` — поведение v1 (строки-ключи, без суффикса / заголовка / spv, затравки Adreno 750 пишутся в списки).
+- **Проверено без устройства:** `engine/tests/pipeguard_test.cpp` (WSL g++ ASan/UBSan, вместе с `xbg_shader_key.c`): заголовок,
+  `.stale` / v1-миграция, spv-записи, режим 1, правило двух смертей, выбор драйвера по статусу (в т. ч. `not-taken-over` → system, `-occ`),
+  SHA-256 по векторам FIPS — всё зелёное; `tools/build_apk.ps1` — собрано, предупреждений в новом коде нет. Бэкапы `*.bak_pg2`.
+- **Проверить на телефоне.** См. отчёт агента 08.11: строки загрузки с двумя старыми банами; дважды убить процесс во время сборки
+  (маркер `gfx-pipe-inflight<suffix>` вручную: `<key>\t<spv>` из строки `first death`) → `first death`, затем `ban`.
+
+### 2.49 `DM_GFX_DIM_FIX`: тип image view по Dim шейдера (VUID-vkCmdDispatch-viewType-07752; KB SH-08, из Eternal `c1885fe`; 08.11; собрано, на телефоне не проверено)
+- **Симптом (валидация).** Compute частиц `cec755c4e27678b5` сэмплирует `Dim3D`, а получает 2D view — UB: Turnip переживает случайно,
+  другие драйверы могут рисовать мусор или падать.
+- **Исправление (`DM_GFX_DIM_FIX`, по умолч. 1).** `dim_check` перед созданием view: форма из флагов биндинга (bit31, dim в битах 8..10,
+  их пишет `pack_game_shaders.py`). Шейдер хочет 3D, а образ 3D (view назвал другой target) → 3D view (`Image::view(..., force_target=2)`);
+  любое другое расхождение 3D / не-3D → defined null нужной формы (`null_texture`), такой биндинг не кэшируется в `img_cache` и не
+  мемоизируется (иначе null спрятал бы перерегистрацию текстуры). Ключ `img_cache` теперь включает форму биндинга. Лог: `NVN DM_GFX_DIM_FIX=1 (…)`,
+  `NVN dim mismatch shader=… binding=… dim=… serial=… target=… view_target=… depth=… -> 3D view|null (total N)` (раз на shader / binding / serial),
+  `NVN dim mismatch (kept)` — куб vs не куб, только лог. `DM_GFX_DIM_FIX=0` — старые view.
+- **`DM_GFX_STORAGE_EXACT` / `STORAGE_FORMATLESS_INT` (ETR `e9099df` / `7d39c0d`) не перенесены:** к DIM_FIX не нужны. EXACT чинит
+  `StorageImage-FormatMismatch` (R8ui-декларация на R32_UINT view); в DOOM `storage_int_view` (§2.2) срабатывает только на 4-байтных
+  образах, и такого VVL-сообщения в логах DOOM нет. FORMATLESS_INT опирается на правку транслятора ETR (Unknown-format с uint-типом),
+  у пака DOOM её нет. Имеет смысл только после прогона с валидацией, если появится `FormatMismatch`.
+- **Риск.** Если образ у частиц на самом деле 2D (а не 3D с 2D view), частицы будут сэмплировать нули → эффект может потускнеть; строка
+  `-> null` это покажет, `DM_GFX_DIM_FIX=0` — откат.

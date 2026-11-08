@@ -95,6 +95,10 @@ typedef struct {
     _Atomic int dev_err; _Atomic uintptr_t err_st;     // 错误回调报的错与报错的流（只认当前流的错） | error reported by the error callback and the stream that reported it (only the current stream's errors count)
     int ll, reopen, handover, fails, incidents;   // 当前流是低延迟 / 待重开 / 新流已启动、等它第一次回调再交还队列 / 连续重开失败次数 / 出事次数（日志限流） | current stream is low latency / reopen pending / new stream started, queue handed back at its first callback / consecutive reopen failures / incidents (log rate limit)
     uint64_t hand_renders, next_try_ns, bridge_ns, bridge_rel0, fake_t0; int fake_logged;
+    // [DOOM] issue #32 diagnostic (aa_keeper, every 10 s): callbacks that found the queue empty while playing (the producer was late), and the
+    // stream's own underruns (AAudioStream_getXRunCount: the callback was late for the device)
+    char name[16]; _Atomic uint64_t drys;
+    uint64_t dg_t0, dg_r0, dg_d0, dg_x; uintptr_t dg_st; int32_t dg_xlast; int dg_quiet;
 } aout;
 static void *null_sink(void *p);
 static void null_on(aout *a);
@@ -232,6 +236,7 @@ static void render(aout *a, void *data, uint32_t bytes) {
     { static FILE *df; static int on = -1; if (on < 0) { const char *e = getenv("DM_AUDIO_OUT_DUMP"); on = e != NULL; if (on && !(df = fopen(e, "wb"))) LOG("【红】DM_AUDIO_OUT_DUMP 打不开 %s", e); }
       if (df) fwrite(data, 1, bytes, df); }
     { int q = nq_phase(); atomic_fetch_add_explicit(&g_nq_calls[q], 1, memory_order_relaxed); if (a->dry) atomic_fetch_add_explicit(&g_nq_dry[q], 1, memory_order_relaxed); }   // 通知线程 QoS 对照：按当前相记 | Notification thread QoS comparison: recorded per current phase
+    if (a->dry) atomic_fetch_add_explicit(&a->drys, 1, memory_order_relaxed);   // [DOOM] issue #32: per-output count for aa_keeper's 10 s line
 }
 #ifdef __APPLE__
 static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *bl) {
@@ -378,6 +383,13 @@ static uint64_t aa_stall_ns(void) {
 // Diagnostic switch DM_AUDIO_FAKE_STALL=<ms>: every low-latency stream pretends to stall after its callbacks have run this long (the callback returns STOP,
 // the stream stops without an error), to exercise "stall detection -> wall-clock bridge -> reopen as NONE -> hand back" on any phone; NONE streams are not
 // affected, so the sound should come back after the fallback
+// [DOOM] issue #32: DM_AUDIO_BUFFER_MS=<ms> floor of every AAudio stream's buffer (default 32; 0 = keep the system's size), see aa_open
+static _Atomic int g_buf_ms = -1;
+static int aa_buf_ms(void) {
+    int s = atomic_load(&g_buf_ms);
+    if (s < 0) { const char *e = getenv("DM_AUDIO_BUFFER_MS"); s = e && *e ? atoi(e) : 32; if (s < 0) s = 0; if (s > 200) s = 200; atomic_store(&g_buf_ms, s); }
+    return s;
+}
 static int g_fake_ms = -1;
 static int aa_fake_ms(void) { if (g_fake_ms < 0) { const char *e = getenv("DM_AUDIO_FAKE_STALL"); g_fake_ms = e ? atoi(e) : 0; if (g_fake_ms < 0) g_fake_ms = 0; } return g_fake_ms; }
 static aaudio_data_callback_result_t aa_render(AAudioStream *st, void *ctx, void *data, int32_t frames) {
@@ -419,6 +431,16 @@ static int aa_open(aout *a, dm_audev *out, int *ll) {
     aaudio_result_t r = AAudioStreamBuilder_openStream(b, out);
     AAudioStreamBuilder_delete(b);
     if (r != AAUDIO_OK) { *out = NULL; LOG("【红】AAudio 打开失败 %d（%s）", (int)r, AAudio_convertResultToText(r)); return -1; }
+    {   // [DOOM] issue #32: buffer floor DM_AUDIO_BUFFER_MS (default 32; 0 = the system's size). The Mi 14 Ultra's low-latency streams come up
+        // at 1536 / 1536 frames (32 ms), the Samsung S23's MMAP streams at 768 / 1536 (16 ms, 8 bursts of 96): raise a smaller buffer to
+        // the floor (at most the capacity), so a late callback has the same margin on both. Latency +16 ms at most, where it was raised
+        int ms = aa_buf_ms(); int32_t cur = AAudioStream_getBufferSizeInFrames(*out), cap = AAudioStream_getBufferCapacityInFrames(*out), want = ms * (RATE / 1000);
+        if (want > cap) want = cap;
+        if (ms > 0 && cur > 0 && cur < want) {
+            int32_t got = AAudioStream_setBufferSizeInFrames(*out, want);
+            static _Atomic int told; if (atomic_fetch_add(&told, 1) < 4) LOG("audio: AAudio buffer %d -> %d frames (floor %d ms, DM_AUDIO_BUFFER_MS; capacity %d)", (int)cur, (int)(got > 0 ? got : cur), ms, (int)cap);
+        }
+    }
     if (a->mix) LOG("audio：游戏给 6 声道（5.1）→ 交给声卡前自己下混成双声道（中置 / 后环绕 ×0.707 并入左右，低音不并入，整体 −3 dB、饱和截断）");
     *ll = AAudioStream_getPerformanceMode(*out) == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY;
     LOG("audio：AAudio 流 %d Hz %d 声道，性能模式 %d%s，每次回调 %d 帧，缓冲 %d / %d 帧", AAudioStream_getSampleRate(*out), AAudioStream_getChannelCount(*out),
@@ -529,6 +551,30 @@ static void *aa_keeper(void *p) {
             } else { if (!r) AAudioStream_close(nu); a->fails++; }
             if (a->reopen) a->next_try_ns = now_ns() + 1000000000ull;
         }
+        // [DOOM] issue #32: every 10 s while the sound card plays: callbacks, how many found the queue empty (the producer was late: the
+        // render thread for HostPcmOut, Wwise for the 6-channel one) and the stream's own underruns (the callback was late). Logged when
+        // either is non-zero, otherwise once a minute
+        if (a->au && a->dev_on && !a->handover && !atomic_load(&a->owner) && atomic_load_explicit(&a->state, memory_order_acquire) == STATE_STARTED && !g_suspended) {
+            uint64_t t = now_ns(), rn = atomic_load(&a->renders), dn = atomic_load(&a->drys);
+            int32_t xr = AAudioStream_getXRunCount(a->au);
+            if ((uintptr_t)a->au != a->dg_st) { a->dg_st = (uintptr_t)a->au; a->dg_xlast = xr > 0 ? xr : 0; }
+            else if (xr > a->dg_xlast) { a->dg_x += (uint64_t)(xr - a->dg_xlast); a->dg_xlast = xr; }
+            if (!a->dg_t0) { a->dg_t0 = t; a->dg_r0 = rn; a->dg_d0 = dn; a->dg_x = 0; }
+            else if (t - a->dg_t0 >= 10000000000ull) {
+                uint64_t d = dn - a->dg_d0, calls = rn - a->dg_r0;
+                // every callback empty = an idle stream (the game opened it and feeds nothing: DOOM's 2-channel default out in the menus),
+                // not a late producer; only a window with some data and some empty callbacks is a gap in the sound
+                int idle = d && d == calls;
+                if ((d && !idle) || a->dg_x || ++a->dg_quiet >= 6) {
+                    LOG("%saudio: %s %dch last %.1f s: %llu callbacks, %llu found the queue empty (%s), %llu device underruns (callback late); buffer %d / %d frames, burst %d, perf %d",
+                        (d && !idle) || a->dg_x ? "[RED] " : "", a->name, a->ch, (t - a->dg_t0) / 1e9, (unsigned long long)calls, (unsigned long long)d,
+                        idle ? "idle: nothing written" : "producer late", (unsigned long long)a->dg_x,
+                        (int)AAudioStream_getBufferSizeInFrames(a->au), (int)AAudioStream_getBufferCapacityInFrames(a->au), (int)AAudioStream_getFramesPerBurst(a->au), (int)AAudioStream_getPerformanceMode(a->au));
+                    a->dg_quiet = 0;
+                }
+                a->dg_t0 = t; a->dg_r0 = rn; a->dg_d0 = dn; a->dg_x = 0;
+            }
+        } else a->dg_t0 = 0;   // paused / bridging / stopped: the next window starts when it plays again
         pthread_mutex_unlock(&a->dm);
     }
     return NULL;
@@ -552,6 +598,7 @@ HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKN
     aout *a = calloc(1, sizeof *a);
     if (!a) die("AudioOut alloc");
     pthread_mutex_init(&a->m, NULL); pthread_mutex_init(&a->dm, NULL); a->event = ev; a->ch = ch;
+    snprintf(a->name, sizeof a->name, "%s", name ? name : "default");   // [DOOM] issue #32: for aa_keeper's 10 s line
     atomic_init(&a->state, STATE_STOPPED);
     atomic_init(&a->q_head, 0); atomic_init(&a->q_tail, 0);
     atomic_init(&a->rel_head, 0); atomic_init(&a->rel_tail, 0);

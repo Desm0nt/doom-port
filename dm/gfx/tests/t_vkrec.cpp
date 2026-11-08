@@ -44,8 +44,12 @@ void dm_present_queue_unlock(void){}
 __attribute__((weak)) unsigned dm_present_pin_mask(void);   // weak, as in the engine
 unsigned dm_present_pin_mask(void){return 0;}
 __attribute__((weak)) unsigned dm_present_record_mask(void);   // [DOOM] weak and undefined: the block falls back to "every core but the pin"
-VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer c,const VkCommandBufferBeginInfo *b){tag("begin");put(c);put(b->flags);return VK_SUCCESS;}
-VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer c){tag("end");put(c);return VK_SUCCESS;}
+// [pvr] DM_GFX_COMPILE_LOCK (BUGS_AND_FIXES 2.47): a simulated driver compile holds drvc::mu with in_compile set; with the lock on, no
+// render-pass / copy / blit / clear / fill / begin / end call may run inside one (CK counts those that do).
+std::atomic<int> in_compile{0},cmd_in_compile{0};
+#define CK() do{if(in_compile.load(std::memory_order_relaxed))++cmd_in_compile;}while(0)
+VKAPI_ATTR VkResult VKAPI_CALL vkBeginCommandBuffer(VkCommandBuffer c,const VkCommandBufferBeginInfo *b){CK();tag("begin");put(c);put(b->flags);return VK_SUCCESS;}
+VKAPI_ATTR VkResult VKAPI_CALL vkEndCommandBuffer(VkCommandBuffer c){CK();tag("end");put(c);return VK_SUCCESS;}
 std::atomic<uint64_t> queue_submits{0};
 // [pvr] DM_GFX_FENCE_GUARD=2: a simulated status poll holds fguard::mu with in_status set; a submit must never run inside one.
 std::atomic<int> in_status{0},submit_in_status{0};
@@ -58,17 +62,17 @@ VKAPI_ATTR void VKAPI_CALL vkCmdEndQuery(VkCommandBuffer c,VkQueryPool p,uint32_
 VKAPI_ATTR void VKAPI_CALL vkCmdResetQueryPool(VkCommandBuffer c,VkQueryPool p,uint32_t a,uint32_t n){tag("rq");put(c);put(p);put(a);put(n);}
 VKAPI_ATTR void VKAPI_CALL vkCmdWriteTimestamp(VkCommandBuffer c,VkPipelineStageFlagBits s,VkQueryPool p,uint32_t i){tag("ts");put(c);put(s);put(p);put(i);}
 VKAPI_ATTR void VKAPI_CALL vkCmdCopyQueryPoolResults(VkCommandBuffer c,VkQueryPool p,uint32_t a,uint32_t n,VkBuffer d,VkDeviceSize o,VkDeviceSize s,VkQueryResultFlags f){tag("cqp");put(c);put(p);put(a);put(n);put(d);put(o);put(s);put(f);}
-VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer c,const VkRenderPassBeginInfo *b,VkSubpassContents k){tag("brp");put(c);put(b->renderPass);put(b->framebuffer);put(b->renderArea);putn(b->pClearValues,b->clearValueCount);put(k);}
-VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer c){tag("erp");put(c);}
-VKAPI_ATTR void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer c,VkBuffer s,VkBuffer d,uint32_t n,const VkBufferCopy *r){tag("cb");put(c);put(s);put(d);putn(r,n);}
-VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer c,VkBuffer b,VkImage i,VkImageLayout l,uint32_t n,const VkBufferImageCopy *r){tag("b2i");put(c);put(b);put(i);put(l);putn(r,n);}
-VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer c,VkImage i,VkImageLayout l,VkBuffer b,uint32_t n,const VkBufferImageCopy *r){tag("i2b");put(c);put(i);put(l);put(b);putn(r,n);}
-VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer c,VkImage s,VkImageLayout sl,VkImage d,VkImageLayout dl,uint32_t n,const VkImageCopy *r){tag("ci");put(c);put(s);put(sl);put(d);put(dl);putn(r,n);}
-VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer c,VkImage s,VkImageLayout sl,VkImage d,VkImageLayout dl,uint32_t n,const VkImageBlit *r,VkFilter f){tag("blit");put(c);put(s);put(sl);put(d);put(dl);putn(r,n);put(f);}
-VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer c,VkImage s,VkImageLayout sl,VkImage d,VkImageLayout dl,uint32_t n,const VkImageResolve *r){tag("res");put(c);put(s);put(sl);put(d);put(dl);putn(r,n);}
-VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer c,VkImage i,VkImageLayout l,const VkClearColorValue *v,uint32_t n,const VkImageSubresourceRange *r){tag("ccol");put(c);put(i);put(l);put(*v);putn(r,n);}
-VKAPI_ATTR void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer c,VkImage i,VkImageLayout l,const VkClearDepthStencilValue *v,uint32_t n,const VkImageSubresourceRange *r){tag("cds");put(c);put(i);put(l);put(*v);putn(r,n);}
-VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer c,uint32_t na,const VkClearAttachment *a,uint32_t nr,const VkClearRect *r){tag("catt");put(c);putn(a,na);putn(r,nr);}
+VKAPI_ATTR void VKAPI_CALL vkCmdBeginRenderPass(VkCommandBuffer c,const VkRenderPassBeginInfo *b,VkSubpassContents k){CK();tag("brp");put(c);put(b->renderPass);put(b->framebuffer);put(b->renderArea);putn(b->pClearValues,b->clearValueCount);put(k);}
+VKAPI_ATTR void VKAPI_CALL vkCmdEndRenderPass(VkCommandBuffer c){CK();tag("erp");put(c);}
+VKAPI_ATTR void VKAPI_CALL vkCmdCopyBuffer(VkCommandBuffer c,VkBuffer s,VkBuffer d,uint32_t n,const VkBufferCopy *r){CK();tag("cb");put(c);put(s);put(d);putn(r,n);}
+VKAPI_ATTR void VKAPI_CALL vkCmdCopyBufferToImage(VkCommandBuffer c,VkBuffer b,VkImage i,VkImageLayout l,uint32_t n,const VkBufferImageCopy *r){CK();tag("b2i");put(c);put(b);put(i);put(l);putn(r,n);}
+VKAPI_ATTR void VKAPI_CALL vkCmdCopyImageToBuffer(VkCommandBuffer c,VkImage i,VkImageLayout l,VkBuffer b,uint32_t n,const VkBufferImageCopy *r){CK();tag("i2b");put(c);put(i);put(l);put(b);putn(r,n);}
+VKAPI_ATTR void VKAPI_CALL vkCmdCopyImage(VkCommandBuffer c,VkImage s,VkImageLayout sl,VkImage d,VkImageLayout dl,uint32_t n,const VkImageCopy *r){CK();tag("ci");put(c);put(s);put(sl);put(d);put(dl);putn(r,n);}
+VKAPI_ATTR void VKAPI_CALL vkCmdBlitImage(VkCommandBuffer c,VkImage s,VkImageLayout sl,VkImage d,VkImageLayout dl,uint32_t n,const VkImageBlit *r,VkFilter f){CK();tag("blit");put(c);put(s);put(sl);put(d);put(dl);putn(r,n);put(f);}
+VKAPI_ATTR void VKAPI_CALL vkCmdResolveImage(VkCommandBuffer c,VkImage s,VkImageLayout sl,VkImage d,VkImageLayout dl,uint32_t n,const VkImageResolve *r){CK();tag("res");put(c);put(s);put(sl);put(d);put(dl);putn(r,n);}
+VKAPI_ATTR void VKAPI_CALL vkCmdClearColorImage(VkCommandBuffer c,VkImage i,VkImageLayout l,const VkClearColorValue *v,uint32_t n,const VkImageSubresourceRange *r){CK();tag("ccol");put(c);put(i);put(l);put(*v);putn(r,n);}
+VKAPI_ATTR void VKAPI_CALL vkCmdClearDepthStencilImage(VkCommandBuffer c,VkImage i,VkImageLayout l,const VkClearDepthStencilValue *v,uint32_t n,const VkImageSubresourceRange *r){CK();tag("cds");put(c);put(i);put(l);put(*v);putn(r,n);}
+VKAPI_ATTR void VKAPI_CALL vkCmdClearAttachments(VkCommandBuffer c,uint32_t na,const VkClearAttachment *a,uint32_t nr,const VkClearRect *r){CK();tag("catt");put(c);putn(a,na);putn(r,nr);}
 VKAPI_ATTR void VKAPI_CALL vkCmdBindPipeline(VkCommandBuffer c,VkPipelineBindPoint bp,VkPipeline p){tag("bp");put(c);put(bp);put(p);}
 VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer c,VkPipelineBindPoint bp,VkPipelineLayout l,uint32_t f,uint32_t ns,const VkDescriptorSet *s,uint32_t nd,const uint32_t *d){tag("bds");put(c);put(bp);put(l);put(f);putn(s,ns);putn(d,nd);}
 VKAPI_ATTR void VKAPI_CALL vkCmdSetViewport(VkCommandBuffer c,uint32_t f,uint32_t n,const VkViewport *v){tag("vp");put(c);put(f);putn(v,n);}
@@ -81,7 +85,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdDrawIndexed(VkCommandBuffer c,uint32_t a,uint32_
 VKAPI_ATTR void VKAPI_CALL vkCmdDraw(VkCommandBuffer c,uint32_t a,uint32_t b,uint32_t d,uint32_t e){tag("d");put(c);put(a);put(b);put(d);put(e);}
 VKAPI_ATTR void VKAPI_CALL vkCmdDispatch(VkCommandBuffer c,uint32_t x,uint32_t y,uint32_t z){tag("disp");put(c);put(x);put(y);put(z);}
 VKAPI_ATTR void VKAPI_CALL vkCmdDispatchIndirect(VkCommandBuffer c,VkBuffer b,VkDeviceSize o){tag("dispi");put(c);put(b);put(o);}
-VKAPI_ATTR void VKAPI_CALL vkCmdFillBuffer(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkDeviceSize n,uint32_t d){tag("fill");put(c);put(b);put(o);put(n);put(d);}   // [DOOM] DM_GFX_CRUMBS markers
+VKAPI_ATTR void VKAPI_CALL vkCmdFillBuffer(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkDeviceSize n,uint32_t d){CK();tag("fill");put(c);put(b);put(o);put(n);put(d);}   // [DOOM] DM_GFX_CRUMBS markers
 VKAPI_ATTR void VKAPI_CALL vkCmdPushConstants(VkCommandBuffer c,VkPipelineLayout l,VkShaderStageFlags s,uint32_t o,uint32_t n,const void *v){tag("pc");put(c);put(l);put(s);put(o);putn(static_cast<const uint8_t*>(v),n);}
 }
 void VKAPI_CALL mock_dicnt(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkBuffer cb,VkDeviceSize co,uint32_t n,uint32_t s){tag("dicnt");put(c);put(b);put(o);put(cb);put(co);put(n);put(s);}
@@ -187,6 +191,18 @@ int main(){
      stop=true;poller.join();fguard::level=0;
      CHECK(!bad,"mode 1 with fence guard 2: trace differs in %d/4 runs",bad);CHECK(!submit_in_status.load(),"%d submits ran inside a guarded status poll",submit_in_status.load());
      CHECK(polls>0,"the poller never ran");printf("fence guard 2: %llu guarded polls beside the record thread, %d submits inside one\n",(unsigned long long)polls,submit_in_status.load());}
+    // [pvr] DM_GFX_COMPILE_LOCK=1 / 2: the same traces (direct = the translation thread's direct calls, mode 1 = dm-record) while another
+    // thread keeps "compiling" under drvc::mu as pipeline builds / vkCreateShaderModule do, and no locked command runs inside a compile.
+    {std::atomic<bool> stop{false};uint64_t compiles=0;
+     std::thread compiler([&]{while(!stop.load()){{std::lock_guard<std::mutex> g(drvc::mu);in_compile=1;for(volatile int i=0;i<300;i++){}in_compile=0;}++compiles;std::this_thread::yield();}});
+     int bad=0;for(int level=1;level<=2;level++){drvc::level=level;
+        Run g0=script(0,false,slots);if(g0.trace!=d.trace){if(!bad++)diff("direct compile lock",d.trace,g0.trace);}
+        for(int rep=0;rep<3;rep++){Run g=script(1,false,slots);if(g.trace!=d.trace){if(!bad++)diff("mode 1 compile lock",d.trace,g.trace);}}}
+     const int inside=cmd_in_compile.load();drvc::level=0;cmd_in_compile=0;
+     for(int rep=0;rep<2;rep++)(void)script(1,false,slots);   // lock off: the same race is (usually) seen
+     stop=true;compiler.join();
+     CHECK(!bad,"compile lock: trace differs in %d runs",bad);CHECK(!inside,"compile lock: %d locked commands ran inside a compile",inside);CHECK(compiles>0,"the compiler thread never ran");
+     printf("compile lock 1/2: %llu compiles beside the record thread, %d locked commands inside one (lock off: %d)\n",(unsigned long long)compiles,inside,cmd_in_compile.load());}
     printf("fallbacks direct-run %llu, mode2 %llu, mode1 %llu; syncs %llu; ring %llu KB, written %llu KB; record thread executed %llu packets\n",(unsigned long long)d.fallbacks,(unsigned long long)m2.fallbacks,(unsigned long long)m1.fallbacks,(unsigned long long)m1.syncs_n,
         (unsigned long long)(vkrec::cap>>10),(unsigned long long)(vkrec::wpos>>10),(unsigned long long)vkrec::executed.load());
     printf(fails?"t_vkrec: %d FAILED\n":"t_vkrec: PASS\n",fails);fflush(stdout);_exit(fails?1:0);   // the record thread is never joined (as in the engine)

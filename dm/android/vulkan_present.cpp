@@ -6,6 +6,11 @@
 #include "vulkan_present.h"
 #ifdef DM_GAME_DOOM
 extern "C" void dm_aperf_present(ANativeWindow*,float);
+// [pvr] DM_GFX_COMPILE_LOCK (xbg_game.cpp drvc, BUGS_AND_FIXES 2.47): the PowerVR driver compiles transfer / clear programs inside vkCmd*;
+// the present blit and clear take the engine's driver-compiler lock (no-ops unless the level is on: PowerVR).
+extern "C" __attribute__((weak)) void xbg_drvc_lock(void);
+extern "C" __attribute__((weak)) void xbg_drvc_unlock(void);
+struct DrvcLock{DrvcLock(){if(xbg_drvc_lock)xbg_drvc_lock();}~DrvcLock(){if(xbg_drvc_unlock)xbg_drvc_unlock();}DrvcLock(const DrvcLock&)=delete;DrvcLock &operator=(const DrvcLock&)=delete;};
 extern "C" void dm_aperf_note_wait(int64_t);   // [r2] perf_android.c: the present thread's acquire wait (DM_ADPF_WORK=wall)
 extern "C" void dm_aperf_frame_tid(int);   // [mt 2a] perf_android.c: the ADPF session's frame thread when presents run elsewhere
 #endif
@@ -264,7 +269,7 @@ bool setup(){
     if(vkCreatePipelineLayout(device,&pl,nullptr,&layout))return false;
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};mi.codeSize=sizeof code;mi.pCode=code;VkShaderModule module{};if(vkCreateShaderModule(device,&mi,nullptr,&module))return false;
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};ci.stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;ci.stage.stage=VK_SHADER_STAGE_COMPUTE_BIT;ci.stage.module=module;ci.stage.pName="main";ci.layout=layout;
-    VkResult r=vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&ci,nullptr,&pipeline);vkDestroyShaderModule(device,module,nullptr);if(r)return false;
+    VkResult r;{DrvcLock compile;r=vkCreateComputePipelines(device,VK_NULL_HANDLE,1,&ci,nullptr,&pipeline);}vkDestroyShaderModule(device,module,nullptr);if(r)return false;
     VkDescriptorPoolSize ps[2]{{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2},{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,2}};VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dp.maxSets=2;dp.poolSizeCount=2;dp.pPoolSizes=ps;
     if(vkCreateDescriptorPool(device,&dp,nullptr,&pool))return false;
     VkDescriptorSetLayout ls[2]={set_layout,set_layout};VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};ai.descriptorPool=pool;ai.descriptorSetCount=2;ai.pSetLayouts=ls;if(vkAllocateDescriptorSets(device,&ai,sets))return false;
@@ -384,7 +389,7 @@ bool make_pipeline(VkFormat format){
     VkDynamicState dyn[2]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};ds.dynamicStateCount=2;ds.pDynamicStates=dyn;
     VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};gp.stageCount=2;gp.pStages=st;gp.pVertexInputState=&vi;gp.pInputAssemblyState=&ia;gp.pViewportState=&vp;gp.pRasterizationState=&rs;
     gp.pMultisampleState=&ms;gp.pColorBlendState=&cb;gp.pDynamicState=&ds;gp.layout=layout;gp.renderPass=passes[0];gp.subpass=0;
-    r=vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&pipeline);vkDestroyShaderModule(device,m[0],nullptr);vkDestroyShaderModule(device,m[1],nullptr);
+    {DrvcLock compile;r=vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&pipeline);}vkDestroyShaderModule(device,m[0],nullptr);vkDestroyShaderModule(device,m[1],nullptr);
     if(r){pipeline={};fail("GSR pipeline",r);return false;}
     target_format=format;return true;
 }
@@ -550,7 +555,7 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     // finished reading the image (synchronization validation: SYNC-HAZARD-WRITE-AFTER-READ).
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);
     if(dx || dy || dw!=int(extent.width) || dh!=int(extent.height)){   // letterbox bars only where the blit leaves part of the image
-        VkClearColorValue black{};vkCmdClearColorImage(cmd,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&barrier.subresourceRange);
+        VkClearColorValue black{};{DrvcLock compile;vkCmdClearColorImage(cmd,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&black,1,&barrier.subresourceRange);}
         barrier.oldLayout=barrier.newLayout;barrier.srcAccessMask=barrier.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,0,nullptr,1,&barrier);}
     VkImageBlit blit{};blit.srcSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};blit.dstSubresource=blit.srcSubresource;blit.srcOffsets[0]={x,y,0};blit.srcOffsets[1]={x+w,y+h,1};blit.dstOffsets[0]={dx,dy,0};blit.dstOffsets[1]={dx+dw,dy+dh,1};
     // [r3] source stored bottom-up (DM_GFX_TAA_FIX lower-left): the crop rows [y, y+h) of the upright image are rows
@@ -565,7 +570,7 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     // [DOOM] DM_GFX_UPSCALE without its pass (format not taken, setup failed): the buffer is the window size, so scale linearly
     if(upscale::enabled() && (dw!=w || dh!=h) && (sp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))filter=VK_FILTER_LINEAR;
     const bool sharpened=rcas::record(cmd,f,source,source_format,width,height);
-    vkCmdBlitImage(cmd,sharpened?rcas::image:source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,filter);
+    {DrvcLock compile;vkCmdBlitImage(cmd,sharpened?rcas::image:source,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,images[index],VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&blit,filter);}   // [pvr] DM_GFX_COMPILE_LOCK
     // 同队列后续写入必须等源图读取完成；即使下一次图像布局未改变也建立 WAR 执行依赖。
     // Order subsequent same-queue writes after the source read, including reuse without a layout change.
     VkMemoryBarrier source_read{VK_STRUCTURE_TYPE_MEMORY_BARRIER};source_read.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;source_read.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;

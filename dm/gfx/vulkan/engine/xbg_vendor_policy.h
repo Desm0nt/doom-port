@@ -69,7 +69,9 @@ enum : uint32_t {
     XBG_SIM_FAMILY_XCLIPSE=1u<<26,
 };
 constexpr uint32_t XBG_SIM_PROFILE_MALI=XBG_SIM_NOBC|XBG_SIM_NOFILTER16|XBG_SIM_SUBGROUP16|XBG_SIM_NODEPTHBOUNDS|XBG_SIM_NOFILLMODE|XBG_SIM_NOCLIP|XBG_SIM_FAMILY_MALI;
-constexpr uint32_t XBG_SIM_PROFILE_POWERVR=XBG_SIM_NOBC|XBG_SIM_DEPTHNOLINEAR|XBG_SIM_PVRFORMATS|XBG_SIM_SUBGROUP1|XBG_SIM_NODEPTHBOUNDS|XBG_SIM_NOFILLMODE|XBG_SIM_TEXEL64K|XBG_SIM_FAMILY_POWERVR;
+// [pvr] + NOANISO (BUGS_AND_FIXES 2.47): the only PowerVR a player ran (moto g64, BXM-8-256 1.15) has samplerAnisotropy=0 and the game
+// asks aniso 4 for some samplers anyway (a fatal in v0.4.19), so the profile models it.
+constexpr uint32_t XBG_SIM_PROFILE_POWERVR=XBG_SIM_NOBC|XBG_SIM_DEPTHNOLINEAR|XBG_SIM_PVRFORMATS|XBG_SIM_SUBGROUP1|XBG_SIM_NODEPTHBOUNDS|XBG_SIM_NOFILLMODE|XBG_SIM_TEXEL64K|XBG_SIM_NOANISO|XBG_SIM_FAMILY_POWERVR;
 constexpr uint32_t XBG_SIM_PROFILE_XCLIPSE=XBG_SIM_NOBC47|XBG_SIM_NOD24|XBG_SIM_NOVERTEX3|XBG_SIM_FAMILY_XCLIPSE;
 
 inline uint32_t xbg_sim_parse(const char *text,char *unknown=nullptr,size_t unknown_bytes=0){
@@ -151,6 +153,17 @@ inline VkResult xbg_fence_poll(Status status,Now now,Pause pause,uint64_t timeou
     }
 }
 
+// [pvr] DM_GFX_ANISO_FALLBACK (BUGS_AND_FIXES 2.47): the anisotropy a sampler may use on this device. NVN takes any value up to 16
+// (Maxwell filters anisotropically); Vulkan needs samplerAnisotropy enabled and maxAnisotropy <= maxSamplerAnisotropy. Without the
+// feature the sampler is trilinear / bilinear (1 = off), above the limit it is clamped. A capability rule (no family): it only acts
+// where the old code stopped the game ("NVN sampler anisotropy unsupported/disabled/out of range result=-5").
+inline float xbg_aniso_allowed(float wanted,bool feature,float max_aniso){
+    if(!(wanted>1))return wanted;   // 1 (off), or garbage the converter rejects as before
+    if(!feature)return 1;
+    if(max_aniso>=1 && wanted>max_aniso)return max_aniso;
+    return wanted;
+}
+
 // Zero-copy guest memory (AHardwareBuffer BLOB pages imported as VkBuffer memory, CPU-cached pages read by the GPU through IO
 // coherency) was proven only on Adreno (work/zc_test). Elsewhere the copy path is the default: a GPU that does not snoop the CPU
 // caches would read stale vertices / uniforms (Arm documents ACE-Lite only for some SoCs). DM_GFX_ZEROCOPY=1 forces it on.
@@ -158,6 +171,13 @@ inline bool xbg_zero_copy_default(XbgGpuFamily f){return f==XBG_GPU_ADRENO;}
 // The PowerVR shader compiler is not thread-safe (forums.imgtec.com t/4334, BXM-8-256 1.15) and builds slowly (t/4280):
 // one vkCreate*Pipelines at a time (warm-up threads included). DM_GFX_PIPE_SERIAL.
 inline bool xbg_pipe_serial_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR;}
+// [pvr] DM_GFX_COMPILE_LOCK (BUGS_AND_FIXES 2.47). The same compiler also runs outside vkCreate*Pipelines on this driver: the moto g64
+// (BXM-8-256, 1.15@6133110) spends 2-56 ms in vkCreateShaderModule (the SPIR-V front end), and v0.4.19 died with SIGBUS inside
+// PVRUniFlexCompileToHw called from a vkCmd* on the dm-record thread (driver-made transfer / render-pass programs) while the
+// translation thread was creating modules and pipelines. Level 1: the pipeline lock also covers vkCreateShaderModule, the record
+// thread's render-pass / copy / blit / clear / fill packets (and their direct calls) and the present thread's blit and clear;
+// 2: every record-thread packet but submit / present (diagnostic). 1 on PowerVR, 0 elsewhere.
+inline int xbg_compile_lock_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR?1:0;}
 // Graphics-pipeline crash guard (in-flight markers, skip after two crashed boots). Off on Adreno, whose compiler crashes are
 // known and handled by the compute guard; on for the rest, where we have never run. DM_GFX_PIPE_GUARD.
 inline bool xbg_pipe_guard_default(XbgGpuFamily f){return f!=XBG_GPU_ADRENO;}

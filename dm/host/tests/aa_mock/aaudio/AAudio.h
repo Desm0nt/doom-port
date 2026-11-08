@@ -23,7 +23,7 @@ typedef struct AAudioStream AAudioStream;
 typedef aaudio_data_callback_result_t (*AAudioStream_dataCallback)(AAudioStream *, void *, void *, int32_t);
 typedef void (*AAudioStream_errorCallback)(AAudioStream *, void *, aaudio_result_t);
 typedef struct { int rate, ch, perf; AAudioStream_dataCallback cb; AAudioStream_errorCallback ecb; void *ctx, *ectx; } AAudioStreamBuilder;
-struct AAudioStream { AAudioStreamBuilder p; pthread_t th; int live; _Atomic int run; int16_t buf[960 * 8]; };
+struct AAudioStream { AAudioStreamBuilder p; pthread_t th; int live; _Atomic int run; int16_t buf[960 * 8]; int32_t bufsz; };
 
 static _Atomic int mock_stall_ll_ms, mock_fail_start_ll, mock_opens_ll, mock_opens_none, mock_closes, mock_timeouts, mock_live;
 static _Atomic uint64_t mock_cb_ll, mock_cb_none;
@@ -72,6 +72,9 @@ static int32_t AAudioStream_getChannelCount(AAudioStream *s) { return s->p.ch; }
 static int32_t AAudioStream_getSampleRate(AAudioStream *s) { return s->p.rate; }
 static int32_t AAudioStream_getPerformanceMode(AAudioStream *s) { return s->p.perf; }
 static int32_t AAudioStream_getFramesPerBurst(AAudioStream *s) { return s->p.perf == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? 96 : 960; }
-static int32_t AAudioStream_getBufferSizeInFrames(AAudioStream *s) { return 2 * AAudioStream_getFramesPerBurst(s); }
+static int32_t AAudioStream_getBufferSizeInFrames(AAudioStream *s) { return s->bufsz ? s->bufsz : 2 * AAudioStream_getFramesPerBurst(s); }
 static int32_t AAudioStream_getBufferCapacityInFrames(AAudioStream *s) { return 4 * AAudioStream_getFramesPerBurst(s); }
+// [DOOM] issue #32: buffer floor (hle_audio.c aa_open) and the keeper's underrun count
+static aaudio_result_t AAudioStream_setBufferSizeInFrames(AAudioStream *s, int32_t n) { int32_t c = AAudioStream_getBufferCapacityInFrames(s); s->bufsz = n > c ? c : n; return s->bufsz; }
+static int32_t AAudioStream_getXRunCount(AAudioStream *s) { (void)s; return 0; }
 static const char *AAudio_convertResultToText(aaudio_result_t r) { return r == AAUDIO_ERROR_TIMEOUT ? "AAUDIO_ERROR_TIMEOUT" : r == AAUDIO_ERROR_DISCONNECTED ? "AAUDIO_ERROR_DISCONNECTED" : "?"; }

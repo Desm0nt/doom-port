@@ -203,6 +203,18 @@ int main(){
      clock=0;const uint64_t signal_at=23000;auto later=[&]{return clock>=signal_at?VK_SUCCESS:VK_NOT_READY;};
      CHECK(xbg_fence_wait_early(VK_TIMEOUT,1000000ull,10000000000ull) && xbg_fence_poll(later,now,pause,10000000000ull,&checks)==VK_SUCCESS && clock<signal_at+400);}
 
+    // [pvr] 2.47: DM_GFX_COMPILE_LOCK only on PowerVR (and the simulated family); the PowerVR profile has no anisotropy; the sampler
+    // anisotropy a device can take (moto g64: feature off, the game asked 4 -> 1; Adreno with the feature: unchanged up to 16, clamped above).
+    CHECK(xbg_compile_lock_default(XBG_GPU_POWERVR)==1 && xbg_compile_lock_default(XBG_GPU_ADRENO)==0 && xbg_compile_lock_default(XBG_GPU_MALI)==0 &&
+          xbg_compile_lock_default(XBG_GPU_XCLIPSE)==0 && xbg_compile_lock_default(XBG_GPU_OTHER)==0);
+    CHECK(xbg_compile_lock_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("powervr")))==1);
+    CHECK(xbg_sim_parse("powervr")&XBG_SIM_NOANISO);CHECK(!(XBG_SIM_PROFILE_MALI&XBG_SIM_NOANISO));
+    {VkPhysicalDeviceFeatures g{};g.samplerAnisotropy=VK_TRUE;xbg_sim_features(XBG_SIM_PROFILE_POWERVR,&g);CHECK(!g.samplerAnisotropy);}
+    CHECK(xbg_aniso_allowed(4,false,16)==1);CHECK(xbg_aniso_allowed(16,false,1)==1);
+    CHECK(xbg_aniso_allowed(4,true,16)==4);CHECK(xbg_aniso_allowed(16,true,16)==16);CHECK(xbg_aniso_allowed(16,true,8)==8);
+    CHECK(xbg_aniso_allowed(1,false,16)==1);CHECK(xbg_aniso_allowed(1,true,16)==1);
+    {const float bad=xbg_aniso_allowed(0.5f,true,16);CHECK(bad==0.5f);}   // invalid values reach the converter unchanged (its -5 stays)
+
     if(failures){printf("%d failure(s)\n",failures);return 1;}
     printf("vendor_policy_test: all checks passed\n");return 0;
 }

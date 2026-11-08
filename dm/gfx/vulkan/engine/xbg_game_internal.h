@@ -15,6 +15,7 @@ void xbg_logf(const char *format,...);
 __attribute__((noreturn)) void xbg_fatalf(const char *format,...);
 int xbg_backend_failed(void);
 int xbg_shader_control_key(const void *control_0x880,char out_hex17[17]);
+int xbg_sha256_hex16(const void *data,size_t n,char out_hex17[17]);   /* [DOOM] pipeguard v2 spv identities */
 int xbg_device_integer(int property,int *value);
 void xbg_legacy_pool_add(void *memory,size_t bytes);
 void xbg_legacy_pool_del(void *memory);
