@@ -232,6 +232,13 @@ final class FrontMenu implements PauseMenu.Listener {
             CheckBox look = new CheckBox(act); look.setText(t("Камера свайпом по свободному месту экрана", "Turn the camera by swiping a free spot")); look.setChecked(cp.getBoolean("look_on", true));
             look.setOnCheckedChangeListener((c, on) -> { cp.edit().putBoolean("look_on", on).apply(); pad.reloadSettings(); }); box.addView(look);
         }
+        // [issue #40] the floating move stick and its zone, only for a port whose pad offers it (DOOM 2016)
+        if (pad instanceof DoomPadView && ((DoomPadView) pad).floatingOffered()) {
+            CheckBox fl = new CheckBox(act); fl.setText(t("Плавающий стик движения: появляется под пальцем в левой части экрана", "Floating move stick: appears under the finger on the left part of the screen"));
+            fl.setChecked(cp.getBoolean("float_stick", ((DoomPadView) pad).floatingDefault()));
+            fl.setOnCheckedChangeListener((c, on) -> { cp.edit().putBoolean("float_stick", on).apply(); pad.reloadSettings(); }); box.addView(fl);
+            slider(box, cp, t("Зона плавающего стика (доля ширины экрана)", "Floating stick zone (share of the screen width)"), "float_zone", DoomPadView.FLOAT_ZONE_MIN, DoomPadView.FLOAT_ZONE_MAX, DoomPadView.FLOAT_ZONE_DEFAULT);
+        }
         CheckBox shown = new CheckBox(act); shown.setText(t("Показывать геймпад (кнопка меню видна всегда)", "Show the gamepad (the menu button always shows)")); shown.setChecked(cp.getBoolean("shown", true));
         shown.setOnCheckedChangeListener((c, on) -> { cp.edit().putBoolean("shown", on).apply(); pad.reloadSettings(); }); box.addView(shown);
         android.widget.Button edit = new android.widget.Button(act); edit.setText(t("Изменить раскладку…", "Edit the layout…")); box.addView(edit);

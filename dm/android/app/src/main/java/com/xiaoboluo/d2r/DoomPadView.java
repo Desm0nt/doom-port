@@ -30,7 +30,9 @@ import java.util.Set;
 // input read, so the view turns by exactly that much in the next frame, however slow or fast the finger is, and stops with it.
 // DM_TOUCH_LOOK=stick (or a host that cannot use the gyro channel: nativeLookDelta false / missing) keeps the older path: the travel is added to a
 // pending turn, played out through the right stick as tilt x time. Both use the same unit (tilt-seconds), so a sensitivity value means the same turn.
-// The move stick is linear (DOOM's dead zone is off); the gear dialog can add an offset if the game keeps one anyway.
+// The move stick is linear (DOOM's dead zone is off); the gear dialog can add an offset if the game keeps one anyway. [issue #40] A port can
+// offer a floating move stick (six-argument constructor, pref "float_stick"; DOOM 2016: on): it appears under a finger anywhere on the left part
+// of the screen, which then no longer turns the view; and a "map mode" (pref "map_key", DOOM 2016: "-") in which touch look drives the right stick.
 // It feeds the same native controller channel as a physical gamepad (DmActivity.nativePadKey / nativePadAxes, device PAD_DEVICE)
 // with the keycodes front_android.c maps to Switch buttons (Enter=A, Esc=B, R=X, F=Y, Q=L, E=R, Shift=ZL, Ctrl=ZR, Tab=+, M=-,
 // BUTTON_THUMBL / THUMBR = L3 / R3, the d-pad keys); the keys sent are the union of every held control's, so FIRE and ZR (both Ctrl) never
@@ -58,6 +60,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         boolean look, right; int clickKey; float grab = 1.6f;
         String group;   // the editor moves and resizes a group as one (Diablo III's pad: the A/B/X/Y diamond); null = alone
         int pointer = -1; float kx, ky, travel; long down; boolean onKnob; int dirBits;   // runtime: the finger, a stick's knob (px), a d-pad's held directions
+        float bx = Float.NaN, by;                                                         // runtime: a floating stick's base (px) while a finger holds it
         float px = -1, py = -1, ps = 1;                                                   // the player's place (fractions of the view) and size
         Ctl(String name, String label, int kind, int key, float fx, float fy, float ox, float oy, float hw, float hh, boolean win) {
             this.name = name; this.label = label; this.kind = kind; this.key = key; this.fx = fx; this.fy = fy; this.ox = ox; this.oy = oy; this.hw = hw; this.hh = hh; this.win = win;
@@ -90,6 +93,26 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     private static final float WHEEL_R_DP = 40;
     private final int wheelDefault;
     private int wheelKey; private boolean wheelOn; private float wheelX, wheelY;
+    // [issue #40] Floating move stick ("as in Diablo III's pad", D3PadView): a finger going down on a free spot of the move stick's side of the
+    // screen (the left "float_zone" % of the width, below the top FLOAT_TOP of the height; mirrored when the stick was placed on the right half)
+    // or on the stick itself puts the stick's base under the finger, so the tilt is the travel from the touch-down point (no dead circle, no jump
+    // to the home centre) and walking starts with the first few dp (shape(): 0.04 of the radius, the move_dz offset). The stick is drawn at its
+    // home while no finger holds it. A short tap that went down on the home knob is still L3. Buttons and the d-pad win over the zone; free spots
+    // outside it turn the view as before. "float_stick" (doom_controls, boolean): on / off; without a saved value the port's floatDefault (the
+    // constructor: DOOM 2016 true; the shorter constructors: not offered = the old fixed stick, no row in the gamepad dialog).
+    static final int FLOAT_ZONE_DEFAULT = 45, FLOAT_ZONE_MIN = 25, FLOAT_ZONE_MAX = 60;
+    private static final float FLOAT_TOP = 0.18f;
+    private final boolean floatOffered, floatDefault;
+    private boolean floatOn; private float floatZone = FLOAT_ZONE_DEFAULT / 100f;
+    // [issue #40] 3D map (DOOM 2016: "-" = JOY10 opens the dossier / automap, rotated with the right stick). Touch look goes to the gyro channel,
+    // which the map does not read (the same cause as the weapon wheel). While "map mode" is on, look-finger travel is played out on the right stick
+    // (the pending-turn path of DM_TOUCH_LOOK=stick: finger offset -> rotation) instead of nativeLookDelta. The map key ("map_key", doom_controls;
+    // 0 = off) toggles it, B (Esc) ends it. A wrong guess only gives the older stick feel of touch look in game until the next B. The host also
+    // declines nativeLookDelta outside gameplay (hle_hid.c, DM_TOUCH_LOOK_GAMEPLAY), so a map that pauses the game turns without this.
+    // mapDefault: the constructor's mapKeyDefault (DOOM 2016: KEYCODE_M = "-", every other port 0).
+    private final int mapDefault;
+    private int mapKey; private boolean mapOn;
+    private int lookTakenLog = -1, lookTakenLogs;   // the last path touch look took (1 host gyro, 0 stick), logged on a change
     private long lookNanos;
     private float opacity = 1, sizeK = 1; private boolean shown = true, lookOn = true;
     // "split" (doom_controls, the editor's Grouped / Separate button; GitHub issue #9): every button is placed on its own: the A/B/X/Y
@@ -124,19 +147,29 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     @Override public void setVisibility(int v) { super.setVisibility(v); PadSurface s = surface; if (s != null) s.setVisibility(v); }
 
     // defaultPreset: PRESET_GAME (DOOM, Eternal, XC2) or PRESET_SWITCH (XC3); defaultSkin: PadSkin.CLASSIC or a pack; wheelKeyDefault: the weapon
-    // wheel key without a saved "wheel_key" (0 = no wheel: the two shorter constructors; DOOM 2016: KeyEvent.KEYCODE_E)
+    // wheel key without a saved "wheel_key" (0 = no wheel: the two shorter constructors; DOOM 2016: KeyEvent.KEYCODE_E); mapKeyDefault: the map key
+    // without a saved "map_key" (0 = no map mode; DOOM 2016: KeyEvent.KEYCODE_M = "-"); floatStickDefault: the floating move stick without a saved
+    // "float_stick" (only the six-argument constructor offers it; the shorter ones keep the fixed stick and show no option for it)
     public DoomPadView(Context c) { this(c, PRESET_GAME, PadSkin.CLASSIC, 0); }
     public DoomPadView(Context c, String defaultPreset, String defaultSkin) { this(c, defaultPreset, defaultSkin, 0); }
-    public DoomPadView(Context c, String defaultPreset, String defaultSkin, int wheelKeyDefault) {
+    public DoomPadView(Context c, String defaultPreset, String defaultSkin, int wheelKeyDefault) { this(c, defaultPreset, defaultSkin, wheelKeyDefault, 0, false, false); }
+    public DoomPadView(Context c, String defaultPreset, String defaultSkin, int wheelKeyDefault, int mapKeyDefault, boolean floatStickDefault) {
+        this(c, defaultPreset, defaultSkin, wheelKeyDefault, mapKeyDefault, true, floatStickDefault);
+    }
+    private DoomPadView(Context c, String defaultPreset, String defaultSkin, int wheelKeyDefault, int mapKeyDefault, boolean offerFloat, boolean floatStickDefault) {
         super(c);
         dp = c.getResources().getDisplayMetrics().density; dpi = c.getResources().getDisplayMetrics().ydpi;
         defPreset = defaultPreset; defSkin = defaultSkin; wheelDefault = wheelKeyDefault;
+        mapDefault = mapKeyDefault; floatOffered = offerFloat; floatDefault = offerFloat && floatStickDefault;
         skin = new PadSkin(c);
         line.setStyle(Paint.Style.STROKE); line.setStrokeWidth(2 * dp);
         text.setTextAlign(Paint.Align.CENTER); text.setTextSize(15 * dp);
         reloadSettings();
     }
     String defaultSkin() { return defSkin; }
+    // [issue #40] the gamepad dialog (FrontMenu) shows the floating stick's row and zone slider only for a port that offers it
+    boolean floatingOffered() { return floatOffered; }
+    boolean floatingDefault() { return floatDefault; }
 
     // ---- the controls of a preset
     private void build(int layout) {
@@ -231,6 +264,9 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         SharedPreferences p = prefs();
         deadzone = p.getFloat("move_dz", 0f); showFps = p.getBoolean("fps", true); removeCallbacks(fpsTick); if (showFps) postDelayed(fpsTick, 500); lookGain = p.getFloat("look", 1.0f);
         wheelKey = p.getInt("wheel_key", wheelDefault);
+        mapKey = p.getInt("map_key", mapDefault); if (mapKey == 0) mapOn = false;
+        floatOn = floatOffered && p.getBoolean("float_stick", floatDefault);
+        floatZone = Math.max(FLOAT_ZONE_MIN, Math.min(FLOAT_ZONE_MAX, p.getInt("float_zone", FLOAT_ZONE_DEFAULT))) / 100f;
         gearMode = p.getInt("gear_mode", GEAR_NORMAL) == GEAR_NORMAL ? GEAR_NORMAL : GEAR_FADED; gearAlpha = Math.max(1, Math.min(100, p.getInt("gear_alpha", GEAR_ALPHA_DEFAULT)));
         opacity = Math.max(5, Math.min(100, p.getInt("opacity", OPACITY_DEFAULT))) / 100f; sizeK = Math.max(60, Math.min(160, p.getInt("size", SIZE_DEFAULT))) / 100f;
         shown = p.getBoolean("shown", true); lookOn = p.getBoolean("look_on", true); tick = p.getBoolean("tick", false);
@@ -285,18 +321,32 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         }
         return best;
     }
+    // a stick's box with its centre at the floating base while a finger holds it there (home otherwise)
+    private float[] stickBox(Ctl s) { float[] b = box(s); if (!Float.isNaN(s.bx)) { b[0] = s.bx; b[1] = s.by; } return b; }
     private void moveStick(Ctl s, float x, float y) {
-        float[] b = box(s); float R = b[2], dx = x - b[0], dy = y - b[1], d = (float) Math.sqrt(dx * dx + dy * dy);
+        float[] b = stickBox(s); float R = b[2], dx = x - b[0], dy = y - b[1], d = (float) Math.sqrt(dx * dx + dy * dy);
         if (d > R) { dx *= R / d; dy *= R / d; }
         s.kx = dx; s.ky = dy; s.travel = Math.max(s.travel, d);
     }
-    private void grab(Ctl s, int id, float x, float y) { float[] b = box(s); s.onKnob = Math.hypot(x - b[0], y - b[1]) <= b[2]; s.pointer = id; s.down = SystemClock.uptimeMillis(); moveStick(s, x, y); s.travel = 0; }
+    private void grab(Ctl s, int id, float x, float y) { float[] b = box(s); s.onKnob = Math.hypot(x - b[0], y - b[1]) <= b[2]; s.bx = Float.NaN; s.pointer = id; s.down = SystemClock.uptimeMillis(); moveStick(s, x, y); s.travel = 0; }
+    // [issue #40] the floating move stick: the base goes under the finger, the knob starts centred on it
+    private void grabFloat(Ctl s, int id, float x, float y) {
+        float[] b = box(s); s.onKnob = Math.hypot(x - b[0], y - b[1]) <= b[2];
+        s.bx = x; s.by = y; s.pointer = id; s.down = SystemClock.uptimeMillis(); s.kx = s.ky = 0; s.travel = 0;
+    }
+    private boolean floats(Ctl s) { return floatOn && s.kind == K_STICK && !s.right; }
+    private Ctl moveCtl() { for (Ctl c : ctls) if (c.kind == K_STICK && !c.right) return c; return null; }
+    // a free spot on the move stick's side: the left float_zone of the width (the right one when the stick sits on the right half), below the top strip
+    private boolean inFloatZone(Ctl s, float x, float y) {
+        float W = getWidth(), H = getHeight(); if (y < FLOAT_TOP * H) return false;
+        return box(s)[0] <= W / 2 ? x < floatZone * W : x > (1 - floatZone) * W;
+    }
     private void release(Ctl s) {   // a short tap on a stick's knob still presses L3 / R3
         float R = box(s)[2];
         if (s.onKnob && s.travel < 0.5f * R && SystemClock.uptimeMillis() - s.down < 300 && s.clickKey != 0) {
             final int k = s.clickKey; key(k, true); postDelayed(() -> key(k, false), 120);
         }
-        s.pointer = -1; s.kx = s.ky = 0;
+        s.pointer = -1; s.kx = s.ky = 0; s.bx = Float.NaN;
     }
     private void dpadAt(Ctl c, float x, float y) {
         float[] b = box(c); float dx = (x - b[0]) / b[2], dy = (y - b[1]) / b[3], m = (float) Math.sqrt(dx * dx + dy * dy);
@@ -331,9 +381,22 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         }
         float k = lookGain / DP_PER_TILT_SECOND;
         boolean taken = false;
-        if (hostLook) try { taken = DmActivity.nativeLookDelta(lookDx, lookDy, k); } catch (UnsatisfiedLinkError err) { hostLook = false; }
+        // map mode (issue #40): the right stick, not the host's gyro channel; the host itself declines outside gameplay (hle_hid.c)
+        if (hostLook && !mapOn) try { taken = DmActivity.nativeLookDelta(lookDx, lookDy, k); } catch (UnsatisfiedLinkError err) { hostLook = false; }
         if (!taken) { pendX += lookDx * k; pendY += lookDy * k; }
+        if (hostLook && (taken ? 1 : 0) != lookTakenLog && lookTakenLogs < 60) {
+            lookTakenLog = taken ? 1 : 0; lookTakenLogs++;
+            android.util.Log.i("dm", "[java] touch look -> " + (taken ? "gyro aim channel (host)" : mapOn ? "right stick (map mode)" : "right stick (host declined: not in gameplay / no gyro reads / DM_TOUCH_LOOK=stick)"));
+        }
         lookDx = lookDy = 0;
+    }
+    // [issue #40] map mode: the map key toggles it, B ends it (sendKeys, on a fresh press of the pad)
+    private void mapKeyPressed(int k) {
+        if (mapKey == 0) return;
+        boolean on = k == mapKey ? !mapOn : k == KeyEvent.KEYCODE_ESCAPE ? false : mapOn;
+        if (on == mapOn) return;
+        mapOn = on; pendX = pendY = lookDx = lookDy = 0; lookTakenLog = -1;
+        android.util.Log.i("dm", "[java] map mode " + (on ? "on (map key): touch look turns the right stick" : "off (" + (k == mapKey ? "map key" : "B") + ")"));
     }
     // Play the pending turn out: tilt = pending / PLAYOUT_S (at most full tilt); what was played since the last tick leaves the pending
     // turn, so the total rotation equals the finger travel. A very fast flick just takes a little longer than its swipe to finish.
@@ -364,7 +427,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         }
         for (Integer k : new ArrayList<>(sent)) if (!want.contains(k)) { key(k, false); sent.remove(k); }
         boolean pressed = false;
-        for (Integer k : want) if (sent.add(k)) { key(k, true); pressed = true; }
+        for (Integer k : want) if (sent.add(k)) { key(k, true); pressed = true; mapKeyPressed(k); }
         if (pressed && tick && getContext() instanceof Ticker) ((Ticker) getContext()).padTick();
     }
     // a host that can tick the phone's vibrator on a press (Xenoblade 3: nativeTap); "tick" pref, off unless set
@@ -386,7 +449,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     // Every held key up, sticks centred, look stopped, zero axes (the pause menu, the editor, a controller taking over).
     @Override public void releaseAll() { synchronized (lock) { releaseAllLocked(); } redraw(); }
     private void releaseAllLocked() {
-        for (Ctl c : ctls) { c.pointer = -1; c.kx = c.ky = 0; c.dirBits = 0; }
+        for (Ctl c : ctls) { c.pointer = -1; c.kx = c.ky = 0; c.dirBits = 0; c.bx = Float.NaN; }
         look.pointer = fireLook.pointer = wheelLook.pointer = -1; pendX = pendY = lookX = lookY = lookDx = lookDy = 0; lookNanos = 0; menuPtr = -1;
         wheelOn = false; wheelX = wheelY = 0;
         for (Integer k : sent) key(k, false);
@@ -405,14 +468,15 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         float x = e.getX(i), y = e.getY(i);
         switch (a) {
         case MotionEvent.ACTION_DOWN: case MotionEvent.ACTION_POINTER_DOWN: {
-            Ctl c = hit(x, y, false);
+            Ctl c = hit(x, y, false), ms;
             if (c != null && c.kind == K_MENU) { c.pointer = id; menuPtr = id; menuMoved = false; menuX0 = x; menuY0 = y; float[] b = box(c); menuGX = b[0] - x; menuGY = b[1] - y; }
             else if (controllerMode) { /* a real controller drives the game: only the menu button, and no axes from this pad (they would make the touch pad
                 the active controller in front_android.c) */ }
-            else if (c != null && c.kind == K_STICK && c.pointer < 0) grab(c, id, x, y);
+            else if (c != null && c.kind == K_STICK && c.pointer < 0) { if (floats(c)) grabFloat(c, id, x, y); else grab(c, id, x, y); }
             else if (c != null && c.kind == K_DPAD && c.pointer < 0) { c.pointer = id; dpadAt(c, x, y); }
             else if (c != null && c.kind == K_BUTTON && c.pointer < 0) { c.pointer = id; if (c.look && fireLook.pointer < 0) lookStart(fireLook, id, x, y);
                 if (wheelKey != 0 && c.key == wheelKey && wheelLook.pointer < 0) lookStart(wheelLook, id, x, y); }
+            else if (c == null && floatOn && (ms = moveCtl()) != null && ms.pointer < 0 && visible(ms) && inFloatZone(ms, x, y)) grabFloat(ms, id, x, y);   // [issue #40]
             else if (lookOn && look.pointer < 0) lookStart(look, id, x, y);   // any other free spot turns the view
             break;
         }
@@ -572,6 +636,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         for (Ctl k : ctls) {
             s = s * 31 + (k.pointer >= 0 ? 1 : 0); s = s * 31 + k.dirBits;
             s = s * 31 + Float.floatToIntBits(k.kx); s = s * 31 + Float.floatToIntBits(k.ky);
+            s = s * 31 + Float.floatToIntBits(k.bx); s = s * 31 + Float.floatToIntBits(k.by);
             s = s * 31 + Float.floatToIntBits(k.px); s = s * 31 + Float.floatToIntBits(k.py); s = s * 31 + Float.floatToIntBits(k.ps);
         }
         return s == PadSurface.NOT_READY ? s + 1 : s;
@@ -592,7 +657,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     }
     private boolean inSel(Ctl k) { return edSel != null && (k == edSel || (edSel.group != null && edSel.group.equals(k.group))); }
     private void drawCtl(Canvas c, Ctl k) {
-        float[] b = box(k); float al = alphaOf(k);
+        float[] b = k.kind == K_STICK && !edit ? stickBox(k) : box(k); float al = alphaOf(k);   // a floating stick is drawn where the finger put it
         boolean held = k.pointer >= 0;
         float R = b[2], kx = k.kind == K_STICK ? k.kx / R : 0, ky = k.kind == K_STICK ? k.ky / R : 0;
         float sa = al * (k.kind == K_MENU ? 1 : skin.packAlpha());

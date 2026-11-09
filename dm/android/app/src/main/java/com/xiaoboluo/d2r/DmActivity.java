@@ -460,7 +460,9 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             catch (UnsatisfiedLinkError error) { showStartError(getString(R.string.dmAndroidLibrary)); return; }
             nativeContext(getApplicationContext());
         }
-        if (DOOM && doomPad == null) { doomPad = new DoomPadView(this, DoomPadView.PRESET_GAME, PadSkin.CLASSIC, KeyEvent.KEYCODE_E);
+        if (DOOM && doomPad == null) { doomPad = new DoomPadView(this, DoomPadView.PRESET_GAME, PadSkin.CLASSIC, KeyEvent.KEYCODE_E, KeyEvent.KEYCODE_M, true);
+            // [DOOM] issue #40: floating move stick on by default (pad dialog "Floating move stick", pref float_stick), "-" (KEYCODE_M) = map mode:
+            // touch look turns the right stick while the 3D map is open (pref map_key; BUGS_AND_FIXES 2.51)
             // [DOOM] 2.45 (from Eternal's anrfix, docs/port-kb APP-01): the pad is drawn on its own surface and thread (frontend-common PadSurface.java),
             // above the game's surface and below the window; the UI thread then draws nothing while the game runs and cannot be held by HWUI waiting
             // for a GPU our Vulkan work occupies (ANR "Input dispatching timed out"). Touches still go to doomPad on the window, as before.

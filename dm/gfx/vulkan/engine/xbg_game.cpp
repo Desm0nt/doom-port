@@ -3,6 +3,9 @@
 #include <vulkan/vulkan_android.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <linux/dma-buf.h>   // [zc3] DMA_BUF_IOCTL_SYNC (zc::selftest)
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <errno.h>
@@ -1657,14 +1660,34 @@ inline void drs_busy_add(uint64_t serial,uint64_t t0,uint64_t t1,uint64_t ns){
     const uint64_t b0=chunk::busy_ticks;chunk::gpu_span(serial,t0,t1);
     if(chunk::busy_ticks>b0)drs_busy_total_ns.fetch_add(uint64_t(double(chunk::busy_ticks-b0)*properties.limits.timestampPeriod),std::memory_order_relaxed);
 }
+// [gpuclk] GPU busy time without GPU timestamps (timestampValidBits 0: PowerVR BXM-8-256 1.15 reports gpu_ms=-1): the CPU clock from a
+// submission (Slot::diag.submit_t) to the return of a retire fence wait that really waited, folded so overlapping slots count once. A
+// slot whose fence had already signalled only says the GPU was ahead, so it adds nothing: GPU-bound frames give about the GPU time (an
+// upper bound: GPU idle after the CPU stamp counts too), CPU-bound frames a small value with few waited slots. DM_GFX_GPU_CPUCLOCK: unset
+// = only without timestamps, 1 = also with them (to compare with gpu_ms), 0 = off. Logged as "NVN PERF gpuclk" every 60 frames.
+// The game's own fence waits (legacy wait, without the engine lock) feed it too (done): a wait that blocked >= 100 us ended when the
+// fence signalled.
+namespace gpuclk{
+std::atomic<int> on{-1};std::mutex mu;uint64_t last_end=0,busy_ns=0,waited=0,retired=0;
+bool enabled(){int v=on.load(std::memory_order_relaxed);if(v<0){const char *e=getenv("DM_GFX_GPU_CPUCLOCK");v=e && *e?atoi(e)!=0:timestamp_bits==0;
+    int was=-1;if(on.compare_exchange_strong(was,v))xbg_logf("NVN gpu time from the CPU clock=%d (DM_GFX_GPU_CPUCLOCK; queue timestamp bits %u)",v,timestamp_bits);else v=was;}return v>0;}
+void add(uint64_t t0,uint64_t t1){   // mu held
+    ++waited;const uint64_t b=std::max(t0,last_end);if(t1>b)busy_ns+=t1-b;last_end=std::max(last_end,t1);}
+void retire(uint64_t t0,bool busy,uint64_t t1){
+    if(!enabled())return;std::lock_guard<std::mutex> l(mu);++retired;if(busy && t0 && t1>t0)add(t0,t1);}
+void done(uint64_t t0,uint64_t b0,uint64_t t1){
+    if(!t0 || t1<b0+100000 || t1<=t0 || !enabled())return;std::lock_guard<std::mutex> l(mu);add(t0,t1);}
+}
 void retire_slot(Slot &s){
     if(!s.pending)return;
     poolreset::finish(s);
     if(!vkrec::wait_submitted(s.rec_ticket))vkrec::check_err();   // [mtb] DM_GFX_RECORD_THREAD: its SUBMIT packet ran (0: submitted directly)
+    bool fence_busy=false;uint64_t fence_done=0;   // [gpuclk] the fence was still unsignalled here, and when the wait returned
     {CPU_SCOPE(Fence);bool busy=fguard::status(s.fence,s.rec_ticket)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
      const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);uint64_t waited=0;
      const VkResult fr=fguard::wait(s.fence,timeout,&waited,"retire");if(fr!=VK_SUCCESS)fence_fatal(s,fr,waited,timeout,"retire");   // [pvr] was VK(vkWaitForFences(...))
-     if(busy){block_ns[sync_site]+=timing_clock()-b0;++block_calls[sync_site];}}
+     if(busy){fence_done=timing_clock();block_ns[sync_site]+=fence_done-b0;++block_calls[sync_site];fence_busy=true;}}
+    gpuclk::retire(s.diag.submit_t,fence_busy,fence_done);
     ++perf.waits;
     if(s.prof){
         s.prof=false;
@@ -1965,6 +1988,8 @@ void perf_frame(){
         int(sync_mode),(unsigned long long)perf.frames,wall,f*1000.0/wall,double(perf.submit_cpu_ns)/1e6/f,double(perf.present_cpu_ns)/1e6/f,perf.gpu_samples?double(perf.gpu_ns)/1e6/f:-1.0,(unsigned long long)perf.gpu_samples,
         double(perf.submits)/f,double(perf.waits)/f,(unsigned long long)perf.sync_writeback,(unsigned long long)perf.sync_readback,(unsigned long long)perf.sync_query,double(perf.ops)/f,double(perf.folded_clears)/f,double(perf.passes)/f,double(perf.draws)/f,double(perf.dispatches)/f,
         (unsigned long long)perf.why_wait,(unsigned long long)perf.why_poll,(unsigned long long)perf.why_access,(unsigned long long)perf.access_by[1],(unsigned long long)perf.access_by[2],(unsigned long long)perf.access_by[3],(unsigned long long)perf.access_by[4],(unsigned long long)perf.access_by[5],(unsigned long long)perf.access_by[6],(unsigned long long)perf.access_by[8],(unsigned long long)perf.access_by[9],(unsigned long long)perf.access_by[10],(unsigned long long)perf.access_by[11],(unsigned long long)perf.why_cmdwait,(unsigned long long)perf.why_finish,(unsigned long long)perf.why_slot,(unsigned long long)perf.pending_views,(unsigned long long)perf.snapshot_hits,(unsigned long long)perf.snapshot_misses,double(perf.snapshot_bytes)/1048576.0,double(perf.arena_peak)/1048576.0,perf_counts().pipelines,perf_counts().layouts,perf_counts().samplers,perf_counts().passes,perf_counts().images,perf_counts().host_segments,double(perf_counts().host_bytes)/1048576.0);
+    if(gpuclk::on.load()>0){std::lock_guard<std::mutex> gl(gpuclk::mu);xbg_logf("NVN PERF gpuclk gpu_cpuclock_ms=%.2f waited=%.2f retired=%.2f (per frame; CPU clock from submit to a retire wait that waited: about the GPU time when most retired slots were waited, an upper bound)",   // [gpuclk]
+        gpuclk::busy_ns/1e6/f,gpuclk::waited/f,gpuclk::retired/f);gpuclk::busy_ns=gpuclk::waited=gpuclk::retired=0;}
     if(!timing_active){
         static const char *names[]={"other","draw","dispatch","descriptor","pass","buffer","pipeline","submit","fence","present","cleanup","hash","image","log","program","cpuwrite","snapshot"};
         char line[1024];int at=snprintf(line,sizeof(line),"NVN PERF parts_ms_per_frame timed=%llu",(unsigned long long)perf_timed_frames);
@@ -2382,7 +2407,50 @@ int recv_fd(int sock){char buf[512];char ctrl[CMSG_SPACE(sizeof(int)*8)];iovec i
     if(recvmsg(sock,&m,0)<0)return -1;int fd=-1;
     for(cmsghdr *c=CMSG_FIRSTHDR(&m);c;c=CMSG_NXTHDR(&m,c))if(c->cmsg_level==SOL_SOCKET && c->cmsg_type==SCM_RIGHTS){int n=int((c->cmsg_len-CMSG_LEN(0))/sizeof(int));for(int i=0;i<n;i++){int f;memcpy(&f,CMSG_DATA(c)+i*sizeof(int),sizeof f);if(fd<0)fd=f;else close(f);}}
     return fd;}
+// [zc-map] How the CPU sees a zero-copy chunk (DM_GFX_ZC_MAP: unset = the first method that passes the self-test, else fd / vkmap /
+// vkalloc). Issue #3, POCO (Xiaomi 2412DPC0AI, MT6899, Mali-G720 MC7, Android 16): the AHB dma-buf fd refused a writable mmap
+// (errno 13), so the self-test never ran and zero-copy stayed off.
+//  ZC_MAP_FD      mmap of the AHB dma-buf fd, MAP_FIXED at the guest address (Adreno, as before; VMA coalescing re-maps from the fd).
+//  ZC_MAP_VKMAP   the imported AHB memory's vkMapMemory view, moved with mremap: the driver maps the pages itself (Mali kbase maps an
+//                 imported dma-buf through /dev/mali0), no writable fd needed.
+//  ZC_MAP_VKALLOC no AHB at all: plain vkAllocateMemory (a HOST_VISIBLE type of the mode), its vkMapMemory view moved with mremap.
+// A moved view leaves a PROT_NONE placeholder at the driver's old address, so a later vkUnmapMemory / vkFreeMemory cannot unmap what the
+// process puts there next. map_chunk moves a view twice (driver address -> spare range, fill, -> guest address): the first move proves
+// mremap works on this mapping before the guest range is touched (MREMAP_FIXED unmaps the target before it can fail). Moved chunks have
+// no fd, so the dirty tracker cannot coalesce their split VMAs (issue #21); "[perf] memory 60s: maps=" shows the cost.
+enum ZcMap{ZC_MAP_FD=0,ZC_MAP_VKMAP=1,ZC_MAP_VKALLOC=2};int map_method=ZC_MAP_FD;
+const char *map_name(int m){return m==ZC_MAP_FD?"fd":m==ZC_MAP_VKMAP?"vkmap":"vkalloc";}
+// the driver's view of mem moved to dst (nullptr: a fresh range); copy_from: n bytes written into it before the move. MAP_FAILED + *err.
+void *moved_view(VkDeviceMemory mem,size_t n,void *dst,const void *copy_from,int *err){
+    void *p=nullptr;const VkResult r=vkMapMemory(cfg.device,mem,0,VK_WHOLE_SIZE,0,&p);if(r!=VK_SUCCESS || !p){*err=1000+int(-r);return MAP_FAILED;}
+    if(uintptr_t(p)&4095){vkUnmapMemory(cfg.device,mem);*err=2000;return MAP_FAILED;}
+    const bool own=!dst;if(own && (dst=mmap(nullptr,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0))==MAP_FAILED){*err=errno;vkUnmapMemory(cfg.device,mem);return MAP_FAILED;}
+    if(copy_from)memcpy(p,copy_from,n);
+    void *q=mremap(p,n,n,MREMAP_MAYMOVE|MREMAP_FIXED,dst);
+    if(q==MAP_FAILED){*err=errno;if(own)munmap(dst,n);vkUnmapMemory(cfg.device,mem);return MAP_FAILED;}
+    mmap(p,n,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);   // the placeholder at the driver's old address
+    *err=0;return q;}
+// ZC_MAP_VKALLOC memory: !cached = HOST_VISIBLE|COHERENT without CACHED first; cached = HOST_VISIBLE|COHERENT|CACHED, then HOST_VISIBLE|CACHED.
+bool alloc_plain(size_t n,bool cached,VkBuffer *buffer,VkDeviceMemory *memory,uint32_t *type){
+    VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bc.size=n;bc.usage=arena_usage;if(vkCreateBuffer(cfg.device,&bc,nullptr,buffer))return false;
+    VkMemoryRequirements q;vkGetBufferMemoryRequirements(cfg.device,*buffer,&q);
+    const VkMemoryPropertyFlags hv=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,hc=VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,ca=VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    auto find=[&](VkMemoryPropertyFlags want,VkMemoryPropertyFlags avoid){for(uint32_t t=0;t<memories.memoryTypeCount;t++){const VkMemoryPropertyFlags f=memories.memoryTypes[t].propertyFlags;if(q.memoryTypeBits>>t&1 && (f&want)==want && !(f&avoid))return t;}return 32u;};
+    uint32_t pick=cached?find(hv|hc|ca,0):find(hv|hc,ca);if(pick==32)pick=cached?find(hv|ca,0):find(hv|hc,0);
+    if(pick==32){vkDestroyBuffer(cfg.device,*buffer,nullptr);*buffer=VK_NULL_HANDLE;return false;}
+    VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};a.allocationSize=q.size;a.memoryTypeIndex=pick;*type=pick;*memory=VK_NULL_HANDLE;
+    if(vkAllocateMemory(cfg.device,&a,nullptr,memory) || vkBindBufferMemory(cfg.device,*buffer,*memory,0)){if(*memory)vkFreeMemory(cfg.device,*memory,nullptr);*memory=VK_NULL_HANDLE;vkDestroyBuffer(cfg.device,*buffer,nullptr);*buffer=VK_NULL_HANDLE;return false;}
+    return true;}
 bool map_chunk(uint8_t *lo,size_t n){
+    if(map_method==ZC_MAP_VKALLOC){VkBuffer buffer{};VkDeviceMemory memory{};uint32_t type=32;   // [zc-map]
+        if(!alloc_plain(n,mode==XBG_ZC_CACHED,&buffer,&memory,&type)){xbg_logf("NVN zero-copy: vkalloc of %zu bytes failed",n);return false;}
+        int err=0;void *tmp=moved_view(memory,n,nullptr,lo,&err);
+        if(tmp==MAP_FAILED){xbg_logf("NVN zero-copy: vkalloc view failed err=%d",err);vkDestroyBuffer(cfg.device,buffer,nullptr);vkFreeMemory(cfg.device,memory,nullptr);return false;}
+        if(mremap(tmp,n,n,MREMAP_MAYMOVE|MREMAP_FIXED,lo)!=lo)xbg_fatalf("NVN zero-copy: mremap of guest pool %p+%zu failed errno=%d",(void*)lo,n,errno);
+        {static unsigned told=0;if(told++<2)xbg_logf("NVN zero-copy memory: vkalloc type %u flags %#x",type,unsigned(memories.memoryTypes[type].propertyFlags));}
+        int i=count.load();if(i>=512)xbg_fatalf("NVN zero-copy: chunk table full");
+        Chunk &c=table[i];c.lo=uintptr_t(lo);c.n=n;c.buffer=buffer;c.memory=memory;c.ahb=nullptr;c.sticky.assign((n+4095)/4096,0);count.store(i+1,std::memory_order_release);mapped_bytes+=n;
+        return true;}
     AHardwareBuffer_Desc d{};d.width=uint32_t(n);d.height=1;d.layers=1;d.format=AHARDWAREBUFFER_FORMAT_BLOB;
     d.usage=AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
     // [perf5] DM_GFX_ZC_CPU (default 0): CPU usage of the zero-copy pools. 0 = READ_OFTEN|WRITE_OFTEN (CPU-cached pages; the GPU
@@ -2394,11 +2462,11 @@ bool map_chunk(uint8_t *lo,size_t n){
     AHardwareBuffer *ahb=nullptr;if(AHardwareBuffer_allocate(&d,&ahb)){xbg_logf("NVN zero-copy: AHardwareBuffer_allocate(%zu) failed",n);return false;}
     int sv[2]={-1,-1};if(socketpair(AF_UNIX,SOCK_STREAM,0,sv)){AHardwareBuffer_release(ahb);return false;}
     int fd=-1;if(!AHardwareBuffer_sendHandleToUnixSocket(ahb,sv[0]))fd=recv_fd(sv[1]);close(sv[0]);close(sv[1]);
-    if(fd<0){xbg_logf("NVN zero-copy: no dma-buf fd");AHardwareBuffer_release(ahb);return false;}
+    if(fd<0 && map_method==ZC_MAP_FD){xbg_logf("NVN zero-copy: no dma-buf fd");AHardwareBuffer_release(ahb);return false;}
     VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};eb.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
     VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bc.pNext=&eb;bc.size=n;bc.usage=arena_usage;VkBuffer buffer{};
     VkAndroidHardwareBufferPropertiesANDROID props{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
-    if(vkCreateBuffer(cfg.device,&bc,nullptr,&buffer) || get_props(cfg.device,ahb,&props)){xbg_logf("NVN zero-copy: buffer/properties failed");close(fd);AHardwareBuffer_release(ahb);return false;}
+    if(vkCreateBuffer(cfg.device,&bc,nullptr,&buffer) || get_props(cfg.device,ahb,&props)){xbg_logf("NVN zero-copy: buffer/properties failed");if(fd>=0)close(fd);AHardwareBuffer_release(ahb);return false;}
     VkImportAndroidHardwareBufferInfoANDROID imp{VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};imp.buffer=ahb;
     VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};ded.buffer=buffer;imp.pNext=&ded;
     VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};a.pNext=&imp;a.allocationSize=props.allocationSize;
@@ -2408,7 +2476,13 @@ bool map_chunk(uint8_t *lo,size_t n){
         xbg_logf("NVN zero-copy memory: allowed=%#x picked=%u flags=%#x (1 dev-local 2 host-visible 4 coherent 8 cached); types%s",props.memoryTypeBits,a.memoryTypeIndex,a.memoryTypeIndex<mp.memoryTypeCount?unsigned(mp.memoryTypes[a.memoryTypeIndex].propertyFlags):0u,all.c_str());}}
     VkDeviceMemory memory{};VkResult r=vkAllocateMemory(cfg.device,&a,nullptr,&memory);
     if(r){imp.pNext=nullptr;r=vkAllocateMemory(cfg.device,&a,nullptr,&memory);}
-    if(r || vkBindBufferMemory(cfg.device,buffer,memory,0)){xbg_logf("NVN zero-copy: import failed %d",int(r));vkDestroyBuffer(cfg.device,buffer,nullptr);close(fd);AHardwareBuffer_release(ahb);return false;}
+    if(r || vkBindBufferMemory(cfg.device,buffer,memory,0)){xbg_logf("NVN zero-copy: import failed %d",int(r));vkDestroyBuffer(cfg.device,buffer,nullptr);if(fd>=0)close(fd);AHardwareBuffer_release(ahb);return false;}
+    if(map_method==ZC_MAP_VKMAP){if(fd>=0)close(fd);int err=0;void *tmp=moved_view(memory,n,nullptr,lo,&err);   // [zc-map] carry the contents over, move twice
+        if(tmp==MAP_FAILED){xbg_logf("NVN zero-copy: vkmap view failed err=%d",err);vkDestroyBuffer(cfg.device,buffer,nullptr);vkFreeMemory(cfg.device,memory,nullptr);AHardwareBuffer_release(ahb);return false;}
+        if(mremap(tmp,n,n,MREMAP_MAYMOVE|MREMAP_FIXED,lo)!=lo)xbg_fatalf("NVN zero-copy: mremap of guest pool %p+%zu failed errno=%d",(void*)lo,n,errno);
+        int i=count.load();if(i>=512)xbg_fatalf("NVN zero-copy: chunk table full");
+        Chunk &c=table[i];c.lo=uintptr_t(lo);c.n=n;c.buffer=buffer;c.memory=memory;c.ahb=ahb;c.sticky.assign((n+4095)/4096,0);count.store(i+1,std::memory_order_release);mapped_bytes+=n;
+        return true;}
     // carry the current contents over, then put the shared pages at the guest address
     void *tmp=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
     if(tmp==MAP_FAILED){xbg_logf("NVN zero-copy: dma-buf mmap failed errno=%d",errno);close(fd);vkDestroyBuffer(cfg.device,buffer,nullptr);vkFreeMemory(cfg.device,memory,nullptr);AHardwareBuffer_release(ahb);return false;}
@@ -2426,16 +2500,45 @@ bool map_chunk(uint8_t *lo,size_t n){
 // one submission copies the first half into a host-coherent readback buffer and fills the second half; the CPU then checks both. CPU-
 // cached pages a GPU does not snoop fail the first check (512 KB written just before the copy sit in the CPU caches); stale CPU lines
 // fail the second; a GPU cache that keeps old lines across submissions fails a later round. Returns the mismatching words (~0 = not run).
-uint64_t selftest(uint64_t usage,char *why,size_t why_n){
+// [zc3] maint / prefer_cached: the mode-3 candidate (log only, decide): CPU-cached pages kept in step by hand, as the Switch does for
+// NVN CPU_CACHED pools (nvnMemoryPoolFlushMappedRange / InvalidateMappedRange): ZC_MAINT_DC cleans what the CPU wrote (DC CVAC) before the
+// submission and cleans+invalidates what the GPU wrote (DC CIVAC) after it; ZC_MAINT_SYNC has the kernel do it (DMA_BUF_IOCTL_SYNC END
+// before the submission, START after). prefer_cached imports into the lowest allowed HOST_CACHED type.
+enum ZcMaint{ZC_MAINT_NONE=0,ZC_MAINT_DC=1,ZC_MAINT_SYNC=2};
+size_t dcache_line(){static size_t l=0;if(!l){
+#if defined(__aarch64__)
+    uint64_t ctr;asm volatile("mrs %0, ctr_el0":"=r"(ctr));l=size_t(4)<<((ctr>>16)&15);   // CTR_EL0.DminLine (Linux lets EL0 read it)
+#else
+    l=64;
+#endif
+    }return l;}
+void dcache_op(const void *p,size_t n,bool invalidate){   // EL0 cache maintenance by VA to the point of coherency (Linux sets SCTLR_EL1.UCI)
+#if defined(__aarch64__)
+    const size_t l=dcache_line();uintptr_t a=uintptr_t(p)&~uintptr_t(l-1);const uintptr_t e=uintptr_t(p)+n;
+    if(invalidate)for(;a<e;a+=l)asm volatile("dc civac, %0"::"r"(a):"memory");
+    else for(;a<e;a+=l)asm volatile("dc cvac, %0"::"r"(a):"memory");
+    asm volatile("dsb sy":::"memory");
+#else
+    (void)p;(void)n;(void)invalidate;
+#endif
+}
+int dmabuf_sync(int fd,uint64_t flags){dma_buf_sync s{};s.flags=flags;return ioctl(fd,DMA_BUF_IOCTL_SYNC,&s);}
+// [zc-map] method: how the CPU view is made (ZcMap, as map_chunk will): fd = mmap of the dma-buf fd; vkmap = the imported memory's
+// vkMapMemory view moved to a fresh range with mremap; vkalloc = plain Vulkan memory (no AHB, usage ignored), its view moved the same way.
+uint64_t selftest(uint64_t usage,char *why,size_t why_n,int maint=ZC_MAINT_NONE,bool prefer_cached=false,int method=ZC_MAP_FD){
     *why=0;const size_t n=1u<<20;const uint32_t half=uint32_t(n/8);   // words per half
+    uint64_t maint_ns=0;const char *maint_fail=nullptr;uint32_t ztype=32,allowed=0;
     AHardwareBuffer_Desc d{};d.width=uint32_t(n);d.height=1;d.layers=1;d.format=AHARDWAREBUFFER_FORMAT_BLOB;d.usage=usage|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
-    AHardwareBuffer *ahb=nullptr;if(AHardwareBuffer_allocate(&d,&ahb)){snprintf(why,why_n,"AHardwareBuffer_allocate failed");return ~0ull;}
-    int sv[2]={-1,-1},fd=-1;if(!socketpair(AF_UNIX,SOCK_STREAM,0,sv)){if(!AHardwareBuffer_sendHandleToUnixSocket(ahb,sv[0]))fd=recv_fd(sv[1]);close(sv[0]);close(sv[1]);}
+    AHardwareBuffer *ahb=nullptr;if(method!=ZC_MAP_VKALLOC && AHardwareBuffer_allocate(&d,&ahb)){snprintf(why,why_n,"AHardwareBuffer_allocate failed");return ~0ull;}
+    int sv[2]={-1,-1},fd=-1;if(ahb && !socketpair(AF_UNIX,SOCK_STREAM,0,sv)){if(!AHardwareBuffer_sendHandleToUnixSocket(ahb,sv[0]))fd=recv_fd(sv[1]);close(sv[0]);close(sv[1]);}
     VkBuffer zb{},rb{};VkDeviceMemory zm{},rm{};VkCommandPool pool{};VkFence zt_fence{};void *cpu=MAP_FAILED,*rmap=nullptr;uint64_t bad=~0ull;
     auto done=[&](uint64_t r){if(cpu!=MAP_FAILED)munmap(cpu,n);if(zt_fence)vkDestroyFence(cfg.device,zt_fence,nullptr);if(pool)vkDestroyCommandPool(cfg.device,pool,nullptr);
         if(rb)vkDestroyBuffer(cfg.device,rb,nullptr);if(rm)vkFreeMemory(cfg.device,rm,nullptr);if(zb)vkDestroyBuffer(cfg.device,zb,nullptr);if(zm)vkFreeMemory(cfg.device,zm,nullptr);
-        if(fd>=0)close(fd);AHardwareBuffer_release(ahb);return r;};
-    if(fd<0){snprintf(why,why_n,"no dma-buf fd");return done(~0ull);}
+        if(fd>=0)close(fd);if(ahb)AHardwareBuffer_release(ahb);return r;};
+    if(fd<0 && method==ZC_MAP_FD){snprintf(why,why_n,"no dma-buf fd");return done(~0ull);}
+    VkResult r=VK_SUCCESS;
+    if(method==ZC_MAP_VKALLOC){if(!alloc_plain(n,prefer_cached || mode==XBG_ZC_CACHED,&zb,&zm,&ztype)){snprintf(why,why_n,"vkalloc: no HOST_VISIBLE memory of the mode");return done(~0ull);}}
+    else{
     VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};eb.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
     VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bc.pNext=&eb;bc.size=n;bc.usage=arena_usage;
     VkAndroidHardwareBufferPropertiesANDROID props{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
@@ -2443,10 +2546,16 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n){
     VkImportAndroidHardwareBufferInfoANDROID imp{VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};imp.buffer=ahb;
     VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};ded.buffer=zb;imp.pNext=&ded;
     VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};a.pNext=&imp;a.allocationSize=props.allocationSize;a.memoryTypeIndex=xbg_zc_pick_type(props.memoryTypeBits,memories,mode);
-    const unsigned flags=a.memoryTypeIndex<memories.memoryTypeCount?unsigned(memories.memoryTypes[a.memoryTypeIndex].propertyFlags):0u;
-    VkResult r=vkAllocateMemory(cfg.device,&a,nullptr,&zm);if(r){imp.pNext=nullptr;r=vkAllocateMemory(cfg.device,&a,nullptr,&zm);}
+    if(prefer_cached)for(uint32_t t=0;t<memories.memoryTypeCount;t++)if(props.memoryTypeBits>>t&1 && memories.memoryTypes[t].propertyFlags&VK_MEMORY_PROPERTY_HOST_CACHED_BIT){a.memoryTypeIndex=t;break;}
+    ztype=a.memoryTypeIndex;allowed=props.memoryTypeBits;
+    r=vkAllocateMemory(cfg.device,&a,nullptr,&zm);if(r){imp.pNext=nullptr;r=vkAllocateMemory(cfg.device,&a,nullptr,&zm);}
     if(r || vkBindBufferMemory(cfg.device,zb,zm,0)){snprintf(why,why_n,"import failed %d (allowed=%#x type=%u)",int(r),props.memoryTypeBits,a.memoryTypeIndex);return done(~0ull);}
-    cpu=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);if(cpu==MAP_FAILED){snprintf(why,why_n,"dma-buf mmap failed errno=%d",errno);return done(~0ull);}
+    }
+    const unsigned flags=ztype<memories.memoryTypeCount?unsigned(memories.memoryTypes[ztype].propertyFlags):0u;
+    if(method==ZC_MAP_FD){cpu=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+        if(cpu==MAP_FAILED){const int e=errno,fl=fcntl(fd,F_GETFL);void *ro=mmap(nullptr,n,PROT_READ,MAP_SHARED,fd,0);if(ro!=MAP_FAILED)munmap(ro,n);   // [zc-map] why: a read-only fd, or no mmap at all
+            snprintf(why,why_n,"dma-buf mmap failed errno=%d (fd access %s, read-only mmap %s)",e,fl<0?"?":(fl&O_ACCMODE)==O_RDONLY?"read-only":(fl&O_ACCMODE)==O_WRONLY?"write-only":"read-write",ro!=MAP_FAILED?"works":"fails too");return done(~0ull);}}
+    else{int err=0;cpu=moved_view(zm,n,nullptr,nullptr,&err);if(cpu==MAP_FAILED){snprintf(why,why_n,"%s view failed err=%d (1000+n: vkMapMemory VkResult -n, else mremap errno)",map_name(method),err);return done(~0ull);}}
     VkBufferCreateInfo rc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};rc.size=n/2;rc.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if(vkCreateBuffer(cfg.device,&rc,nullptr,&rb)){snprintf(why,why_n,"readback buffer failed");return done(~0ull);}
     {VkMemoryRequirements q;vkGetBufferMemoryRequirements(cfg.device,rb,&q);VkMemoryAllocateInfo ra{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ra.allocationSize=q.size;
@@ -2458,8 +2567,14 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n){
     if(vkCreateCommandPool(cfg.device,&cp,nullptr,&pool) || vkCreateFence(cfg.device,&fc,nullptr,&zt_fence) || (ca.commandPool=pool,vkAllocateCommandBuffers(cfg.device,&ca,&cb))){snprintf(why,why_n,"command pool / zt_fence failed");return done(~0ull);}
     uint32_t *w=static_cast<uint32_t*>(cpu);const uint32_t *back=static_cast<const uint32_t*>(rmap);bad=0;uint32_t first=0;volatile uint32_t sink=0;
     for(uint32_t round=0;round<8 && !bad;round++){
+        if(maint==ZC_MAINT_SYNC && (fd<0 || dmabuf_sync(fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_RW)))maint_fail=fd<0?"DMA_BUF_IOCTL_SYNC (no fd)":"DMA_BUF_IOCTL_SYNC START";
         for(uint32_t i=0;i<half;i++)w[i]=xbg_zc_test_word(round,i);
         for(uint32_t i=0;i<half;i+=16)sink=sink+w[half+i];   // the second half's lines into the CPU caches (stale if the GPU fill does not reach them)
+        {const uint64_t m0=timing_clock();   // [zc3] the CPU's writes out to memory before the GPU reads them
+         if(maint==ZC_MAINT_DC)dcache_op(w,half*4u,false);
+         else if(maint==ZC_MAINT_SYNC && dmabuf_sync(fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_RW))maint_fail="DMA_BUF_IOCTL_SYNC END";
+         maint_ns+=timing_clock()-m0;}
+        if(maint_fail){snprintf(why,why_n,"%s failed errno=%d",maint_fail,errno);return done(~0ull);}
         std::atomic_thread_fence(std::memory_order_seq_cst);
         vkResetCommandBuffer(cb,0);VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;vkBeginCommandBuffer(cb,&bi);
         VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};hb.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;hb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2472,9 +2587,17 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n){
         if(ql)dm_present_queue_lock();r=vkQueueSubmit(cfg.queue,1,&si,zt_fence);if(ql)dm_present_queue_unlock();
         if(r==VK_SUCCESS)r=vkWaitForFences(cfg.device,1,&zt_fence,VK_TRUE,3000000000ull);
         if(r!=VK_SUCCESS){snprintf(why,why_n,"round %u not run (VkResult %d)",round,int(r));return done(~0ull);}
+        {const uint64_t m0=timing_clock();   // [zc3] drop the CPU's stale lines of what the GPU wrote
+         if(maint==ZC_MAINT_DC)dcache_op(w+half,half*4u,true);
+         else if(maint==ZC_MAINT_SYNC && dmabuf_sync(fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ))maint_fail="DMA_BUF_IOCTL_SYNC START (read)";
+         maint_ns+=timing_clock()-m0;}
+        if(maint_fail){snprintf(why,why_n,"%s failed errno=%d",maint_fail,errno);return done(~0ull);}
         bad=xbg_zc_test_check(round,back,w+half,half,&first);
+        if(maint==ZC_MAINT_SYNC)dmabuf_sync(fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ);
         if(bad)snprintf(why,why_n,"round %u: %llu of %u words wrong, first %s word %u",round,(unsigned long long)bad,2*half,first<half?"GPU-read (CPU wrote)":"CPU-read (GPU filled)",first%half);}
-    if(!bad)snprintf(why,why_n,"8 rounds x %u words both ways equal, memory type %u flags %#x (allowed %#x)",half,a.memoryTypeIndex,flags,props.memoryTypeBits);
+    if(!bad)snprintf(why,why_n,"8 rounds x %u words both ways equal, view %s, memory type %u flags %#x (allowed %#x)",half,map_name(method),ztype,flags,allowed);
+    if(maint!=ZC_MAINT_NONE || prefer_cached){const size_t at=strlen(why);   // [zc3] what the maintenance cost: 512 KB each way per round
+        snprintf(why+at,why_n-at,"; maintenance %.3f ms per round (512 KB each way, cache line %zu B)",maint_ns/1e6/8,dcache_line());}
     return done(bad);
 }
 void decide(){
@@ -2491,22 +2614,41 @@ void decide(){
     if(enabled && !(get_props=(PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(cfg.device,"vkGetAndroidHardwareBufferPropertiesANDROID"))){enabled=0;mode=0;xbg_logf("NVN zero-copy: AHardwareBuffer import unavailable, off");}
     // The self-test: everywhere but real-Adreno cached (unchanged there; under DM_GFX_SIM_GPU the family is the simulated one, so it runs).
     const char *t=getenv("DM_GFX_ZC_SELFTEST");const int st=t && *t?std::clamp(atoi(t),0,2):1;
-    if(enabled && st && !(gpu_policy==XBG_GPU_ADRENO && mode==XBG_ZC_CACHED)){
-        // uncached: write-combined candidates in order; cached: the pages map_chunk allocates
+    // [zc-map] DM_GFX_ZC_MAP=fd|vkmap|vkalloc forces the CPU-view method (and runs the self-test with it, real Adreno included)
+    const char *mm=getenv("DM_GFX_ZC_MAP");const int fmap=!mm || !*mm?-1:!strcmp(mm,"fd")?ZC_MAP_FD:!strcmp(mm,"vkmap")?ZC_MAP_VKMAP:!strcmp(mm,"vkalloc")?ZC_MAP_VKALLOC:-1;
+    if(fmap>=0)map_method=fmap;
+    if(enabled && st && !(gpu_policy==XBG_GPU_ADRENO && mode==XBG_ZC_CACHED && fmap<0)){
+        // uncached: write-combined candidates in order; cached: the pages map_chunk allocates. [zc-map] Each usage with the fd view, then
+        // the vkmap view; at last vkalloc (no AHB, so once). A forced DM_GFX_ZC_MAP tries only that view.
         std::vector<uint64_t> cands;
         if(mode==XBG_ZC_UNCACHED){cands={AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY};}
         else cands={AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN};
+        std::vector<std::pair<uint64_t,int>> tries;
+        for(uint64_t u:cands)for(int m:{int(ZC_MAP_FD),int(ZC_MAP_VKMAP)})if(fmap<0 || fmap==m)tries.push_back({u,m});
+        if(fmap<0 || fmap==ZC_MAP_VKALLOC)tries.push_back({cands[0],ZC_MAP_VKALLOC});
         bool pass=false;uint64_t used=cands[0];
-        for(uint64_t u:cands){char why[200];const uint64_t t0=timing_clock();const uint64_t bad=selftest(u,why,sizeof why);
-            xbg_logf("NVN zero-copy self-test: mode=%s usage=%#llx -> %s (%s; %.1f ms)",mode==XBG_ZC_UNCACHED?"uncached":"cached",(unsigned long long)u,bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);
-            if(bad==0){pass=true;used=u;break;}}
+        for(auto [u,m]:tries){char why[400];const uint64_t t0=timing_clock();const uint64_t bad=selftest(u,why,sizeof why,ZC_MAINT_NONE,false,m);
+            xbg_logf("NVN zero-copy self-test: mode=%s view=%s usage=%#llx -> %s (%s; %.1f ms)",mode==XBG_ZC_UNCACHED?"uncached":"cached",map_name(m),(unsigned long long)u,bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);
+            if(bad==0){pass=true;used=u;map_method=m;break;}}
         if(mode==XBG_ZC_UNCACHED)ahb_usage=used;
         if(!pass && st==1){enabled=0;xbg_logf("NVN zero-copy: self-test failed, off (snapshot path; DM_GFX_ZC_SELFTEST=2 keeps zero-copy anyway)");}
         else if(!pass)xbg_logf("NVN zero-copy: self-test failed, kept on (DM_GFX_ZC_SELFTEST=2)");}
     else if(mode==XBG_ZC_UNCACHED)ahb_usage=AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+    // [zc3] Log only, changes nothing: would CPU-cached pages work if the CPU caches were kept in step by hand (a possible zero-copy
+    // mode 3 for GPUs that do not snoop the CPU caches)? Three runs on READ_OFTEN pages in a HOST_CACHED type: no maintenance (is the
+    // GPU coherent after all?), DC CVAC / CIVAC by VA, DMA_BUF_IOCTL_SYNC. DM_GFX_ZC3_SELFTEST: unset = on Mali / PowerVR (also
+    // simulated), 0 = off, 1 = everywhere.
+    {const char *z=getenv("DM_GFX_ZC3_SELFTEST");const int z3=z && *z?atoi(z):(gpu_policy==XBG_GPU_MALI || gpu_policy==XBG_GPU_POWERVR)?1:0;
+     if(z3 && !get_props)get_props=(PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(cfg.device,"vkGetAndroidHardwareBufferPropertiesANDROID");
+     if(z3 && get_props){static const char *names[3]={"none","dc-by-va","dma-buf-sync"};
+         int view=ZC_MAP_FD;   // [zc-map] the fd view, or the vkmap view when the fd one cannot be made
+         for(int k=0;k<3;k++){char why[400];const uint64_t t0=timing_clock();
+             uint64_t bad=selftest(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,why,sizeof why,k,true,view);
+             if(bad==~0ull && view==ZC_MAP_FD && strstr(why,"mmap failed")){view=ZC_MAP_VKMAP;bad=selftest(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,why,sizeof why,k,true,view);}
+             xbg_logf("NVN zero-copy mode-3 self-test (log only): cached pages, view=%s, maintenance=%s -> %s (%s; %.1f ms)",map_name(view),names[k],bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);}}}
     if(!enabled)mode=0;
-    xbg_logf("NVN zero-copy guest memory=%d mode=%s (DM_GFX_ZEROCOPY=%s: 0 off, 1 cached, 2 uncached, auto; cached-coherent memory type %s%s)",enabled,
-             mode==XBG_ZC_CACHED?"cached":mode==XBG_ZC_UNCACHED?"uncached":"off",e && *e?e:"auto",cc?"present":"absent",forced?", forced":"");
+    xbg_logf("NVN zero-copy guest memory=%d mode=%s view=%s (DM_GFX_ZEROCOPY=%s: 0 off, 1 cached, 2 uncached, auto; cached-coherent memory type %s%s; DM_GFX_ZC_MAP=%s)",enabled,
+             mode==XBG_ZC_CACHED?"cached":mode==XBG_ZC_UNCACHED?"uncached":"off",map_name(map_method),e && *e?e:"auto",cc?"present":"absent",forced?", forced":"",mm && *mm?mm:"auto");
 }
 // a whole guest pool, called synchronously from nvnMemoryPoolInitialize (before the game uses it as GPU memory); nvn_flags: the pool's
 // NVN flags (-1 unknown). [tileopt] The uncached mode takes only CPU_UNCACHED / CPU_NO_ACCESS pools (xbg_zc_pool_eligible).
@@ -8434,8 +8576,9 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
             uint64_t remaining=completion_path?deadline.remaining_ns():timeout;if(!completion_path && timeout!=UINT64_MAX){auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();remaining=uint64_t(elapsed)>=timeout?0:timeout-uint64_t(elapsed);}
             XTRACE_COUNT("dm-legacy-slot", t-slots);XTRACE_COUNT("dm-legacy-covers", t->covers);
             XTRACE_COUNT("dm-legacy-completed", completed.load());
-            VkFence f=t->fence;const uint64_t tk=t->rec_ticket;t->waiters.n.fetch_add(1);lock.unlock();   // tk: [mtb] its SUBMIT packet (0: submitted directly)
+            VkFence f=t->fence;const uint64_t tk=t->rec_ticket,st=t->diag.submit_t;t->waiters.n.fetch_add(1);lock.unlock();   // st: [gpuclk]   // tk: [mtb] its SUBMIT packet (0: submitted directly)
             XTRACE_BEGIN("dm-legacy-wait");uint64_t b0=timing_clock();VkResult r=vkrec::wait_submitted(tk,remaining)?fguard::wait(f,remaining,nullptr,"legacy wait"):VK_TIMEOUT;uint64_t b1=timing_clock();XTRACE_END();
+            if(r==VK_SUCCESS)gpuclk::done(st,b0,b1);   // [gpuclk]
             // 先释放 waiter 再等待完成/重锁；此后槽可被另一线程复用，不再读取 t。
             // Release the waiter before completion/relock waits; another thread may now reuse the slot, so never read t again.
             t->waiters.n.fetch_sub(1);
@@ -8465,7 +8608,7 @@ extern "C" int xbg_legacy_wait(uint64_t fence,uint64_t timeout){
         if(completion_path && !remaining)return fence<=completed;
         if(!completion_path && timeout!=UINT64_MAX){auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count();remaining=uint64_t(elapsed)>=timeout?0:timeout-uint64_t(elapsed);}
         bool busy=fguard::status(slot.fence,slot.rec_ticket)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
-        VkResult r=vkrec::wait_submitted(slot.rec_ticket,remaining)?fguard::wait(slot.fence,remaining,nullptr,"legacy wait all"):VK_TIMEOUT;if(busy){block_ns[SITE_LEGACY_WAIT]+=timing_clock()-b0;++block_calls[SITE_LEGACY_WAIT];}
+        VkResult r=vkrec::wait_submitted(slot.rec_ticket,remaining)?fguard::wait(slot.fence,remaining,nullptr,"legacy wait all"):VK_TIMEOUT;if(busy){const uint64_t b1=timing_clock();block_ns[SITE_LEGACY_WAIT]+=b1-b0;++block_calls[SITE_LEGACY_WAIT];if(r==VK_SUCCESS)gpuclk::done(slot.diag.submit_t,b0,b1);}
         if(r==VK_TIMEOUT)return 0;VK(r);retire_slot(slot);
     }
     resolve_known_reports();if(pending_writebacks.empty()&&pending_reports.empty()){publish_completed(submitted);}

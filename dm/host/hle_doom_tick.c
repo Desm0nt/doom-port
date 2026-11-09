@@ -245,6 +245,15 @@ int dm_doom_play_signal(void) {
     int ran = ts && prev && ts != prev; prev = ts;
     return ran;
 }
+// [issue #40] The same gameplay stamp for touch look (hle_hid.c tl_gameplay), stateless so it does not disturb the pacer's `prev` above:
+// 1 and *ts = S+0x90 (Sys_Microseconds of the last adaptive game frame; it changes every gameplay frame), 0 when unavailable (another
+// main build, com_adaptiveTick or ImmediateMode off). Any thread; one 8-byte read.
+int dm_doom_play_stamp(uint64_t *ts) {
+    if (!main_ok()) return 0;
+    if (cv_i(GOT_ADAPTIVE) <= 0 || cv_i(GOT_IMMEDIATE) <= 0) return 0;
+    *ts = *(volatile uint64_t *)(g_mb + STATIC_S + 0x90);
+    return 1;
+}
 #else
 void dm_doom_tick_diag(void) {}
 #endif

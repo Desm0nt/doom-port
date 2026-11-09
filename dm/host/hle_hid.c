@@ -1052,7 +1052,33 @@ static struct {
     double dpx, dpy;              // finger dp since the last log line
     uint64_t t_read, t_nz;        // last gyro read; last read that carried a turn (or a delta added)
     unsigned npad_no_read, no_ug, reads;
-} g_tl;
+    uint64_t play_ts, play_ns;    // [issue #40] the game's gameplay stamp last seen (hle_doom_tick.c dm_doom_play_stamp) and when it changed
+    int play_on;                  // the last answer of tl_gameplay (-1 none yet), for its log line
+} g_tl = {.play_on = -1};
+// [issue #40] Touch look goes to the gyro aim channel only in gameplay. Outside it (DOOM's 3D map / dossier, menus, the pause screen: no
+// adaptive game frame, game state != 6) the usercmd view is not what the player turns -- the map rotates with the right stick only, like
+// the weapon wheel (#34) -- so dm_touch_look_add declines and DoomPadView plays the finger travel out on the right stick (its
+// DM_TOUCH_LOOK=stick path; same unit, so the gear's look sensitivity sets the map's turn too). The signal: S+0x90 of the frame loop's
+// static, which the adaptive tick rewrites every gameplay frame (hle_doom_tick.c; the present pacer DM_PRESENT_MENU_HZ uses the same).
+// DM_TOUCH_LOOK_GAMEPLAY=<ms> (default 300): no change for that long = not gameplay; 0 = the old behaviour (the gyro channel everywhere).
+// Unavailable (another main, com_adaptiveTick off) = gameplay. Callers hold g_six_mu.
+__attribute__((weak)) int dm_doom_play_stamp(uint64_t *ts) { (void)ts; return 0; }
+static int tl_gameplay(uint64_t now) {
+    static int ms = -1;
+    if (ms < 0) { const char *e = getenv("DM_TOUCH_LOOK_GAMEPLAY"); ms = e && *e ? atoi(e) : 300; if (ms < 0) ms = 0;
+                  LOG("hid: touch look: %s (DM_TOUCH_LOOK_GAMEPLAY=%d)", ms ? "gyro aim channel in gameplay only, the right stick elsewhere (map, menus)" : "gyro aim channel everywhere", ms); }
+    if (!ms) return 1;
+    uint64_t ts = 0;
+    if (!dm_doom_play_stamp(&ts)) return 1;
+    if (ts != g_tl.play_ts) { g_tl.play_ts = ts; g_tl.play_ns = now; }
+    int on = g_tl.play_ns && now - g_tl.play_ns < (uint64_t)ms * 1000000ull;
+    if (on != g_tl.play_on) {
+        static int n;
+        if (n++ < 60) LOG("hid: touch look: %s", on ? "gameplay: the gyro aim channel" : "no gameplay frame (map / menu / pause): the right stick (DoomPadView)");
+        g_tl.play_on = on;
+    }
+    return on;
+}
 static int tl_mode(void) {
     static int m = -1;
     if (m < 0) { const char *e = getenv("DM_TOUCH_LOOK"); m = !(e && !strcmp(e, "stick")); LOG("hid: touch look: %s (DM_TOUCH_LOOK)", m ? "gyro aim channel" : "right stick (DoomPadView)"); }
@@ -1063,6 +1089,7 @@ int dm_touch_look_add(float dx_dp, float dy_dp, float k) {
     if (!tl_mode()) return 0;
     pthread_mutex_lock(&g_six_mu);
     int st = g_tl.state;
+    if (st >= 0 && !tl_gameplay(now_ns())) st = -3;   // [issue #40] not gameplay: the stick, nothing pending here
     if (st >= 0) {
         uint64_t now = now_ns();
         if (!g_tl.t_read || now - g_tl.t_read > 250000000ull) g_tl.px = g_tl.py = 0;   // the game is not reading: no stale turn later
@@ -1127,6 +1154,7 @@ static int tl_active(uint64_t now) {   // a turn pending or one in the last 0.5 
 static void tl_npad(NpadState *s) {
     if (!tl_mode() || g_tl.state == -1) return;
     pthread_mutex_lock(&g_six_mu);
+    tl_gameplay(now_ns());   // [issue #40] keep the gameplay stamp's change time fresh between finger moves (the map's first drag goes to the stick at once)
     int on = tl_active(now_ns());
     if (on && ++g_tl.npad_no_read > 90 && g_tl.state >= 0) { g_tl.state = -2; g_tl.px = g_tl.py = 0; LOG("hid: touch look: npad read 90 times without a gyro read: stick path until the game reads the gyro again"); }
     unsigned reads = g_tl.reads;

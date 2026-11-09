@@ -277,7 +277,23 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     return 1;
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pool_flags_del(p); if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
-NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
+// [zc3] NVN CPU cache maintenance (Flush / InvalidateMappedRange on pools and buffers) stays a no-op here: the host pools are CPU-coherent.
+// Counted by the pool's CPU class, to see whether DOOM keeps its CPU_CACHED pools in step by hand, which a zero-copy mode with cached
+// pages on GPUs that do not snoop the CPU caches would rely on (xbg_game.cpp zc::selftest maint). One line for the first 4 calls of each
+// kind and class, then at every power of two.
+static _Atomic unsigned long long g_cm_calls[4][4], g_cm_bytes[4][4];
+static void cache_maint_note(int kind, const pool_t *pool, long long off, size_t n) {
+    static const char *const kinds[4] = {"pool flush", "pool invalidate", "buffer flush", "buffer invalidate"};
+    static const char *const classes[4] = {"CPU_CACHED", "CPU_UNCACHED", "CPU_NO_ACCESS", "unknown"};
+    const unsigned f = pool ? pool->flags : 0u;
+    const int cls = !pool ? 3 : (f & 4) ? 0 : (f & 2) ? 1 : (f & 1) ? 2 : 3;
+    const unsigned long long c = atomic_fetch_add(&g_cm_calls[kind][cls], 1) + 1, b = atomic_fetch_add(&g_cm_bytes[kind][cls], n) + n;
+    if (c <= 4 || !(c & (c - 1)))
+        LOG("[nvn] cache maintenance: %s #%llu on a %s pool (flags %#x, %.1f MB) off %#llx size %#zx, %.1f MB in total (no-op on the host)",
+            kinds[kind], c, classes[cls], f, pool ? pool->size / 1048576.0 : 0.0, off, n, b / 1048576.0);
+}
+NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { cache_maint_note(0, (const pool_t *)p, (long long)off, n); }
+NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { cache_maint_note(1, (const pool_t *)p, (long long)off, n); }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
 
 // ---------- 描述符池 ----------
@@ -1241,7 +1257,7 @@ static const char *const g_nops[] = {
     "nvnCommandBufferSetConservativeRasterDilate", "nvnCommandBufferSetStencilCullCriteria", "nvnCommandBufferBindCoverageModulationTable",
     "nvnCommandBufferResolveDepthBuffer",
     "nvnDeviceSetDebugLabel", "nvnDeviceSetIntermediateShaderCache", "nvnDeviceApplyDeferredFinalizes",
-    "nvnMemoryPoolSetDebugLabel", "nvnMemoryPoolInvalidateMappedRange", "nvnTexturePoolSetDebugLabel", "nvnSamplerPoolSetDebugLabel",
+    "nvnMemoryPoolSetDebugLabel", "nvnTexturePoolSetDebugLabel",   // [zc3] nvnMemoryPoolInvalidateMappedRange is counted (cache_maint_note) "nvnSamplerPoolSetDebugLabel",
     "nvnTextureSetDebugLabel", "nvnSamplerSetDebugLabel", "nvnProgramSetDebugLabel", "nvnSyncSetDebugLabel", "nvnQueueSetDebugLabel",
     "nvnWindowSetDebugLabel", "nvnTextureFlushTexels", "nvnQueueBuilderSetQueuePriority", "nvnQueueResetMemoryUsageCounts",
 #endif
@@ -1904,8 +1920,8 @@ NVN(nvnBufferSetDebugLabel, void, NVNbuffer *b, const char *l) { (void)b; (void)
 NVN(nvnBufferFinalize, void, NVNbuffer *b) { ((buf_t *)b)->magic = 0; }
 NVN(nvnBufferMap, void *, const NVNbuffer *b) { return ((const buf_t *)b)->mem; }
 NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *b) { return (NVNbufferAddress)((const buf_t *)b)->mem; }
-NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { (void)b; (void)off; (void)n; }
-NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { (void)b; (void)off; (void)n; }
+NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { const buf_t *o = (const buf_t *)b; cache_maint_note(2, o->pool, (long long)(o->off + off), n); }
+NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t off, size_t n) { const buf_t *o = (const buf_t *)b; cache_maint_note(3, o->pool, (long long)(o->off + off), n); }
 NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *b) { return (NVNmemoryPool *)((const buf_t *)b)->pool; }
 NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *b) { return ((const buf_t *)b)->off; }
 NVN(nvnBufferGetSize, size_t, const NVNbuffer *b) { return ((const buf_t *)b)->size; }
