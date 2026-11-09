@@ -2686,9 +2686,12 @@ void decide(){
         std::vector<uint64_t> cands;
         if(mode==XBG_ZC_UNCACHED){cands={AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY};}
         else cands={AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN};
+        // [zc-map] v0.5.1 (issue #46, OPPO Reno12 / Dimensity 7300 / Mali-G615): the vkmap view crashed every start on Mali (SIGSEGV
+        // SEGV_ACCERR at the moved view's old address: the driver still touches its own mapping, which is now the PROT_NONE placeholder).
+        // auto tries the fd view only again; vkmap / vkalloc only when DM_GFX_ZC_MAP forces them.
         std::vector<std::pair<uint64_t,int>> tries;
-        for(uint64_t u:cands)for(int m:{int(ZC_MAP_FD),int(ZC_MAP_VKMAP)})if(fmap<0 || fmap==m)tries.push_back({u,m});
-        if(fmap<0 || fmap==ZC_MAP_VKALLOC)tries.push_back({cands[0],ZC_MAP_VKALLOC});
+        for(uint64_t u:cands)if(fmap<0 || fmap==ZC_MAP_FD || fmap==ZC_MAP_VKMAP)tries.push_back({u,fmap<0?int(ZC_MAP_FD):fmap});
+        if(fmap==ZC_MAP_VKALLOC)tries.push_back({cands[0],ZC_MAP_VKALLOC});
         bool pass=false;uint64_t used=cands[0];
         for(auto [u,m]:tries){char why[400];const uint64_t t0=timing_clock();const uint64_t bad=selftest(u,why,sizeof why,ZC_MAINT_NONE,false,m);
             xbg_logf("NVN zero-copy self-test: mode=%s view=%s usage=%#llx -> %s (%s; %.1f ms)",mode==XBG_ZC_UNCACHED?"uncached":"cached",map_name(m),(unsigned long long)u,bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);
@@ -2707,7 +2710,8 @@ void decide(){
          int view=ZC_MAP_FD;   // [zc-map] the fd view, or the vkmap view when the fd one cannot be made
          for(int k=0;k<3;k++){char why[400];const uint64_t t0=timing_clock();
              uint64_t bad=selftest(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,why,sizeof why,k,true,view);
-             if(bad==~0ull && view==ZC_MAP_FD && strstr(why,"mmap failed")){view=ZC_MAP_VKMAP;bad=selftest(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,why,sizeof why,k,true,view);}
+             if(bad==~0ull && view==ZC_MAP_FD && strstr(why,"mmap failed") && fmap==ZC_MAP_VKMAP){view=ZC_MAP_VKMAP;   // [zc-map] 0.5.1: only when forced (#46)
+bad=selftest(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,why,sizeof why,k,true,view);}
              xbg_logf("NVN zero-copy mode-3 self-test (log only): cached pages, view=%s, maintenance=%s -> %s (%s; %.1f ms)",map_name(view),names[k],bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);}}}
     if(!enabled)mode=0;
     xbg_logf("NVN zero-copy guest memory=%d mode=%s view=%s (DM_GFX_ZEROCOPY=%s: 0 off, 1 cached, 2 uncached, auto; cached-coherent memory type %s%s; DM_GFX_ZC_MAP=%s)",enabled,

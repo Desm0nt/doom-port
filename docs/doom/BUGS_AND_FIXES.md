@@ -3355,3 +3355,13 @@ Aiming и ползунок чувствительности гироскопа �
   следующий запуск — `NVN pvr ladder: step 1 … DM_GFX_NOLOAD=0 …`, игра работает (глаз хозяина). Ступень 3 принудительно (`DM_PVR_LADDER=3`): без падений и артефактов, ≈46 fps против ≈55 — цена GS и выключенных тайловых политик, только на устройствах, где лестница дошла до 3.
 - **Игроку:** локальный `work/pvrdiag1/DOOM-Mobile-v0.5.0-pvrdiag1-arm64.apk` + `MESSAGE.md` (4 запуска подряд, логи после 2-го и 4-го).
 - **Дальше:** по строке `crash pass:` — формат / ops прохода, на котором падает драйвер, и точечный обход (подмена формата или ops только там).
+
+### 2.54 v0.5.0: падение на старте на Mali с MediaTek gralloc — окно `vkmap` (§2.52) (issue #46, OPPO Reno12 / Dimensity 7300 / Mali-G615 MC2; 10.11; v0.5.1)
+- **Лог:** `NVN zero-copy self-test: mode=uncached view=fd usage=0x32 -> not run (dma-buf mmap failed errno=13 (fd access read-only, read-only mmap
+  fails too))`, сразу `Fatal signal 11 (SIGSEGV), code 2 (SEGV_ACCERR), fault addr 0x5ff6b00000` (начало страницы), без строки `CRASH`; каждый запуск.
+- **Причина:** следующий шаг самотеста — `vkmap`: окно драйвера переносится `mremap`, на старом адресе — `PROT_NONE`-заглушка. Драйвер Mali сам
+  обращается к своему старому окну → SEGV_ACCERR в заглушке. На Turnip (модель на Mi 14) драйвер после `vkMapMemory` окна не трогает — не видно.
+- **Фикс v0.5.1:** auto пробует только окно `fd` (как v0.5.0-test2); `vkmap` / `vkalloc` — только при `DM_GFX_ZC_MAP`; самотест «режима 3» не
+  переходит на `vkmap` сам. На таких телефонах zero-copy снова выключен (snapshot-путь, как 0.4.22).
+- **Урок:** перенос окна драйвера — не обход для Mali; проверять на настоящем Mali до включения по умолчанию. Следующие кандидаты для #3/#46:
+  `VK_EXT_external_memory_dma_buf` экспорт из Vulkan + mmap того fd, или окно без переноса (gralloc lock).
