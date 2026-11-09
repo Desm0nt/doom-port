@@ -64,6 +64,7 @@ Adreno 750), драйвер Qualcomm, если не сказано иное.
 | 52 | Шейдер навсегда в `gfx-pipe-skip` / `gfx-lone-lane` после одной смерти процесса (MIUI-kill, force-stop) во время сборки; бан действует на любом драйвере и после обновлений | списки pipeguard v1 без версии, общие для всех драйверов, suspect не сбрасывался; затравки Adreno 750 (одна — ключ D2R) писались и на Turnip | pipeguard v2 (`DM_PIPEGUARD`=2): списки по реально загруженному драйверу, заголовок `# pipeguard v2 …` (иначе `.stale`), записи по spv, две смерти подряд; v1-списки → `.stale`; `DM_PIPEGUARD=1` — v1 | собрано 08.11, хост-тест `pipeguard_test` зелёный, на телефоне не проверено (§2.48) |
 | 53 | (валидация) VUID-vkCmdDispatch-viewType-07752: частицы `cec755c4` сэмплируют 3D через 2D view | тип view брался из target текстуры / view NVN, а не из Dim шейдера | `DM_GFX_DIM_FIX`=1: 3D view для 3D-образа, иначе null нужной формы | собрано 08.11, на телефоне не проверено (§2.49) |
 | 54 | — (внутреннее: перф-приёмы DOOM Eternal, KB PERF-E02/E04/E09/E13) | ретайр отчётов эпохи × отчёты; full barrier вокруг каждой dispatch; тяжёлые зависимости проходов; обход карт снапшотов и таблицы zero-copy; census-диагностика на каждой загрузке | `DM_GFX_REPORT_FAST`=1, `DM_GFX_CPU_FIX`=0x5, `DM_GFX_FAST_LOOKUPS`=1, `DM_GFX_DIAG`=auto; `DM_GFX_DISPATCH_RUNS`=0, `DM_GFX_RP_DEPS`=0 (§3.22) | собрано 08.11, хост-тесты зелёные, на телефоне не проверено |
+| 55 | Mali / PowerVR (модели на Mi 14): powervr 32.8 fps, mali 34.7 против 60 на Adreno; zero-copy=1 → 60, UBO dynamic=1 → 44.9 | zero-copy только на Adreno (у Mali / PowerVR нет cached-coherent памяти: кэшируемые AHB-страницы без flush); dynamic UBO выключен целиком на PowerVR (PPSSPP overrun); fence guard 2 ждал замок в неблокирующих опросах; crumbs на PowerVR | `DM_GFX_ZEROCOPY`=auto (Mali/PowerVR: uncached write-combined AHB, только CPU_UNCACHED-пулы, самотест `DM_GFX_ZC_SELFTEST`=1), `DM_GFX_UBO_DYNAMIC`=2 на PowerVR (только читаемые блоки), `DM_GFX_FENCE_TRYLOCK`=1, `DM_GFX_CRUMBS`=0 + `gfx-crumbs-auto` после hang-fatal, токен `noiocoherent` | собрано 09.11, хост-тесты зелёные, на телефоне не проверено (§2.50) |
 
 ---
 
@@ -3074,6 +3075,22 @@ Aiming и ползунок чувствительности гироскопа �
   `low-water ≥ 1`, `found the queue empty` 0–1 (старт), `device underruns 0`. (2) Условия S23 + голодание:
   `DM_AUDREN_NBUF=4 DM_AUDREN_NICE=0 DM_AUDIO_BUFFER_MS=0 DM_AUDREN_FAKE_STALL=30` → треск раз в секунду, `low-water 0`, у `HostPcmOut`
   `found the queue empty` > 0; затем только `DM_AUDREN_FAKE_STALL=30` (новые умолчания) → чисто, `low-water ≥ 1`. (3) У игрока S23 — новый boot.log.
+- **09.11, второй отчёт (POCO F5 Pro 23013PC75G, SD 8+ Gen 1, Android 15, Turnip v27, test1): треск остался — настоящая причина другая.**
+  Низколатентные потоки на этом телефоне ждут первого callback 250–300 мс после старта или возврата из фона. Проверка «в эфире, но
+  без callback ≥ `DM_AUDIO_STALL_MS`=250» принимает это за зависание (`音频流（低延迟）卡死… 294 ms`) и переводит процесс в режим NONE.
+  Поток NONE на этом телефоне открывается с callback по 4810 кадров (100 мс; буфер 9620), а audren держит в полёте только 40 мс.
+  В итоге 2 callback из 3 опустошают очередь: `HostPcmOut 2ch: 179 callbacks, 118 found the queue empty`, у 6ch 114/178, `low-water 7 of 8`,
+  то есть наш поток не опаздывает. Это и есть треск в роликах и в игре. В обычной игре низколатентные потоки работали чисто (burst 192, 0 xrun).
+  **Фикс (test2):** `DM_AUDIO_START_STALL_MS` (1000, не меньше `STALL_MS`) — сколько запущенный поток может ждать первого callback
+  (настоящее зависание #12/#20 всё равно приходит через 1 с как TIMEOUT). `DM_AUDIO_SAFE_CB` (480 = 10 мс; 0 = как в системе) — у потоков NONE
+  `setFramesPerDataCallback`, ёмкость буфера запрашивается в 8 таких callback. В строке открытия потока теперь есть `(data callback N)`.
+  Проверить: в boot.log нет `卡死` после старта или возврата, а если NONE всё же включится — `data callback 480` и `found the queue empty` ≈ 0.
+  **Без отставания:** через `STALL_MS` без первого callback очередь сразу берёттаймер (wall clock) (буферы гостю возвращаются в реальном времени, задержка
+  не копится), но поток не закрывается и забирает очередь обратно на первом callback (`first callback N ms after the start: … the stream is kept`).
+  Имитация: `DM_AUDIO_FAKE_SLOW_START=<мс>`. **Mi 14 Ultra, 09.11:** (1) умолчания — 0 пустых у HostPcmOut / 6ch, ложных зависаний нет;
+  (2) `FAKE_STALL=5000` → NONE с `data callback 480`, 1000 callback / 10 с, пустых 0–1 (у POCO было 118/179); (3) `FAKE_SLOW_START=400` →
+  все три потока `first callback ~440 ms … covered 150 ms, the stream is kept`, без NONE, потом 0 пустых. (Прогон со `STALL_MS=30` негоден:
+  у NONE callback идут пачками раз в ~40 мс, и 30 мс даёт ложные зависания, пока потоки не останутся в тишине. При 250 мс этого нет.)
 
 ---
 
@@ -3178,3 +3195,70 @@ Aiming и ползунок чувствительности гироскопа �
   у пака DOOM её нет. Имеет смысл только после прогона с валидацией, если появится `FormatMismatch`.
 - **Риск.** Если образ у частиц на самом деле 2D (а не 3D с 2D view), частицы будут сэмплировать нули → эффект может потускнеть; строка
   `-> null` это покажет, `DM_GFX_DIM_FIX=0` — откат.
+
+### 2.50 Mali / PowerVR: вернуть производительность, которую забрали политики безопасности (zero-copy без IO-когерентности, dynamic UBO на PowerVR, fence guard без блокировок, crumbs по требованию) (09.11; собрано, хост-тесты зелёные, на телефоне не проверено)
+- **Замер (Mi 14 Ultra, Turnip, `tools/ab_report.py`, медианы игровых окон, thermal none).** Adreno 60 fps / gpu 11.5 / submit 4.3 мс;
+  `DM_GFX_SIM_GPU=mali` 34.7 / 15.9 / 18.4; `=powervr` 32.8 / 16.5 / 19.0. В модели PowerVR: `ZEROCOPY=1` **60.0** / 10.8 / 6.8,
+  `UBO_DYNAMIC=1` **44.9** / 12.1 / 12.9, `FENCE_GUARD=0` 47.3, `=1` 29.3, `PIPE_SERIAL=0` 38.9, `CRUMBS=0` 33.9, `WARP_MODE=native` 32.3,
+  `NOLOAD=0` 34.1, `ASTC_OVERLAY=1` 32.5. **Шум одного прогона ≈ ±6 fps:** `PIPE_SERIAL=0` при `COMPILE_LOCK=1` в коде ничего не меняет
+  (`gpguard::Lock` берёт замок при `drvc::level>0`), а дал +6. Одиночные разницы < 8 fps не считать.
+- **Почему каждая политика была (по логам игроков, issues #7/#25/#27/#28/#33 и PowerVR 0.4.19).**
+  - *zero-copy только на Adreno*: не баг, а осторожность — когерентность AHB-страниц доказана только на Adreno (`work/zc_test`). Логи всех
+    Mali (G57 r32p1/r54p1, G615 r44p1, G715 r54p3, PanVK) и PowerVR (BXM-8-256 1.15): типы памяти `0x7` (coherent, не cached) и `0xb`
+    (cached, **не** coherent), типа `0xf` нет ни у кого ⇒ GPU не снупит кэши CPU, а наш путь давал AHB `CPU_READ_OFTEN` (кэшируемые страницы
+    без flush) — на них zero-copy действительно читал бы устаревшие данные. Доказательство сильное (логи + спецификация).
+  - *UBO dynamic off на PowerVR*: PPSSPP `PVR_UNUSED_DYNAMIC_UBO_OVERRUN` (commit 73559d15aa, BXM-8-256 / 1.15, тот же драйвер): драйвер
+    пишет 16 байт на каждый dynamic UBO, видимый стадии, в таблицу размером «по прочитанным» — page fault, если стадия UBO не читает. У нас
+    на устройстве не воспроизводилось (политика превентивная). PPSSPP dynamic UBO **не выключил**, а заставил каждую стадию читать свои.
+  - *fence guard 2*: §2.38, доказанная гонка (а) — уровень 1; «один поток за раз» (б) — догадка. Уровень 1 по коду делает те же вызовы
+    Vulkan, что 0 (неотправленный fence драйвер тоже назвал бы NOT_READY), поэтому 29.3 против 47.3 — скорее шум/сцена; цена уровня 2 по коду —
+    неблокирующие опросы трансляции (каждые 64 команды, chunk-проверки, zc race) ждали `fguard::mu`, пока `dm-record` сидит в `vkQueueSubmit`.
+  - *crumbs на PowerVR*: «ни один прогон не работал» — больше не так (0.4.19: `early=0`, без IMGSRV), а SIGBUS — падение CPU, crumbs о нём молчат.
+  - *pipe_serial / compile lock*: SIGBUS 0.4.19 (§2.47) — оставлены; замок ≈ бесплатен (замер), `PIPE_SERIAL` при замке — no-op.
+  - *lone-lane*: в DOOM только 7 модулей с subgroup-операциями (6 culling GS уже lone-lane везде + частицы `cec755`), на Adreno тоже lone-lane ⇒
+    ~0 (замер 32.3). Mali: subgroup 16, `subgroup_size_control` есть, но 32 не бывает (Mesa pan: min=max=16) — оставлено.
+  - *модель PowerVR*: профиль ставил subgroup 1 (BXM-4-64), а у игрока BXM-8-256 `subgroup size=128`, `32-lane warps in wider subgroups=1`.
+- **Сделано (бэкапы `*.bak_tileopt`).**
+  1. **`DM_GFX_ZEROCOPY` = `auto` | 0 | 1 cached | 2 uncached** (`zc::decide`, `xbg_zero_copy_auto`). Adreno — `1` как раньше (без теста,
+     бит в бит). Mali / PowerVR — `1`, если есть тип `HOST_VISIBLE|COHERENT|CACHED`, иначе **`2`**: AHB `CPU_READ_RARELY|CPU_WRITE_OFTEN`
+     (gralloc4 Mali: всё, кроме ровно `SW_READ_OFTEN`, — куча `system-uncached`, `pgprot_writecombine`), импорт с типом `HOST_COHERENT` без
+     `CACHED` (`xbg_zc_pick_type`), и **только пулы с NVN-флагом `CPU_UNCACHED` / `CPU_NO_ACCESS`** (`xbg_zc_pool_eligible`): пулы DOOM
+     `0x12/0x22/0xa2/0x62` — CPU_UNCACHED уже на Switch, т. е. память та же, что у игры там; единственный CPU_CACHED пул (`0x24`, 23 МБ) —
+     на снапшотах. Флаги пула теперь передаются из `nvnMemoryPoolInitialize` (`xbg_zc_pool_map(p,n,flags)`, `hle_nvn.c`).
+     **Самотест на устройстве** (`DM_GFX_ZC_SELFTEST`: 1 — без прохода zero-copy выключен, 2 — только лог, 0 — без теста): AHB 1 МБ с той же
+     usage и тем же импортом, 8 раундов: CPU пишет 512 КБ узора и читает вторую половину (тянет её линии в кэш), одна отправка копирует первую
+     половину в readback и заливает вторую; CPU проверяет обе. Кэшируемые неснупаемые страницы проваливают первую проверку, устаревшие линии
+     CPU — вторую, GPU-кэш, держащий старое между отправками, — следующий раунд. Кандидаты usage: `READ_RARELY|WRITE_OFTEN`, затем
+     `READ_RARELY|WRITE_RARELY`. Не на Adreno и под `DM_GFX_SIM_GPU` тест идёт всегда. Новый токен симуляции **`noiocoherent`** (в профилях
+     mali и powervr): модель берёт uncached-путь и на Mi 14.
+  2. **`DM_GFX_UBO_DYNAMIC` = 0 | 1 | 2**, по умолчанию **2 на PowerVR** (1 остальные, Adreno/Mali без изменений): dynamic только у uniform-
+     блоков, которые SPIR-V стадии читает (`xbg_spirv_reads.h`: база OpLoad / access chain / OpArrayLength / OpCopyObject / аргумент вызова;
+     модуль с >1 функцией или непонятный → все его блоки статические), для модуля, его A/B- и no-psize-вариантов вместе (бит
+     `XBG_BIND_UNREAD`, `UBO_DYN`). Скан всех 863 бандлов DOOM: **462 модуля объявляют support-блок (source 1) и не читают его** — ровно условие
+     сбоя PPSSPP; guest / c1 / driver-блоки читаются всегда; 27 модулей с несколькими функциями → без dynamic. Каждая привязка у нас и так
+     видна только своей стадии (`stageFlags=1<<st`). Лог `NVN UBO dynamic=2: shader … never reads`.
+  3. **`DM_GFX_FENCE_TRYLOCK`** (1; действует только при `FENCE_GUARD=2`): неблокирующий опрос статуса берёт `fguard::mu` через try_lock;
+     занят → `VK_NOT_READY` (все вызывающие понимают это как «ещё занят, позже»), правило «один поток в драйвере» сохраняется. Блокирующие
+     ожидания по-прежнему берут замок. Счётчик `busy=` в `NVN PERF fence`.
+  4. **Crumbs**: `xbg_crumbs_default` = 0 везде; `fence_fatal` пишет `DM_FILES_DIR/gfx-crumbs-auto` = 3 ⇒ следующие 3 запуска с crumbs 1
+     (лог `NVN crumbs: on for this boot after a GPU-hang fatal`). Попутно: `DM_GFX_CRUMBS_STALL_MS` с мержа ETR стоял внутри комментария и не читался.
+  5. **Профиль `powervr`** без `subgroup1` (как реальный BXM-8-256 / 1.15); `subgroup1` остался токеном.
+- **Не трогали.** `COMPILE_LOCK` 1 / `PIPE_SERIAL` (SIGBUS §2.47; замок ≈ бесплатен), `PIPE_GUARD` (только при сборке), `NOOUT_MASK`
+  (корректность Mali, d2r #179), ASTC sanitize / оверлей, clip-fix, анизотропия, fence recover.
+- **Вспышки зелёным / пурпуром в моделях mali и powervr (не NOLOAD).** На Mi 14 Turnip идёт с `TU_DEBUG=sysmem` (`vk_driver.c:320`): load/store
+  op там ничего не меняют ⇒ NOLOAD / STORE_DEAD / STORE_NONE в модели видимого мусора дать не могут (кроме `TILE_POISON`). Общие для обоих
+  профилей и влияющие в sysmem: путь без BC (`nobc`: GPU-декод BC, частичные дозаливки VT-кэшей — классические зелёные/пурпурные блоки),
+  `TILE_BARRIER` (сужённые зависимости — гонки), `LEAN_USAGE` (пересоздание образа с копией), `NOOUT_MASK`. План бисекции — в отчёте 09.11 /
+  KB gpu-mali MALI-10.
+- **Тесты.** `engine/tests/vendor_policy_test.cpp` (WSL g++ ASan/UBSan): режимы zero-copy, выбор типа памяти, флаги пулов, слова/проверка
+  самотеста, уровни UBO, сканер чтений на ручном SPIR-V (в т. ч. литерал, равный id, — не чтение; две функции / обрезка → not ok), профиль
+  powervr = subgroup устройства, crumbs 0, trylock — зелёный. `fence_guard_source_test.py` (+ `zt_fence` самотеста), `compile_lock_source_test.py`,
+  `source_structure_test.py` — зелёные. `tools/build_apk.ps1` — собрано, новых предупреждений нет.
+- **Проверить.** См. KB [gpu-mali.md](../../docs/port-kb/gpu-mali.md) MALI-10 (план A/B на Mi 14). Ожидание: модель powervr → ≈ 55–60 fps
+  (zero-copy uncached + UBO 2 + trylock), модель mali → ≈ 55–60. Строки: `NVN zero-copy self-test: … -> pass`, `NVN zero-copy guest memory=1
+  mode=uncached`, `NVN zero-copy: pool … flags=0x24 left on guest heap`, `NVN UBO dynamic=2`, `NVN PERF fence … busy=`.
+- **Риски.** (1) zero-copy uncached: чтения CPU из write-combined пулов (заливка текстур из TextureBuffer, хэши texdirty, sticky-снапшоты) медленнее —
+  заметно на загрузках; `DM_GFX_ZC_MAX_MB=600` убирает TextureBuffer с zero-copy. Gralloc MediaTek / IMG закрыт: может дать кэшируемые страницы —
+  тогда самотест провалится и zero-copy выключится сам (лог). (2) UBO 2: если компилятор драйвера сам выбросит чтение (результат не нужен),
+  условие PPSSPP нарушится — откат `DM_GFX_UBO_DYNAMIC=0`, первым делом проверить у игрока PowerVR. (3) trylock: ретайр слотов может
+  смещаться на позже (видно по `busy=`). (4) crumbs: первый настоящий hang придёт без маркеров (следующие 3 запуска — с ними).

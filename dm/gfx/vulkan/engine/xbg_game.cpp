@@ -42,6 +42,7 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_spirv_lone.h"
 #include "xbg_spirv_gscull.h"
 #include "xbg_spirv_warp.h"
+#include "xbg_spirv_reads.h"   // [tileopt] DM_GFX_UBO_DYNAMIC=2: the uniform blocks a module reads
 #include "xbg_spirv_ldc.h"
 #include "xbg_spirv_temps.h"
 #include "xbg_spirv_raster.h"
@@ -137,7 +138,8 @@ __attribute__((weak)) float dm_bright_k(void);
 // the switch sim_gpu is 0 and this is the driver's answer unchanged.
 static uint32_t sim_gpu=0;
 static XbgGpuFamily gpu_family=XBG_GPU_OTHER,gpu_policy=XBG_GPU_OTHER;
-static bool ubo_dynamic_on=true,noout_mask_on=false;static uint64_t depth_bounds_dropped=0,noout_masked=0;   // DM_GFX_UBO_DYNAMIC (dyn_mode_for), DM_GFX_NOOUT_MASK (draw); per-family defaults   // the real family / the one the per-family defaults use (sim)
+static bool ubo_dynamic_on=true,noout_mask_on=false;static int ubo_dynamic_level=1;   // [tileopt] DM_GFX_UBO_DYNAMIC 0 / 1 / 2 (xbg_ubo_dynamic_level_default)
+static uint64_t depth_bounds_dropped=0,noout_masked=0;   // DM_GFX_UBO_DYNAMIC (dyn_mode_for), DM_GFX_NOOUT_MASK (draw); per-family defaults   // the real family / the one the per-family defaults use (sim)
 static void dm_sim_format_properties(VkPhysicalDevice d,VkFormat f,VkFormatProperties *p){vkGetPhysicalDeviceFormatProperties(d,f,p);if(sim_gpu)xbg_sim_format_features(sim_gpu,f,p);}
 #define vkGetPhysicalDeviceFormatProperties dm_sim_format_properties
 // [nonadreno] Mali drivers wait for fences in ppoll(), which is not restarted after a signal: vkWaitForFences then returns
@@ -823,6 +825,7 @@ void invalidate(){desc_valid=false;pipe_valid=false;++desc_gen;++pso_gen;}
 namespace fguard {
 std::atomic<int> level{0};std::atomic<bool> recover{true};std::mutex mu;
 std::atomic<uint64_t> unsubmitted{0},polls{0},early{0},early_recovered{0},pool_recovered{0};   // NVN PERF fence: unsubmitted / polls per window, the rest whole run
+std::atomic<bool> trylock{true};std::atomic<uint64_t> busy{0};   // [tileopt] DM_GFX_FENCE_TRYLOCK (xbg_fence_trylock_default); busy: queries answered NOT_READY because the lock was held (per window)
 struct Lock{std::unique_lock<std::mutex> l;Lock():l(mu,std::defer_lock){if(level.load(std::memory_order_relaxed)>=2)l.lock();}};
 }
 // [pvr] DM_GFX_COMPILE_LOCK (xbg_vendor_policy.h, BUGS_AND_FIXES 2.47): the PowerVR compiler is not thread-safe and runs not only in
@@ -1291,6 +1294,12 @@ inline VkResult raw_status(VkFence f){Lock g;return vkGetFenceStatus(cfg.device,
 VkResult status(VkFence f,uint64_t ticket){
     const int lv=level.load(std::memory_order_relaxed);if(!lv)return vkGetFenceStatus(cfg.device,f);
     if(!ran(ticket)){unsubmitted.fetch_add(1,std::memory_order_relaxed);return VK_NOT_READY;}
+    // [tileopt] DM_GFX_FENCE_TRYLOCK: level 2 made this non-blocking query wait while dm-record sat in vkQueueSubmit (under the same
+    // lock) or the pool-reset worker polled; the translation thread polls every 64 commands. Lock held -> "not signalled yet": the
+    // caller looks again later, and no two threads are ever in the driver on slot fences at once.
+    if(lv>=2 && trylock.load(std::memory_order_relaxed)){std::unique_lock<std::mutex> l(mu,std::try_to_lock);
+        if(!l.owns_lock()){busy.fetch_add(1,std::memory_order_relaxed);return VK_NOT_READY;}
+        return vkGetFenceStatus(cfg.device,f);}
     return raw_status(f);
 }
 inline void pause(uint64_t n){const unsigned us=xbg_fence_pause_us(n);if(!us)std::this_thread::yield();else std::this_thread::sleep_for(std::chrono::microseconds(us));}
@@ -1512,7 +1521,16 @@ bool create(){
 bool init(){
     if(mode>=0)return active;
     auto env_i=[](const char *n,long d){const char *e=getenv(n);return e && *e?strtol(e,nullptr,0):d;};
-    mode=gdiag::allow()?int(std::clamp(env_i("DM_GFX_CRUMBS",xbg_crumbs_default(gpu_policy)),0l,2l)):0;   // [ETR perf] DM_GFX_DIAG=0 keeps them offstall_ms=unsigned(std::max(0l,env_i("DM_GFX_CRUMBS_STALL_MS",2000)));   // [pvr] DM_GFX_CRUMBS family default: 1 on PowerVR (BUGS_AND_FIXES 2.38)
+    // [tileopt] family default 0 (xbg_crumbs_default); a GPU-hang fatal left gfx-crumbs-auto (fence_fatal): crumbs 1 for the next
+    // xbg_crumbs_auto_boots boots, counted down here, so the next hang log names the pass. DM_GFX_CRUMBS still wins.
+    long def=xbg_crumbs_default(gpu_policy);int auto_left=0;
+    if(const char *fd=getenv("DM_FILES_DIR");fd && *fd && !getenv("DM_GFX_CRUMBS")){const std::string path=std::string(fd)+"/gfx-crumbs-auto";
+        if(FILE *m=fopen(path.c_str(),"rb")){if(fscanf(m,"%d",&auto_left)!=1)auto_left=0;fclose(m);
+            if(auto_left>0){def=1;if(auto_left>1){if(FILE *w=fopen(path.c_str(),"wb")){fprintf(w,"%d\n",auto_left-1);fclose(w);}}else remove(path.c_str());}
+            else remove(path.c_str());}}
+    mode=gdiag::allow()?int(std::clamp(env_i("DM_GFX_CRUMBS",def),0l,2l)):0;   // [ETR perf] DM_GFX_DIAG=0 keeps them off
+    stall_ms=unsigned(std::max(0l,env_i("DM_GFX_CRUMBS_STALL_MS",2000)));   // [tileopt] was inside the comment above since the ETR merge (never read)
+    if(auto_left>0)xbg_logf("NVN crumbs: on for this boot after a GPU-hang fatal (marker gfx-crumbs-auto, %d boot(s) left before this one)",auto_left);
     if(mode && !create())mode=0;active=mode>0;
     xbg_logf("NVN crumbs switches: crumbs=%d (DM_GFX_CRUMBS: 0 off, 1 pass ends + dispatches + buffer ends, 2 dispatches + buffer ends) stall_ms=%u (DM_GFX_CRUMBS_STALL_MS)",mode,stall_ms.load());
     return active;
@@ -1940,7 +1958,7 @@ void perf_frame(){
     double wall=double(now-perf.window_start)/1e6,f=double(perf.frames);
     perf_quiet_now=perf_quiet && !perf_force_verbose && !pass_prof_enabled && !r4_off("perfquiet");   // [r4] DM_GFX_PERF_VERBOSE=0
     if(poolreset::enabled){perf_vlogf("NVN PERF poolreset queued=%.2f waits=%.2f wait_ms=%.3f",poolreset::queued/f,poolreset::waits/f,poolreset::wait_ns/1e6/f);poolreset::queued=poolreset::waits=poolreset::wait_ns=0;}
-    if(fguard::level.load() || fguard::early.load() || fguard::pool_recovered.load())perf_vlogf("NVN PERF fence guard=%d unsubmitted=%.2f polls=%.2f early=%llu early_recovered=%llu pool_recovered=%llu",fguard::level.load(),fguard::unsubmitted.exchange(0)/f,fguard::polls.exchange(0)/f,
+    if(fguard::level.load() || fguard::early.load() || fguard::pool_recovered.load())perf_vlogf("NVN PERF fence guard=%d unsubmitted=%.2f polls=%.2f busy=%.2f early=%llu early_recovered=%llu pool_recovered=%llu",fguard::level.load(),fguard::unsubmitted.exchange(0)/f,fguard::polls.exchange(0)/f,fguard::busy.exchange(0)/f,
         (unsigned long long)fguard::early.load(),(unsigned long long)fguard::early_recovered.load(),(unsigned long long)fguard::pool_recovered.load());   // [pvr]
     const double tf=perf_timed_frames?double(perf_timed_frames):1.0;   // parts and descriptor timers come from the timed frames only
     xbg_logf("NVN PERF v=1 sync=%d frames=%llu wall_ms=%.1f fps=%.2f submit_cpu_ms=%.2f present_cpu_ms=%.2f gpu_ms=%.2f gpu_samples=%llu submits=%.2f waits=%.2f sync_wb=%llu sync_rb=%llu sync_q=%llu ops=%.1f folded=%.1f passes=%.1f draws=%.1f dispatches=%.1f why=w%llu/p%llu/a%llu(%llu,%llu,%llu,%llu,%llu,%llu|%llu,%llu,%llu,%llu)/c%llu/f%llu/s%llu views=%llu snap_hit=%llu snap_miss=%llu snap_mb=%.1f arena_peak_mb=%.1f pipelines=%zu layouts=%zu samplers=%zu passes=%zu images=%zu host_segments=%zu host_mb=%.1f",
@@ -2351,18 +2369,13 @@ namespace zc {
 constexpr size_t CHUNK=64u<<20;
 struct Chunk{uintptr_t lo=0;size_t n=0;VkBuffer buffer{};VkDeviceMemory memory{};AHardwareBuffer *ahb=nullptr;std::vector<uint8_t> sticky;};
 Chunk table[512];std::atomic<int> count{0};std::mutex mu;int enabled=-1;
+int mode=0;uint64_t ahb_usage=0;   // [tileopt] XbgZcMode (xbg_vendor_policy.h) and the AHB CPU usage of the uncached mode (picked by the self-test)
+void decide();
 uint64_t hits=0,sticky_misses=0,align_misses=0,pending_misses=0,mapped_bytes=0;uint64_t sticky_gen=0;   // sticky_gen: [r4] moves when a page turns sticky (DM_GFX_UBO_VIEWCACHE validity)
 PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_props=nullptr;
+// [tileopt] decided once at engine init (zc::decide, with the self-test on non-Adreno); a later first call decides here.
 bool on(){
-    if(enabled<0){const char *e=getenv("DM_GFX_ZEROCOPY");
-#ifdef DM_GAME_DOOM
-        enabled=e?atoi(e)!=0:int(xbg_zero_copy_default(gpu_policy));   // [DOOM] on by default on Adreno (zc_test: AHB pages coherent both ways on Adreno 750); [nonadreno] off elsewhere (xbg_vendor_policy.h)
-#else
-        enabled=e?atoi(e)!=0:0;
-#endif
-
-        if(enabled && !(get_props=(PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(cfg.device,"vkGetAndroidHardwareBufferPropertiesANDROID"))){enabled=0;xbg_logf("NVN zero-copy: AHardwareBuffer import unavailable, off");}
-        xbg_logf("NVN zero-copy guest memory=%d (DM_GFX_ZEROCOPY)",enabled);}
+    if(enabled<0)decide();
     return enabled>0;
 }
 int recv_fd(int sock){char buf[512];char ctrl[CMSG_SPACE(sizeof(int)*8)];iovec io{buf,sizeof buf};msghdr m{};m.msg_iov=&io;m.msg_iovlen=1;m.msg_control=ctrl;m.msg_controllen=sizeof ctrl;
@@ -2377,6 +2390,7 @@ bool map_chunk(uint8_t *lo,size_t n){
     // 1 = READ_RARELY|WRITE_OFTEN (gralloc may hand out write-combined, GPU-friendly pages; CPU reads of the pools get slow).
     {static int zc_cpu=-1;if(zc_cpu<0){const char *e=getenv("DM_GFX_ZC_CPU");zc_cpu=e?atoi(e):0;xbg_logf("NVN zero-copy DM_GFX_ZC_CPU=%d",zc_cpu);}
      if(zc_cpu==1)d.usage=AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;}
+    if(mode==XBG_ZC_UNCACHED)d.usage=ahb_usage|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;   // [tileopt] the usage the self-test passed with (write-combined pages)
     AHardwareBuffer *ahb=nullptr;if(AHardwareBuffer_allocate(&d,&ahb)){xbg_logf("NVN zero-copy: AHardwareBuffer_allocate(%zu) failed",n);return false;}
     int sv[2]={-1,-1};if(socketpair(AF_UNIX,SOCK_STREAM,0,sv)){AHardwareBuffer_release(ahb);return false;}
     int fd=-1;if(!AHardwareBuffer_sendHandleToUnixSocket(ahb,sv[0]))fd=recv_fd(sv[1]);close(sv[0]);close(sv[1]);
@@ -2387,8 +2401,8 @@ bool map_chunk(uint8_t *lo,size_t n){
     if(vkCreateBuffer(cfg.device,&bc,nullptr,&buffer) || get_props(cfg.device,ahb,&props)){xbg_logf("NVN zero-copy: buffer/properties failed");close(fd);AHardwareBuffer_release(ahb);return false;}
     VkImportAndroidHardwareBufferInfoANDROID imp{VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};imp.buffer=ahb;
     VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};ded.buffer=buffer;imp.pNext=&ded;
-    VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};a.pNext=&imp;a.allocationSize=props.allocationSize;a.memoryTypeIndex=0;
-    while(a.memoryTypeIndex<32 && !(props.memoryTypeBits&(1u<<a.memoryTypeIndex)))++a.memoryTypeIndex;
+    VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};a.pNext=&imp;a.allocationSize=props.allocationSize;
+    a.memoryTypeIndex=xbg_zc_pick_type(props.memoryTypeBits,memories,mode);   // [tileopt] cached: the lowest allowed (as before); uncached: a HOST_COHERENT one first
     {static unsigned told=0;if(told++<2){VkPhysicalDeviceMemoryProperties mp;vkGetPhysicalDeviceMemoryProperties(cfg.physical,&mp);
         std::string all;for(uint32_t t=0;t<mp.memoryTypeCount;t++){char b[48];snprintf(b,sizeof b," %u:%#x%s",t,unsigned(mp.memoryTypes[t].propertyFlags),props.memoryTypeBits>>t&1?"*":"");all+=b;}
         xbg_logf("NVN zero-copy memory: allowed=%#x picked=%u flags=%#x (1 dev-local 2 host-visible 4 coherent 8 cached); types%s",props.memoryTypeBits,a.memoryTypeIndex,a.memoryTypeIndex<mp.memoryTypeCount?unsigned(mp.memoryTypes[a.memoryTypeIndex].propertyFlags):0u,all.c_str());}}
@@ -2406,9 +2420,99 @@ bool map_chunk(uint8_t *lo,size_t n){
     Chunk &c=table[i];c.lo=uintptr_t(lo);c.n=n;c.buffer=buffer;c.memory=memory;c.ahb=ahb;c.sticky.assign((n+4095)/4096,0);count.store(i+1,std::memory_order_release);mapped_bytes+=n;
     return true;
 }
-// a whole guest pool, called synchronously from nvnMemoryPoolInitialize (before the game uses it as GPU memory)
-void map_pool(void *p,size_t n){
+// [tileopt] Zero-copy self-test (DM_GFX_ZC_SELFTEST: 1 default = zero-copy only if it passes, 2 = run and log but keep zero-copy, 0 = skip).
+// A 1 MB AHardwareBuffer with the CPU usage under test, imported exactly as map_chunk does (xbg_zc_pick_type) and mapped from its dma-buf
+// fd. 8 rounds: the CPU writes a new pattern into the first half and reads the second half (pulling its lines into the CPU caches), then
+// one submission copies the first half into a host-coherent readback buffer and fills the second half; the CPU then checks both. CPU-
+// cached pages a GPU does not snoop fail the first check (512 KB written just before the copy sit in the CPU caches); stale CPU lines
+// fail the second; a GPU cache that keeps old lines across submissions fails a later round. Returns the mismatching words (~0 = not run).
+uint64_t selftest(uint64_t usage,char *why,size_t why_n){
+    *why=0;const size_t n=1u<<20;const uint32_t half=uint32_t(n/8);   // words per half
+    AHardwareBuffer_Desc d{};d.width=uint32_t(n);d.height=1;d.layers=1;d.format=AHARDWAREBUFFER_FORMAT_BLOB;d.usage=usage|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
+    AHardwareBuffer *ahb=nullptr;if(AHardwareBuffer_allocate(&d,&ahb)){snprintf(why,why_n,"AHardwareBuffer_allocate failed");return ~0ull;}
+    int sv[2]={-1,-1},fd=-1;if(!socketpair(AF_UNIX,SOCK_STREAM,0,sv)){if(!AHardwareBuffer_sendHandleToUnixSocket(ahb,sv[0]))fd=recv_fd(sv[1]);close(sv[0]);close(sv[1]);}
+    VkBuffer zb{},rb{};VkDeviceMemory zm{},rm{};VkCommandPool pool{};VkFence zt_fence{};void *cpu=MAP_FAILED,*rmap=nullptr;uint64_t bad=~0ull;
+    auto done=[&](uint64_t r){if(cpu!=MAP_FAILED)munmap(cpu,n);if(zt_fence)vkDestroyFence(cfg.device,zt_fence,nullptr);if(pool)vkDestroyCommandPool(cfg.device,pool,nullptr);
+        if(rb)vkDestroyBuffer(cfg.device,rb,nullptr);if(rm)vkFreeMemory(cfg.device,rm,nullptr);if(zb)vkDestroyBuffer(cfg.device,zb,nullptr);if(zm)vkFreeMemory(cfg.device,zm,nullptr);
+        if(fd>=0)close(fd);AHardwareBuffer_release(ahb);return r;};
+    if(fd<0){snprintf(why,why_n,"no dma-buf fd");return done(~0ull);}
+    VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};eb.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+    VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bc.pNext=&eb;bc.size=n;bc.usage=arena_usage;
+    VkAndroidHardwareBufferPropertiesANDROID props{VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID};
+    if(vkCreateBuffer(cfg.device,&bc,nullptr,&zb) || get_props(cfg.device,ahb,&props)){snprintf(why,why_n,"buffer / AHB properties failed");return done(~0ull);}
+    VkImportAndroidHardwareBufferInfoANDROID imp{VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID};imp.buffer=ahb;
+    VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};ded.buffer=zb;imp.pNext=&ded;
+    VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};a.pNext=&imp;a.allocationSize=props.allocationSize;a.memoryTypeIndex=xbg_zc_pick_type(props.memoryTypeBits,memories,mode);
+    const unsigned flags=a.memoryTypeIndex<memories.memoryTypeCount?unsigned(memories.memoryTypes[a.memoryTypeIndex].propertyFlags):0u;
+    VkResult r=vkAllocateMemory(cfg.device,&a,nullptr,&zm);if(r){imp.pNext=nullptr;r=vkAllocateMemory(cfg.device,&a,nullptr,&zm);}
+    if(r || vkBindBufferMemory(cfg.device,zb,zm,0)){snprintf(why,why_n,"import failed %d (allowed=%#x type=%u)",int(r),props.memoryTypeBits,a.memoryTypeIndex);return done(~0ull);}
+    cpu=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);if(cpu==MAP_FAILED){snprintf(why,why_n,"dma-buf mmap failed errno=%d",errno);return done(~0ull);}
+    VkBufferCreateInfo rc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};rc.size=n/2;rc.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    if(vkCreateBuffer(cfg.device,&rc,nullptr,&rb)){snprintf(why,why_n,"readback buffer failed");return done(~0ull);}
+    {VkMemoryRequirements q;vkGetBufferMemoryRequirements(cfg.device,rb,&q);VkMemoryAllocateInfo ra{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ra.allocationSize=q.size;
+     ra.memoryTypeIndex=memory_type(q.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+     if(vkAllocateMemory(cfg.device,&ra,nullptr,&rm) || vkBindBufferMemory(cfg.device,rb,rm,0) || vkMapMemory(cfg.device,rm,0,VK_WHOLE_SIZE,0,&rmap)){snprintf(why,why_n,"readback memory failed");return done(~0ull);}}
+    VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;cp.queueFamilyIndex=cfg.queue_family;
+    VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};VkCommandBuffer cb{};
+    VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;
+    if(vkCreateCommandPool(cfg.device,&cp,nullptr,&pool) || vkCreateFence(cfg.device,&fc,nullptr,&zt_fence) || (ca.commandPool=pool,vkAllocateCommandBuffers(cfg.device,&ca,&cb))){snprintf(why,why_n,"command pool / zt_fence failed");return done(~0ull);}
+    uint32_t *w=static_cast<uint32_t*>(cpu);const uint32_t *back=static_cast<const uint32_t*>(rmap);bad=0;uint32_t first=0;volatile uint32_t sink=0;
+    for(uint32_t round=0;round<8 && !bad;round++){
+        for(uint32_t i=0;i<half;i++)w[i]=xbg_zc_test_word(round,i);
+        for(uint32_t i=0;i<half;i+=16)sink=sink+w[half+i];   // the second half's lines into the CPU caches (stale if the GPU fill does not reach them)
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        vkResetCommandBuffer(cb,0);VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;vkBeginCommandBuffer(cb,&bi);
+        VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};hb.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;hb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&hb,0,nullptr,0,nullptr);
+        VkBufferCopy c{0,0,n/2};vkCmdCopyBuffer(cb,zb,rb,1,&c);vkCmdFillBuffer(cb,zb,n/2,n/2,xbg_zc_fill_word(round));
+        VkMemoryBarrier tb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};tb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;tb.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&tb,0,nullptr,0,nullptr);vkEndCommandBuffer(cb);
+        vkResetFences(cfg.device,1,&zt_fence);VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=1;si.pCommandBuffers=&cb;
+        const bool ql=dm_present_queue_lock && dm_present_queue_unlock;   // the present thread may already own the queue
+        if(ql)dm_present_queue_lock();r=vkQueueSubmit(cfg.queue,1,&si,zt_fence);if(ql)dm_present_queue_unlock();
+        if(r==VK_SUCCESS)r=vkWaitForFences(cfg.device,1,&zt_fence,VK_TRUE,3000000000ull);
+        if(r!=VK_SUCCESS){snprintf(why,why_n,"round %u not run (VkResult %d)",round,int(r));return done(~0ull);}
+        bad=xbg_zc_test_check(round,back,w+half,half,&first);
+        if(bad)snprintf(why,why_n,"round %u: %llu of %u words wrong, first %s word %u",round,(unsigned long long)bad,2*half,first<half?"GPU-read (CPU wrote)":"CPU-read (GPU filled)",first%half);}
+    if(!bad)snprintf(why,why_n,"8 rounds x %u words both ways equal, memory type %u flags %#x (allowed %#x)",half,a.memoryTypeIndex,flags,props.memoryTypeBits);
+    return done(bad);
+}
+void decide(){
+    if(enabled>=0)return;
+    const char *e=getenv("DM_GFX_ZEROCOPY");
+#ifdef DM_GAME_DOOM
+    int m=xbg_zero_copy_parse(e);const bool forced=m>=0;
+    const bool cc=xbg_mem_cached_coherent(memories) && !(sim_gpu&XBG_SIM_NOIOCOHERENT);
+    if(m<0)m=xbg_zero_copy_auto(gpu_policy,cc);   // [DOOM] Adreno: cached, as before (zc_test); [tileopt] Mali / PowerVR: cached if IO-coherent, else uncached; others off
+#else
+    int m=e && atoi(e)!=0?XBG_ZC_CACHED:XBG_ZC_OFF;const bool forced=e!=nullptr;const bool cc=false;
+#endif
+    mode=m;enabled=m>0;
+    if(enabled && !(get_props=(PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(cfg.device,"vkGetAndroidHardwareBufferPropertiesANDROID"))){enabled=0;mode=0;xbg_logf("NVN zero-copy: AHardwareBuffer import unavailable, off");}
+    // The self-test: everywhere but real-Adreno cached (unchanged there; under DM_GFX_SIM_GPU the family is the simulated one, so it runs).
+    const char *t=getenv("DM_GFX_ZC_SELFTEST");const int st=t && *t?std::clamp(atoi(t),0,2):1;
+    if(enabled && st && !(gpu_policy==XBG_GPU_ADRENO && mode==XBG_ZC_CACHED)){
+        // uncached: write-combined candidates in order; cached: the pages map_chunk allocates
+        std::vector<uint64_t> cands;
+        if(mode==XBG_ZC_UNCACHED){cands={AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY};}
+        else cands={AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN};
+        bool pass=false;uint64_t used=cands[0];
+        for(uint64_t u:cands){char why[200];const uint64_t t0=timing_clock();const uint64_t bad=selftest(u,why,sizeof why);
+            xbg_logf("NVN zero-copy self-test: mode=%s usage=%#llx -> %s (%s; %.1f ms)",mode==XBG_ZC_UNCACHED?"uncached":"cached",(unsigned long long)u,bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);
+            if(bad==0){pass=true;used=u;break;}}
+        if(mode==XBG_ZC_UNCACHED)ahb_usage=used;
+        if(!pass && st==1){enabled=0;xbg_logf("NVN zero-copy: self-test failed, off (snapshot path; DM_GFX_ZC_SELFTEST=2 keeps zero-copy anyway)");}
+        else if(!pass)xbg_logf("NVN zero-copy: self-test failed, kept on (DM_GFX_ZC_SELFTEST=2)");}
+    else if(mode==XBG_ZC_UNCACHED)ahb_usage=AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+    if(!enabled)mode=0;
+    xbg_logf("NVN zero-copy guest memory=%d mode=%s (DM_GFX_ZEROCOPY=%s: 0 off, 1 cached, 2 uncached, auto; cached-coherent memory type %s%s)",enabled,
+             mode==XBG_ZC_CACHED?"cached":mode==XBG_ZC_UNCACHED?"uncached":"off",e && *e?e:"auto",cc?"present":"absent",forced?", forced":"");
+}
+// a whole guest pool, called synchronously from nvnMemoryPoolInitialize (before the game uses it as GPU memory); nvn_flags: the pool's
+// NVN flags (-1 unknown). [tileopt] The uncached mode takes only CPU_UNCACHED / CPU_NO_ACCESS pools (xbg_zc_pool_eligible).
+void map_pool(void *p,size_t n,int nvn_flags){
     if(!on() || !p || (uintptr_t(p)&4095) || n<(1u<<20) || (n&4095))return;
+    if(!xbg_zc_pool_eligible(mode,nvn_flags)){static unsigned told=0;if(told++<8)xbg_logf("NVN zero-copy: pool %p+%#zx (%.1f MB) flags=%#x left on guest heap memory (uncached zero-copy takes only CPU_UNCACHED / CPU_NO_ACCESS pools)",p,n,n/1048576.0,unsigned(nvn_flags));return;}
     if(texdiscard::on() && n>=texdiscard::zc_min_bytes()){xbg_logf("NVN zero-copy: pool %p+%#zx (%.1f MB) left on guest heap memory for DM_TEX_DISCARD (>= DM_TEX_DISCARD_ZC_MIN_MB)",p,n,n/1048576.0);return;}
     // [DOOM] DM_GFX_ZC_MAX_MB=<n> (default 0 = no limit): pools larger than n MB stay on guest heap memory (lazy, swappable) instead
     // of dma-buf pages that are all resident and unswappable from the start; A/B of the memory effect without DM_TEX_DISCARD.
@@ -4151,6 +4255,10 @@ void clip_rewrite(std::vector<uint32_t> &w,uint32_t stage,const char *key){
 // but other draws of the same shaders (a door, floor plates, the weapon) then dropped out of the G-buffer pass (07.11, validation
 // clean; BUGS_AND_FIXES 2.34). Decided once at init (bones_ssbo_decide), before the warm-up threads start.
 constexpr uint32_t XBG_BIND_SSBO=1u<<30;   // xbg_shader_binding.flags of a guest uniform block bound as a storage buffer
+// [tileopt] DM_GFX_UBO_DYNAMIC=2: a uniform binding the module's SPIR-V (or one of its r3 / no-psize variants) never reads, or every
+// binding of a module xbg_spirv_binding_reads does not understand. Such a block never takes a dynamic offset there (PowerVR overrun rule).
+// DOOM's pack: 462 of 863 modules declare the support block (source 1) without reading it; every guest / c1 / driver block is read.
+constexpr uint32_t XBG_BIND_UNREAD=1u<<29;
 // DM_GFX_DEBUG_ZWRITE (see the pipeline's depth state): the current vertex shader is listed.
 bool zwrite_listed(){static const std::string zl=[]{const char *e=getenv("DM_GFX_DEBUG_ZWRITE");return std::string(e?e:"");}();
     return !zl.empty() && state.shader[0] && zl.find(state.shader[0]->key)!=std::string::npos;}
@@ -4494,6 +4602,17 @@ Shader *load_shader(const void *control){
     {bool unknown=false;p->storage_writes=spirv_storage_writes(words,unknown);if(unknown){for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)p->storage_writes.insert(b.binding);}}
     if(dead_box_on){bool fx=!p->storage_writes.empty();for(size_t i=5;i<words.size() && !fx;){uint32_t n=words[i]>>16,op=words[i]&0xffff;if(!n)break;if(op==99 || (op>=227 && op<=242) || op==5614 || op==5615 || op==6035)fx=true;i+=n;}p->effects=fx;}   // [r3] image stores, atomics
     if(h.stage==0){p->input_classes.resize(p->inputs.size());need(xbg_vertex_input_classes(words.data(),words.size(),p->inputs.data(),p->inputs.size(),p->input_classes.data())==0,"Unsupported vertex input scalar interface");}
+    // [tileopt] DM_GFX_UBO_DYNAMIC=2 (PowerVR default): mark the uniform bindings this module, its A/B variant or its no-psize variants
+    // do not read (XBG_BIND_UNREAD); UBO_DYN keeps them out of the dynamic set. The bit is ours, never the bundle's.
+    for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)b.flags&=~XBG_BIND_UNREAD;
+    if(ubo_dynamic_level==2){
+        auto mark=[&](const std::vector<uint32_t> &w){const XbgSpirvReads rd=xbg_spirv_binding_reads(w.data(),w.size());
+            for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && (!rd.ok || !rd.read.count(b.binding)))b.flags|=XBG_BIND_UNREAD;};
+        mark(words);if(!ab_words.empty())mark(ab_words);
+        if(no_psize && h.stage==0 && r3_variants){std::vector<uint32_t> o;if(xbg_spirv_strip_pointsize(words.data(),words.size(),o))mark(o);
+            if(!ab_words.empty() && xbg_spirv_strip_pointsize(ab_words.data(),ab_words.size(),o))mark(o);}
+        unsigned n=0;for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && (b.flags&XBG_BIND_UNREAD))++n;
+        if(n){static std::atomic<unsigned> told{0};if(told.fetch_add(1)<4)xbg_logf("NVN UBO dynamic=2: shader %s stage=%u has %u declared uniform block(s) it never reads: bound at fixed offsets (PowerVR unused-dynamic-UBO overrun)",key.c_str(),h.stage,n);}}
     load_t3=timing_clock();
     if(p->unusable.empty() && r3_variants){   // [r3] variant modules (A/B off phase of a round-3 rewrite; DM_GFX_NO_PSIZE), warm-up keys <key>!ab / !np
         auto make=[&](const std::vector<uint32_t> &w,const std::string &k){VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=w.size()*4;ci.pCode=w.data();VkShaderModule m{};VkResult mr;{drvc::Lock compile(true);mr=vkCreateShaderModule(cfg.device,&ci,nullptr,&m);}if(mr!=VK_SUCCESS)return VkShaderModule{};warm::register_module(m,k);return m;};
@@ -4526,6 +4645,8 @@ static void fence_slot_log(const Slot &o,const char *what,uint64_t now){
 }
 [[noreturn]] void fence_fatal(Slot &s,VkResult r,uint64_t waited_ns,uint64_t timeout_ns,const char *who){
     const bool early=xbg_fence_wait_early(r,waited_ns,timeout_ns),timeout=r==VK_TIMEOUT;const uint64_t now=timing_clock();
+    // [tileopt] crumbs are off by default now: ask for them on the next boots (crumbs::init reads gfx-crumbs-auto)
+    if(const char *fd=getenv("DM_FILES_DIR");fd && *fd){if(FILE *w=fopen((std::string(fd)+"/gfx-crumbs-auto").c_str(),"wb")){fprintf(w,"%d\n",xbg_crumbs_auto_boots);fclose(w);}}
     xbg_logf("NVN fence failure (%s): result=%d after %.1f ms of a %.0f ms timeout (%s); fence guard=%d recover=%d, early waits %llu (recovered %llu), worker waits recovered %llu; record thread ran SUBMIT tickets through %llu",
         who,int(r),waited_ns/1e6,timeout_ns/1e6,timeout?(early?"early VK_TIMEOUT: the driver gave up, not a GPU hang":"the whole timeout: the GPU did not finish"):r==VK_ERROR_DEVICE_LOST?"VK_ERROR_DEVICE_LOST":"an error result",
         fguard::level.load(),int(fguard::recover.load()),(unsigned long long)fguard::early.load(),(unsigned long long)fguard::early_recovered.load(),(unsigned long long)fguard::pool_recovered.load(),
@@ -5317,7 +5438,8 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute);
 // mode 2 = only the per-draw ones (guest uniform buffers, driver blocks) dynamic, the support block (depends on the viewport
 // only, kept in the static arena) and c1 constants (static) bound at fixed offsets; mode 0 = none dynamic.
 #define UBO_DYN(mode,b) ((b).type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && ((mode)==1 || ((mode)==2 && ((b).source==XBG_SOURCE_UNIFORM||(b).source==XBG_SOURCE_DRIVER0||(b).source==XBG_SOURCE_DRIVER2))) \
-    && !(bones_ssbo_nodyn && ((b).flags&XBG_BIND_SSBO)))   /* [DOOM] DM_GFX_BONES_SSBO_NODYN: storage-buffer bones never dynamic */
+    && !(bones_ssbo_nodyn && ((b).flags&XBG_BIND_SSBO)) \
+    && !(ubo_dynamic_level==2 && ((b).flags&XBG_BIND_UNREAD)))   /* [DOOM] DM_GFX_BONES_SSBO_NODYN: storage-buffer bones never dynamic; [tileopt] UBO_DYNAMIC=2: unread blocks never */
 // [DOOM] DM_GFX_BONES_SSBO: a guest uniform block bound as a storage buffer (XBG_BIND_SSBO) stays a uniform block everywhere in the
 // engine (UBO_DYN, snapshots, memo keys) and only takes the Vulkan type STORAGE_BUFFER(_DYNAMIC) here; its dynamic count is checked
 // against maxDescriptorSetStorageBuffersDynamic (dyn_mode_for).
@@ -5328,7 +5450,7 @@ inline VkDescriptorType desc_type(unsigned mode,const xbg_shader_binding &b){con
 unsigned dyn_mode_for(bool compute,bool *no_ubo=nullptr){unsigned all=0,vary=0,ssbo=0;
     for(unsigned st=0;st<6;st++)if(state.shader[st] && (st==5)==compute)for(auto &b:state.shader[st]->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER){if(bind_ssbo(b)){if(!bones_ssbo_nodyn)ssbo+=b.count;continue;}all+=b.count;if(b.source==XBG_SOURCE_UNIFORM||b.source==XBG_SOURCE_DRIVER0||b.source==XBG_SOURCE_DRIVER2)vary+=b.count;}
     if(no_ubo)*no_ubo=all+ssbo==0;unsigned lim=properties.limits.maxDescriptorSetUniformBuffersDynamic;
-    if(!ubo_dynamic_on)return 0;   // [nonadreno] DM_GFX_UBO_DYNAMIC=0 / PowerVR: no dynamic uniform buffers (unused-dynamic-UBO overrun)
+    if(!ubo_dynamic_on)return 0;   // [nonadreno] DM_GFX_UBO_DYNAMIC=0: no dynamic uniform buffers (PowerVR before [tileopt]: unused-dynamic-UBO overrun; now level 2)
     if(ssbo>properties.limits.maxDescriptorSetStorageBuffersDynamic)return 0;   // [DOOM] bones as dynamic storage buffers (all are guest blocks: dynamic in modes 1 and 2)
     return (all || ssbo) && all<=lim?1:((vary || ssbo) && vary<=lim && dyn_partial_enabled?2:0);}
 void memo_unpin_all(unsigned si){Slot &s=slots[si];for(auto &pn:memo_pinned[si])s.used_sets[pn.second.layout].push_back(pn.first);memo_pinned[si].clear();desc_memo_slot[si].clear();desc_memo_local[si]=0;++memo_mod_gen;}
@@ -7920,9 +8042,9 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      drvc::level=xbg_env_level(getenv("DM_GFX_COMPILE_LOCK"),xbg_compile_lock_default(gpu_policy),0,2);   // [pvr] before the warm-up / record / present threads
      xbg_logf("NVN compile lock=%d (DM_GFX_COMPILE_LOCK: 0 off, 1 shader modules + render-pass / copy / blit / clear packets + the present blit share the pipeline lock, 2 every packet but submit / present; default 1 on PowerVR)",drvc::level);
      gpguard::careful=false;gpguard::loaded=false;gpguard::skip.clear();gpguard::told.clear();gpguard::proven.clear();gpguard::any=false;gpguard::load();
-     ubo_dynamic_on=xbg_env_or(getenv("DM_GFX_UBO_DYNAMIC"),xbg_ubo_dynamic_default(gpu_policy));noout_mask_on=xbg_env_or(getenv("DM_GFX_NOOUT_MASK"),xbg_noout_mask_default(gpu_policy));
-     xbg_logf("NVN gpu policy: pipe_serial=%d pipe_guard=%d ubo_dynamic=%d noout_mask=%d zero-copy default=%d (DM_GFX_PIPE_SERIAL / PIPE_GUARD / UBO_DYNAMIC / NOOUT_MASK / ZEROCOPY)",
-              int(gpguard::serial),int(gpguard::guard),int(ubo_dynamic_on),int(noout_mask_on),int(xbg_zero_copy_default(gpu_policy)));
+     ubo_dynamic_level=xbg_env_level(getenv("DM_GFX_UBO_DYNAMIC"),xbg_ubo_dynamic_level_default(gpu_policy),0,2);ubo_dynamic_on=ubo_dynamic_level>0;   // [tileopt] 2 on PowerVR: only blocks the stage readsnoout_mask_on=xbg_env_or(getenv("DM_GFX_NOOUT_MASK"),xbg_noout_mask_default(gpu_policy));
+     xbg_logf("NVN gpu policy: pipe_serial=%d pipe_guard=%d ubo_dynamic=%d noout_mask=%d zero-copy default=%d (DM_GFX_PIPE_SERIAL / PIPE_GUARD / UBO_DYNAMIC: 0 none, 1 all that fit, 2 only blocks the stage reads / NOOUT_MASK / ZEROCOPY)",
+              int(gpguard::serial),int(gpguard::guard),ubo_dynamic_level,int(noout_mask_on),int(xbg_zero_copy_default(gpu_policy)));
      bones_ssbo_decide();bones_ssbo_modules=0;bones_ssbo_realign=0;   // [DOOM] DM_GFX_BONES_SSBO, before the warm-up threads rewrite shaders
      // [tile] tile-based GPU paths (xbg_vendor_policy.h, docs/research/tile_gpu_impl.md); DM_GFX_NOLOAD is read with its marker below.
      tile_area_on=xbg_env_or(getenv("DM_GFX_TILE_AREA"),xbg_tile_area_default(gpu_policy));tile_barrier_on=xbg_env_or(getenv("DM_GFX_TILE_BARRIER"),xbg_tile_barrier_default(gpu_policy));
@@ -7933,8 +8055,9 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
               int(tile_area_on),int(tile_barrier_on),int(chunk_mid_split),int(tile_poison),int(xbg_noload_default(gpu_policy)));
      // [pvr] slot fences across threads (namespace fguard, BUGS_AND_FIXES 2.38): before the poolreset worker and the record thread start.
      {const char *e=getenv("DM_GFX_FENCE_GUARD");fguard::level=xbg_env_level(e,xbg_fence_guard_default(gpu_policy),0,2);fguard::recover=xbg_env_or(getenv("DM_GFX_FENCE_RECOVER"),true);
-      xbg_logf("NVN fence policy: guard=%d recover=%d crumbs default=%d (DM_GFX_FENCE_GUARD: 0 off, 1 no slot fence access before its vkQueueSubmit ran, 2 also one thread at a time with polled waits; DM_GFX_FENCE_RECOVER; DM_GFX_CRUMBS)",
-               fguard::level.load(),int(fguard::recover.load()),xbg_crumbs_default(gpu_policy));}
+      fguard::trylock=xbg_env_or(getenv("DM_GFX_FENCE_TRYLOCK"),xbg_fence_trylock_default());   // [tileopt] level 2 only
+      xbg_logf("NVN fence policy: guard=%d recover=%d trylock=%d crumbs default=%d (DM_GFX_FENCE_GUARD: 0 off, 1 no slot fence access before its vkQueueSubmit ran, 2 also one thread at a time with polled waits; DM_GFX_FENCE_RECOVER; DM_GFX_FENCE_TRYLOCK: level-2 status queries do not wait for the lock; DM_GFX_CRUMBS)",
+               fguard::level.load(),int(fguard::recover.load()),int(fguard::trylock.load()),xbg_crumbs_default(gpu_policy));}
      // [nonadreno][afbc] AFBC-friendly usage, store ops and the compression query (xbg_vendor_policy.h, docs/research/tile_gpu_impl.md 7).
      lean_usage_on=xbg_env_or(getenv("DM_GFX_LEAN_USAGE"),xbg_lean_usage_default(gpu_policy));lean_dropped_images=lean_upgrades=0;
      {const char *e=getenv("DM_GFX_STORE_NONE");store_none_on=e && *e?atoi(e):(xbg_store_none_default(gpu_policy)?1:0);if(store_none_on<0 || store_none_on>2)store_none_on=1;}
@@ -8034,6 +8157,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      if(r5_rawcache&2)r5raw::mirror_start();
      if(r5_log)xbg_logf("NVN r5 switches: shader_rawcache=%d (memory cap %zu MB, mirror %s) deswz_direct=%d arena_keep=%s (window %.0f s) protect_churn=%d",r5_rawcache,r5raw::cap>>20,r5raw::mirror_dir.empty()?"off":r5raw::mirror_dir.c_str(),
                         r5_deswz,r5_decay?"decay":"peak",r5_decay_ns/1e9,r5_churn);}
+    zc::enabled=-1;zc::mode=0;zc::decide();   // [tileopt] zero-copy mode + its self-test, on this thread before the warm-up / record / pool-reset threads and the first pool
     xbg_module_id_hook=warm::module_id;{std::string lp=warm::list_path();FILE *nw=fopen((lp.substr(0,lp.find_last_of('/'))+"/gfx-no-warm").c_str(),"rb");warm::enabled=!nw;if(nw)fclose(nw);}warm::start();
     wtrack::enabled=false;state=State{};state.color.logic_op=3;state.color.alpha_func=8;for(unsigned i=0;i<8;i++)state.blend[i]={i,2,1,2,1,1,1};stats.reset();timing=XbgCpuTiming(timing_clock);pipeline_counts={};pipeline_before={};pipeline_tick=0;timing_active=false;timing_first=timing_last=0;live_profile_used=false;descriptor_detail=false;descriptor_timing=XbgDescriptorTiming{};descriptor_root=nullptr;draw_detail=false;draw_timing=XbgDrawTiming{};draw_root=nullptr;completed=0;last_attachment_trace=UINT64_MAX;sampler_mirror_clamp_enabled=VK_FALSE;sampler_minmax_enabled=VK_FALSE;failed=false;error_text[0]=0;initialized=true;
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-submit").c_str(),"rb");bool sync_submit=false;if(m){sync_submit=fgetc(m)=='1';fclose(m);}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-async-pool-reset").c_str(),"rb");poolreset::enabled=false;if(w){poolreset::enabled=fgetc(w)!='0';fclose(w);}else if(const char *e=getenv("DM_GFX_ASYNC_POOL_RESET"))poolreset::enabled=atoi(e)!=0;poolreset::start();xbg_logf("NVN async command pool reset=%d (marker gfx-async-pool-reset)",int(poolreset::enabled));}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-bindcache").c_str(),"rb");if(w){bind_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-no-imgcache").c_str(),"rb");if(w){img_cache_enabled=false;fclose(w);}}{FILE *w=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pass-profile").c_str(),"rb");if(w){pass_prof_enabled=true;unsigned long long from=0,period=0,count=0;if(fscanf(w,"%llu %llu %llu",&from,&period,&count)>=2){pass_prof_next=from;pass_prof_period=period?period:1;if(count)pass_prof_until=from+count;}fclose(w);}}
@@ -8361,7 +8485,7 @@ extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned la
     else{p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride,old_image=state.copy_image_stride;state.copy_stride=row;state.copy_image_stride=image;copy_texture_buffer(p,true);state.copy_stride=old;state.copy_image_stride=old_image;}}
 
 // ---- public entry points (queued in order on the graphics thread) ----
-extern "C" void xbg_zc_pool_map(void *p,size_t n){if(initialized)zc::map_pool(p,n);else{static int told=0;if(!told++)xbg_logf("NVN zero-copy: pool %p+%#zx before the engine is initialized, not mapped",p,n);}}
+extern "C" void xbg_zc_pool_map(void *p,size_t n,int nvn_flags){if(initialized)zc::map_pool(p,n,nvn_flags);else{static int told=0;if(!told++)xbg_logf("NVN zero-copy: pool %p+%#zx before the engine is initialized, not mapped",p,n);}}
 extern "C" void xbg_legacy_pool_add(void *p,size_t n){gfx_enqueue([p,n]{xbg_legacy_pool_add_now(p,n);});}
 extern "C" void xbg_legacy_pool_del(void *p){gfx_enqueue([p]{xbg_legacy_pool_del_now(p);});}
 extern "C" void xbg_register_texture(const dpool_t *p,int id,const tex_t *t,const view_t *v){

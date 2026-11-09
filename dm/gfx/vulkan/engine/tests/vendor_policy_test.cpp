@@ -2,6 +2,7 @@
 // directly; integer / struct work only, no device. Build (WSL or any host with the Vulkan headers, e.g. the NDK sysroot):
 //   g++ -std=c++17 -Wall -idirafter <ndk>/toolchains/llvm/prebuilt/<host>/sysroot/usr/include -o vendor_policy_test vendor_policy_test.cpp
 #include "../xbg_vendor_policy.h"
+#include "../xbg_spirv_reads.h"
 #include <stdio.h>
 #include <initializer_list>
 
@@ -88,7 +89,8 @@ int main(){
     VkPhysicalDeviceSubgroupProperties s{};s.subgroupSize=64;s.supportedStages=VK_SHADER_STAGE_ALL;s.supportedOperations=0xff;s.quadOperationsInAllStages=VK_TRUE;
     VkPhysicalDeviceSubgroupProperties t=s;xbg_sim_subgroup(XBG_SIM_PROFILE_MALI,&t);
     CHECK(t.subgroupSize==16 && t.supportedStages==(VK_SHADER_STAGE_FRAGMENT_BIT|VK_SHADER_STAGE_COMPUTE_BIT) && !t.quadOperationsInAllStages && t.supportedOperations==0xff);
-    t=s;xbg_sim_subgroup(XBG_SIM_PROFILE_POWERVR,&t);CHECK(t.subgroupSize==1);
+    t=s;xbg_sim_subgroup(XBG_SIM_PROFILE_POWERVR,&t);CHECK(t.subgroupSize==64);   // [tileopt] the BXM-8-256 / 1.15 reports 128: the device's own subgroup stays
+    t=s;xbg_sim_subgroup(xbg_sim_parse("powervr,subgroup1"),&t);CHECK(t.subgroupSize==1);
     t=s;xbg_sim_subgroup(0,&t);CHECK(t.subgroupSize==64 && t.quadOperationsInAllStages);
     VkPhysicalDeviceLimits l{};l.maxTexelBufferElements=1u<<27;xbg_sim_limits(XBG_SIM_PROFILE_MALI,&l);CHECK(l.maxTexelBufferElements==1u<<27);
     xbg_sim_limits(XBG_SIM_PROFILE_POWERVR,&l);CHECK(l.maxTexelBufferElements==65536);
@@ -172,7 +174,9 @@ int main(){
     // [pvr] DM_GFX_FENCE_GUARD / DM_GFX_CRUMBS family defaults (BUGS_AND_FIXES 2.38): PowerVR only; Adreno and Mali keep 0.
     CHECK(xbg_fence_guard_default(XBG_GPU_POWERVR)==2);
     for(XbgGpuFamily f:{XBG_GPU_ADRENO,XBG_GPU_MALI,XBG_GPU_XCLIPSE,XBG_GPU_MALEOON,XBG_GPU_OTHER}){CHECK(xbg_fence_guard_default(f)==0);CHECK(xbg_crumbs_default(f)==0);}
-    CHECK(xbg_crumbs_default(XBG_GPU_POWERVR)==1);
+    CHECK(xbg_crumbs_default(XBG_GPU_POWERVR)==0);   // [tileopt] off; a GPU-hang fatal turns it on for xbg_crumbs_auto_boots boots
+    CHECK(xbg_crumbs_auto_boots>=1);
+    CHECK(xbg_fence_trylock_default());
     // the simulated PowerVR family (DM_GFX_SIM_GPU=powervr on Adreno) takes the PowerVR defaults
     CHECK(xbg_fence_guard_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("powervr")))==2);
     CHECK(xbg_fence_guard_default(xbg_effective_family(XBG_GPU_ADRENO,xbg_sim_parse("mali")))==0);
@@ -214,6 +218,56 @@ int main(){
     CHECK(xbg_aniso_allowed(4,true,16)==4);CHECK(xbg_aniso_allowed(16,true,16)==16);CHECK(xbg_aniso_allowed(16,true,8)==8);
     CHECK(xbg_aniso_allowed(1,false,16)==1);CHECK(xbg_aniso_allowed(1,true,16)==1);
     {const float bad=xbg_aniso_allowed(0.5f,true,16);CHECK(bad==0.5f);}   // invalid values reach the converter unchanged (its -5 stays)
+
+    // [tileopt] zero-copy modes.
+    {VkPhysicalDeviceMemoryProperties m{};m.memoryTypeCount=3;   // the Mali / PowerVR logs: 0x1 (or 0x7) / 0x7 / 0xb, no 0xf
+     m.memoryTypes[0].propertyFlags=0x1;m.memoryTypes[1].propertyFlags=0x7;m.memoryTypes[2].propertyFlags=0xb;
+     CHECK(!xbg_mem_cached_coherent(m));
+     VkPhysicalDeviceMemoryProperties c=m;c.memoryTypes[2].propertyFlags=0xf;CHECK(xbg_mem_cached_coherent(c));
+     CHECK(xbg_zero_copy_auto(XBG_GPU_ADRENO,false)==XBG_ZC_CACHED && xbg_zero_copy_auto(XBG_GPU_ADRENO,true)==XBG_ZC_CACHED);
+     CHECK(xbg_zero_copy_auto(XBG_GPU_MALI,false)==XBG_ZC_UNCACHED && xbg_zero_copy_auto(XBG_GPU_MALI,true)==XBG_ZC_CACHED);
+     CHECK(xbg_zero_copy_auto(XBG_GPU_POWERVR,false)==XBG_ZC_UNCACHED);
+     for(XbgGpuFamily f:{XBG_GPU_XCLIPSE,XBG_GPU_MALEOON,XBG_GPU_OTHER})CHECK(xbg_zero_copy_auto(f,true)==XBG_ZC_OFF);
+     CHECK(xbg_zero_copy_parse(nullptr)==-1 && xbg_zero_copy_parse("")==-1 && xbg_zero_copy_parse("auto")==-1);
+     CHECK(xbg_zero_copy_parse("0")==XBG_ZC_OFF && xbg_zero_copy_parse("1")==XBG_ZC_CACHED && xbg_zero_copy_parse("2")==XBG_ZC_UNCACHED);
+     // pools: DOOM's flags 0x12 / 0x22 / 0xa2 / 0x62 (CPU_UNCACHED) and 0xa1 (CPU_NO_ACCESS) qualify, 0x24 (CPU_CACHED) and unknown do not
+     for(int f:{0x12,0x22,0xa2,0x62,0xa1})CHECK(xbg_zc_pool_eligible(XBG_ZC_UNCACHED,f));
+     CHECK(!xbg_zc_pool_eligible(XBG_ZC_UNCACHED,0x24) && !xbg_zc_pool_eligible(XBG_ZC_UNCACHED,-1) && !xbg_zc_pool_eligible(XBG_ZC_UNCACHED,0x20));
+     CHECK(xbg_zc_pool_eligible(XBG_ZC_CACHED,0x24) && xbg_zc_pool_eligible(XBG_ZC_CACHED,-1) && !xbg_zc_pool_eligible(XBG_ZC_OFF,0x22));
+     // memory type: cached = lowest allowed (the old loop), uncached = coherent-uncached first
+     CHECK(xbg_zc_pick_type(0x6,m,XBG_ZC_CACHED)==1 && xbg_zc_pick_type(0x6,m,XBG_ZC_UNCACHED)==1);
+     CHECK(xbg_zc_pick_type(0x5,m,XBG_ZC_UNCACHED)==0);   // 0x1 not coherent, 0xb not coherent -> lowest
+     CHECK(xbg_zc_pick_type(0x4,m,XBG_ZC_UNCACHED)==2 && xbg_zc_pick_type(0,m,XBG_ZC_CACHED)==32);
+     VkPhysicalDeviceMemoryProperties k=m;k.memoryTypes[0].propertyFlags=0xf;CHECK(xbg_zc_pick_type(0x7,k,XBG_ZC_UNCACHED)==1 && xbg_zc_pick_type(0x5,k,XBG_ZC_UNCACHED)==0);
+     // self-test words and check
+     std::vector<uint32_t> cp(64),fl(64);for(uint32_t i=0;i<64;i++){cp[i]=xbg_zc_test_word(3,i);fl[i]=xbg_zc_fill_word(3);}
+     uint32_t first=99;CHECK(xbg_zc_test_check(3,cp.data(),fl.data(),64,&first)==0 && first==99);
+     CHECK(xbg_zc_test_word(0,5)!=xbg_zc_test_word(1,5) && xbg_zc_fill_word(0)!=xbg_zc_fill_word(1));
+     cp[7]^=1;fl[9]=0;CHECK(xbg_zc_test_check(3,cp.data(),fl.data(),64,&first)==2 && first==7);
+     cp[7]^=1;CHECK(xbg_zc_test_check(3,cp.data(),fl.data(),64,&first)==1 && first==64+9);
+     CHECK(xbg_zc_test_check(4,cp.data(),fl.data(),64,nullptr)==128);   // last round's data in a new round: everything stale
+     CHECK(xbg_sim_parse("noiocoherent")==XBG_SIM_NOIOCOHERENT && (XBG_SIM_PROFILE_MALI&XBG_SIM_NOIOCOHERENT) && (XBG_SIM_PROFILE_POWERVR&XBG_SIM_NOIOCOHERENT));}
+    // [tileopt] DM_GFX_UBO_DYNAMIC levels and the SPIR-V read scan.
+    CHECK(xbg_ubo_dynamic_level_default(XBG_GPU_POWERVR)==2);
+    for(XbgGpuFamily f:{XBG_GPU_ADRENO,XBG_GPU_MALI,XBG_GPU_XCLIPSE,XBG_GPU_MALEOON,XBG_GPU_OTHER})CHECK(xbg_ubo_dynamic_level_default(f)==1);
+    CHECK(xbg_env_level("1",2,0,2)==1 && xbg_env_level("0",2,0,2)==0 && xbg_env_level(nullptr,2,0,2)==2);
+    {auto I=[](std::vector<uint32_t> &v,uint32_t op,std::initializer_list<uint32_t> a){v.push_back(uint32_t((a.size()+1)<<16)|op);for(uint32_t x:a)v.push_back(x);};
+     // ids: 1 void, 2 fn type, 3 float, 4 struct, 5 ptr Uniform struct, 6 var b0 (read), 7 var b1 (only named / decorated), 8 var b2 (load),
+     // 9 main, 10 label, 11 ptr Uniform float, 12 int const, 13 chain, 14 load, 15 load, 16 = literal 7 in an OpLoad memory operand
+     std::vector<uint32_t> w={0x07230203u,0x10000,0,32,0};
+     I(w,17,{1});I(w,5,{7,0});
+     I(w,71,{6,34,0});I(w,71,{6,33,0});I(w,71,{7,34,0});I(w,71,{7,33,1});I(w,71,{8,34,0});I(w,71,{8,33,2});
+     I(w,19,{1});I(w,33,{2,1});I(w,22,{3,32});I(w,30,{4,3});I(w,32,{5,2,4});I(w,32,{11,2,3});I(w,21,{20,32,1});I(w,43,{20,12,0});
+     I(w,59,{5,6,2});I(w,59,{5,7,2});I(w,59,{5,8,2});
+     I(w,54,{1,9,0,2});I(w,248,{10});
+     I(w,65,{11,13,6,12});I(w,61,{3,14,13});I(w,61,{4,15,8,2,7});   // the last word 7 (an alignment literal) equals var 7's id: not a use
+     I(w,253,{});I(w,56,{});
+     XbgSpirvReads r=xbg_spirv_binding_reads(w.data(),w.size());
+     CHECK(r.ok && r.declared==std::set<uint32_t>({0,1,2}) && r.read==std::set<uint32_t>({0,2}));
+     std::vector<uint32_t> two=w;I(two,54,{1,21,0,2});I(two,248,{22});I(two,253,{});I(two,56,{});two[3]=32;
+     CHECK(!xbg_spirv_binding_reads(two.data(),two.size()).ok);   // two functions: not understood (safe: nothing dynamic)
+     std::vector<uint32_t> cut(w.begin(),w.end()-1);cut.back()=0x00050000u|61;CHECK(!xbg_spirv_binding_reads(cut.data(),cut.size()).ok);
+     CHECK(!xbg_spirv_binding_reads(nullptr,0).ok);}
 
     if(failures){printf("%d failure(s)\n",failures);return 1;}
     printf("vendor_policy_test: all checks passed\n");return 0;

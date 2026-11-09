@@ -64,14 +64,19 @@ enum : uint32_t {
     XBG_SIM_NOANISO       =1u<<13,  // samplerAnisotropy=0 (PowerVR BXM driver 1.15)
     XBG_SIM_TEXEL64K      =1u<<14,  // maxTexelBufferElements=65536 (PowerVR)
     XBG_SIM_NOVERTEX3     =1u<<15,  // no VERTEX_BUFFER on 3-component 8/16-bit formats (AMD-style hardware: RADV / Xclipse)
+    XBG_SIM_NOIOCOHERENT  =1u<<16,  // [tileopt] no HOST_VISIBLE|HOST_COHERENT|HOST_CACHED memory type (every Mali / PowerVR log we have:
+                                    // only 0x7 coherent-uncached and 0xb cached-non-coherent): zero-copy takes the uncached path
     XBG_SIM_FAMILY_MALI   =1u<<24,  // the per-family defaults below act as on that family
     XBG_SIM_FAMILY_POWERVR=1u<<25,
     XBG_SIM_FAMILY_XCLIPSE=1u<<26,
 };
-constexpr uint32_t XBG_SIM_PROFILE_MALI=XBG_SIM_NOBC|XBG_SIM_NOFILTER16|XBG_SIM_SUBGROUP16|XBG_SIM_NODEPTHBOUNDS|XBG_SIM_NOFILLMODE|XBG_SIM_NOCLIP|XBG_SIM_FAMILY_MALI;
+constexpr uint32_t XBG_SIM_PROFILE_MALI=XBG_SIM_NOBC|XBG_SIM_NOFILTER16|XBG_SIM_SUBGROUP16|XBG_SIM_NODEPTHBOUNDS|XBG_SIM_NOFILLMODE|XBG_SIM_NOCLIP|XBG_SIM_NOIOCOHERENT|XBG_SIM_FAMILY_MALI;
 // [pvr] + NOANISO (BUGS_AND_FIXES 2.47): the only PowerVR a player ran (moto g64, BXM-8-256 1.15) has samplerAnisotropy=0 and the game
 // asks aniso 4 for some samplers anyway (a fatal in v0.4.19), so the profile models it.
-constexpr uint32_t XBG_SIM_PROFILE_POWERVR=XBG_SIM_NOBC|XBG_SIM_DEPTHNOLINEAR|XBG_SIM_PVRFORMATS|XBG_SIM_SUBGROUP1|XBG_SIM_NODEPTHBOUNDS|XBG_SIM_NOFILLMODE|XBG_SIM_TEXEL64K|XBG_SIM_NOANISO|XBG_SIM_FAMILY_POWERVR;
+// [tileopt] The profile models that player's BXM-8-256 / 1.15: its boot.log reports subgroup size 128 ("NVN caps subgroup size=128",
+// "32-lane warps in wider subgroups=1"), not 1, so the profile keeps the device's subgroup (Adreno: the same warp32 / lone-lane path);
+// "subgroup1" (BXM-4-64 DDK 24.2) stays a token. Memory types 0x1 / 0x7 / 0xb: no cached-coherent type (NOIOCOHERENT).
+constexpr uint32_t XBG_SIM_PROFILE_POWERVR=XBG_SIM_NOBC|XBG_SIM_DEPTHNOLINEAR|XBG_SIM_PVRFORMATS|XBG_SIM_NODEPTHBOUNDS|XBG_SIM_NOFILLMODE|XBG_SIM_TEXEL64K|XBG_SIM_NOANISO|XBG_SIM_NOIOCOHERENT|XBG_SIM_FAMILY_POWERVR;
 constexpr uint32_t XBG_SIM_PROFILE_XCLIPSE=XBG_SIM_NOBC47|XBG_SIM_NOD24|XBG_SIM_NOVERTEX3|XBG_SIM_FAMILY_XCLIPSE;
 
 inline uint32_t xbg_sim_parse(const char *text,char *unknown=nullptr,size_t unknown_bytes=0){
@@ -82,7 +87,7 @@ inline uint32_t xbg_sim_parse(const char *text,char *unknown=nullptr,size_t unkn
         {"nobc",XBG_SIM_NOBC},{"nobc47",XBG_SIM_NOBC47},{"nofilter16",XBG_SIM_NOFILTER16},{"depthnolinear",XBG_SIM_DEPTHNOLINEAR},
         {"nod24",XBG_SIM_NOD24},{"pvrformats",XBG_SIM_PVRFORMATS},{"subgroup16",XBG_SIM_SUBGROUP16},{"subgroup1",XBG_SIM_SUBGROUP1},
         {"nogs",XBG_SIM_NOGS},{"nodepthbounds",XBG_SIM_NODEPTHBOUNDS},{"nofillmode",XBG_SIM_NOFILLMODE},{"noclip",XBG_SIM_NOCLIP},
-        {"nogather",XBG_SIM_NOGATHER},{"noaniso",XBG_SIM_NOANISO},{"texel64k",XBG_SIM_TEXEL64K},{"novertex3",XBG_SIM_NOVERTEX3},
+        {"nogather",XBG_SIM_NOGATHER},{"noaniso",XBG_SIM_NOANISO},{"texel64k",XBG_SIM_TEXEL64K},{"novertex3",XBG_SIM_NOVERTEX3},{"noiocoherent",XBG_SIM_NOIOCOHERENT},
         {"family-mali",XBG_SIM_FAMILY_MALI},{"family-powervr",XBG_SIM_FAMILY_POWERVR},{"family-xclipse",XBG_SIM_FAMILY_XCLIPSE}};
     uint32_t bits=0;const char *p=text;
     while(*p){
@@ -125,9 +130,17 @@ inline int xbg_env_level(const char *environment,int fallback,int lo,int hi){
 // (vkGetFenceStatus of a fence the record thread was passing to vkQueueSubmit, whose fence is externally synchronized). Level 1: no
 // slot fence access before its SUBMIT ran; 2: also one thread at a time, waits poll vkGetFenceStatus. 2 on PowerVR, 0 elsewhere.
 inline int xbg_fence_guard_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR?2:0;}
-// DM_GFX_CRUMBS family default: GPU progress markers on PowerVR (1), where no run has worked yet, so the next hang log names the pass /
-// dispatch the GPU was in. Costs a barrier + fill per pass end; DM_GFX_CRUMBS=0 turns it off. Off elsewhere.
-inline int xbg_crumbs_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR?1:0;}
+// DM_GFX_CRUMBS family default. It was 1 on PowerVR while no run had worked there; v0.4.19 on the BXM-8-256 ran (fence guard: early=0,
+// no IMGSRV; B&F 2.47) and its crash was a CPU one (SIGBUS in the compiler), where crumbs say nothing. [tileopt] Now 0 everywhere: a
+// GPU-hang fatal (fence_fatal) leaves the marker gfx-crumbs-auto, which turns crumbs 1 on for the next xbg_crumbs_auto_boots boots, so the
+// next hang log names the pass. Costs a barrier + fill per pass end; DM_GFX_CRUMBS=0 / 1 / 2 still wins.
+inline int xbg_crumbs_default(XbgGpuFamily f){(void)f;return 0;}
+constexpr int xbg_crumbs_auto_boots=3;
+// [tileopt] DM_GFX_FENCE_TRYLOCK (default 1; acts only with DM_GFX_FENCE_GUARD=2): a non-blocking fence status query (poll_retire, chunk
+// checks, the zc race check, the idle check) that finds another thread inside the driver on a slot fence (vkQueueSubmit on dm-record,
+// a status poll of the pool-reset worker) answers VK_NOT_READY instead of waiting for it. Every such caller treats NOT_READY as "still
+// busy, look again later", a valid answer for any fence, and level 2's one-thread-at-a-time rule still holds. Blocking waits still lock.
+inline bool xbg_fence_trylock_default(){return true;}
 // A fence wait that came back VK_TIMEOUT well before its timeout: the driver gave up (a fence error), the GPU did not run the whole time.
 // Only for timeouts of 100 ms and more (a short or zero timeout is a poll).
 inline bool xbg_fence_wait_early(VkResult r,uint64_t waited_ns,uint64_t timeout_ns){
@@ -168,6 +181,57 @@ inline float xbg_aniso_allowed(float wanted,bool feature,float max_aniso){
 // coherency) was proven only on Adreno (work/zc_test). Elsewhere the copy path is the default: a GPU that does not snoop the CPU
 // caches would read stale vertices / uniforms (Arm documents ACE-Lite only for some SoCs). DM_GFX_ZEROCOPY=1 forces it on.
 inline bool xbg_zero_copy_default(XbgGpuFamily f){return f==XBG_GPU_ADRENO;}
+// [tileopt] Zero-copy modes (DM_GFX_ZEROCOPY: 0 off, 1 cached, 2 uncached, unset / auto = xbg_zero_copy_auto).
+//  1 cached (Adreno, as before): AHardwareBuffer CPU_READ_OFTEN (cached CPU pages), the lowest memory type the import allows. Needs a GPU
+//    that snoops the CPU caches (IO coherency); a Vulkan driver says so with a HOST_VISIBLE|HOST_COHERENT|HOST_CACHED type.
+//  2 uncached (Mali / PowerVR without such a type: every log we have): AHB CPU_READ_RARELY|CPU_WRITE_OFTEN, which Android gralloc maps
+//    write-combined (gralloc4 mali_gralloc_ion.cpp: only SW_READ_OFTEN gets the cached heap; dma-buf system_heap.c: pgprot_writecombine),
+//    imported with a HOST_COHERENT type when the import allows one, and only for pools the game created CPU_UNCACHED / CPU_NO_ACCESS, so
+//    the memory is what it is on the Switch (DOOM's GPU pools are 0x12 / 0x22 / 0xa2 / 0x62 = CPU_UNCACHED; the one CPU_CACHED pool, 0x24,
+//    keeps the snapshot path). Write-combined, coherent memory is what Arm, Imagination ("no host cached coherent memory types"), Skia, Dawn
+//    and Eden use for CPU-written GPU data. A start-up self-test (zc::selftest, xbg_zc_test_*) must pass on the device, else zero-copy is off.
+enum XbgZcMode{XBG_ZC_OFF=0,XBG_ZC_CACHED=1,XBG_ZC_UNCACHED=2};
+inline bool xbg_mem_cached_coherent(const VkPhysicalDeviceMemoryProperties &m){
+    const VkMemoryPropertyFlags want=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    for(uint32_t t=0;t<m.memoryTypeCount && t<VK_MAX_MEMORY_TYPES;t++)if((m.memoryTypes[t].propertyFlags&want)==want)return true;
+    return false;}
+// Family default: Adreno cached (no test: work/zc_test proved it); Mali / PowerVR cached when the device has a cached-coherent type, else
+// uncached (both only after the self-test passed); every other family off.
+inline int xbg_zero_copy_auto(XbgGpuFamily f,bool cached_coherent){
+    if(f==XBG_GPU_ADRENO)return XBG_ZC_CACHED;
+    if(f==XBG_GPU_MALI || f==XBG_GPU_POWERVR)return cached_coherent?XBG_ZC_CACHED:XBG_ZC_UNCACHED;
+    return XBG_ZC_OFF;}
+// DM_GFX_ZEROCOPY text -> mode; -1 = unset / "auto" (xbg_zero_copy_auto decides).
+inline int xbg_zero_copy_parse(const char *e){
+    if(!e || !*e || !strcmp(e,"auto"))return -1;
+    const int v=atoi(e);return v<=0?XBG_ZC_OFF:v==1?XBG_ZC_CACHED:XBG_ZC_UNCACHED;}
+// May a pool with these NVN flags (CPU_NO_ACCESS 1, CPU_UNCACHED 2, CPU_CACHED 4; -1 unknown) live on zero-copy pages in this mode?
+inline bool xbg_zc_pool_eligible(int mode,int nvn_flags){
+    if(mode==XBG_ZC_CACHED)return true;
+    if(mode!=XBG_ZC_UNCACHED || nvn_flags<0 || (nvn_flags&4))return false;
+    return (nvn_flags&3)!=0;}
+// The memory type an AHB import takes: cached mode the lowest allowed (the old pick: bit-identical on Adreno); uncached mode the lowest
+// allowed HOST_COHERENT type without HOST_CACHED, then any allowed HOST_COHERENT one, then the lowest allowed. 32 when none is allowed.
+inline uint32_t xbg_zc_pick_type(uint32_t allowed,const VkPhysicalDeviceMemoryProperties &m,int mode){
+    uint32_t lowest=32,coherent=32,coherent_uc=32;
+    for(uint32_t t=0;t<32;t++){if(!(allowed>>t&1))continue;if(lowest==32)lowest=t;
+        if(mode!=XBG_ZC_UNCACHED || t>=m.memoryTypeCount)continue;
+        const VkMemoryPropertyFlags f=m.memoryTypes[t].propertyFlags;
+        if((f&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && coherent==32)coherent=t;
+        if((f&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && !(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && coherent_uc==32)coherent_uc=t;}
+    if(mode==XBG_ZC_UNCACHED){if(coherent_uc<32)return coherent_uc;if(coherent<32)return coherent;}
+    return lowest;}
+// Self-test words: round r, word i of the half the CPU writes; the GPU fills the other half with xbg_zc_fill_word(r).
+inline uint32_t xbg_zc_test_word(uint32_t r,uint32_t i){uint32_t x=i*0x9E3779B1u^(r+1)*0x85EBCA77u;x^=x>>15;x*=0x2C1B3C6Du;x^=x>>12;return x;}
+inline uint32_t xbg_zc_fill_word(uint32_t r){return 0xA5000000u|((r+1)*0x010203u&0xFFFFFFu);}
+// Mismatching words of one round: copied = what the GPU copied out of the CPU-written half; gpu_half = the half the GPU filled, as the
+// CPU reads it. *first_bad: index of the first bad word (copied half 0..words-1, filled half words..2*words-1).
+inline uint64_t xbg_zc_test_check(uint32_t r,const uint32_t *copied,const uint32_t *gpu_half,uint32_t words,uint32_t *first_bad){
+    uint64_t bad=0;const uint32_t f=xbg_zc_fill_word(r);
+    for(uint32_t i=0;i<words;i++){
+        if(copied[i]!=xbg_zc_test_word(r,i)){if(!bad && first_bad)*first_bad=i;++bad;}
+        if(gpu_half[i]!=f){if(!bad && first_bad)*first_bad=words+i;++bad;}}
+    return bad;}
 // The PowerVR shader compiler is not thread-safe (forums.imgtec.com t/4334, BXM-8-256 1.15) and builds slowly (t/4280):
 // one vkCreate*Pipelines at a time (warm-up threads included). DM_GFX_PIPE_SERIAL.
 inline bool xbg_pipe_serial_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR;}
@@ -184,6 +248,12 @@ inline bool xbg_pipe_guard_default(XbgGpuFamily f){return f!=XBG_GPU_ADRENO;}
 // PowerVR writes the address of every dynamic uniform buffer of a set into a table sized for the ones the stage uses: a page
 // fault in vkCmdDrawIndexed on BXM-8-256 (PPSSPP PVR_UNUSED_DYNAMIC_UBO_OVERRUN). No dynamic uniform buffers there. DM_GFX_UBO_DYNAMIC.
 inline bool xbg_ubo_dynamic_default(XbgGpuFamily f){return f!=XBG_GPU_POWERVR;}
+// [tileopt] DM_GFX_UBO_DYNAMIC levels: 0 none, 1 as many as fit (the old default), 2 only the uniform blocks the stage's SPIR-V reads
+// (the variable is the base of an OpLoad / access chain / OpArrayLength / OpCopyObject or an OpFunctionCall argument). PPSSPP's fix of
+// this very fault (commit 73559d15aa, BXM-8-256 / 1.15: 5/5 crashes -> 0/5) keeps its dynamic UBOs and makes every stage that sees one
+// read it; our set layouts give each binding the stage flag of the one shader that declares it, so leaving the declared-but-never-read
+// blocks out of the dynamic set meets the same rule. Default 2 on PowerVR, 1 elsewhere (Adreno and Mali unchanged).
+inline int xbg_ubo_dynamic_level_default(XbgGpuFamily f){return f==XBG_GPU_POWERVR?2:1;}
 // A fragment shader that declares no colour output (NVN's depth-only draw) leaves the colour attachments undefined in Vulkan;
 // Adreno keeps them, Mali writes 0 (d2r-mobile issue #179, PR #229). Colour writes are masked off for such draws everywhere
 // but Adreno (whose pipelines stay as they were). DM_GFX_NOOUT_MASK.

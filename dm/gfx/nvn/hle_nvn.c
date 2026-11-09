@@ -266,11 +266,11 @@ int nvn_pool_flags(const void *addr, size_t len) {
     pthread_mutex_unlock(&g_pool_flags_mu);
     return f;
 }
-void xbg_zc_pool_map(void *p, size_t n);
+void xbg_zc_pool_map(void *p, size_t n, int nvn_flags);   /* [tileopt] flags: the uncached zero-copy mode takes CPU_UNCACHED / CPU_NO_ACCESS pools only */
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
-    if (o->mem) xbg_zc_pool_map(o->mem, o->size);   // [DOOM] zero-copy guest memory (xbg_game.cpp zc, DM_GFX_ZEROCOPY)
+    if (o->mem) xbg_zc_pool_map(o->mem, o->size, (int)o->flags);   // [DOOM] zero-copy guest memory (xbg_game.cpp zc, DM_GFX_ZEROCOPY)
     if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(p,o->mem, o->size, o->flags); }
     if (!o->mem && !(o->flags & 0x200)) LOG("【红】MemoryPoolInitialize 非虚拟池没有存储 flags=%#x size=%#llx", o->flags, o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
