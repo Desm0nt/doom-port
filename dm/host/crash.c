@@ -229,6 +229,7 @@ static int crash_read_words(const uint64_t *src, uint64_t *dst, int n) {
 // Download/DOOM Mobile/logs/crash.txt from them at the next start).
 static void (*g_report_hook)(int phase, int sig, uint64_t addr, uint64_t pc);
 extern const char *xbg_crash_rec_op(void) __attribute__((weak));   // [pvr] xbg_game.cpp: the dm-record packet being executed, or NULL
+extern void xbg_crash_rec_detail(void) __attribute__((weak));     // [pvr-ladder] xbg_game.cpp: that packet's render pass / pipelines + the PowerVR ladder step
 void crash_set_report_hook(void (*fn)(int phase, int sig, uint64_t addr, uint64_t pc)) { g_report_hook = fn; }
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
@@ -256,6 +257,7 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
 #endif
         const char *rec = xbg_crash_rec_op ? xbg_crash_rec_op() : 0;
         fprintf(stderr, "[dm] crash thread %s tid=%d; dm-record in %s\n", tn, fault_tid(), rec ? rec : "(no packet)");
+        if (rec && xbg_crash_rec_detail) xbg_crash_rec_detail();
     }
     // [DOOM] issues #12/#20: a fault in the page of sp or up to 64 KiB below it is the thread running off its stack into the guard
     // page (sp itself may already point there). Said plainly, and the stack scan below, which reads upward from sp, is skipped:

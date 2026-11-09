@@ -3333,3 +3333,25 @@ Aiming и ползунок чувствительности гироскопа �
 - **Риски.** `vkmap` на Mali kbase: если драйвер мапит импорт тем же fd — снова EACCES (тогда `vkalloc`; если и он нет — zero-copy выключен,
   как сейчас). `mremap` kbase-мэппинга: kbase держит vma в своих структурах; самотест переносит окно до того, как трогать гостевую память.
 - Бэкапы: `work/bak_zc3` нет — `xbg_game.cpp.bak_zc3` / `hle_nvn.c.bak_zc3` в scratchpad сессии 09.11.
+
+### 2.53 PowerVR (moto g64, BXM-8-256 1.15), v0.5.0-test1: SIGBUS в компиляторе драйвера в `vkCmdEndRenderPass` на старте кампании — не гонка; описание прохода в крэш-репорте и лестница обходов (09.11; локальный APK pvrdiag1, на Mi 14 проверено в модели)
+- **Лог игрока** (Google Drive, `DOOM V 0.5.0-ARM64 LOG AND CRASH FILE…`): три прогона подряд, после экрана яркости — `CRASH sig=7 addr=0x3c04343e
+  pc=0x3c04343e lr=PVRUniFlexCompileToHw+0x58`, `crash thread dm-record …; dm-record in vkCmdEndRenderPass`, `bt: vulkan.mtk.so+0x39898 +0x3f1ec
+  +0x5dee0 libdm.so…`. Каждый раз сразу после загрузки `25d81d40`, `53014b30` (VS) и GS-куллинга `703f1fcc` (lone-lane). `NVN compile lock=1`
+  стоял, тот же pc был и в прогоне 0.4.19 02:05 → **детерминированная** ошибка компилятора IMG на программе, которую драйвер собирает в конце
+  прохода (end-of-tile / load-store / эмуляция GS), а не гонка §2.47. Какой проход — из лога не видно.
+- **Сделано (`xbg_game.cpp` `[pvr-ladder]`, `host/crash.c`).**
+  1. `crashinfo`: каждому render pass (все места создания, включая noload / store / lazy-твины и warm) и графическому пайплайну — строка в
+     фиксированной таблице (формат/samples, load>store, stencil, colors/depth/resolve; пайплайн — его pass и ключи шейдеров). `dm-record`
+     помнит начатый pass, 16 последних привязанных пайплайнов и число draw. `xbg_crash_rec_detail` (слабый, из обработчика сигнала) печатает
+     `crash pass: rp … (<описание>); draws in it N` и `crash pass pipeline k …`.
+  2. **Лестница**: на PowerVR такое падение (внутри пакета `dm-record`) увеличивает `DM_FILES_DIR/gfx-pvr-ladder`; следующий запуск
+     (`pvr_ladder_apply`, до чтения политик семейства) включает ступень по счётчику: 1 — тайловые политики выкл. (`NOLOAD`, `STORE_DEAD`,
+     `STORE_NONE`, `LEAN_USAGE`, `TILE_BARRIER`, `LAZY_CLEAR` = 0), 2 — + `COMPILE_LOCK=2`, `NOOUT_MASK=0`, 3 — + `GS_PASSTHRU=0`.
+     Переключатель игрока в `dm/env` важнее. `DM_PVR_LADDER` = 0 выкл / N принудительно; `DM_PVR_LADDER_FAKE=<с>` — тестовый SIGBUS в первом
+     `vkCmdEndRenderPass` через N секунд. Лог: `NVN pvr ladder: step N (…) <что включено>`.
+- **Проверено на Mi 14 Ultra (модель `SIM_GPU=powervr`, 09.11).** `DM_PVR_LADDER_FAKE=60`: `crash pass: rp … (store twin 122/1 C>S st L>S 83/1 C>S
+  st L>S 37/1 C>S st L>S 129/1 L>S st L>S; colors 3 depth 3 resolve 0); draws in it 15`, 4 пайплайна с ключами, `gfx-pvr-ladder -> 1`;
+  следующий запуск — `NVN pvr ladder: step 1 … DM_GFX_NOLOAD=0 …`, игра работает (глаз хозяина). Ступень 3 принудительно (`DM_PVR_LADDER=3`): без падений и артефактов, ≈46 fps против ≈55 — цена GS и выключенных тайловых политик, только на устройствах, где лестница дошла до 3.
+- **Игроку:** локальный `work/pvrdiag1/DOOM-Mobile-v0.5.0-pvrdiag1-arm64.apk` + `MESSAGE.md` (4 запуска подряд, логи после 2-го и 4-го).
+- **Дальше:** по строке `crash pass:` — формат / ops прохода, на котором падает драйвер, и точечный обход (подмена формата или ops только там).

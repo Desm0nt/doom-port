@@ -239,13 +239,33 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     // Frame counter (gear dialog): fps, mean / max frame time and GPU time of the last 0.5 s, redrawn twice a second.
     private boolean showFps; private final float[] fstats = new float[4];
     private final Runnable fpsTick = new Runnable() { public void run() { if (!showFps) return; synchronized (lock) { try { DmActivity.nativeFrameStats(fstats); } catch (UnsatisfiedLinkError e) { fstats[0] = 0; } } redraw(); postDelayed(this, 500); } };
+    // The top-left rounded screen corner and the cutout inset (Android 12+, from WindowInsets), so the FPS counter starts where the top of
+    // its glyphs clears the corner arc (Poco F8 Ultra: a bigger radius than the Mi 14 Ultra cut off the start of the line; diablo3-port #1,
+    // D3PadView 5941060). Android 10 / 11: 18 dp, as before (also the minimum).
+    private float cornerCx, cornerCy, cornerR, safeLeft;
+    @Override public android.view.WindowInsets onApplyWindowInsets(android.view.WindowInsets in) {
+        cornerR = 0; safeLeft = 0;
+        if (android.os.Build.VERSION.SDK_INT >= 31) {
+            android.view.RoundedCorner rc = in.getRoundedCorner(android.view.RoundedCorner.POSITION_TOP_LEFT);
+            if (rc != null) { cornerR = rc.getRadius(); cornerCx = rc.getCenter().x; cornerCy = rc.getCenter().y; }
+            safeLeft = in.getInsets(android.view.WindowInsets.Type.displayCutout()).left;
+        }
+        redraw();
+        return super.onApplyWindowInsets(in);
+    }
+    private float cornerLeft(float y) {   // x where the corner arc ends at height y (0 below the arc)
+        if (cornerR <= 0 || y >= cornerCy) return 0;
+        float dy = cornerCy - y; return dy >= cornerR ? cornerCx : cornerCx - (float) Math.sqrt(cornerR * cornerR - dy * dy);
+    }
     private void drawFps(Canvas c) {
         if (!showFps || fstats[0] <= 0) return;
         String t = String.format(Locale.ROOT, "%.0f fps  %.1f ms (max %.0f)%s", fstats[0], fstats[1], fstats[2],
             fstats[3] >= 0 ? String.format(Locale.ROOT, "  GPU %.1f", fstats[3]) : "");
-        // top left corner, clear of the rounded screen corner (Xiaomi 14 Ultra: ~147 px radius)
+        // top left corner, clear of the rounded screen corner (cornerLeft; at least 18 dp)
         text.setTextSize(15 * dp); text.setColor(0xd0ffffff);
-        float w = text.measureText(t), x = 18 * dp + w / 2, y = text.getTextSize();
+        float y = text.getTextSize(), top = y + text.ascent();
+        float left = Math.max(18 * dp, Math.max(safeLeft, cornerLeft(top)) + 6 * dp);
+        float w = text.measureText(t), x = left + w / 2;
         fill.setColor(0x80000000); c.drawRect(0, 0, x + w / 2 + 6 * dp, y + 5 * dp, fill);
         c.drawText(t, x, y, text);
     }

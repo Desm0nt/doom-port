@@ -841,6 +841,68 @@ namespace drvc {
 int level=0;std::mutex mu;std::atomic<uint32_t> cur_op{0};std::atomic<uint64_t> locks{0};
 struct Lock{std::unique_lock<std::mutex> l;explicit Lock(bool want):l(mu,std::defer_lock){if(want && level>0){l.lock();locks.fetch_add(1,std::memory_order_relaxed);}}};
 }
+// [pvr-ladder] BUGS_AND_FIXES 2.53: a driver crash inside a dm-record packet (moto g64 / BXM-8-256 1.15: SIGBUS in PVRUniFlexCompileToHw
+// from vkCmdEndRenderPass, the same pc 0x3c04343e in every run, compile lock on: not a race, a program the driver compiles at the end of
+// a pass). crashinfo: every render pass and graphics pipeline gets a one-line description in a fixed table when it is made; dm-record
+// notes the pass it began and the pipelines it bound since; the crash handler (host/crash.c, weak xbg_crash_rec_detail) prints them.
+// A slot is filled and only then its handle published, without a lock: a reader in the signal handler may at worst print a mixed line.
+// ladder: on PowerVR such a crash adds one to DM_FILES_DIR/gfx-pvr-ladder, and the next boot turns on workarounds by that count
+// (pvr_ladder_apply, before the family policies are read): 1 = tile policies off (NOLOAD, STORE_DEAD, STORE_NONE, LEAN_USAGE,
+// TILE_BARRIER, LAZY_CLEAR: plain load / store ops), 2 = + COMPILE_LOCK 2 and NOOUT_MASK 0, 3 = + GS_PASSTHRU 0 (the culling GS kept, so
+// no vertex shader meant for a GS feeds a fragment shader directly). A switch the player set (dm/env) wins. DM_PVR_LADDER: unset = the
+// file, 0 = off, N = force level N. DM_PVR_LADDER_FAKE=<s> (test only): a SIGBUS in the first vkCmdEndRenderPass after s seconds.
+namespace crashinfo {
+struct Slot{std::atomic<uint64_t> h{0};char d[232];};
+constexpr unsigned NRP=1024,NPL=4096;Slot rps[NRP],pls[NPL];std::atomic<unsigned> nrp{0},npl{0};
+std::atomic<uint64_t> cur_rp{0},bound[16];std::atomic<unsigned> nbound{0},draws{0};
+char ladder_path[512]="";int ladder_level=0;uint64_t fake_at_ns=0;
+void put(Slot *t,unsigned n,std::atomic<unsigned> &c,uint64_t h,const char *d){const unsigned i=c.fetch_add(1)%n;t[i].h.store(0);snprintf(t[i].d,sizeof t[i].d,"%s",d);t[i].h.store(h,std::memory_order_release);}
+const char *find(Slot *t,unsigned n,uint64_t h){if(!h)return nullptr;for(unsigned i=0;i<n;i++)if(t[i].h.load(std::memory_order_acquire)==h)return t[i].d;return nullptr;}
+const char *lop(VkAttachmentLoadOp o){return o==VK_ATTACHMENT_LOAD_OP_LOAD?"L":o==VK_ATTACHMENT_LOAD_OP_CLEAR?"C":o==VK_ATTACHMENT_LOAD_OP_DONT_CARE?"D":"N";}
+const char *sop(VkAttachmentStoreOp o){return o==VK_ATTACHMENT_STORE_OP_STORE?"S":o==VK_ATTACHMENT_STORE_OP_DONT_CARE?"D":"N";}
+// "<what> fmt/samples load>store[ stencil load>store] ...; colors N depth a resolve r": L load C clear D dont-care N none, S store
+void note_rp(VkRenderPass rp,const VkRenderPassCreateInfo &ci,const char *what){
+    char d[232];int at=snprintf(d,sizeof d,"%s",what);
+    for(uint32_t k=0;k<ci.attachmentCount && at<int(sizeof d)-24;k++){const VkAttachmentDescription &a=ci.pAttachments[k];
+        at+=snprintf(d+at,sizeof d-at," %u/%u %s>%s",unsigned(a.format),unsigned(a.samples),lop(a.loadOp),sop(a.storeOp));
+        if(a.stencilLoadOp!=VK_ATTACHMENT_LOAD_OP_DONT_CARE || a.stencilStoreOp!=VK_ATTACHMENT_STORE_OP_DONT_CARE)at+=snprintf(d+at,sizeof d-at," st %s>%s",lop(a.stencilLoadOp),sop(a.stencilStoreOp));}
+    if(ci.subpassCount && at<int(sizeof d)-40){const VkSubpassDescription &sp=ci.pSubpasses[0];
+        snprintf(d+at,sizeof d-at,"; colors %u depth %d resolve %d",sp.colorAttachmentCount,sp.pDepthStencilAttachment?int(sp.pDepthStencilAttachment->attachment):-1,sp.pResolveAttachments?1:0);}
+    put(rps,NRP,nrp,uint64_t(uintptr_t(rp)),d);}
+void note_pl(VkPipeline pl,VkRenderPass rp,const std::string &keys){char d[232];snprintf(d,sizeof d,"rp %#llx %s",(unsigned long long)uintptr_t(rp),keys.c_str());put(pls,NPL,npl,uint64_t(uintptr_t(pl)),d);}
+// dm-record (exec): the pass it began, the graphics pipelines bound since (last 16) and the draws since
+inline void rec_begin(VkRenderPass rp){cur_rp.store(uint64_t(uintptr_t(rp)),std::memory_order_relaxed);nbound.store(0,std::memory_order_relaxed);draws.store(0,std::memory_order_relaxed);}
+inline void rec_bind(VkPipeline pl){const unsigned n=nbound.load(std::memory_order_relaxed);if(n && bound[(n-1)%16].load(std::memory_order_relaxed)==uint64_t(uintptr_t(pl)))return;bound[n%16].store(uint64_t(uintptr_t(pl)),std::memory_order_relaxed);nbound.store(n+1,std::memory_order_relaxed);}
+inline void rec_draw(){draws.fetch_add(1,std::memory_order_relaxed);}
+}
+// host/crash.c (weak), in the signal handler right after the "crash thread" line: the pass and pipelines dm-record was working on, and
+// on PowerVR one more step of the ladder for the next boot (open / read / write / close only).
+extern "C" void xbg_crash_rec_detail(void){
+    if(!drvc::cur_op.load(std::memory_order_relaxed))return;   // dm-record was not inside a packet
+    const uint64_t rp=crashinfo::cur_rp.load();const char *d=crashinfo::find(crashinfo::rps,crashinfo::NRP,rp);
+    fprintf(stderr,"[dm] crash pass: rp %#llx (%s); draws in it %u; ladder level this boot %d\n",(unsigned long long)rp,d?d:"not in the table",crashinfo::draws.load(),crashinfo::ladder_level);
+    const unsigned n=crashinfo::nbound.load(),m=n<16?n:16;
+    for(unsigned k=0;k<m;k++){const uint64_t pl=crashinfo::bound[(n-1-k)%16].load();const char *pd=crashinfo::find(crashinfo::pls,crashinfo::NPL,pl);
+        fprintf(stderr,"[dm] crash pass pipeline %u (last bound first): %#llx %s\n",k,(unsigned long long)pl,pd?pd:"not in the table");}
+    if(gpu_policy!=XBG_GPU_POWERVR || !crashinfo::ladder_path[0])return;
+    int fd=open(crashinfo::ladder_path,O_RDWR|O_CREAT,0600);if(fd<0)return;
+    char b[16]={0};const ssize_t r=read(fd,b,sizeof b-1);int v=0;for(ssize_t i=0;i<r && b[i]>='0' && b[i]<='9';i++)v=v*10+(b[i]-'0');
+    v=v<9?v+1:9;char o[4]={char('0'+v),'\n',0,0};lseek(fd,0,SEEK_SET);if(ftruncate(fd,0)==0 && write(fd,o,2)==2){}close(fd);
+    fprintf(stderr,"[dm] crash: PowerVR driver crash inside dm-record: gfx-pvr-ladder -> %d (the next start turns on workaround step %d)\n",v,v<3?v:3);}
+// [pvr-ladder] before the family policies are read (init, after gpu_policy): the workarounds of this boot's step
+void pvr_ladder_apply(){
+    const char *fd=getenv("DM_FILES_DIR");if(fd && *fd)snprintf(crashinfo::ladder_path,sizeof crashinfo::ladder_path,"%s/gfx-pvr-ladder",fd);
+    if(const char *f=getenv("DM_PVR_LADDER_FAKE");f && *f && atoi(f)>0)crashinfo::fake_at_ns=timing_clock()+uint64_t(atoi(f))*1000000000ull;
+    if(gpu_policy!=XBG_GPU_POWERVR)return;
+    int lv=0;const char *e=getenv("DM_PVR_LADDER");
+    if(e && *e)lv=atoi(e);
+    else if(crashinfo::ladder_path[0]){if(FILE *f=fopen(crashinfo::ladder_path,"rb")){if(fscanf(f,"%d",&lv)!=1)lv=0;fclose(f);}}
+    lv=std::clamp(lv,0,3);crashinfo::ladder_level=lv;
+    std::string set;auto on=[&](const char *k,const char *v){if(getenv(k)){set+=" ";set+=k;set+="(player's)";return;}setenv(k,v,0);set+=" ";set+=k;set+="=";set+=v;};
+    if(lv>=1){on("DM_GFX_NOLOAD","0");on("DM_GFX_STORE_DEAD","0");on("DM_GFX_STORE_NONE","0");on("DM_GFX_LEAN_USAGE","0");on("DM_GFX_TILE_BARRIER","0");on("DM_GFX_LAZY_CLEAR","0");}
+    if(lv>=2){on("DM_GFX_COMPILE_LOCK","2");on("DM_GFX_NOOUT_MASK","0");}
+    if(lv>=3)on("DM_GFX_GS_PASSTHRU","0");
+    xbg_logf("NVN pvr ladder: step %d (%s; file %s, DM_PVR_LADDER=%s)%s",lv,e && *e?"forced":"crashes counted in the file",crashinfo::ladder_path[0]?crashinfo::ladder_path:"-",e && *e?e:"-",set.empty()?" nothing changed":set.c_str());}
 extern "C" void xbg_drvc_lock(void){if(drvc::level>0)drvc::mu.lock();}
 extern "C" void xbg_drvc_unlock(void){if(drvc::level>0)drvc::mu.unlock();}
 namespace vkrec {
@@ -926,9 +988,10 @@ void exec(const Hdr *h){
     case K_RESET_QP:{const PQuery &q=*reinterpret_cast<const PQuery*>(p);vkCmdResetQueryPool(c,q.pool,q.a,q.b);break;}
     case K_TIMESTAMP:{const PTimestamp &q=*reinterpret_cast<const PTimestamp*>(p);vkCmdWriteTimestamp(c,VkPipelineStageFlagBits(q.stage),q.pool,q.query);break;}
     case K_COPY_QP:{const PCopyQP &q=*reinterpret_cast<const PCopyQP*>(p);vkCmdCopyQueryPoolResults(c,q.pool,q.first,q.count,q.dst,q.off,q.stride,q.flags);break;}
-    case K_BEGIN_RP:{const PBeginRP &q=*reinterpret_cast<const PBeginRP*>(p);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=q.rp;b.framebuffer=q.fb;b.renderArea=q.area;
+    case K_BEGIN_RP:{const PBeginRP &q=*reinterpret_cast<const PBeginRP*>(p);crashinfo::rec_begin(q.rp);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=q.rp;b.framebuffer=q.fb;b.renderArea=q.area;
         b.clearValueCount=q.nclear;b.pClearValues=q.nclear?reinterpret_cast<const VkClearValue*>(&q+1):nullptr;vkCmdBeginRenderPass(c,&b,VkSubpassContents(q.contents));break;}
-    case K_END_RP:vkCmdEndRenderPass(c);break;
+    case K_END_RP:if(crashinfo::fake_at_ns && timing_clock()>=crashinfo::fake_at_ns){crashinfo::fake_at_ns=0;raise(SIGBUS);}   // [pvr-ladder] DM_PVR_LADDER_FAKE
+        vkCmdEndRenderPass(c);break;
     case K_COPY_BUF:{const PCopyBuf &q=*reinterpret_cast<const PCopyBuf*>(p);vkCmdCopyBuffer(c,q.src,q.dst,q.n,reinterpret_cast<const VkBufferCopy*>(&q+1));break;}
     case K_COPY_B2I:{const PB2I &q=*reinterpret_cast<const PB2I*>(p);vkCmdCopyBufferToImage(c,q.buf,q.img,VkImageLayout(q.layout),q.n,reinterpret_cast<const VkBufferImageCopy*>(&q+1));break;}
     case K_COPY_I2B:{const PB2I &q=*reinterpret_cast<const PB2I*>(p);vkCmdCopyImageToBuffer(c,q.img,VkImageLayout(q.layout),q.buf,q.n,reinterpret_cast<const VkBufferImageCopy*>(&q+1));break;}
@@ -938,22 +1001,22 @@ void exec(const Hdr *h){
     case K_CLEAR_COLOR:{const PClearColor &q=*reinterpret_cast<const PClearColor*>(p);vkCmdClearColorImage(c,q.img,VkImageLayout(q.layout),&q.v,q.n,reinterpret_cast<const VkImageSubresourceRange*>(&q+1));break;}
     case K_CLEAR_DS:{const PClearDS &q=*reinterpret_cast<const PClearDS*>(p);vkCmdClearDepthStencilImage(c,q.img,VkImageLayout(q.layout),&q.v,q.n,reinterpret_cast<const VkImageSubresourceRange*>(&q+1));break;}
     case K_CLEAR_ATT:{const PCount2 &q=*reinterpret_cast<const PCount2*>(p);const auto *a=reinterpret_cast<const VkClearAttachment*>(&q+1);vkCmdClearAttachments(c,q.a,a,q.b,reinterpret_cast<const VkClearRect*>(a+q.a));break;}
-    case K_BIND_PIPE:{const PBindPipe &q=*reinterpret_cast<const PBindPipe*>(p);vkCmdBindPipeline(c,VkPipelineBindPoint(q.bp),q.p);break;}
+    case K_BIND_PIPE:{const PBindPipe &q=*reinterpret_cast<const PBindPipe*>(p);if(q.bp==VK_PIPELINE_BIND_POINT_GRAPHICS)crashinfo::rec_bind(q.p);vkCmdBindPipeline(c,VkPipelineBindPoint(q.bp),q.p);break;}
     case K_BIND_SETS:{const PBindSets &q=*reinterpret_cast<const PBindSets*>(p);const auto *s=reinterpret_cast<const VkDescriptorSet*>(&q+1);
         vkCmdBindDescriptorSets(c,VkPipelineBindPoint(q.bp),q.l,q.first,q.ns,s,q.nd,q.nd?reinterpret_cast<const uint32_t*>(s+q.ns):nullptr);break;}
     case K_VIEWPORT:{const PCount2 &q=*reinterpret_cast<const PCount2*>(p);vkCmdSetViewport(c,q.a,q.b,reinterpret_cast<const VkViewport*>(&q+1));break;}
     case K_SCISSOR:{const PCount2 &q=*reinterpret_cast<const PCount2*>(p);vkCmdSetScissor(c,q.a,q.b,reinterpret_cast<const VkRect2D*>(&q+1));break;}
     case K_BIND_VB:{const PCount2 &q=*reinterpret_cast<const PCount2*>(p);const auto *b=reinterpret_cast<const VkBuffer*>(&q+1);vkCmdBindVertexBuffers(c,q.a,q.b,b,reinterpret_cast<const VkDeviceSize*>(b+q.b));break;}
     case K_BIND_IB:{const PBindIB &q=*reinterpret_cast<const PBindIB*>(p);vkCmdBindIndexBuffer(c,q.b,q.off,VkIndexType(q.type));break;}
-    case K_DRAW_IDX_IND:{const PDrawInd &q=*reinterpret_cast<const PDrawInd*>(p);vkCmdDrawIndexedIndirect(c,q.b,q.off,q.count,q.stride);break;}
-    case K_DRAW_IND:{const PDrawInd &q=*reinterpret_cast<const PDrawInd*>(p);vkCmdDrawIndirect(c,q.b,q.off,q.count,q.stride);break;}
-    case K_DRAW_IDX:{const PDrawIdx &q=*reinterpret_cast<const PDrawIdx*>(p);vkCmdDrawIndexed(c,q.ic,q.inst,q.fi,q.vo,q.finst);break;}
-    case K_DRAW:{const PDraw &q=*reinterpret_cast<const PDraw*>(p);vkCmdDraw(c,q.vc,q.inst,q.fv,q.fi);break;}
+    case K_DRAW_IDX_IND:{crashinfo::rec_draw();const PDrawInd &q=*reinterpret_cast<const PDrawInd*>(p);vkCmdDrawIndexedIndirect(c,q.b,q.off,q.count,q.stride);break;}
+    case K_DRAW_IND:{crashinfo::rec_draw();const PDrawInd &q=*reinterpret_cast<const PDrawInd*>(p);vkCmdDrawIndirect(c,q.b,q.off,q.count,q.stride);break;}
+    case K_DRAW_IDX:{crashinfo::rec_draw();const PDrawIdx &q=*reinterpret_cast<const PDrawIdx*>(p);vkCmdDrawIndexed(c,q.ic,q.inst,q.fi,q.vo,q.finst);break;}
+    case K_DRAW:{crashinfo::rec_draw();const PDraw &q=*reinterpret_cast<const PDraw*>(p);vkCmdDraw(c,q.vc,q.inst,q.fv,q.fi);break;}
     case K_DISPATCH:{const PDispatch &q=*reinterpret_cast<const PDispatch*>(p);vkCmdDispatch(c,q.x,q.y,q.z);break;}
     case K_DISPATCH_IND:{const PDispatchInd &q=*reinterpret_cast<const PDispatchInd*>(p);vkCmdDispatchIndirect(c,q.b,q.off);break;}
     case K_PUSH:{const PPush &q=*reinterpret_cast<const PPush*>(p);vkCmdPushConstants(c,q.l,q.stages,q.off,q.size,&q+1);break;}
-    case K_DRAW_IDX_IND_CNT:{const PDrawCnt &q=*reinterpret_cast<const PDrawCnt*>(p);reinterpret_cast<PFN_vkCmdDrawIndexedIndirectCountKHR>(q.pfn)(c,q.b,q.off,q.cb,q.coff,q.max,q.stride);break;}
-    case K_DRAW_IND_CNT:{const PDrawCnt &q=*reinterpret_cast<const PDrawCnt*>(p);reinterpret_cast<PFN_vkCmdDrawIndirectCountKHR>(q.pfn)(c,q.b,q.off,q.cb,q.coff,q.max,q.stride);break;}
+    case K_DRAW_IDX_IND_CNT:{crashinfo::rec_draw();const PDrawCnt &q=*reinterpret_cast<const PDrawCnt*>(p);reinterpret_cast<PFN_vkCmdDrawIndexedIndirectCountKHR>(q.pfn)(c,q.b,q.off,q.cb,q.coff,q.max,q.stride);break;}
+    case K_DRAW_IND_CNT:{crashinfo::rec_draw();const PDrawCnt &q=*reinterpret_cast<const PDrawCnt*>(p);reinterpret_cast<PFN_vkCmdDrawIndirectCountKHR>(q.pfn)(c,q.b,q.off,q.cb,q.coff,q.max,q.stride);break;}
     case K_FILL_BUF:{const PFill &q=*reinterpret_cast<const PFill*>(p);vkCmdFillBuffer(c,q.b,q.off,q.size,q.data);break;}   // [DOOM] DM_GFX_CRUMBS
     default:fail(Op(h->op),-1);break;}
 }
@@ -5027,7 +5090,7 @@ VkRenderPass make_pass(const uint32_t *w,uint32_t n){
     uint32_t nd=r.u();if(nd>8)return VK_NULL_HANDLE;std::vector<VkSubpassDependency> dep(nd);for(auto &x:dep){x.srcSubpass=r.u();x.dstSubpass=r.u();x.srcStageMask=r.u();x.dstStageMask=r.u();x.srcAccessMask=r.u();x.dstAccessMask=r.u();x.dependencyFlags=r.u();}
     if(r.bad || r.i!=n)return VK_NULL_HANDLE;
     s.colorAttachmentCount=nc;s.pColorAttachments=c.data();s.pDepthStencilAttachment=hd?&d:nullptr;p.attachmentCount=na;p.pAttachments=a.data();p.subpassCount=1;p.pSubpasses=&s;p.dependencyCount=nd;p.pDependencies=dep.data();
-    VkRenderPass rp;if(vkCreateRenderPass(cfg.device,&p,nullptr,&rp)!=VK_SUCCESS)return VK_NULL_HANDLE;
+    VkRenderPass rp;if(vkCreateRenderPass(cfg.device,&p,nullptr,&rp)!=VK_SUCCESS)return VK_NULL_HANDLE;crashinfo::note_rp(rp,p,"warm pass");
     std::lock_guard<std::mutex> l(mu);auto ins=passes.emplace(k,rp);if(!ins.second){vkDestroyRenderPass(cfg.device,rp,nullptr);return ins.first->second;}return rp;
 }
 bool build(const Rec &rec){
@@ -5061,6 +5124,7 @@ bool build(const Rec &rec){
     // [nonadreno] gpguard: a skipped combination is not built; serial builds and in-flight markers where the policy asks for them
     const std::string combo=(gpguard::guard || gpguard::any.load())?gpguard::join(rec.keys):std::string();if(!combo.empty() && gpguard::skipped(combo))return false;
     uint64_t c0=timing_clock();VkPipeline pl=VK_NULL_HANDLE;VkResult made;{gpguard::Lock serial;const bool marked=gpguard::begin(combo);made=vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&ci,nullptr,&pl);if(marked)gpguard::end(combo,gpguard::built(made,pl));}
+    if(made==VK_SUCCESS && pl)crashinfo::note_pl(pl,ci.renderPass,"warm "+(combo.empty()?gpguard::join(rec.keys):combo));   // [pvr-ladder]
     if(!gpguard::built(made,pl)){if(pl)vkDestroyPipeline(cfg.device,pl,nullptr);return false;}
     if(timing_clock()-c0>=compile_ns)++compiled;
     std::string bytes(reinterpret_cast<const char*>(words.data()),words.size()*4);
@@ -5253,6 +5317,7 @@ void pipeline_lookup(PipelineLease &out,const XbgPipelineKey &key,bool cacheable
         const std::string combo=(gpguard::guard || gpguard::any.load())?warm::stage_combo(*graphics):std::string();
         if(!combo.empty() && gpguard::skipped(combo)){++gpguard::skipped_draws;out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}
         VkResult made;{gpguard::Lock serial;const bool marked=gpguard::begin(combo);made=vkCreateGraphicsPipelines(cfg.device,pipeline_cache,1,&g,nullptr,&out.pipeline);if(marked)gpguard::end(combo,gpguard::built(made,out.pipeline));}
+        if(made==VK_SUCCESS && out.pipeline)crashinfo::note_pl(out.pipeline,g.renderPass,combo.empty()?warm::stage_combo(*graphics):combo);   // [pvr-ladder]
         if(!gpguard::built(made,out.pipeline)){if(out.pipeline)vkDestroyPipeline(cfg.device,out.pipeline,nullptr);gpguard::record(combo.empty()?warm::stage_combo(*graphics):combo,made);out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}if(pipe_stats && !pstat_env)pstat_log(out.pipeline);uint64_t dt=timing_clock()-t0;if(dt>=compile_ns)++pipelines_unsaved;++warm::creates;warm::create_ns+=dt;++hud::pipelines;hud::pipeline_ns+=dt;warm::create_max_ns=std::max(warm::create_max_ns,dt);if(cacheable)warm::record(*graphics,key);}
     else{uint64_t t0=timing_clock();VkComputePipelineCreateInfo cc=*compute;if(pipe_stats)cc.flags|=VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;const std::string &shader_key=state.shader[5]->key;pipeguard::begin(shader_key);VkResult made;{gpguard::Lock serial;made=vkCreateComputePipelines(cfg.device,pipeline_cache,1,&cc,nullptr,&out.pipeline);}if(made==VK_INCOMPLETE && out.pipeline)made=VK_SUCCESS;pipeguard::end(shader_key,made==VK_SUCCESS);if(made!=VK_SUCCESS){if(out.pipeline)vkDestroyPipeline(cfg.device,out.pipeline,nullptr);char why[64];snprintf(why,sizeof why,"failed to build (result=%d)",int(made));pipeguard::record(shader_key,why);out.pipeline=VK_NULL_HANDLE;out.transient=true;return;}++pipelines_unsaved;++hud::pipelines;hud::pipeline_ns+=timing_clock()-t0;if(pipe_stats)pstat_log(out.pipeline);}
     if(!cacheable){out.transient=true;return;}
@@ -6156,19 +6221,19 @@ bool create_pass(Pass &p,Commands &c,int clear_color=-1,bool clear_depth=false,b
     VkSubpassDependency cdep[2];VkRenderPassCreateInfo crp=rp;crp.dependencyCount=gsync::rp_deps_make(dep,depth.attachment!=VK_ATTACHMENT_UNUSED,cdep);crp.pDependencies=cdep;
     {XbgPipelineKey key;bool valid=xbg_renderpass_key(key,rp);
         if(valid && key.valid){static std::vector<uint32_t> words;words.assign(key.words,key.words+key.count);auto it=render_pass_cache.find(words);
-            if(it==render_pass_cache.end()){RenderPassEntry e;VK(vkCreateRenderPass(cfg.device,&crp,nullptr,&e.pass));gsync::note_made();e.definition.assign(key,true);
+            if(it==render_pass_cache.end()){RenderPassEntry e;VK(vkCreateRenderPass(cfg.device,&crp,nullptr,&e.pass));gsync::note_made();crashinfo::note_rp(e.pass,crp,"pass");e.definition.assign(key,true);
                 if(lazy_clear_on){LazyInfo &li=lazy_info[e.pass];li.desc.assign(descriptions.begin(),descriptions.end());li.colors.assign(colors.begin(),colors.end());li.depth=depth;li.ndep=crp.dependencyCount;for(uint32_t k=0;k<li.ndep;k++)li.dep[k]=cdep[k];}   // [r3] lazy_twin ([ETR perf] crp's dependencies)
                 if(store_none_on || store_dead_on){LazyInfo &si=store_info[e.pass];si.desc.assign(descriptions.begin(),descriptions.end());si.colors.assign(colors.begin(),colors.end());si.depth=depth;si.ndep=crp.dependencyCount;for(uint32_t k=0;k<si.ndep;k++)si.dep[k]=cdep[k];}   // [afbc] store_twin
                 if(noload_enabled && p.samples==VK_SAMPLE_COUNT_1_BIT){std::vector<VkAttachmentDescription> nl(descriptions.begin(),descriptions.end());bool any=false;
                     // [tile] DM_GFX_TILE_POISON: the twin clears to magenta instead, so a wrong coverage proof shows on any GPU (on Adreno sysmem
                     // DONT_CARE keeps the old contents and would hide it).
                     for(size_t k=0;k<nl.size() && k<p.images.size();k++)if(p.images[k]->aspects==VK_IMAGE_ASPECT_COLOR_BIT){nl[k].loadOp=tile_poison?VK_ATTACHMENT_LOAD_OP_CLEAR:VK_ATTACHMENT_LOAD_OP_DONT_CARE;any=true;}
-                    if(any){VkRenderPassCreateInfo r2=crp;r2.pAttachments=nl.data();VK(vkCreateRenderPass(cfg.device,&r2,nullptr,&e.noload));
+                    if(any){VkRenderPassCreateInfo r2=crp;r2.pAttachments=nl.data();VK(vkCreateRenderPass(cfg.device,&r2,nullptr,&e.noload));crashinfo::note_rp(e.noload,r2,"noload twin");
                         if(store_none_on || store_dead_on){LazyInfo &si=store_info[e.noload];si=store_info[e.pass];si.desc.assign(nl.begin(),nl.end());}}}   // [afbc] store twins of the noload twin
                 it=render_pass_cache.emplace(words,std::move(e)).first;}
             p.pass=it->second.pass;p.pass_noload=it->second.noload;p.definition=&it->second.definition;
         }
-        else{VK(vkCreateRenderPass(cfg.device,&crp,nullptr,&p.pass));gsync::note_made();VkRenderPass rpass=p.pass;retire_handle([rpass]{vkDestroyRenderPass(cfg.device,rpass,nullptr);});static PipelineDefinition invalid;p.definition=&invalid;}
+        else{VK(vkCreateRenderPass(cfg.device,&crp,nullptr,&p.pass));gsync::note_made();crashinfo::note_rp(p.pass,crp,"pass (no key)");VkRenderPass rpass=p.pass;retire_handle([rpass]{vkDestroyRenderPass(cfg.device,rpass,nullptr);});static PipelineDefinition invalid;p.definition=&invalid;}
     }
     Slot &slot=recording_slot();static std::vector<uint64_t> fb_key;fb_key.assign({uint64_t(p.pass),p.width,p.height});for(auto v:views)fb_key.push_back(uint64_t(v));
     // Cached render passes live until shutdown, so their framebuffers can outlive the frame; they go with the first of their
@@ -6242,7 +6307,7 @@ VkRenderPass store_twin(VkRenderPass base,uint32_t none,uint32_t dead){
     if(xbg_store_twin(desc.data(),uint32_t(desc.size()),none,dead,store_none_op,si.depth.attachment!=VK_ATTACHMENT_UNUSED)){
         VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=uint32_t(si.colors.size());sub.pColorAttachments=si.colors.data();sub.pDepthStencilAttachment=si.depth.attachment!=VK_ATTACHMENT_UNUSED?&si.depth:nullptr;
         VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};rp.attachmentCount=uint32_t(desc.size());rp.pAttachments=desc.data();rp.subpassCount=1;rp.pSubpasses=&sub;rp.dependencyCount=si.ndep;rp.pDependencies=si.dep;
-        if(vkCreateRenderPass(cfg.device,&rp,nullptr,&twin)!=VK_SUCCESS)twin=VK_NULL_HANDLE;}
+        if(vkCreateRenderPass(cfg.device,&rp,nullptr,&twin)!=VK_SUCCESS)twin=VK_NULL_HANDLE;else crashinfo::note_rp(twin,rp,"twin");}
     store_twins.emplace(key,twin);return twin;}
 // [r3] DM_GFX_LAZY_CLEAR (pipeline_audit.md 3.12). lazy_clear_open records the pass instead of beginning it; the clears of the
 // whole framebuffer that follow collect in lazy (later ones of the same aspect replace earlier ones, as they would overwrite them).
@@ -6273,7 +6338,7 @@ VkRenderPass lazy_twin(VkRenderPass base,uint32_t mask){
     std::vector<VkAttachmentDescription> desc=li.desc;for(size_t k=0;k<desc.size();k++){if(mask&(1u<<(2*k)))desc[k].loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;if(mask&(2u<<(2*k)))desc[k].stencilLoadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;}
     VkSubpassDescription sub{};sub.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sub.colorAttachmentCount=uint32_t(li.colors.size());sub.pColorAttachments=li.colors.data();sub.pDepthStencilAttachment=li.depth.attachment!=VK_ATTACHMENT_UNUSED?&li.depth:nullptr;
     VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};rp.attachmentCount=uint32_t(desc.size());rp.pAttachments=desc.data();rp.subpassCount=1;rp.pSubpasses=&sub;rp.dependencyCount=li.ndep;rp.pDependencies=li.dep;
-    VkRenderPass twin{};if(vkCreateRenderPass(cfg.device,&rp,nullptr,&twin)!=VK_SUCCESS)twin=VK_NULL_HANDLE;
+    VkRenderPass twin{};if(vkCreateRenderPass(cfg.device,&rp,nullptr,&twin)!=VK_SUCCESS)twin=VK_NULL_HANDLE;else crashinfo::note_rp(twin,rp,"store twin");
     lazy_twins.emplace(std::make_pair(base,mask),twin);return twin;}
 // Draw in the pending pass: begin it with the clears as load ops (fallback: the former recording, the pass stays open).
 void lazy_clear_begin(Pass &p,VkCommandBuffer cmd){
@@ -8179,6 +8244,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      gpu_policy=xbg_effective_family(gpu_family,sim_gpu);
      xbg_logf("NVN gpu family=%s (vendor=%#x \"%s\") policy family=%s DM_GFX_SIM_GPU=%s sim=%#x%s%s",xbg_gpu_family_name(gpu_family),properties.vendorID,properties.deviceName,
               xbg_gpu_family_name(gpu_policy),se&&*se?se:"-",sim_gpu,*unknown?" unknown token: ":"",unknown);
+     pvr_ladder_apply();   // [pvr-ladder] this boot's workaround step (before the switches below are read)
      // Per-family defaults (xbg_vendor_policy.h), each overridable by its DM_GFX_* switch ("0" / "1"); on Adreno they equal the old behaviour.
      gpguard::serial=xbg_env_or(getenv("DM_GFX_PIPE_SERIAL"),xbg_pipe_serial_default(gpu_policy));gpguard::guard=xbg_env_or(getenv("DM_GFX_PIPE_GUARD"),xbg_pipe_guard_default(gpu_policy));
      drvc::level=xbg_env_level(getenv("DM_GFX_COMPILE_LOCK"),xbg_compile_lock_default(gpu_policy),0,2);   // [pvr] before the warm-up / record / present threads
