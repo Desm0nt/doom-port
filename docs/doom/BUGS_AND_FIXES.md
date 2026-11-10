@@ -66,6 +66,8 @@ Adreno 750), драйвер Qualcomm, если не сказано иное.
 | 54 | — (внутреннее: перф-приёмы DOOM Eternal, KB PERF-E02/E04/E09/E13) | ретайр отчётов эпохи × отчёты; full barrier вокруг каждой dispatch; тяжёлые зависимости проходов; обход карт снапшотов и таблицы zero-copy; census-диагностика на каждой загрузке | `DM_GFX_REPORT_FAST`=1, `DM_GFX_CPU_FIX`=0x5, `DM_GFX_FAST_LOOKUPS`=1, `DM_GFX_DIAG`=auto; `DM_GFX_DISPATCH_RUNS`=0, `DM_GFX_RP_DEPS`=0 (§3.22) | собрано 08.11, хост-тесты зелёные, на телефоне не проверено |
 | 55 | Mali / PowerVR (модели на Mi 14): powervr 32.8 fps, mali 34.7 против 60 на Adreno; zero-copy=1 → 60, UBO dynamic=1 → 44.9 | zero-copy только на Adreno (у Mali / PowerVR нет cached-coherent памяти: кэшируемые AHB-страницы без flush); dynamic UBO выключен целиком на PowerVR (PPSSPP overrun); fence guard 2 ждал замок в неблокирующих опросах; crumbs на PowerVR | `DM_GFX_ZEROCOPY`=auto (Mali/PowerVR: uncached write-combined AHB, только CPU_UNCACHED-пулы, самотест `DM_GFX_ZC_SELFTEST`=1), `DM_GFX_UBO_DYNAMIC`=2 на PowerVR (только читаемые блоки), `DM_GFX_FENCE_TRYLOCK`=1, `DM_GFX_CRUMBS`=0 + `gfx-crumbs-auto` после hang-fatal, токен `noiocoherent` | собрано 09.11, хост-тесты зелёные, на телефоне не проверено (§2.50) |
 | 56 | Issue #40 (OnePlus Pad 2): (а) левый стик фиксированный — «персонаж не идёт, пока палец внутри круга», маленький стик трудно попасть; (б) 3D-карту нельзя крутить пальцем (только правым стиком геймпада / раскладки «два стика») | (а) стик движения — круг на месте, наклон от его центра; (б) карта крутится правым стиком, а тач-обзор идёт в канал гироскопа (как колесо, №46) | (а) плавающий стик движения (как D3PadView): появляется под пальцем в левых 45 % экрана, наклон — от точки касания; pref `float_stick` (DOOM: вкл.) и `float_zone` в «Экранный геймпад»; (б) хост вне геймплея (нет адаптивных кадров игры > 300 мс: карта, меню, пауза) не берёт `nativeLookDelta` → пад ведёт правый стик (`DM_TOUCH_LOOK_GAMEPLAY`=300) + «режим карты» по «−» (pref `map_key`, выход по «−» / B) (§2.51) | собрано 09.11, `check_frontend.sh` / `doom_prefs_check.py` / `doom_text_check.py` зелёные; на телефоне не проверено |
+| 57 | Issue #33 (Mali-G57): выбран PanVK zenith 26.3.1 в ⚙ → `Swapchain: VkResult -1000072003`, экран «Graphics initialization failed» без ⚙ — игрок заперт на драйвере до очистки данных; присланные логи другого драйвера перезаписаны (хранились только 2 запуска) | экран ошибки старта не даёт сменить драйвер, отката нет; ротация `boot.log` → `boot.prev.log` одна | откат на системный драйвер **в том же процессе** (`vk_fallback_to_system`: всё созданное уже уничтожено, таблица трамплинов сброшена, `DM_VK_DRIVER` снят, вторая инициализация), выбор в ⚙ сброшен, тост `toast_driver_init_failed` (13 языков, «сторонние драйверы экспериментальные»); если движок уже стартовал — перезапуск процесса; тест `DM_VK_FAKE_INIT_FAIL`; логи: 3 запуска (`boot.prev2.log`, `crash.prev2.txt`) + `logs/boot-<драйвер>.log` по последнему запуску каждого драйвера (§2.56) | собрано 10.11, `check_frontend.sh` / `doom_prefs_check.py` / `doom_text_check.py` зелёные, `tools/build_apk.ps1` → APK; на телефоне не проверено |
+| 58 | Mali / PowerVR: экспериментальные ускорения 0.5.x (zero-copy, UBO 2, fence trylock) могут ронять драйвер у игрока — лестница обходов была только на PowerVR и только для крэша в `dm-record`; после падения игрок видел только вылет | нет общего учёта графических сбоев и отката для Mali, нет перезапуска и объяснения | безопасный режим: `gfx-safe-mode` считает сбои (крэш в пакете / на графическом потоке / в драйвере / в zero-copy памяти, GPU hang, DEVICE_LOST) → ступени 1–3 (`DM_SAFE_MODE`, синоним `DM_PVR_LADDER`); откаты в процессе (zero-copy при самотесте, fence trylock, сборка пайплайнов по одному) с тостом; окно после сбоя; сторож `:guard` перезапускает или ставит уведомление; ⚙ Выкл/Авто/Вкл; тесты `DM_GFX_FAKE_GPU_CRASH`, `DM_GFX_FAKE_FALLBACK` | собрано 10.11, на телефоне не проверено (§2.57) |
 
 ---
 
@@ -3365,3 +3367,154 @@ Aiming и ползунок чувствительности гироскопа �
   переходит на `vkmap` сам. На таких телефонах zero-copy снова выключен (snapshot-путь, как 0.4.22).
 - **Урок:** перенос окна драйвера — не обход для Mali; проверять на настоящем Mali до включения по умолчанию. Следующие кандидаты для #3/#46:
   `VK_EXT_external_memory_dma_buf` экспорт из Vulkan + mmap того fd, или окно без переноса (gralloc lock).
+
+### 2.55 Zero-copy на Mali с read-only fd gralloc без переноса окон драйвера: свой записываемый dma-buf (`vkexport` / `dmaheap`) (10.11; v0.5.2-test1, на Mi 14 в модели)
+- **Задача:** вернуть zero-copy там, где AHB fd read-only (#3 MT6899/G720, #46 Dimensity 7300/G615), не повторяя ошибку §2.54. У обоих Mali в логах есть
+  `VK_EXT_external_memory_dma_buf` + `VK_KHR_external_memory_fd`.
+- **Сделано:** `vulkan_present.cpp` включает эти два расширения на не-Adreno (на Adreno — только при `DM_GFX_SIM_GPU` / `DM_GFX_ZC_MAP`), `dm_vk_dmabuf`.
+  `xbg_game.cpp` `zc::dmabuf_chunk`: `vkexport` — память Vulkan с `VkExportMemoryAllocateInfo(DMA_BUF)` + `vkGetMemoryFdKHR`; `dmaheap` — буфер из
+  `/dev/dma_heap/{system-uncached, mtk_mm-uncached, system, mtk_mm}` (`DMA_HEAP_IOCTL_ALLOC`, fd O_RDWR) + импорт (`VkImportMemoryFdInfoKHR`,
+  `vkGetMemoryFdPropertiesKHR`). Дальше тот же `mmap MAP_FIXED`, что у `fd`: окна драйвера никто не двигает, fd свой → склейка VMA (#21) работает.
+  auto: AHB `fd` → `vkexport` → `dmaheap` (каждый за самотестом); любая ошибка шага — обычный отказ с причиной в логе.
+- **Проверено на Mi 14 Ultra (модель `SIM_GPU=powervr`, Turnip; хозяин спал — только логи и скриншоты):** `DM_GFX_ZC_MAP=vkexport` — самотест pass,
+  `guest memory=1 mode=uncached view=vkexport`, уровень 60 fps, картинка чистая (скриншот), падений нет. `=dmaheap` — самотест pass (`heap system`),
+  `guest memory=1`, падений нет, но оба прогона не дошли до уровня (первый застрял в главном меню, второй — экран заблокирован после сна): уровень
+  с `dmaheap` не подтверждён → в auto он после `vkexport`. auto без `ZC_MAP` на Turnip — `fd` pass, как раньше.
+- **Риски на реальном Mali:** экспорт dma-buf и mmap его fd драйвером kbase, импорт dma-heap; при отказе — zero-copy выключен, как в 0.5.1. Не
+  публиковано: локальные `work/DOOM-Mobile-v0.5.2-test1-arm64(-android10).apk`.
+
+### 2.56 Откат на системный драйвер Vulkan, если сторонний не запустил графику, + логи по драйверам (issue #33, Mali-G57 MC2, PanVK zenith 26.3.1; 10.11; собрано, на телефоне не проверено)
+- **Симптом (issue #33):** игрок выбрал в ⚙ `panvk-zenith-26.3.1`. Драйвер загрузился и прошёл проверку подмены (`[vk] driver choice:
+  requested=panvk-zenith-26.3.1 active=libvulkan_panfrost.so verified=1`, `driverID=20 driverName="panvk"`), но `vkCreateSwapchainKHR` вернул
+  `-1000072003` (`VK_ERROR_INVALID_EXTERNAL_HANDLE`: PanVK не загрузил gralloc mapper) → `boot: Vulkan initialization failed -1000072003: Swapchain:
+  VkResult -1000072003` → экран «Graphics initialization failed…». На этом экране нет ⚙, crash-guard (§2.16) не срабатывает (кадров нет, но и
+  падения нет — каждый запуск честно показывает ошибку), так что игрок заперт на драйвере до очистки данных. Второе: логи прогона с другим
+  драйвером, которые он прислал, уже перезаписаны — хранились только `boot.log` + `boot.prev.log` и `crash.txt` + `crash.prev.txt`.
+- **Откат в том же процессе (просьба хозяина — без перезапуска APK):** `jni_android.c host_thread` → `vk_fallback_to_system`, если
+  `dm_android_vk_initialize` упал при активном стороннем драйвере (`vk_driver.c dm_vk_driver_custom()`: пакет реально подменил системный; при
+  `not-taken-over` и т. п. уже работал системный — повторять нечего). К этому моменту всё, что создано с драйвером, уже уничтожено
+  (`fail` → `cleanup_initialization`: swapchain, surface — окно отсоединено, device, instance). `dm_vk_driver_reset_to_system()` сбрасывает всю
+  таблицу трамплинов `dm_vk_table`, `g_gipa` / `g_create_instance` / `g_instance`, флаги `log_gpus` / `verify_game_instance` и снимает
+  `DM_VK_DRIVER`: следующий vk*-вызов снова идёт через `load_driver`, который открывает системный `libvulkan.so` в обычном namespace, как при
+  запуске с системным драйвером. `DM_ROMFS_OVERLAY` / `DM_GFX_ASTC_FORMATS` (их дописывает `astc_overlay_mount`) возвращаются к значениям до
+  первой попытки; `dm_vk_dmabuf` / `dm_vk_format_list` / `dm_vk_aux_queue` обнуляются в начале инициализации. Вторая попытка — всегда с системным
+  драйвером, петли нет: если и она упала, показывается обычный экран ошибки.
+  Библиотеку стороннего драйвера **не выгружаем** (`dlclose`): Android-загрузчик (`libvulkan.so`, его копия у adrenotools) держит открытый HAL до
+  конца процесса и сам его не выгружает, а у Mesa-драйвера могут оставаться свои потоки / atexit — выгрузка кода могла бы только уронить процесс.
+  Отображение остаётся, но не используется (ни одного живого объекта Vulkan).
+- **Когда в процессе нельзя:** ошибка уже внутри движка (`dm_vk_initialize` → `xbg_game_initialize`, у него своё состояние) —
+  `dm_android_vk_retry_safe()` = 0, статус `init-failed-restart`, `DmActivity.showBootFailure` → `VkDrivers.graphicsFailed()` = true → выбор уже
+  сброшен, файл `files/driver-fallback` с именем драйвера, перезапуск через `DmRestart` (§2.28); сообщение — в новом процессе из `choose()`.
+- **Статус для Java** (`nativeDriverStatus`, после второй попытки): `<драйвер>\tsystem\tinit-failed|init-failed-all|init-failed-restart\terror=<первая
+  ошибка>`. `VkDrivers.watch` (опрос раз в секунду до первых кадров; статус мог сначала показать ещё сторонний драйвер) → `initFailed`: pref `driver`
+  = "" (если игрок не успел выбрать другой), crash-guard снят, крошка
+  `[java] driver: <имя> failed to start (Vulkan initialization, error=…), fell back to system driver in this process; the saved choice is now the system driver`
+  и тост `toast_driver_init_failed` (EN: «Vulkan driver %1$s failed to start on this device, so the game now uses the system driver. Custom drivers are
+  experimental. You can pick it again in ⚙ → Vulkan driver.»; RU: «Драйвер Vulkan %1$s не смог запуститься на этом устройстве, поэтому игра теперь
+  использует системный драйвер. Сторонние драйверы — экспериментальные. Его можно снова выбрать в ⚙ → Драйвер Vulkan.»; все 13 языков — TSV
+  `frontend-common/i18n/gear_text.tsv` + `res/values*/doom_settings.xml`). В ⚙ строка «Сейчас используется: системный драйвер (X не запустился)» с
+  причиной `reasonText("init-failed")`. Общий тост `toast_driver_fallback` для этих причин не показывается.
+- **Нативный лог:** `boot: Vulkan initialization with the custom driver <имя> (<библиотека>) failed <rc>: <ошибка>`, `boot: driver fallback: everything
+  made with … is destroyed; initializing Vulkan again …`, `[vk] driver fallback: forgetting …`, снова `[vk] driver choice: requested=system …` и
+  `[vk] driver verify (game instance)` уже системного, затем `boot: driver fallback: Vulkan initialized with the system driver in N ms (… did not
+  start: …)` или `boot: driver fallback: the system driver failed too …`.
+- **Тест без Mali:** `DM_VK_FAKE_INIT_FAIL=1` в `dm/env` — инициализация падает сразу после созданного swapchain с тем же `-1000072003`, только
+  пока активен сторонний драйвер (на Adreno — Turnip из ⚙); `=2` — с любым драйвером (проверка «без петли»). `docs/SWITCHES.md`.
+- **Первые кадры** не покрыты: падение после инициализации — это уже crash / device lost, его ловит crash-guard (два запуска без первого кадра → системный).
+- **Логи:** `jni_android.c log_init` при старте `boot.prev.log` → `boot.prev2.log`, `boot.log` → `boot.prev.log` (2 прошлых запуска).
+  `CrashLog.java`: `mirrorBootLogs` копирует все три в `Download/DOOM Mobile/logs/` и текущий запуск ещё в `logs/boot-<драйвер>.log`;
+  `archiveAtStart` (в `onCreate`, до `nativeStart`) открывает три прошлых лога сразу (переименование не трогает открытый файл) и в фоне копирует
+  каждый в его `boot-<драйвер>.log` (от старого к новому; копия, которая новее своего запуска, не трогается) — так файл появляется и после падения,
+  когда `onStop` не было. Драйвер запуска — из первой строки `[vk] driver choice: requested=<имя>` (после отката файл остаётся у сломавшегося
+  драйвера), иначе из шапки `Vulkan driver asked: <имя>`; `system` → `boot-system.log`, `panvk-zenith-26.3.1` → `boot-panvk-zenith-26.3.1.log`; от пути
+  — последняя часть, символы вне `[A-Za-z0-9._-]` → `_`. Размер — как у остальных копий (`MIRROR_MAX` 8 МБ: голова 48 КБ + хвост; сам `boot.log`
+  режется по `DM_LOG_MAX_MB`). Отчёты: `crash.prev.txt` → `crash.prev2.txt`. `wipeForDiag` (diag-APK) удаляет и новые файлы.
+- **Файлы:** `vk_driver.c` (+ та же копия `frontend-common/native/vk/vk_driver.c`): `dm_vk_driver_custom/_requested/_reset_to_system/_note_fallback`;
+  `vulkan_present.cpp`: `dm_android_vk_retry_safe`, `fake_init_fail`, сброс глобалов; `jni_android.c`: `vk_fallback_to_system`, `log_init`;
+  `frontend-common/java/VkDrivers.java`: `initFailed`, `graphicsFailed`, `fallbackFile`, `reasonText`; `GearText.java` (из TSV, `gen_gear_text.py`);
+  `DmActivity.java`: `showBootFailure`, `restartApp(why)`, `CrashLog.archiveAtStart`; `CrashLog.java`. Синхронизация `sync_frontend.sh` принесла и
+  `GearPages.java` из frontend-common (новая перегрузка `pictureShape(..., onPick)` от TL2, на DOOM не влияет). Бэкапы — `work/bak_fallback/`.
+- **Проверка (без телефона):** `frontend-common/tools/check_frontend.sh` → `javac OK`; `doom_prefs_check.py` → `pref keys: IDENTICAL` (новый pref-ключ
+  не нужен: заметка о перезапуске — файл `files/driver-fallback`); `doom_text_check.py` → 910 пар ключ×язык = TSV; `tools/build_apk.ps1` →
+  `work/DOOM-port-debug.apk`, натив без предупреждений.
+- **Проверить на телефоне (Adreno):** `DM_VK_FAKE_INIT_FAIL=1` + Turnip в ⚙ → игра стартует на системном, тост, в ⚙ выбран системный, в логе строки
+  выше; `=2` → экран ошибки, без перезапусков; `logs/boot-turnip27.log` и `boot-system.log` рядом, `boot.prev2.log`. На Mali #33 — реальный PanVK.
+- **Риски:** повторное подключение окна после swapchain другого загрузчика (adrenotools-копия) — на Adreno проверяется фейком (swapchain создаётся и
+  уничтожается настоящий); у PanVK на Mali swapchain не создался вовсе. Отображённая библиотека стороннего драйвера остаётся в памяти процесса.
+
+### 2.57 Безопасный режим графики для Mali / PowerVR: счётчик графических сбоев → ступени обходов, откаты в процессе с сообщением, сторож-перезапуск после падения (10.11; собрано, на телефоне не проверено)
+- **Задача (хозяин).** Ускорения 0.5.x для Mali / PowerVR (zero-copy режим 2 и окна §2.52/§2.55, `UBO_DYNAMIC=2`, `FENCE_TRYLOCK`) — экспериментальные;
+  если на телефоне игрока они роняют драйвер, игра должна сама откатываться на старое поведение, говорить об этом игроку и не оставлять его
+  с вылетом на старте. Обобщение лестницы PowerVR §2.53 (только PowerVR, только крэш в пакете `dm-record`) на Mali и PowerVR.
+- **1. Счётчик и ступени** (`xbg_safe_mode.h` — чистые функции + `tests/safe_mode_test.cpp`; `xbg_game.cpp` ns `safemode`). Семейство — то же, что
+  у политик: реальное + `DM_GFX_SIM_GPU` (модели mali / powervr на Mi 14 включаются). Сбой записывает `xbg_safe_mode_record` (один раз за процесс,
+  signal-safe: open / read / write / fsync / close) в `DM_FILES_DIR/gfx-safe-mode`: `count`, `step` (ступень этого запуска), `pid`, `time` (мс), `family`,
+  `why`. Что считается сбоем: (а) крэш внутри пакета `dm-record`; (б) крэш на графическом потоке (`dm-gfx`, `dm-record`, `dm-present`,
+  `dm-crumbs`, `dm-acquire`, потоки драйвера `mali-*` / `pvr*` / `IMG*` / `Vk*` / `tu_*` / `pan*`); (в) pc или lr в библиотеке GPU-драйвера
+  (`vulkan*`, `*mali*`, `GLES_`, `pvr`, `IMG`, `srv_um`, `freedreno`, `panfrost`, `panvk`, …); (г) SIGSEGV/SIGBUS по адресу в чанке zero-copy;
+  (д) `fence_fatal` (GPU hang / ошибка fence, пишется до fatal); (е) fatal с `VK_ERROR_DEVICE_LOST` / `-4` (`xbg_fatalf`). Классификатор —
+  `xbg_crash_classify` (слабый, `host/crash.c` после строки `crash thread`), прочие падения в лог: `safe mode: crash … not counted`.
+  Решение — `xbg_safe_mode_boot` в `vulkan_present.cpp` сразу после выбора физического устройства (**до** `vkCreateDevice`: при `ZEROCOPY=0`
+  dma-buf-расширения §2.55 не включаются), идемпотентно (вторая инициализация после отката драйвера §2.56 ничего не меняет); движок
+  (`safe_mode_engine_init`, бывший `pvr_ladder_apply`) сверяет семейство с `gpu_policy` и взводит тестовые таймеры.
+  Ступень = min(count, 3), `DM_SAFE_MODE` (`0`/`off`, `on` = не меньше 1, `1..3` ровно): **1** — `ZEROCOPY=0`, `ZC3_SELFTEST=0`, `FENCE_TRYLOCK=0`,
+  PowerVR `UBO_DYNAMIC=0` (Mali остаётся 1 — значение 0.4.22); **2** — + тайловые политики (`NOLOAD`, `STORE_DEAD`, `STORE_NONE`, `LEAN_USAGE`,
+  `TILE_BARRIER`, `LAZY_CLEAR`, `TILE_AREA` = 0; старая ступень 1 лестницы); **3** — + `COMPILE_LOCK=2`, `NOOUT_MASK=0`, `GS_PASSTHRU=0` (старые 2–3).
+  `setenv(…, 0)`: значение игрока из `dm/env` важнее, в логе отдельно `The player's own (dm/env) values kept`. Счётчик не сбрасывается сам
+  (иначе игра снова упадёт); сбрасывает смена выбора в ⚙. **Совместимость:** `DM_PVR_LADDER` — синоним (PowerVR, без `DM_SAFE_MODE`):
+  0→0, 1→2, 2/3→3; файл `gfx-pvr-ladder` c переносится в `gfx-safe-mode` как count c+1 и удаляется; `DM_PVR_LADDER_FAKE` = `DM_GFX_FAKE_GPU_CRASH=<с>:rec`.
+  Тест на Adreno: `DM_GFX_FAKE_GPU_CRASH=<с>[:rec|lost|hang]` (только Mali / PowerVR / модель).
+- **2. Откаты в процессе (без перезапуска) + тост.** Переключаемо на лету: (а) **zero-copy** — решается до первого пула (`zc::decide` при
+  init): самотест не прошёл / не запустился в режиме auto на Mali / PowerVR → snapshot-путь в этом же процессе, событие `zc`;
+  (б) **`FENCE_TRYLOCK` → 0 и `FENCE_GUARD` 0 → 1** (атомики, читаются на каждый вызов) после восстановленной ошибки fence (ранний `VK_TIMEOUT`,
+  дожатый опросом; провал ожидания воркера сброса пулов, `pool_reset_failed`), событие `fence`; (в) **`PIPE_SERIAL` → 1 и `COMPILE_LOCK` 0 → 1**
+  после пайплайна, который драйвер не собрал (`gpguard::record`; его draw и так пропускаются), событие `pipe`. Для (в) `drvc::level` и
+  `gpguard::serial` стали атомиками, пара `xbg_drvc_lock` / `xbg_drvc_unlock` (поток презентера) отпускает только то, что взяла сама
+  (`thread_local`), — уровень можно поднять между её вызовами. Каждый откат — один раз за запуск, только Mali / PowerVR. **Не на лету**
+  (нужен перезапуск, т.е. ступень): zero-copy после того, как пулы уже на AHB/dma-buf по гостевым адресам `MAP_FIXED` и к ним привязаны
+  `VkBuffer` (снять = переложить всю гостевую память и пересоздать буферы); `UBO_DYNAMIC` (раскладки наборов / pipeline layout и пайплайны
+  уже собраны и в кэшах); тайловые политики (render pass и твины в кэше, образы `LEAN_USAGE` уже созданы); `NOOUT_MASK` / `GS_PASSTHRU`
+  (вшиты в собранные пайплайны и SPIR-V); понижение `FENCE_GUARD`. Тексты: `toast_safe_zc` (один раз на версию приложения — MediaTek
+  проваливает самотест на каждом старте), `toast_safe_fence`, `toast_safe_pipe`. Тест: `DM_GFX_FAKE_FALLBACK=zc,fence:<с>,pipe:<с>`.
+- **3. Сторож** (`frontend-common/java/DmGuard.java`, `android:process=":guard"`, не exported, `START_NOT_STICKY`). `SafeMode.startGuard` (Mali /
+  PowerVR по решению натива) стартует сервис с pid, Binder-токеном (`linkToDeath`; запасной путь — опрос `/proc/<pid>`) и `PendingIntent`
+  на `DmActivity` (`NEW_TASK|CLEAR_TASK`, extra `dmSafeRelaunch=guard`), созданным, пока игра на экране (Android 15+: creator opt-in
+  `setPendingIntentCreatorBackgroundActivityStartMode`, 16+: `ALLOW_ALWAYS`); повторно в каждом `onResume` (фоновые сервисы система
+  останавливает через ~1 мин). Смерть процесса → перезапуск **только** если `gfx-safe-mode` называет этот pid и `time` не старше 2 мин;
+  иначе ничего (обычный выход, свайп из недавних, LMK, зависание, не-графический крэш; force-stop убивает и сторожа). Не перезапускает,
+  если умерший запуск сам был автоперезапуском и упал раньше первых кадров (`guard-first`) или в первые 20 с, и после 3 перезапусков за
+  10 мин; сообщение тогда ждёт ручного старта. Отправка — с sender opt-in (Android 14+ `setPendingIntentBackgroundActivityStartMode`);
+  если за 5 с нового процесса игры нет (Android запретил старт из фона) — уведомление «… упала в графическом драйвере — нажмите, чтобы
+  перезапустить в безопасном режиме» (канал «Восстановление после падения»; Android 13+ только при выданном `POST_NOTIFICATIONS`, иначе
+  пропуск). Разрешение спрашивается **один раз** — сразу после первого окна безопасного режима (не на обычном старте). Все решения —
+  строки `files/guard.log` (следующий старт переносит их в `boot.log`: `[java] safe mode guard: …`) и logcat `dm-guard`.
+- **4. Окно после сбоя** (`SafeMode.atStart` в `onCreate`, `gameStarted` после `nativeStart`): `gfx-safe-mode` с `time` ≠ `gfx-safe-mode.seen` →
+  после решения натива (опрос `nativeSafeModeStatus` раз в 150 мс, до 15 с) — `AlertDialog` «Безопасный режим графики»: сбой, какая ступень
+  включена (или «выключен в ⚙ / dm/env»), «следующий сбой — следующая ступень» / «это последняя ступень», «изменить в ⚙», где логи
+  (`CrashLog.dir`, по умолчанию Download/DOOM Mobile/logs), техническая причина в скобках; при автоперезапуске — «перезапущена автоматически».
+  Одинаково для автоперезапуска, тапа по уведомлению и ручного старта; на не-Mali/PowerVR (сбой из модели, теперь без неё) — молча отмечается.
+- **5. ⚙ «Безопасный режим графики (Mali / PowerVR)»** (`GearPages.safeMode`, после драйвера; только Mali / PowerVR / модель): Выкл / Авто / Вкл →
+  pref `safe_mode` 0/1/2 → `DM_SAFE_MODE` 0 / не задан / `on`; строка «Этот запуск: шаг N из 3 (учтено падений графики: K)»; смена обнуляет
+  счётчик. Общий код — `frontend-common` за интерфейсом порта: `GearHost.safeMode()` / `safeModeStatus()` / `safeModeEvent()` / `logsDir()`
+  (по умолчанию null — другие порты без изменений), `SafeMode.java`, `DmGuard.java` (едут в `sync_frontend.sh` вместе с ⚙, без opt-in инертны).
+- **Логи.** Натив: `NVN safe mode: step N of 3 on <family> (<how>; K graphics failure(s) counted in …/gfx-safe-mode, last: …; DM_SAFE_MODE=… DM_PVR_LADDER=…): <ступень>. Set: …`,
+  на Adreno `NVN safe mode: not used on adreno …`; при сбое `[dm] safe mode: graphics failure on <family> (<why>): gfx-safe-mode count -> N …`;
+  `[dm] crash pass: … safe-mode step this boot N`; на лету `NVN safe mode (live): …`; тест `NVN safe mode test: …`. Java: `[java] safe mode: …`
+  (решение натива, окно, сторож запущен, события), `[java] safe mode guard: …`.
+- **Файлы.** `gfx/vulkan/engine/xbg_safe_mode.h` (новый), `tests/safe_mode_test.cpp` (новый, WSL g++ ASan/UBSan — зелёный), `xbg_game.cpp`
+  (ns `safemode`, `xbg_safe_mode_boot/record/status/event`, `xbg_crash_classify`, `safe_mode_engine_init`, `safe_mode_retire_tick`, `safemode::live_fence`,
+  `gpguard::live_pipe`, `fence_fatal`, `xbg_fatalf`, `zc::decide`, `drvc` / `gpguard::serial` атомики), `host/crash.c` (вызов классификатора с
+  библиотеками pc и lr), `android/vulkan_present.cpp` (ранний вызов, dma-buf при `ZEROCOPY=0` не включается), `android/jni_android.c`
+  (`nativeSafeModeStatus` / `nativeSafeModeEvent`), `DmActivity.java`, `DoomGear.java` (+ копия `frontend-common/migration/doom/DoomGear.java`),
+  `AndroidManifest.xml` (сервис `.DmGuard`, `POST_NOTIFICATIONS`), `res/values*/doom_settings.xml` (24 строки × 13 языков = TSV);
+  frontend-common: `SafeMode.java`, `DmGuard.java` (новые), `GearHost.java`, `GearPages.java`, `GearText.java` (сгенерирован), `i18n/gear_text.tsv`,
+  `tools/sync_frontend.sh`, `migration/doom_prefs_check.py` (новый ключ `safe_mode`). Бэкапы — `work/bak_safemode/` (frontend-common и KB — в
+  `_frontend-common/`, `_docs-port-kb/`).
+- **Проверка (без телефона).** `safe_mode_test` — зелёный; `fence_guard_source_test.py`, `compile_lock_source_test.py`, `source_structure_test.py` —
+  PASS (`pipeline_memo_source_test.py` падал и до изменений — поля `State`); `check_frontend.sh` → `javac OK`; `doom_prefs_check.py` →
+  `pref keys: IDENTICAL`; `doom_text_check.py` → 1222 пары = TSV; `tools/build_apk.ps1` → `work/DOOM-port-debug.apk`, новых предупреждений нет;
+  gradle `-PdmMinSdk=29` — собрано, lint minSdk 29 — новых NewApi/ошибок нет (76 ошибок lint старые: MissingTranslation и др.).
+- **Риски.** (1) Сторож — отдельный процесс (~20–30 МБ), только на Mali / PowerVR. (2) Android 10–16 почти всегда запрещает старт активности
+  из фона без видимого окна: ожидаемый путь — уведомление, а без `POST_NOTIFICATIONS` — только окно при следующем ручном старте.
+  (3) Ступень 3 на Mali выключает `NOOUT_MASK` — возможен чёрный цвет у depth-only draw (d2r #179); ступень 3 — крайняя мера по просьбе хозяина.
+  (4) Классификатор по библиотеке pc/lr может посчитать сбоем крэш, где драйвер — лишь жертва (порча памяти игрой); цена — ступень обходов, не потеря.

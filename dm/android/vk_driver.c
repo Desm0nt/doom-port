@@ -53,6 +53,10 @@ static char g_status[768];
 const char *dm_vk_driver_status(void) { return g_status; }
 static char g_expect_lib[1024];   // [DOOM] the custom library we claim runs (checked again on the game's own instance), "" = system
 static int g_custom;              // 1 = the active driver is a custom package
+static char g_requested[160];     // [DOOM] DM_VK_DRIVER as load_driver saw it ("" = system)
+static int g_gpus_logged, g_game_verified;   // [DOOM] log_gpus / verify_game_instance once per loaded driver (again after a fallback)
+int dm_vk_driver_custom(void) { return g_custom; }
+const char *dm_vk_driver_requested(void) { return g_requested; }
 
 // [DOOM] Hardware facts for the driver choice (BUGS_AND_FIXES 2.22, 2.25). Turnip (Mesa freedreno) drives the Adreno through the Qualcomm
 // kernel driver KGSL: without /dev/kgsl-3d0 (Mali, PowerVR, Xclipse, Maleoon...) it cannot work at all, and loading it there only risks a
@@ -268,6 +272,7 @@ static void load_driver(void) {
     const int forced = force && *force == '1';
     probe_t pr; memset(&pr, 0, sizeof pr); int verified = 0; const char *vwhy = "no custom driver loaded";
     char family_s[16] = "-";
+    snprintf(g_requested, sizeof g_requested, "%s", req ? req : "");
 #ifdef DM_ADRENOTOOLS
     const char *drv = req, *hooks = getenv("DM_NATIVE_LIB_DIR"), *pkgs = getenv("DM_DRIVERS_DIR"), *direct = getenv("DM_VK_DRIVER_DIRECT");
     char path[1024] = "", pkgdir[768] = "", meta_name[256] = "", meta_lib[256] = "", meta_abi[96] = "";
@@ -463,8 +468,8 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *ci, const
                 strncmp(dm_vk_names[i], "vkEnumerateInstance", 19))
                 dm_vk_table[i] = NULL;
         pthread_mutex_unlock(&g_lock);
-        static int logged; if (!logged) { logged = 1; log_gpus(*out); }   // [DOOM] breadcrumbs: once per run
-        static int verified_once; if (!verified_once) { verified_once = 1; verify_game_instance(*out); }   // [DOOM] does the claimed driver run?
+        if (!g_gpus_logged) { g_gpus_logged = 1; log_gpus(*out); }   // [DOOM] breadcrumbs: once per run (per driver, after a fallback)
+        if (!g_game_verified) { g_game_verified = 1; verify_game_instance(*out); }   // [DOOM] does the claimed driver run?
     }
     return r;
 }
@@ -484,4 +489,32 @@ __attribute__((visibility("hidden"))) void *dm_vk_resolve(unsigned i) {
     }
     pthread_mutex_unlock(&g_lock);
     return p;
+}
+
+// [DOOM] BUGS_AND_FIXES 2.56 (issue #33): the in-process fallback to the system driver after the game's Vulkan initialization failed with a
+// custom driver (jni_android.c host_thread). The caller has destroyed every Vulkan object it made with that driver (vulkan_present.cpp
+// cleanup_initialization: swapchain, surface, device, instance), so nothing of the custom driver is in use any more. Here every resolved
+// trampoline slot and the loader entry points are forgotten and DM_VK_DRIVER is unset: the next vk* call runs load_driver again, which
+// opens the system loader (libvulkan.so) in the default namespace, as for a launch with the system driver. The custom driver's loader copy
+// (adrenotools' private namespace) is not dlclosed: the Android loader keeps the HAL it opened for the life of the process (it never
+// unloads a driver), and a Mesa driver's code may still be referenced by its own helper threads / atexit handlers, so unloading it could
+// only crash; the mapping stays, idle.
+void dm_vk_driver_reset_to_system(void) {
+    pthread_mutex_lock(&g_lock);
+    LOG("[vk] driver fallback: forgetting %s (requested %s), the next Vulkan call loads the system driver", g_driver_name, g_requested[0] ? g_requested : "system");
+    for (int i = 0; i < DM_VK_COUNT; i++) dm_vk_table[i] = NULL;
+    g_gipa = NULL; g_create_instance = NULL; g_instance = VK_NULL_HANDLE;
+    g_custom = 0; g_expect_lib[0] = 0; g_gpus_logged = g_game_verified = 0;
+    snprintf(g_driver_name, sizeof g_driver_name, "system");
+    unsetenv("DM_VK_DRIVER");
+    pthread_mutex_unlock(&g_lock);
+}
+// [DOOM] 2.56: the status the app reads after such a fallback: "<failed driver>\tsystem\t<reason>\terror=<the first failure>", reason
+// init-failed (the system driver started in this process), init-failed-all (the system driver failed too: the start error is shown) or
+// init-failed-restart (no in-process retry possible: the app restarts with the system driver). VkDrivers.java turns it into the message.
+void dm_vk_driver_note_fallback(const char *failed, const char *reason, const char *error) {
+    pthread_mutex_lock(&g_lock);
+    char e[400]; snprintf(e, sizeof e, "%s", error ? error : ""); for (char *c = e; *c; c++) if (*c == '\t' || *c == '\n') *c = ' ';
+    snprintf(g_status, sizeof g_status, "%s\tsystem\t%s\terror=%s", failed ? failed : "", reason, e);
+    pthread_mutex_unlock(&g_lock);
 }

@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">Utilisé actuellement : pilote système (%1$s n\'a pas démarré)</string>
     <string name="toast_driver_fallback">Le pilote Vulkan %1$s n\'a pas démarré sur cet appareil (%2$s) ; le pilote système est utilisé.</string>
     <string name="toast_driver_crashed">Le dernier lancement avec le pilote Vulkan %1$s a planté ou s\'est figé ; le pilote système est donc utilisé. Vous pouvez le resélectionner dans les paramètres.</string>
+    <string name="toast_driver_init_failed">Le pilote Vulkan %1$s n\'a pas pu démarrer sur cet appareil ; le jeu utilise donc maintenant le pilote système. Les pilotes personnalisés sont expérimentaux. Vous pouvez le resélectionner dans ⚙ → Pilote Vulkan.</string>
     <string name="gear_lang">Langue du jeu (textes et voix)</string>
     <string name="gear_lang_system">Comme le système</string>
     <string name="gear_aa">Aide à la visée</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s : disponible une fois le profil du jeu chargé (ou modifiez-le dans le menu du jeu)</string>
     <string name="gear_game_settings_note">L\'aide à la visée, la visée par mouvement et sa sensibilité sont des réglages du jeu lui-même (réglages de la manette dans le menu du jeu) : un changement ici ou là-bas apparaît aux deux endroits et est conservé dans le profil du jeu.</string>
     <string name="toast_game_setting_failed">Impossible de modifier ce réglage du jeu ici ; utilisez les réglages de la manette dans le menu du jeu</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Mode graphique sûr (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Désactivé</string>
+    <string name="gear_safe_auto">Auto</string>
+    <string name="gear_safe_on">Activé</string>
+    <string name="gear_safe_note">Désactivé : toujours les réglages rapides de la version 0.5 (expérimental). Auto : ils sont désactivés étape par étape après un plantage du pilote graphique. Activé : toujours désactivés (plus lent, mais plus compatible) – essayez-le si vous voyez des scintillements, des couleurs fausses ou d\'autres problèmes d\'image.</string>
+    <string name="gear_safe_now">Ce lancement : étape %1$d sur 3 (plantages graphiques comptés : %2$d)</string>
+    <string name="safe_title">Mode graphique sûr</string>
+    <string name="safe_crash">Le dernier lancement s\'est terminé par un plantage du pilote graphique.</string>
+    <string name="safe_step_1">L\'étape 1 sur 3 est active : les accélérations expérimentales de la version 0.5 pour Mali / PowerVR (mémoire zero-copy et autres) sont désactivées.</string>
+    <string name="safe_step_2">L\'étape 2 sur 3 est active : les accélérations de la version 0.5 et les optimisations pour GPU à tuiles sont désactivées.</string>
+    <string name="safe_step_3">L\'étape 3 sur 3 est active : le mode le plus compatible (et le plus lent) – les accélérations, les optimisations pour GPU à tuiles et certains raccourcis de shaders sont désactivés.</string>
+    <string name="safe_step_0">Le mode sûr est désactivé (⚙ ou dm/env), rien n\'a donc été modifié.</string>
+    <string name="safe_next">Si le jeu plante à nouveau, l\'étape suivante sera essayée.</string>
+    <string name="safe_last">C\'est la dernière étape.</string>
+    <string name="safe_gear">Vous pouvez le modifier dans ⚙ → Mode graphique sûr.</string>
+    <string name="safe_logs">Si les plantages continuent, envoyez les fichiers de %1$s avec un rapport de bug.</string>
+    <string name="safe_relaunched">Le jeu a été redémarré automatiquement.</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">La mémoire zero-copy (une accélération expérimentale) n\'a pas réussi son test sur cet appareil et est désactivée pour ce lancement.</string>
+    <string name="toast_safe_fence">Le pilote graphique a signalé une erreur de synchronisation ; le jeu s\'est rétabli et utilise un mode de synchronisation plus sûr pour ce lancement.</string>
+    <string name="toast_safe_pipe">Le pilote graphique n\'a pas pu compiler un shader ; certains effets peuvent manquer. Les shaders sont désormais compilés un par un pour ce lancement.</string>
+    <string name="notif_safe_channel">Récupération après plantage</string>
+    <string name="notif_safe_title">%1$s a planté dans le pilote graphique</string>
+    <string name="notif_safe_text">Touchez pour redémarrer en mode sûr.</string>
 </resources>

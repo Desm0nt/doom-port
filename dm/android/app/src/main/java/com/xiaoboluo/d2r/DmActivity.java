@@ -91,9 +91,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     static native String nativeDriverStatus();          // [DOOM] "<requested>\t<active>\t<reason>" (vk_driver.c), "" before the driver loads
     static native void nativeLog(String text);          // [DOOM] a "[java] ..." breadcrumb line into boot.log (jni_android.c)
     static native String nativeLogPath();               // [DOOM] this run's boot.log ("" before nativeStart)
+    // [safe-mode] BUGS_AND_FIXES 2.57 (jni_android.c, xbg_game.cpp namespace safemode): the boot decision and the next in-process fallback message
+    static native String nativeSafeModeStatus();
+    static native String nativeSafeModeEvent();
     // [DOOM] crash logs (CrashLog.java, BUGS_AND_FIXES 2.22): breadcrumbs from before the native log exists wait in pendingCrumbs
     private static volatile boolean nativeLogReady;
-    private static boolean crashHandlerInstalled;
+    private static boolean crashHandlerInstalled, logsArchived, driverRestart;
     private static String lastStartError;
     private final java.util.ArrayList<String> pendingCrumbs = new java.util.ArrayList<>();
 
@@ -123,6 +126,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         current = new WeakReference<>(this);
         if (DOOM) updates = new UpdateNotice(new Updates());   // [DOOM] 2.41: started at the first frames (VkDrivers.gameStarted callback)
         if (DOOM) checkLastRun();   // [DOOM] crash report of the last run, before anything of this one is written
+        if (DOOM) { safe = new SafeMode(this); safe.atStart(getIntent()); }   // [safe-mode] 2.57: a graphics failure of an earlier run (its notice comes after nativeStart)
+        if (DOOM && !nativeLogReady && !logsArchived) { logsArchived = true; CrashLog.archiveAtStart(getApplicationContext()); }   // [DOOM] 2.56: boot-<driver>.log of the last runs
         displays = getSystemService(DisplayManager.class);
         if (displays != null) displays.registerDisplayListener(this, null);
         inputs = getSystemService(InputManager.class);
@@ -204,6 +209,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public String driverStatus() { return nativeDriverStatus(); }
     @Override public float[] frameStats() { try { nativeFrameStats(gearStats); } catch (Throwable t) { gearStats[0] = 0; } return gearStats; }
     @Override public File driverImportDir() { return new File(GameFolder.dir(this), "drivers"); }   // [DOOM] <game folder>/drivers (issue #11)
+    // [safe-mode] 2.57: safe graphics mode for Mali / PowerVR (frontend-common SafeMode / DmGuard, GearPages.safeMode in DoomGear)
+    private SafeMode safe;
+    @Override public SafeMode safeMode() { return safe; }
+    @Override public String safeModeStatus() { if (!libraryLoaded) return null; try { return nativeSafeModeStatus(); } catch (UnsatisfiedLinkError e) { return null; } }
+    @Override public String safeModeEvent() { if (!libraryLoaded) return null; try { return nativeSafeModeEvent(); } catch (UnsatisfiedLinkError e) { return null; } }
+    @Override public File logsDir() { return CrashLog.dir(this); }
     // [DOOM] diagnostics APK with -PdmDiagDriver=<pkg> (diag3/4): always that driver on an Adreno 6xx+, whatever was saved or the crash guard decided
     // before (VkDrivers.choose drops the guard file). Without it (diag6, owner 06.11) the saved choice and the crash guard work as in a release build.
     @Override public String forcedDriver() { return BuildConfig.DM_DIAG && !BuildConfig.DM_DIAG_DRIVER.isEmpty() && VkDrivers.turnipPossible() ? BuildConfig.DM_DIAG_DRIVER : null; }
@@ -533,7 +544,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (DOOM) padSurfaceEnv();   // [DOOM] 2.45: dm/env is read by nativeStart, so its pad switches apply from here
         if (touchOverlay != null) touchOverlay.setInputEnabled(true);
         if (DOOM) {   // [front] the driver notice from the start, then the crash guard / fallback / first frames watch (VkDrivers.gameStarted)
-            drivers.gameStarted(view, () -> { if (updates != null) updates.start(); });   // [DOOM] 2.41: the update / game-files checks at the first frames
+            drivers.gameStarted(view, () -> { if (safe != null) safe.firstFrames(); if (updates != null) updates.start(); });   // [DOOM] 2.41: the update / game-files checks at the first frames
+            if (safe != null) safe.gameStarted(view);   // [safe-mode] 2.57: the native decision, the notice after a graphics crash, the crash guard, live messages
             if (BuildConfig.DM_DIAG) view.postDelayed(diagMirror, 60_000);
         }
         nativeFocus(3);
@@ -670,12 +682,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
             return;
         }
         android.widget.Toast.makeText(this, getString(R.string.folder_set_now, what), android.widget.Toast.LENGTH_SHORT).show();
-        if (libraryLoaded) { restartApp(); return; }
+        if (libraryLoaded) { restartApp("the new game folder"); return; }
         GameFolder.forget(); lastStartError = null;
         startHost();   // not resumed yet (back from the picker): onResume runs it
     }
-    private void restartApp() {
-        crumb("restart in a new process for the new game folder");
+    private void restartApp(String why) {
+        crumb("restart in a new process for " + why);
         CrashLog.sessionEnd(this);   // not a crash
         if (libraryLoaded) CrashLog.mirrorBootLogs(this);
         startActivity(new Intent(this, DmRestart.class).putExtra("pid", android.os.Process.myPid()));
@@ -758,6 +770,12 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
 
     private void showBootFailure() {
         releaseTouches();
+        // [DOOM] 2.56 (issue #33): Vulkan failed with a custom driver and the native side could not retry with the system driver in this
+        // process (VkDrivers.graphicsFailed: the choice is already reset): a new process starts with the system driver and says why
+        if (DOOM && bootFailure == -6 && (driverRestart || drivers.graphicsFailed())) {
+            if (!driverRestart) { driverRestart = true; restartApp("the Vulkan driver fell back to the system driver"); }
+            return;
+        }
         showStartError(getString(bootFailure == -6 ? R.string.dmAndroidGraphicsFailed : R.string.dmAndroidHostStopped));
     }
 
@@ -933,7 +951,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     @Override public void onDisplayAdded(int id) { updateRefresh(); }
     @Override public void onDisplayRemoved(int id) { updateRefresh(); }
     @Override public void onDisplayChanged(int id) { updateRefresh(); }
-    @Override protected void onResume() { super.onResume(); resumed = true; immersiveBars(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); } }
+    @Override protected void onResume() { super.onResume(); resumed = true; immersiveBars(); startHost(); updateRefresh(); if (started) { nativeFocus(3); if (touchOverlay != null && bootFailure == 0) touchOverlay.setInputEnabled(true); if (safe != null) safe.onResume(); } }
     @Override protected void onPause() { resumed = false; if (inputDialog != null) inputDialog.dismiss(); releaseTouches(); if (touchOverlay != null) touchOverlay.setInputEnabled(false); if (started) nativeFocus(0); super.onPause(); }
     @Override protected void onStart() { super.onStart(); if (started) { nativeFocus(2); if (DOOM && bootFailure == 0) CrashLog.session(this, "fg"); } }   // [DOOM] session state for CrashLog
     @Override protected void onStop() { if (started) { nativeFocus(1); if (DOOM && bootFailure == 0) CrashLog.session(this, "bg"); }

@@ -25,6 +25,11 @@ import java.util.Locale;
 //     (watch). A file left over means the last launch died before its first frame with that driver: after GUARD_STRIKES such launches in a
 //     row the system driver is chosen (saved, so the player sees it and can pick the package again) and a message says why. Two strikes,
 //     not one: a launch killed by hand (or by a debug script) before its first frame is not a crash;
+//   - (DOOM 2.56, issue #33) the fallback after the game's Vulkan initialization failed with a custom driver: the native side retries with the
+//     system driver in the same process (jni_android.c vk_fallback_to_system, status reason init-failed / init-failed-all) or asks for a
+//     restart (init-failed-restart: the port calls graphicsFailed() on its Vulkan boot failure and restarts when it returns true; the
+//     message then comes at the next start from files/driver-fallback). Either way the saved choice becomes the system driver, boot.log
+//     gets "[java] driver: <name> failed to start ..., fell back to system ..." and the player sees toast_driver_init_failed;
 //   - the package helpers the gear's driver list and DriverManager use (labels, families, problems, the reason texts).
 // Prefs (GearHost.gamePrefs, "doom_graphics"): "driver" ("" = system, else a folder under files/drivers), "driver_removed" (names the
 // player deleted in the manager: the manifest updater does not fetch them again).
@@ -37,7 +42,7 @@ final class VkDrivers {
 
     final GearHost host;
     private String notice;   // shown once the game view is up (started)
-    private boolean guardDone, statusDone, firstFrameDone;
+    private boolean guardDone, statusDone, firstFrameDone, initFailHandled;
     private long startedAt;
     private Runnable onFirstFrames;   // gameStarted's callback, run once right after the "first frames presented" line (DOOM: UpdateNotice.start, 2.41)
 
@@ -46,6 +51,7 @@ final class VkDrivers {
     private String t(String ru, String en) { return Ui.t(a(), ru, en); }
     File dir() { return new File(a().getFilesDir(), "drivers"); }
     private File guardFile() { return new File(a().getFilesDir(), "driver-trying"); }
+    private File fallbackFile() { return new File(a().getFilesDir(), "driver-fallback"); }   // 2.56: "<name>" of a driver whose start failed (restart path)
     private SharedPreferences prefs() { return host.gamePrefs(); }
 
     // ---- at the start, before the library loads
@@ -69,6 +75,10 @@ final class VkDrivers {
         // Samsung Xclipse, and a Linux glibc build (the "-EMULATOR" zips) runs nowhere in an Android app (problem). Such a saved choice (settings
         // restored from another phone, or picked before this check existed) gets the system driver; the choice is reset so the dialog and the
         // next starts agree, and the player is told once why. Runs before the crash guard, so a reset choice never counts as a strike.
+        // 2.56: the last process restarted after this driver's Vulkan initialization failed (graphicsFailed): the message now
+        String failedBefore = readText(fallbackFile());
+        if (failedBefore != null) { fallbackFile().delete(); failedBefore = failedBefore.trim();
+            if (!failedBefore.isEmpty()) notice = GearText.s(a(), "toast_driver_init_failed", label(failedBefore)); }
         boolean turnipOk = turnipPossible();
         String why = drv.isEmpty() ? null : problem(drv);
         if (why != null) {
@@ -117,6 +127,9 @@ final class VkDrivers {
     private void watch(View v) {
         if (!host.started() || a().isDestroyed()) return;
         String[] st = status();
+        // 2.56: the native side fell back to the system driver after the custom one failed to initialize (possibly after a first status line
+        // that still named the custom driver, so this is looked at until the first frames)
+        if (!initFailHandled && st != null && st[2].startsWith("init-failed")) initFailed(st);
         if (!statusDone && st != null) {
             statusDone = true;
             host.crumb("Vulkan driver status: requested \"" + st[0] + "\" active " + st[1] + " reason " + st[2] + (st.length > 3 ? " " + st[3] : ""));
@@ -140,6 +153,35 @@ final class VkDrivers {
             }
         }
         if (!(guardDone && statusDone && firstFrameDone)) v.postDelayed(() -> watch(v), 1000);
+    }
+    // 2.56: the port's Vulkan boot failure (DOOM: DmActivity.showBootFailure, code -6). true = the native side could not retry with the system
+    // driver in this process (init-failed-restart): the saved choice is already the system driver, the port restarts the app now and the
+    // message comes at the next start. false = show the start error as usual (init-failed-all: the system driver failed too; or no custom
+    // driver was involved). Never true twice in a row: the restarted process starts with the system driver.
+    boolean graphicsFailed() {
+        String[] st = status();
+        if (st == null || !st[2].startsWith("init-failed")) return false;
+        initFailed(st);
+        return "init-failed-restart".equals(st[2]) && host.forcedDriver() == null;   // a forced driver (diagnostics APK) would fail again: no restart loop
+    }
+    private void initFailed(String[] st) {
+        if (initFailHandled) return;
+        initFailHandled = true; statusDone = true;
+        String drv = st[0], how = st[2], err = st.length > 3 ? st[3] : "";
+        SharedPreferences p = prefs();
+        boolean reset = !drv.isEmpty() && drv.equals(p.getString("driver", defaultDriver()));
+        if (reset) p.edit().putString("driver", "").commit();   // commit: a restart may follow at once
+        guardFile().delete(); guardDone = true;   // not a crash
+        host.crumb("driver: " + drv + " failed to start (Vulkan initialization, " + err + "), fell back to system driver "
+            + ("init-failed".equals(how) ? "in this process" : "init-failed-all".equals(how) ? "in this process, but the system driver failed too (start error)"
+                : "by restarting the app (no retry in this process: the engine had started)")
+            + (reset ? "; the saved choice is now the system driver" : "; the saved choice (" + p.getString("driver", "") + ") was changed meanwhile, left as is"));
+        android.util.Log.w("dm", "driver " + drv + " failed to start (" + how + "): system driver");
+        if ("init-failed".equals(how)) Toast.makeText(a(), GearText.s(a(), "toast_driver_init_failed", label(drv)), Toast.LENGTH_LONG).show();
+        else if ("init-failed-restart".equals(how)) {
+            try (OutputStream os = new FileOutputStream(fallbackFile())) { os.write(drv.getBytes(StandardCharsets.UTF_8)); }
+            catch (IOException e) { android.util.Log.e("dm", "driver fallback note: " + e); }
+        }
     }
     // "<requested>\t<active>\t<reason>[\t<details>]" from vk_driver.c, or null before the driver is loaded. details (2.25):
     // "verified=0|1 gpu=... driver=... id=..." (what the GPU reports for the custom driver).
@@ -301,6 +343,8 @@ final class VkDrivers {
             case "no-gpu": return t("драйвер не видит GPU этого телефона", "the driver sees no GPU on this phone");
             case "load-failed": return t("драйвер не открылся", "the driver could not be opened");
             case "no-library": return t("в пакете нет библиотеки драйвера", "the package has no driver library");
+            case "init-failed": case "init-failed-all": case "init-failed-restart":   // 2.56
+                return t("с ним не запустилась графика игры (ошибка инициализации Vulkan)", "the game's graphics did not start with it (Vulkan initialization failed)");
             default:
                 if (r.startsWith("missing-lib")) return t("в пакете не хватает библиотеки", "the package lacks a library") + r.substring(11);
                 if (r.startsWith("min-api")) { int api = 0; try { api = Integer.parseInt(r.substring(7).trim()); } catch (NumberFormatException e) { /* shown as is */ }

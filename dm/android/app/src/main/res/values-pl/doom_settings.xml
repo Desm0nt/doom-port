@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">Obecnie używany: sterownik systemowy (%1$s się nie uruchomił)</string>
     <string name="toast_driver_fallback">Sterownik Vulkan %1$s nie uruchomił się na tym urządzeniu (%2$s); używany jest sterownik systemowy.</string>
     <string name="toast_driver_crashed">Ostatnie uruchomienie ze sterownikiem Vulkan %1$s zakończyło się awarią lub zawieszeniem, więc teraz używany jest sterownik systemowy. Możesz wybrać go ponownie w ustawieniach.</string>
+    <string name="toast_driver_init_failed">Sterownik Vulkan %1$s nie mógł się uruchomić na tym urządzeniu, więc gra używa teraz sterownika systemowego. Własne sterowniki są eksperymentalne. Możesz wybrać go ponownie w ⚙ → Sterownik Vulkan.</string>
     <string name="gear_lang">Język gry (teksty i głosy)</string>
     <string name="gear_lang_system">Jak w systemie</string>
     <string name="gear_aa">Wspomaganie celowania</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: dostępne, gdy gra wczyta swój profil (albo zmień w menu gry)</string>
     <string name="gear_game_settings_note">Wspomaganie celowania, celowanie ruchem i jego czułość to ustawienia samej gry (ustawienia kontrolera w menu gry): zmiana tu lub tam jest widoczna w obu miejscach i zapisywana w profilu gry.</string>
     <string name="toast_game_setting_failed">Nie udało się tu zmienić ustawienia gry; użyj ustawień kontrolera w menu gry</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Bezpieczny tryb grafiki (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Wył.</string>
+    <string name="gear_safe_auto">Auto</string>
+    <string name="gear_safe_on">Wł.</string>
+    <string name="gear_safe_note">Wył.: zawsze szybkie ustawienia wersji 0.5 (eksperymentalne). Auto: są wyłączane krok po kroku po awarii sterownika grafiki. Wł.: zawsze wyłączone (wolniej, ale bardziej zgodnie) – spróbuj, jeśli widzisz migotanie, złe kolory lub inne problemy z obrazem.</string>
+    <string name="gear_safe_now">To uruchomienie: krok %1$d z 3 (policzone awarie grafiki: %2$d)</string>
+    <string name="safe_title">Bezpieczny tryb grafiki</string>
+    <string name="safe_crash">Ostatnie uruchomienie zakończyło się awarią sterownika grafiki.</string>
+    <string name="safe_step_1">Teraz działa krok 1 z 3: eksperymentalne przyspieszenia wersji 0.5 dla Mali / PowerVR (pamięć zero-copy i inne) są wyłączone.</string>
+    <string name="safe_step_2">Teraz działa krok 2 z 3: przyspieszenia wersji 0.5 i optymalizacje dla kafelkowych GPU są wyłączone.</string>
+    <string name="safe_step_3">Teraz działa krok 3 z 3: najbardziej zgodny (i najwolniejszy) tryb – przyspieszenia, optymalizacje dla kafelkowych GPU i część skrótów shaderów są wyłączone.</string>
+    <string name="safe_step_0">Bezpieczny tryb jest wyłączony (⚙ lub dm/env), więc nic nie zmieniono.</string>
+    <string name="safe_next">Jeśli gra znowu się wysypie, zostanie wypróbowany następny krok.</string>
+    <string name="safe_last">To ostatni krok.</string>
+    <string name="safe_gear">Możesz to zmienić w ⚙ → Bezpieczny tryb grafiki.</string>
+    <string name="safe_logs">Jeśli awarie się powtarzają, wyślij pliki z %1$s razem z opisem błędu.</string>
+    <string name="safe_relaunched">Gra została uruchomiona ponownie automatycznie.</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">Pamięć zero-copy (eksperymentalne przyspieszenie) nie przeszła testu na tym urządzeniu i jest wyłączona w tym uruchomieniu.</string>
+    <string name="toast_safe_fence">Sterownik grafiki zgłosił błąd synchronizacji; gra się podniosła i w tym uruchomieniu używa bezpieczniejszego trybu synchronizacji.</string>
+    <string name="toast_safe_pipe">Sterownik grafiki nie zbudował shadera; części efektów może brakować. W tym uruchomieniu shadery są budowane po jednym.</string>
+    <string name="notif_safe_channel">Przywracanie po awarii</string>
+    <string name="notif_safe_title">%1$s – awaria sterownika grafiki</string>
+    <string name="notif_safe_text">Dotknij, aby uruchomić ponownie w trybie bezpiecznym.</string>
 </resources>

@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">現在使用中：システムドライバー（%1$s は起動しませんでした）</string>
     <string name="toast_driver_fallback">Vulkan ドライバー %1$s はこの端末で起動しませんでした（%2$s）。システムドライバーを使用します。</string>
     <string name="toast_driver_crashed">前回 Vulkan ドライバー %1$s で起動した際にクラッシュまたはフリーズしたため、システムドライバーに切り替えました。設定で再度選択できます。</string>
+    <string name="toast_driver_init_failed">Vulkan ドライバー %1$s はこの端末で起動できなかったため、ゲームはシステムドライバーを使用しています。カスタムドライバーは実験的な機能です。⚙ → Vulkan ドライバー で再度選択できます。</string>
     <string name="gear_lang">ゲームの言語（テキストと音声）</string>
     <string name="gear_lang_system">システムと同じ</string>
     <string name="gear_aa">エイムアシスト</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s：ゲームがプロフィールを読み込むと使用できます（ゲームメニューでも変更できます）</string>
     <string name="gear_game_settings_note">エイムアシスト、モーションエイムとその感度はゲーム自身の設定です（ゲームメニューのコントローラー設定）。ここで変えてもゲーム内で変えても両方に反映され、ゲームのプロフィールに保存されます。</string>
     <string name="toast_game_setting_failed">ここではゲームの設定を変更できませんでした。ゲームメニューのコントローラー設定を使ってください</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">グラフィック安全モード（Mali / PowerVR）</string>
+    <string name="gear_safe_off">オフ</string>
+    <string name="gear_safe_auto">自動</string>
+    <string name="gear_safe_on">オン</string>
+    <string name="gear_safe_note">オフ：常にバージョン 0.5 の高速設定（実験的）。自動：グラフィックドライバーのクラッシュ後に段階的にオフにします。オン：常にオフ（遅くなりますが互換性が高い）。ちらつき、色の異常、その他の画面の問題があるときに試してください。</string>
+    <string name="gear_safe_now">今回の起動：ステップ %1$d / 3（記録されたグラフィッククラッシュ：%2$d）</string>
+    <string name="safe_title">グラフィック安全モード</string>
+    <string name="safe_crash">前回の実行はグラフィックドライバーのクラッシュで終了しました。</string>
+    <string name="safe_step_1">現在ステップ 1 / 3 が有効です：Mali / PowerVR 向けのバージョン 0.5 の実験的な高速化（ゼロコピーメモリなど）をオフにしました。</string>
+    <string name="safe_step_2">現在ステップ 2 / 3 が有効です：バージョン 0.5 の高速化とタイルベース GPU 向けの最適化をオフにしました。</string>
+    <string name="safe_step_3">現在ステップ 3 / 3 が有効です：最も互換性の高い（そして最も遅い）モードです。高速化、タイルベース GPU 向けの最適化、一部のシェーダーの簡略化をオフにしました。</string>
+    <string name="safe_step_0">安全モードはオフ（⚙ または dm/env）のため、何も変更していません。</string>
+    <string name="safe_next">再びクラッシュした場合は、次のステップを試します。</string>
+    <string name="safe_last">これが最後のステップです。</string>
+    <string name="safe_gear">⚙ → グラフィック安全モード で変更できます。</string>
+    <string name="safe_logs">クラッシュが続く場合は、%1$s のファイルを不具合報告と一緒に送ってください。</string>
+    <string name="safe_relaunched">ゲームは自動的に再起動されました。</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">ゼロコピーメモリ（実験的な高速化）はこの端末でテストに合格しなかったため、今回の実行ではオフです。</string>
+    <string name="toast_safe_fence">グラフィックドライバーが同期エラーを報告しました。ゲームは回復し、今回の実行ではより安全な同期モードを使います。</string>
+    <string name="toast_safe_pipe">グラフィックドライバーがシェーダーを作成できませんでした。一部のエフェクトが表示されない場合があります。今回の実行ではシェーダーを 1 つずつ作成します。</string>
+    <string name="notif_safe_channel">クラッシュからの復旧</string>
+    <string name="notif_safe_title">%1$s がグラフィックドライバーでクラッシュしました</string>
+    <string name="notif_safe_text">タップすると安全モードで再起動します。</string>
 </resources>

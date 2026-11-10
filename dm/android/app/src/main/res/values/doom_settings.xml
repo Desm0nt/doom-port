@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">In use now: system driver (%1$s did not start)</string>
     <string name="toast_driver_fallback">Vulkan driver %1$s did not start on this device (%2$s); the system driver is used.</string>
     <string name="toast_driver_crashed">The last launch with Vulkan driver %1$s crashed or froze, so the system driver is used now. You can select it again in Settings.</string>
+    <string name="toast_driver_init_failed">Vulkan driver %1$s failed to start on this device, so the game now uses the system driver. Custom drivers are experimental. You can pick it again in ⚙ → Vulkan driver.</string>
     <string name="gear_lang">Game language (text and voice)</string>
     <string name="gear_lang_system">As in the system</string>
     <string name="gear_aa">Aim assist</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: available once the game has loaded its profile (or change it in the game menu)</string>
     <string name="gear_game_settings_note">Aim Assist, Motion aiming and its sensitivity are the game\'s own settings (controller settings in the game menu): a change here or there shows in both and is kept in the game profile.</string>
     <string name="toast_game_setting_failed">A game setting could not be changed here; use the controller settings in the game menu</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Safe graphics mode (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Off</string>
+    <string name="gear_safe_auto">Auto</string>
+    <string name="gear_safe_on">On</string>
+    <string name="gear_safe_note">Off: the fast settings of version 0.5 always (experimental). Auto: they are turned off step by step after a crash in the graphics driver. On: always off (slower, but more compatible) – try it if you see flickering, wrong colours or other picture problems.</string>
+    <string name="gear_safe_now">This run: step %1$d of 3 (graphics crashes counted: %2$d)</string>
+    <string name="safe_title">Safe graphics mode</string>
+    <string name="safe_crash">The last run ended with a crash in the graphics driver.</string>
+    <string name="safe_step_1">Step 1 of 3 is on now: the experimental speed-ups of version 0.5 for Mali / PowerVR (zero-copy memory and others) are turned off.</string>
+    <string name="safe_step_2">Step 2 of 3 is on now: the speed-ups of version 0.5 and the tile-GPU optimizations are turned off.</string>
+    <string name="safe_step_3">Step 3 of 3 is on now: the most compatible (and slowest) mode – the speed-ups, the tile-GPU optimizations and some shader shortcuts are turned off.</string>
+    <string name="safe_step_0">Safe mode is off (⚙ or dm/env), so nothing was changed.</string>
+    <string name="safe_next">If the game crashes again, the next step will be tried.</string>
+    <string name="safe_last">This is the last step.</string>
+    <string name="safe_gear">You can change this in ⚙ → Safe graphics mode.</string>
+    <string name="safe_logs">If it keeps crashing, please send the files from %1$s with a bug report.</string>
+    <string name="safe_relaunched">The game was restarted automatically.</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">Zero-copy memory (an experimental speed-up) did not pass its test on this device and is off for this run.</string>
+    <string name="toast_safe_fence">The graphics driver reported a sync error; the game recovered and switched to a safer sync mode for this run.</string>
+    <string name="toast_safe_pipe">The graphics driver failed to build a shader; some effects may be missing. Shaders are now built one at a time for this run.</string>
+    <string name="notif_safe_channel">Crash recovery</string>
+    <string name="notif_safe_title">%1$s crashed in the graphics driver</string>
+    <string name="notif_safe_text">Tap to restart in safe mode.</string>
 </resources>

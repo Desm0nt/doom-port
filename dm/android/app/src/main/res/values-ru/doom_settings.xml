@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">Сейчас используется: системный драйвер (%1$s не запустился)</string>
     <string name="toast_driver_fallback">Драйвер Vulkan %1$s не запустился на этом устройстве (%2$s); используется системный.</string>
     <string name="toast_driver_crashed">Прошлый запуск с драйвером Vulkan %1$s упал или завис, поэтому сейчас используется системный. Его можно снова выбрать в настройках.</string>
+    <string name="toast_driver_init_failed">Драйвер Vulkan %1$s не смог запуститься на этом устройстве, поэтому игра теперь использует системный драйвер. Сторонние драйверы — экспериментальные. Его можно снова выбрать в ⚙ → Драйвер Vulkan.</string>
     <string name="gear_lang">Язык игры (тексты и озвучка)</string>
     <string name="gear_lang_system">Как в системе</string>
     <string name="gear_aa">Помощь в прицеливании</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: доступно, когда игра загрузит профиль (или измените в меню игры)</string>
     <string name="gear_game_settings_note">Помощь в прицеливании, прицеливание гироскопом и его чувствительность — настройки самой игры (настройки контроллера в меню игры): изменение здесь или там видно в обоих местах и сохраняется в профиле игры.</string>
     <string name="toast_game_setting_failed">Не удалось изменить настройку игры здесь; используйте настройки контроллера в меню игры</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Безопасный режим графики (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Выкл</string>
+    <string name="gear_safe_auto">Авто</string>
+    <string name="gear_safe_on">Вкл</string>
+    <string name="gear_safe_note">Выкл: всегда быстрые настройки версии 0.5 (экспериментально). Авто: они отключаются по шагам после падения в графическом драйвере. Вкл: всегда отключены (медленнее, но совместимее) — попробуйте, если видите мерцание, неправильные цвета или другие проблемы с картинкой.</string>
+    <string name="gear_safe_now">Этот запуск: шаг %1$d из 3 (учтено падений графики: %2$d)</string>
+    <string name="safe_title">Безопасный режим графики</string>
+    <string name="safe_crash">Прошлый запуск завершился падением в графическом драйвере.</string>
+    <string name="safe_step_1">Сейчас включён шаг 1 из 3: экспериментальные ускорения версии 0.5 для Mali / PowerVR (zero-copy память и другие) отключены.</string>
+    <string name="safe_step_2">Сейчас включён шаг 2 из 3: отключены ускорения версии 0.5 и оптимизации для тайловых GPU.</string>
+    <string name="safe_step_3">Сейчас включён шаг 3 из 3: самый совместимый (и самый медленный) режим — отключены ускорения, оптимизации для тайловых GPU и часть упрощений шейдеров.</string>
+    <string name="safe_step_0">Безопасный режим выключен (⚙ или dm/env), поэтому ничего не изменено.</string>
+    <string name="safe_next">Если игра упадёт снова, будет включён следующий шаг.</string>
+    <string name="safe_last">Это последний шаг.</string>
+    <string name="safe_gear">Изменить это можно в ⚙ → Безопасный режим графики.</string>
+    <string name="safe_logs">Если падения повторяются, пришлите, пожалуйста, файлы из %1$s вместе с описанием ошибки.</string>
+    <string name="safe_relaunched">Игра была перезапущена автоматически.</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">Zero-copy память (экспериментальное ускорение) не прошла проверку на этом устройстве и отключена на этот запуск.</string>
+    <string name="toast_safe_fence">Графический драйвер сообщил об ошибке синхронизации; игра восстановилась и до конца запуска перешла на более безопасный режим синхронизации.</string>
+    <string name="toast_safe_pipe">Графический драйвер не смог собрать шейдер; часть эффектов может пропасть. До конца запуска шейдеры собираются по одному.</string>
+    <string name="notif_safe_channel">Восстановление после падения</string>
+    <string name="notif_safe_title">Игра %1$s упала в графическом драйвере</string>
+    <string name="notif_safe_text">Нажмите, чтобы перезапустить в безопасном режиме.</string>
 </resources>

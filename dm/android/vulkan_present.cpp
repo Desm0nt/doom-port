@@ -247,6 +247,7 @@ void wait_resize(){std::unique_lock<std::mutex> lock(window_mutex);window_cv.wai
 // compiled). DM_GFX_SHARPEN=<stops> turns it on (0 = strongest, 0.2 typical, 1 mild); used with DM_DOOM_RES (the game renders
 // 3D at a fraction and upscales it itself). Only for 8-bit UNORM RGBA/BGRA frames; anything else is presented unsharpened.
 extern "C" { int dm_vk_format_list=0; }
+extern "C" { int dm_vk_dmabuf=0; }   // [zc-dmabuf] VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf enabled (xbg_game.cpp zc)
 // [nonadreno][afbc] VK_EXT_image_compression_control (query only) / VK_EXT or KHR_load_store_op_none enabled on the device (read by the engine)
 extern "C" { int dm_vk_compression_control=0,dm_vk_store_none=0; }
 // [DOOM] DM_TEX_DISCARD=1: a second queue of the same family for the engine's texture restore worker (xbg_tex_discard.inc), which
@@ -784,6 +785,17 @@ static void astc_overlay_mount(VkPhysicalDevice phys,VkDevice dev,VkQueue q,uint
         c.use?"USED":"not used",c.use?c.variant:"-",c.use?fm:"-",c.why,*why?"; ":"",why,dir.empty()?"-":dir.c_str(),unsigned(f.textureCompressionBC),
         unsigned(f.textureCompressionASTC_LDR),unsigned(f.textureCompressionETC2),unsigned(device_hdr),mode_env?mode_env:"auto");
 }
+// [DOOM] BUGS_AND_FIXES 2.56 (issue #33): the in-process fallback to the system driver (jni_android.c host_thread). A failed initialization
+// destroys what it made (fail -> cleanup_initialization), so it may run again with another driver, as long as the engine was not
+// initialized yet (dm_vk_initialize below keeps state of its own): dm_android_vk_retry_safe. DM_VK_FAKE_INIT_FAIL (test switch, dm/env):
+// 1 = the initialization fails right after the swapchain was made, only while a custom driver is active (the same VkResult as PanVK on
+// the Mali-G57 of issue #33), so the fallback can be checked on a phone where every driver works; 2 = it fails with any driver (the
+// system driver too: the start error must be shown, no loop).
+extern "C" int dm_vk_driver_custom(void);
+extern "C" __attribute__((weak)) void xbg_safe_mode_boot(uint32_t vendor,const char *name);   // [safe-mode] xbg_game.cpp
+static bool engine_touched=false;
+extern "C" int dm_android_vk_retry_safe(void){return !engine_touched && !ready;}
+static bool fake_init_fail(){const char *e=getenv("DM_VK_FAKE_INIT_FAIL");if(!e||!*e)return false;const int v=atoi(e);return v>=2 || (v==1 && dm_vk_driver_custom());}
 extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t bytes){
     if(path){std::string dir=path;size_t cut=dir.find_last_of('/');if(FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-native").c_str(),"rb")){present_native=fgetc(m)!='0';fclose(m);}
         if(FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-present-timing").c_str(),"rb")){present_timing=true;fclose(m);}}
@@ -792,6 +804,7 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     if(ready||!path||!*path)return fail("Initialization requires an external shader directory and an uninitialized renderer",VK_ERROR_INITIALIZATION_FAILED);
     // 每次初始化从缺省的 120 Hz 重新读标记。 | Each initialization starts again from the 120 Hz default before the marker.
     frame_rate_vote=120;
+    dm_vk_dmabuf=0;dm_vk_format_list=0;dm_vk_aux_queue=VK_NULL_HANDLE;dm_vk_aux_family=0;   // [DOOM] 2.56: a repeated initialization starts over
     upscale::enabled();   // [DOOM] DM_GFX_UPSCALE: decided (and logged) once, before the first swapchain and any present-thread caller
     // [DOOM] Frame rate limit above 60 (DM_PRESENT_MAX_HZ 90 / 120, DmActivity): vote that rate, so a panel offering 60/90/120 runs at 90
     // for a 90 cap (a 120 vote would leave 120 Hz, where the cap paces at 60). DmActivity also asks for that display mode.
@@ -823,6 +836,9 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
         if(mk)mk(instance,&mi,nullptr,&m);}
     uint32_t n=0;vkEnumeratePhysicalDevices(instance,&n,nullptr);std::vector<VkPhysicalDevice> devices(n);vkEnumeratePhysicalDevices(instance,&n,devices.data());if(!n)return fail("No Vulkan device",VK_ERROR_INITIALIZATION_FAILED);
     physical=devices[0];
+    // [safe-mode] BUGS_AND_FIXES 2.57: this boot's safe-mode step on Mali / PowerVR (real or DM_GFX_SIM_GPU), before the device is made: its
+    // switches (setenv without overwrite: dm/env wins) are in place for the extension choice below and the engine (xbg_game.cpp)
+    {VkPhysicalDeviceProperties sp{};vkGetPhysicalDeviceProperties(physical,&sp);if(xbg_safe_mode_boot)xbg_safe_mode_boot(sp.vendorID,sp.deviceName);}
     // 启动期间也可能旋转/切后台；等待新窗口，不把瞬时撤回误报为启动失败。
     // Rotation/backgrounding can race startup too; wait for a live window instead of failing boot.
     for(;;){wait_window();r=VkResult(create_surface());if(r==VK_NOT_READY)continue;if(r==VK_ERROR_SURFACE_LOST_KHR){uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}if(r)return fail("Android surface",r);break;}
@@ -852,6 +868,13 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     if(indirect_count)dext.push_back(VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME);
     // [DOOM] format lists keep UBWC compression on images that need a second view format (xbg_game.cpp upgrade_mutable)
     if(format_list){dext.push_back(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);dm_vk_format_list=1;}
+    // [zc-dmabuf] VK_KHR_external_memory_fd + VK_EXT_external_memory_dma_buf (every Mali / PowerVR log has both): zero-copy chunks from a
+    // dma-buf the process can map itself (a dma-heap buffer or a Vulkan export), where gralloc hands out read-only fds (#3, #46). Not on
+    // Adreno unless DM_GFX_SIM_GPU / DM_GFX_ZC_MAP ask, so its device stays exactly as before.
+    {bool fdx=false,dbx=false;for(const auto &x:available){if(!strcmp(x.extensionName,VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME))fdx=true;if(!strcmp(x.extensionName,VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME))dbx=true;}
+     VkPhysicalDeviceProperties pp{};vkGetPhysicalDeviceProperties(physical,&pp);const char *se=getenv("DM_GFX_SIM_GPU"),*zm=getenv("DM_GFX_ZC_MAP");
+     const char *zo=getenv("DM_GFX_ZEROCOPY");const bool zc_off=zo && !strcmp(zo,"0");   // [safe-mode] zero-copy off (safe-mode step >= 1 or the player): no dma-buf views
+     if(fdx && dbx && !zc_off && (pp.vendorID!=0x5143 || (se && *se) || (zm && *zm))){dext.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);dext.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);dm_vk_dmabuf=1;}}
     // [nonadreno][afbc] VK_EXT_image_compression_control: query only (never requests a compression), so the engine can log whether the
     // driver compressed each image (AFBC / fixed rate / none; NVN afbc summary); plus a per-format probe here. VK_EXT/KHR_load_store_op_none:
     // STORE_OP_NONE for attachment aspects a render pass does not write (DM_GFX_STORE_NONE). Both off on Adreno unless DM_GFX_AFBC_QUERY=1 /
@@ -909,6 +932,8 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
         if(r==VK_ERROR_SURFACE_LOST_KHR){uint64_t bad=active_generation;destroy_swap();wait_window_change(bad);continue;}
         if(r)return fail("Swapchain",r);break;
     }
+    if(fake_init_fail()){__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","DM_VK_FAKE_INIT_FAIL=%s: failing the initialization after the swapchain (test of the driver fallback)",getenv("DM_VK_FAKE_INIT_FAIL"));
+        return fail("Swapchain (faked by DM_VK_FAKE_INIT_FAIL)",VK_ERROR_INVALID_EXTERNAL_HANDLE);}
     VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.flags=VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;cp.queueFamilyIndex=family;if((r=vkCreateCommandPool(device,&cp,nullptr,&command_pool)))return fail("Present command pool",r);
     VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=command_pool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;if((r=vkAllocateCommandBuffers(device,&ca,&command)))return fail("Present command",r);
     VkSemaphoreCreateInfo sc{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};if((r=vkCreateSemaphore(device,&sc,nullptr,&acquired)))return fail("Acquire semaphore",r);VkFenceCreateInfo fc{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};if((r=vkCreateFence(device,&fc,nullptr,&fence)))return fail("Present fence",r);
@@ -928,5 +953,5 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
         if((r=vkCreateSemaphore(device,&sc,nullptr,&overlap_acquired)))return fail("Acquire semaphore",r);if((r=vkCreateFence(device,&fc,nullptr,&overlap_fence)))return fail("Present fence",r);}
     __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present overlap=%d (marker gfx-present-overlap)",int(overlap));
     shader_path=path;dm_vk_config config{};config.size=sizeof(config);config.game.size=sizeof(config.game);config.game.physical=physical;config.game.device=device;config.game.queue=queue;config.game.queue_family=family;config.game.enabled_core=features.features;config.game.enabled_shader_draw_parameters=draw.shaderDrawParameters;config.game.fence_timeout_ns=10000000000ull;config.game.shader_directory=shader_path.c_str();config.game.present=present;config.game.log=log_message;config.game.fatal=fatal;config.sampler_mirror_clamp_to_edge=mirror;config.sampler_filter_minmax=minmax;config.has_window=has_window;config.display_hz=0; // Query actual display refresh in frontend; do not guess 60 Hz.
-    int status=dm_vk_initialize(&config,error,bytes);if(!status)ready=true;else cleanup_initialization();return status;
+    engine_touched=true;int status=dm_vk_initialize(&config,error,bytes);if(!status)ready=true;else cleanup_initialization();return status;
 }

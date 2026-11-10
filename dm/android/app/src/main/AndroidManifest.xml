@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- [DOOM] rumble (haptics_android.c): without it every vibrate() threw SecurityException -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57: the crash guard's "tap to restart in safe mode" notification (Android 13+: asked once, after a graphics crash) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
     <application
         android:label="@string/dmAndroidName"
@@ -40,6 +42,12 @@
             android:excludeFromRecents="true"
             android:noHistory="true"
             android:theme="@android:style/Theme.NoDisplay" />
+        <!-- [safe-mode] BUGS_AND_FIXES 2.57: the crash guard (frontend-common DmGuard.java) in its own process: relaunches the game after a graphics
+             crash on Mali / PowerVR (or posts a notification when Android blocks the start); started by SafeMode.startGuard, not exported -->
+        <service
+            android:name=".DmGuard"
+            android:process=":guard"
+            android:exported="false" />
         <receiver android:name=".widget.HeroWidget2x2Provider"
             android:exported="false" android:label="@string/dmAndroidWidgetName2x2">
             <intent-filter><action android:name="android.appwidget.action.APPWIDGET_UPDATE" /></intent-filter>

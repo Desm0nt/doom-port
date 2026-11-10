@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">Derzeit aktiv: Systemtreiber (%1$s ist nicht gestartet)</string>
     <string name="toast_driver_fallback">Der Vulkan-Treiber %1$s ist auf diesem Gerät nicht gestartet (%2$s); der Systemtreiber wird verwendet.</string>
     <string name="toast_driver_crashed">Der letzte Start mit dem Vulkan-Treiber %1$s ist abgestürzt oder hängen geblieben, daher wird jetzt der Systemtreiber verwendet. Du kannst ihn in den Einstellungen wieder auswählen.</string>
+    <string name="toast_driver_init_failed">Der Vulkan-Treiber %1$s konnte auf diesem Gerät nicht starten, daher nutzt das Spiel jetzt den Systemtreiber. Eigene Treiber sind experimentell. Du kannst ihn unter ⚙ → Vulkan-Treiber wieder auswählen.</string>
     <string name="gear_lang">Spielsprache (Texte und Sprachausgabe)</string>
     <string name="gear_lang_system">Wie im System</string>
     <string name="gear_aa">Zielhilfe</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: verfügbar, sobald das Spiel sein Profil geladen hat (oder im Spielmenü ändern)</string>
     <string name="gear_game_settings_note">Zielhilfe, Bewegungszielen und seine Empfindlichkeit sind Einstellungen des Spiels selbst (Controller-Einstellungen im Spielmenü): Eine Änderung hier oder dort zeigt sich an beiden Stellen und wird im Spielprofil gespeichert.</string>
     <string name="toast_game_setting_failed">Eine Spieleinstellung konnte hier nicht geändert werden; nutze die Controller-Einstellungen im Spielmenü</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Sicherer Grafikmodus (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Aus</string>
+    <string name="gear_safe_auto">Auto</string>
+    <string name="gear_safe_on">An</string>
+    <string name="gear_safe_note">Aus: immer die schnellen Einstellungen von Version 0.5 (experimentell). Auto: Sie werden nach einem Absturz im Grafiktreiber stufenweise abgeschaltet. An: immer aus (langsamer, aber kompatibler) – probiere es, wenn du Flackern, falsche Farben oder andere Bildfehler siehst.</string>
+    <string name="gear_safe_now">Dieser Start: Stufe %1$d von 3 (gezählte Grafikabstürze: %2$d)</string>
+    <string name="safe_title">Sicherer Grafikmodus</string>
+    <string name="safe_crash">Der letzte Start endete mit einem Absturz im Grafiktreiber.</string>
+    <string name="safe_step_1">Stufe 1 von 3 ist jetzt aktiv: Die experimentellen Beschleunigungen von Version 0.5 für Mali / PowerVR (Zero-Copy-Speicher und andere) sind abgeschaltet.</string>
+    <string name="safe_step_2">Stufe 2 von 3 ist jetzt aktiv: Die Beschleunigungen von Version 0.5 und die Optimierungen für Tile-GPUs sind abgeschaltet.</string>
+    <string name="safe_step_3">Stufe 3 von 3 ist jetzt aktiv: der kompatibelste (und langsamste) Modus – Beschleunigungen, Tile-GPU-Optimierungen und einige Shader-Abkürzungen sind abgeschaltet.</string>
+    <string name="safe_step_0">Der sichere Modus ist aus (⚙ oder dm/env), daher wurde nichts geändert.</string>
+    <string name="safe_next">Stürzt das Spiel erneut ab, wird die nächste Stufe versucht.</string>
+    <string name="safe_last">Das ist die letzte Stufe.</string>
+    <string name="safe_gear">Du kannst das unter ⚙ → Sicherer Grafikmodus ändern.</string>
+    <string name="safe_logs">Wenn es weiter abstürzt, schick bitte die Dateien aus %1$s mit einer Fehlermeldung.</string>
+    <string name="safe_relaunched">Das Spiel wurde automatisch neu gestartet.</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">Zero-Copy-Speicher (eine experimentelle Beschleunigung) hat den Test auf diesem Gerät nicht bestanden und ist für diesen Start aus.</string>
+    <string name="toast_safe_fence">Der Grafiktreiber hat einen Synchronisationsfehler gemeldet; das Spiel hat sich erholt und nutzt für diesen Start einen sichereren Sync-Modus.</string>
+    <string name="toast_safe_pipe">Der Grafiktreiber konnte einen Shader nicht erstellen; manche Effekte können fehlen. Shader werden für diesen Start einzeln erstellt.</string>
+    <string name="notif_safe_channel">Wiederherstellung nach Absturz</string>
+    <string name="notif_safe_title">%1$s ist im Grafiktreiber abgestürzt</string>
+    <string name="notif_safe_text">Tippen, um im sicheren Modus neu zu starten.</string>
 </resources>

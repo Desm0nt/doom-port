@@ -84,7 +84,8 @@ static int lifecycle_ready(void) { pthread_once(&g_lifecycle_once, lifecycle_ini
 
 // stderr → 管道 → 本线程：逐行写日志文件（adb pull 取）并转 logcat（标签 dm）
 // stderr → pipe → this thread: write line by line to the log file (fetched with adb pull) and forward to logcat (tag dm)
-// [DOOM] (BUGS_AND_FIXES 2.22) The log no longer grows forever: every launch moves boot.log to boot.prev.log (one previous run kept) and
+// [DOOM] (BUGS_AND_FIXES 2.22) The log no longer grows forever: every launch moves boot.log to boot.prev.log (2.56: and boot.prev.log to
+// boot.prev2.log, two previous runs kept; CrashLog.java copies all three, and each run once more per Vulkan driver, boot-<driver>.log) and
 // starts a new one; within a run, past DM_LOG_MAX_MB (default 32) the file is cut back to its first 4 MB (the boot: device, driver, GPU)
 // and goes on from there, so the head and the latest lines both survive. The app's own __android_log_print lines (dm-vulkan: the
 // engine's xbg_logf, swapchain, FATAL; dm-lifecycle; dm-input) are copied into the file too (__wrap___android_log_print below; the
@@ -170,7 +171,7 @@ static void log_header(void) {
     prop("ro.product.manufacturer", mf); prop("ro.product.model", md); prop("ro.product.device", dv); prop("ro.soc.manufacturer", sm); prop("ro.soc.model", so);
     prop("ro.hardware", hw); prop("ro.board.platform", bp); prop("ro.build.version.release", rel); prop("ro.build.version.sdk", sdk); prop("ro.build.fingerprint", fp);
     time_t now = time(NULL); struct tm tm; char when[64]; localtime_r(&now, &tm); strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S %z", &tm);
-    LOG("boot: log %s (the previous run: boot.prev.log), pid %d, %s, app %s", g_log_path, (int)getpid(), when, getenv("DM_APP_VERSION") ? getenv("DM_APP_VERSION") : "?");
+    LOG("boot: log %s (the previous runs: boot.prev.log, boot.prev2.log), pid %d, %s, app %s", g_log_path, (int)getpid(), when, getenv("DM_APP_VERSION") ? getenv("DM_APP_VERSION") : "?");
     LOG("boot: device %s %s (%s), SoC %s %s, hardware %s, platform %s, Android %s (SDK %s), build %s", mf, md, dv, sm, so, hw, bp, rel, sdk, fp);
     char model[96] = ""; FILE *f = fopen("/sys/class/kgsl/kgsl-3d0/gpu_model", "r"); if (f) { if (fgets(model, sizeof model, f)) model[strcspn(model, "\r\n")] = 0; fclose(f); }
     long total = 0, avail = 0; f = fopen("/proc/meminfo", "r");
@@ -222,8 +223,10 @@ static void log_cpu(void) {
 }
 static void log_init(void) {
     static int initialized; if (initialized) return; initialized = 1;
-    char prev[1220]; snprintf(g_log_path, sizeof g_log_path, "%s/boot.log", g_runtime); snprintf(prev, sizeof prev, "%s/boot.prev.log", g_runtime);
-    if (rename(g_log_path, prev) && errno != ENOENT) unlink(g_log_path);   // [DOOM] one previous run kept; never append forever
+    char prev[1220], prev2[1220]; snprintf(g_log_path, sizeof g_log_path, "%s/boot.log", g_runtime); snprintf(prev, sizeof prev, "%s/boot.prev.log", g_runtime);
+    snprintf(prev2, sizeof prev2, "%s/boot.prev2.log", g_runtime);
+    if (rename(prev, prev2) && errno != ENOENT) unlink(prev);                // [DOOM] 2.56: two previous runs kept
+    if (rename(g_log_path, prev) && errno != ENOENT) unlink(g_log_path);   // [DOOM] never append forever
     g_logf = fopen(g_log_path, "w"); g_log_fd = g_logf ? fileno(g_logf) : -1;
     log_limit();
     snprintf(g_crash_flag, sizeof g_crash_flag, "%s/dm-crash.txt", g_files);
@@ -260,6 +263,40 @@ static int link_romfs(const char *romfs) {
 }
 #endif
 
+// [DOOM] BUGS_AND_FIXES 2.56 (issue #33: PanVK on a Mali-G57 failed in vkCreateSwapchainKHR, the start error had no gear, the player was
+// stuck on that driver). The game's Vulkan initialization failed while a custom driver package ran: everything it made is already destroyed
+// (dm_android_vk_initialize -> cleanup_initialization), so the driver is switched to the system one in this process (vk_driver.c
+// dm_vk_driver_reset_to_system) and the initialization runs once more. No loop: the second run has no custom driver. The status for the
+// app (nativeDriverStatus) then says init-failed / init-failed-all; VkDrivers.java resets the saved choice and tells the player. When the
+// engine itself had started (a failure inside dm_vk_initialize: it keeps state of its own), no retry here: init-failed-restart, the app
+// restarts in a new process with the system driver (DmActivity.showBootFailure -> VkDrivers.graphicsFailed).
+int dm_vk_driver_custom(void);
+const char *dm_vk_driver_name(void);
+const char *dm_vk_driver_requested(void);
+void dm_vk_driver_reset_to_system(void);
+void dm_vk_driver_note_fallback(const char *failed, const char *reason, const char *error);
+int dm_android_vk_retry_safe(void);
+static int vk_fallback_to_system(const char *shaders, char *error, size_t bytes, int rc, const char *env_ov, const char *env_af) {
+    char failed[160], first[512]; snprintf(failed, sizeof failed, "%s", dm_vk_driver_requested()); snprintf(first, sizeof first, "%s", error);
+    LOG("boot: Vulkan initialization with the custom driver %s (%s) failed %d: %s", failed, dm_vk_driver_name(), rc, first);
+    if (!dm_android_vk_retry_safe()) {
+        LOG("boot: driver fallback: no retry in this process (the engine had started), the app restarts with the system driver");
+        dm_vk_driver_note_fallback(failed, "init-failed-restart", first);
+        return rc;
+    }
+    LOG("boot: driver fallback: everything made with %s is destroyed; initializing Vulkan again with the system driver in this process", failed);
+    if (env_ov) setenv("DM_ROMFS_OVERLAY", env_ov, 1); else unsetenv("DM_ROMFS_OVERLAY");
+    if (env_af) setenv("DM_GFX_ASTC_FORMATS", env_af, 1); else unsetenv("DM_GFX_ASTC_FORMATS");
+    dm_vk_driver_reset_to_system();
+    error[0] = 0;
+    uint64_t t0 = now_ns();
+    int r = dm_android_vk_initialize(shaders, error, bytes);
+    if (r) LOG("boot: driver fallback: the system driver failed too %d: %s", r, error);
+    else LOG("boot: driver fallback: Vulkan initialized with the system driver in %.0f ms (%s did not start: %s)", (now_ns() - t0) / 1e6, failed, first);
+    dm_vk_driver_note_fallback(failed, r ? "init-failed-all" : "init-failed", first);
+    return r;
+}
+
 static void *host_thread(void *arg) {
     (void)arg;
     char out[1200]; snprintf(out, sizeof out, "%s/out", g_runtime);
@@ -268,7 +305,12 @@ static void *host_thread(void *arg) {
     char shaders[1200], error[512] = {0};
     snprintf(shaders, sizeof shaders, "%s/shaders", g_runtime);
     uint64_t t0 = now_ns(); LOG("boot: Vulkan initialization (shaders %s)", shaders);
+    // [DOOM] 2.56: the ASTC overlay's mount (vulkan_present.cpp astc_overlay_mount) prepends to these; a second initialization starts from
+    // the values before the first one
+    char *env_ov = getenv("DM_ROMFS_OVERLAY") ? strdup(getenv("DM_ROMFS_OVERLAY")) : NULL, *env_af = getenv("DM_GFX_ASTC_FORMATS") ? strdup(getenv("DM_GFX_ASTC_FORMATS")) : NULL;
     int graphics_rc = dm_android_vk_initialize(shaders, error, sizeof error);
+    if (graphics_rc && dm_vk_driver_custom()) graphics_rc = vk_fallback_to_system(shaders, error, sizeof error, graphics_rc, env_ov, env_af);
+    free(env_ov); free(env_af);
     if (graphics_rc) { LOG("boot: Vulkan initialization failed %d: %s", graphics_rc, error); front_android_boot_failed(-6); return NULL; }
     LOG("boot: Vulkan initialized in %.0f ms", (now_ns() - t0) / 1e6);   // [DOOM] breadcrumb
     char *argv[] = {"dmhost", out, "main", "sdk", NULL};
@@ -634,6 +676,20 @@ JNIEXPORT void JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSetDrsFps(JNIEnv 
 const char *dm_vk_driver_status(void);
 JNIEXPORT jstring JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeDriverStatus(JNIEnv *env, jclass cls) {
     (void)cls; return (*env)->NewStringUTF(env, dm_vk_driver_status());
+}
+
+// [safe-mode] BUGS_AND_FIXES 2.57 (xbg_game.cpp namespace safemode, frontend-common SafeMode.java): this boot's safe-mode decision
+// "<eligible>	<step>	<how>	<family>	<count>	<last why>	<switches set>" ("" before the presenter made it), and the next in-process
+// fallback message "<kind>	<detail>" (zc / fence / pipe; "" = none).
+const char *xbg_safe_mode_status(void) __attribute__((weak));
+int xbg_safe_mode_event(char *out, size_t n) __attribute__((weak));
+JNIEXPORT jstring JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSafeModeStatus(JNIEnv *env, jclass cls) {
+    (void)cls; return (*env)->NewStringUTF(env, xbg_safe_mode_status ? xbg_safe_mode_status() : "");
+}
+JNIEXPORT jstring JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeSafeModeEvent(JNIEnv *env, jclass cls) {
+    (void)cls; char b[512] = ""; if (xbg_safe_mode_event && !xbg_safe_mode_event(b, sizeof b)) b[0] = 0;
+    for (char *c = b; *c; c++) if ((unsigned char)*c >= 0x80) *c = '?';   // NewStringUTF wants modified UTF-8: the details are ASCII anyway
+    return (*env)->NewStringUTF(env, b);
 }
 
 // [front] The unified front end (frontend-common, docs/FRONTEND_UNIFIED.md); the same names and signatures as nx2android's front_android.c and DOOM

@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">当前使用：系统驱动（%1$s 未能启动）</string>
     <string name="toast_driver_fallback">Vulkan 驱动 %1$s 未能在此设备上启动（%2$s），已改用系统驱动。</string>
     <string name="toast_driver_crashed">上次使用 Vulkan 驱动 %1$s 启动时崩溃或卡死，现已改用系统驱动。可在设置中重新选择。</string>
+    <string name="toast_driver_init_failed">Vulkan 驱动 %1$s 无法在此设备上启动，游戏已改用系统驱动。自定义驱动属于实验性功能。可在 ⚙ → Vulkan 驱动 中重新选择。</string>
     <string name="gear_lang">游戏语言（文本和语音）</string>
     <string name="gear_lang_system">跟随系统</string>
     <string name="gear_aa">瞄准辅助</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s：游戏载入玩家配置后可用（也可在游戏菜单中更改）</string>
     <string name="gear_game_settings_note">瞄准辅助、体感瞄准及其灵敏度是游戏自身的设置（游戏菜单中的控制器设置）：在这里或在游戏里更改，两边都会显示，并保存在游戏的玩家配置中。</string>
     <string name="toast_game_setting_failed">无法在此更改游戏设置；请使用游戏菜单中的控制器设置</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">图形安全模式（Mali / PowerVR）</string>
+    <string name="gear_safe_off">关</string>
+    <string name="gear_safe_auto">自动</string>
+    <string name="gear_safe_on">开</string>
+    <string name="gear_safe_note">关：始终使用 0.5 版的快速设置（实验性）。自动：图形驱动崩溃后逐步关闭它们。开：始终关闭（较慢，但兼容性更好）——如果看到闪烁、颜色错误或其他画面问题，可以试试。</string>
+    <string name="gear_safe_now">本次启动：第 %1$d 步，共 3 步（已记录的图形崩溃：%2$d）</string>
+    <string name="safe_title">图形安全模式</string>
+    <string name="safe_crash">上次运行因图形驱动崩溃而结束。</string>
+    <string name="safe_step_1">现已启用第 1 步（共 3 步）：已关闭 0.5 版针对 Mali / PowerVR 的实验性加速（零拷贝内存等）。</string>
+    <string name="safe_step_2">现已启用第 2 步（共 3 步）：已关闭 0.5 版的加速和针对分块渲染 GPU 的优化。</string>
+    <string name="safe_step_3">现已启用第 3 步（共 3 步）：兼容性最好（也最慢）的模式——已关闭加速、分块渲染 GPU 优化和部分着色器捷径。</string>
+    <string name="safe_step_0">安全模式已关闭（⚙ 或 dm/env），因此没有做任何更改。</string>
+    <string name="safe_next">如果游戏再次崩溃，将尝试下一步。</string>
+    <string name="safe_last">这是最后一步。</string>
+    <string name="safe_gear">可在 ⚙ → 图形安全模式 中更改。</string>
+    <string name="safe_logs">如果仍然崩溃，请将 %1$s 中的文件随问题报告一起发送。</string>
+    <string name="safe_relaunched">游戏已自动重新启动。</string>
+    <string name="safe_ok">确定</string>
+    <string name="toast_safe_zc">零拷贝内存（一项实验性加速）未通过此设备上的测试，本次运行已关闭。</string>
+    <string name="toast_safe_fence">图形驱动报告了同步错误；游戏已恢复，本次运行改用更安全的同步模式。</string>
+    <string name="toast_safe_pipe">图形驱动未能编译某个着色器；部分效果可能缺失。本次运行中着色器改为逐个编译。</string>
+    <string name="notif_safe_channel">崩溃恢复</string>
+    <string name="notif_safe_title">%1$s 在图形驱动中崩溃</string>
+    <string name="notif_safe_text">点按以安全模式重新启动。</string>
 </resources>

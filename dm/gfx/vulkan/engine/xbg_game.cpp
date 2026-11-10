@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <linux/dma-buf.h>   // [zc3] DMA_BUF_IOCTL_SYNC (zc::selftest)
+#include <linux/dma-heap.h>  // [zc-dmabuf] DMA_HEAP_IOCTL_ALLOC (zc::dmabuf_chunk)
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <errno.h>
@@ -135,6 +136,7 @@ __attribute__((weak)) float dm_bright_k(void);
 #include <condition_variable>
 #include <set>
 #include "xbg_vendor_policy.h"
+#include "xbg_safe_mode.h"   // [safe-mode] BUGS_AND_FIXES 2.57
 
 // [nonadreno] DM_GFX_SIM_GPU (xbg_vendor_policy.h): every format-feature query of this file goes through here, so a simulated
 // Mali / PowerVR / Xclipse profile also narrows format features (BC, linear filtering of 16-bit / depth formats, D24). Without
@@ -838,7 +840,7 @@ struct Lock{std::unique_lock<std::mutex> l;Lock():l(mu,std::defer_lock){if(level
 // clear, fill and begin / end packets; 2: every packet but submit / present (those wait for the present thread, which takes this lock).
 // cur_op: the packet dm-record is executing (0 = none), printed by the crash handler (xbg_crash_rec_op).
 namespace drvc {
-int level=0;std::mutex mu;std::atomic<uint32_t> cur_op{0};std::atomic<uint64_t> locks{0};
+std::atomic<int> level{0};std::mutex mu;std::atomic<uint32_t> cur_op{0};std::atomic<uint64_t> locks{0};   // [safe-mode] level atomic: raised live (gpguard::live_pipe)
 struct Lock{std::unique_lock<std::mutex> l;explicit Lock(bool want):l(mu,std::defer_lock){if(want && level>0){l.lock();locks.fetch_add(1,std::memory_order_relaxed);}}};
 }
 // [pvr-ladder] BUGS_AND_FIXES 2.53: a driver crash inside a dm-record packet (moto g64 / BXM-8-256 1.15: SIGBUS in PVRUniFlexCompileToHw
@@ -846,16 +848,14 @@ struct Lock{std::unique_lock<std::mutex> l;explicit Lock(bool want):l(mu,std::de
 // a pass). crashinfo: every render pass and graphics pipeline gets a one-line description in a fixed table when it is made; dm-record
 // notes the pass it began and the pipelines it bound since; the crash handler (host/crash.c, weak xbg_crash_rec_detail) prints them.
 // A slot is filled and only then its handle published, without a lock: a reader in the signal handler may at worst print a mixed line.
-// ladder: on PowerVR such a crash adds one to DM_FILES_DIR/gfx-pvr-ladder, and the next boot turns on workarounds by that count
-// (pvr_ladder_apply, before the family policies are read): 1 = tile policies off (NOLOAD, STORE_DEAD, STORE_NONE, LEAN_USAGE,
-// TILE_BARRIER, LAZY_CLEAR: plain load / store ops), 2 = + COMPILE_LOCK 2 and NOOUT_MASK 0, 3 = + GS_PASSTHRU 0 (the culling GS kept, so
-// no vertex shader meant for a GS feeds a fragment shader directly). A switch the player set (dm/env) wins. DM_PVR_LADDER: unset = the
-// file, 0 = off, N = force level N. DM_PVR_LADDER_FAKE=<s> (test only): a SIGBUS in the first vkCmdEndRenderPass after s seconds.
+// [safe-mode] 2.57: the PowerVR-only ladder (gfx-pvr-ladder) became safe mode for Mali and PowerVR (namespace safemode below,
+// xbg_safe_mode.h): any graphics failure is counted in gfx-safe-mode, the steps are 1 = the 0.5.x speed-ups off, 2 = + the tile policies
+// (the old ladder step 1), 3 = + COMPILE_LOCK 2, NOOUT_MASK 0, GS_PASSTHRU 0 (the old steps 2-3). DM_PVR_LADDER / DM_PVR_LADDER_FAKE stay
+// as aliases of DM_SAFE_MODE / DM_GFX_FAKE_GPU_CRASH.
 namespace crashinfo {
 struct Slot{std::atomic<uint64_t> h{0};char d[232];};
 constexpr unsigned NRP=1024,NPL=4096;Slot rps[NRP],pls[NPL];std::atomic<unsigned> nrp{0},npl{0};
 std::atomic<uint64_t> cur_rp{0},bound[16];std::atomic<unsigned> nbound{0},draws{0};
-char ladder_path[512]="";int ladder_level=0;uint64_t fake_at_ns=0;
 void put(Slot *t,unsigned n,std::atomic<unsigned> &c,uint64_t h,const char *d){const unsigned i=c.fetch_add(1)%n;t[i].h.store(0);snprintf(t[i].d,sizeof t[i].d,"%s",d);t[i].h.store(h,std::memory_order_release);}
 const char *find(Slot *t,unsigned n,uint64_t h){if(!h)return nullptr;for(unsigned i=0;i<n;i++)if(t[i].h.load(std::memory_order_acquire)==h)return t[i].d;return nullptr;}
 const char *lop(VkAttachmentLoadOp o){return o==VK_ATTACHMENT_LOAD_OP_LOAD?"L":o==VK_ATTACHMENT_LOAD_OP_CLEAR?"C":o==VK_ATTACHMENT_LOAD_OP_DONT_CARE?"D":"N";}
@@ -875,36 +875,123 @@ inline void rec_begin(VkRenderPass rp){cur_rp.store(uint64_t(uintptr_t(rp)),std:
 inline void rec_bind(VkPipeline pl){const unsigned n=nbound.load(std::memory_order_relaxed);if(n && bound[(n-1)%16].load(std::memory_order_relaxed)==uint64_t(uintptr_t(pl)))return;bound[n%16].store(uint64_t(uintptr_t(pl)),std::memory_order_relaxed);nbound.store(n+1,std::memory_order_relaxed);}
 inline void rec_draw(){draws.fetch_add(1,std::memory_order_relaxed);}
 }
-// host/crash.c (weak), in the signal handler right after the "crash thread" line: the pass and pipelines dm-record was working on, and
-// on PowerVR one more step of the ladder for the next boot (open / read / write / close only).
+// [safe-mode] BUGS_AND_FIXES 2.57 (xbg_safe_mode.h). Boot: xbg_safe_mode_boot (vulkan_present.cpp, before the device is made, so the
+// dma-buf extensions follow DM_GFX_ZEROCOPY; engine init calls it itself when no presenter did) reads gfx-safe-mode, decides the step and
+// sets its switches (setenv without overwrite: dm/env wins). Record: xbg_safe_mode_record, once per process and signal-safe (open / read /
+// write / close), from the crash classifier (xbg_crash_classify, host/crash.c), fence_fatal and a VK_ERROR_DEVICE_LOST fatal. Live
+// (in-process, no restart): live_fence / live_pipe / the zero-copy self-test turn the switchable behaviour to its safe value and queue a
+// message for the app (xbg_safe_mode_event -> JNI nativeSafeModeEvent -> SafeMode.java toast). status: one line for the app (JNI
+// nativeSafeModeStatus).
+namespace safemode {
+char path[512]="";bool booted=false,eligible=false;int step=0,how=XBG_SAFE_NOT_ELIGIBLE,count=0;XbgGpuFamily family=XBG_GPU_OTHER;
+std::atomic<int> recorded{0};
+int fake_kind=0,fake_s=0;uint64_t fake_at_ns=0;   // DM_GFX_FAKE_GPU_CRASH / DM_PVR_LADDER_FAKE (armed at engine init)
+int fb_fence_s=-1,fb_pipe_s=-1;bool fb_zc=false;uint64_t fb_fence_at=0,fb_pipe_at=0;   // DM_GFX_FAKE_FALLBACK
+char status[768]="";std::mutex ev_mu;std::deque<std::string> events;
+std::atomic<bool> fence_done{false},pipe_done{false},zc_done{false};
+// signal-safe text helpers
+inline size_t cat(char *o,size_t at,size_t cap,const char *s){while(s && *s && at+1<cap)o[at++]=*s++;o[at]=0;return at;}
+inline size_t dec(char *o,size_t at,size_t cap,long long v){char t[24];int n=0;unsigned long long u=v<0?0ull-(unsigned long long)v:(unsigned long long)v;do{t[n++]=char('0'+u%10);u/=10;}while(u && n<23);
+    if(v<0 && at+1<cap)o[at++]='-';while(n && at+1<cap)o[at++]=t[--n];o[at]=0;return at;}
+void event(const char *kind,const std::string &detail){std::lock_guard<std::mutex> l(ev_mu);if(events.size()<16)events.push_back(std::string(kind)+"\t"+detail);}
+// live: a fence error the engine recovered from (fguard::wait polled an early VK_TIMEOUT to success; the pool-reset worker's failed wait,
+// pool_reset_failed): the 0.5.x fence trylock off for the rest of the run, and where the family runs fence guard 0 (Mali), level 1 (a slot
+// fence is not touched before its vkQueueSubmit ran: the Vulkan rule, free). Both atomics, read per call: safe to change while running.
+// Once per run, Mali / PowerVR only.
+void live_fence(const char *what){
+    if(!eligible || fence_done.exchange(true))return;
+    const bool tl=fguard::trylock.exchange(false);const int lv=fguard::level.load();if(lv<1)fguard::level.store(1);
+    xbg_logf("NVN safe mode (live): a fence error was recovered (%s): DM_GFX_FENCE_TRYLOCK %d -> 0, DM_GFX_FENCE_GUARD %d -> %d for the rest of this run (no restart)",what,int(tl),lv,lv<1?1:lv);
+    event("fence",what);}
+}
+// The count of graphics failures in gfx-safe-mode + 1, written once per process. Signal-safe. Returns the new count (0 = not recorded:
+// not Mali / PowerVR, no files dir, or already recorded by this process).
+extern "C" int xbg_safe_mode_record(const char *why){
+    using namespace safemode;
+    if(!eligible || !path[0] || recorded.exchange(1))return 0;
+    const int fd=open(path,O_RDWR|O_CREAT|O_CLOEXEC,0600);if(fd<0)return 0;
+    char b[1024];const ssize_t r=read(fd,b,sizeof b-1);int c=0;
+    if(r>0){b[r]=0;for(const char *p=b;*p;){if(!strncmp(p,"count=",6)){for(const char *q=p+6;*q>='0' && *q<='9';q++)c=c*10+(*q-'0');break;}while(*p && *p!='\n')++p;if(*p)++p;}}
+    c=c<99?c+1:99;
+    struct timespec ts;clock_gettime(CLOCK_REALTIME,&ts);const long long ms=(long long)ts.tv_sec*1000+ts.tv_nsec/1000000;
+    char o[512];size_t n=0;n=cat(o,n,sizeof o,"count=");n=dec(o,n,sizeof o,c);n=cat(o,n,sizeof o,"\nstep=");n=dec(o,n,sizeof o,step);
+    n=cat(o,n,sizeof o,"\npid=");n=dec(o,n,sizeof o,getpid());n=cat(o,n,sizeof o,"\ntime=");n=dec(o,n,sizeof o,ms);
+    n=cat(o,n,sizeof o,"\nfamily=");n=cat(o,n,sizeof o,xbg_gpu_family_name(family));n=cat(o,n,sizeof o,"\nwhy=");
+    for(const char *w=why?why:"?";*w && n+2<sizeof o;w++)o[n++]=*w=='\n' || *w=='\t'?' ':*w;
+    o[n++]='\n';o[n]=0;
+    if(lseek(fd,0,SEEK_SET)==0 && ftruncate(fd,0)==0 && write(fd,o,n)==ssize_t(n)){}
+    fsync(fd);close(fd);
+    const int next=c<XBG_SAFE_MAX_STEP?c:XBG_SAFE_MAX_STEP;
+    fprintf(stderr,"[dm] safe mode: graphics failure on %s (%s): gfx-safe-mode count -> %d (this run had step %d; the next start, counted, turns on step %d)\n",
+        xbg_gpu_family_name(family),why?why:"?",c,step,next);
+    return c;
+}
+// [safe-mode] this boot's step: before the Vulkan device exists (vulkan_present.cpp, physical device known) or at engine init. Once per process.
+extern "C" void xbg_safe_mode_boot(uint32_t vendor,const char *name){
+    using namespace safemode;
+    if(booted)return;booted=true;
+    const uint32_t sim=xbg_sim_parse(getenv("DM_GFX_SIM_GPU"));
+    family=xbg_effective_family(xbg_gpu_family(vendor,name),sim);eligible=xbg_safe_family(family);
+    const char *fd=getenv("DM_FILES_DIR");if(fd && *fd)snprintf(path,sizeof path,"%s/gfx-safe-mode",fd);
+    XbgSafeMarker m;std::string text;
+    if(path[0])if(FILE *f=fopen(path,"rb")){char b[1024];const size_t k=fread(b,1,sizeof b-1,f);b[k]=0;text=b;fclose(f);}
+    xbg_safe_parse(text.c_str(),&m);
+    // v0.5.0's PowerVR ladder file: its count carries over (ladder c -> safe count c + 1), then it is removed
+    if(family==XBG_GPU_POWERVR && fd && *fd){const std::string old=std::string(fd)+"/gfx-pvr-ladder";
+        if(FILE *f=fopen(old.c_str(),"rb")){int lv=0;if(fscanf(f,"%d",&lv)!=1)lv=0;fclose(f);remove(old.c_str());
+            if(lv>0 && !m.count && path[0])if(FILE *w=fopen(path,"wb")){m.count=xbg_safe_from_ladder(lv);snprintf(m.why,sizeof m.why,"v0.5.0 gfx-pvr-ladder %d carried over",lv);
+                fprintf(w,"count=%d\nstep=0\npid=0\ntime=0\nfamily=powervr\nwhy=%s\n",m.count,m.why);fclose(w);}
+            xbg_logf("NVN safe mode: v0.5.0 PowerVR ladder file gfx-pvr-ladder=%d carried over as count %d (and removed)",lv,m.count);}}
+    count=m.count;
+    const char *sm=getenv("DM_SAFE_MODE"),*pl=getenv("DM_PVR_LADDER");
+    step=xbg_safe_step(sm,pl,family==XBG_GPU_POWERVR,count,&how);
+    if(!eligible){step=0;how=XBG_SAFE_NOT_ELIGIBLE;
+        snprintf(status,sizeof status,"0\t0\tnot-eligible\t%s\t%d\t%s\t",xbg_gpu_family_name(family),count,m.why);
+        xbg_logf("NVN safe mode: not used on %s (Mali / PowerVR only, DM_GFX_SIM_GPU=%s)",xbg_gpu_family_name(family),getenv("DM_GFX_SIM_GPU")?getenv("DM_GFX_SIM_GPU"):"-");
+        return;}
+    XbgSafeSwitch sw[24];const int n=xbg_safe_switches(step,family,sw,24);std::string set,player;
+    for(int i=0;i<n;i++){if(const char *have=getenv(sw[i].key)){player+=" ";player+=sw[i].key;player+="=";player+=have;continue;}
+        setenv(sw[i].key,sw[i].value,0);set+=" ";set+=sw[i].key;set+="=";set+=sw[i].value;}
+    snprintf(status,sizeof status,"1\t%d\t%s\t%s\t%d\t%s\t%s",step,xbg_safe_how_name(how),xbg_gpu_family_name(family),count,m.why,set.empty()?"":set.c_str()+1);
+    xbg_logf("NVN safe mode: step %d of 3 on %s (%s; %d graphics failure(s) counted in %s, last: %s; DM_SAFE_MODE=%s DM_PVR_LADDER=%s): %s.%s%s%s%s",
+        step,xbg_gpu_family_name(family),xbg_safe_how_name(how),count,path[0]?path:"-",m.why[0]?m.why:"-",sm && *sm?sm:"-",pl && *pl?pl:"-",xbg_safe_step_text(step),
+        set.empty()?"":" Set:",set.c_str(),player.empty()?"":" The player's own (dm/env) values kept:",player.c_str());
+    // test triggers (only here: Mali / PowerVR, real or simulated)
+    {const char *e=getenv("DM_GFX_FAKE_GPU_CRASH");if(!(e && *e))e=getenv("DM_PVR_LADDER_FAKE");fake_kind=xbg_safe_fake_parse(e,&fake_s);
+     const char *f=getenv("DM_GFX_FAKE_FALLBACK");fb_zc=xbg_safe_fallback_fake(f,"zc")>=0;fb_fence_s=xbg_safe_fallback_fake(f,"fence");fb_pipe_s=xbg_safe_fallback_fake(f,"pipe");
+     if(fake_kind)xbg_logf("NVN safe mode test: DM_GFX_FAKE_GPU_CRASH=%s: a fake %s %d s after the engine starts",e,fake_kind==XBG_FAKE_REC?"SIGBUS in the dm-record vkCmdEndRenderPass packet":fake_kind==XBG_FAKE_LOST?"VK_ERROR_DEVICE_LOST fatal":"GPU-hang fence fatal",fake_s);
+     if(f && *f)xbg_logf("NVN safe mode test: DM_GFX_FAKE_FALLBACK=%s (zc %d, fence %d s, pipe %d s)",f,int(fb_zc),fb_fence_s,fb_pipe_s);}
+}
+// For the app (JNI nativeSafeModeStatus): "<eligible>\t<step>\t<how>\t<family>\t<count>\t<last why>\t<switches set>", "" before the boot decision.
+extern "C" const char *xbg_safe_mode_status(void){return safemode::booted?safemode::status:"";}
+// The next in-process fallback message for the app ("<kind>\t<detail>"), copied into out; 0 = none.
+extern "C" int xbg_safe_mode_event(char *out,size_t n){
+    std::lock_guard<std::mutex> l(safemode::ev_mu);if(safemode::events.empty() || !n)return 0;
+    snprintf(out,n,"%s",safemode::events.front().c_str());safemode::events.pop_front();return 1;}
+// host/crash.c (weak), in the signal handler right after the "crash thread" line: the pass and pipelines dm-record was working on.
 extern "C" void xbg_crash_rec_detail(void){
     if(!drvc::cur_op.load(std::memory_order_relaxed))return;   // dm-record was not inside a packet
     const uint64_t rp=crashinfo::cur_rp.load();const char *d=crashinfo::find(crashinfo::rps,crashinfo::NRP,rp);
-    fprintf(stderr,"[dm] crash pass: rp %#llx (%s); draws in it %u; ladder level this boot %d\n",(unsigned long long)rp,d?d:"not in the table",crashinfo::draws.load(),crashinfo::ladder_level);
+    fprintf(stderr,"[dm] crash pass: rp %#llx (%s); draws in it %u; safe-mode step this boot %d\n",(unsigned long long)rp,d?d:"not in the table",crashinfo::draws.load(),safemode::step);
     const unsigned n=crashinfo::nbound.load(),m=n<16?n:16;
     for(unsigned k=0;k<m;k++){const uint64_t pl=crashinfo::bound[(n-1-k)%16].load();const char *pd=crashinfo::find(crashinfo::pls,crashinfo::NPL,pl);
         fprintf(stderr,"[dm] crash pass pipeline %u (last bound first): %#llx %s\n",k,(unsigned long long)pl,pd?pd:"not in the table");}
-    if(gpu_policy!=XBG_GPU_POWERVR || !crashinfo::ladder_path[0])return;
-    int fd=open(crashinfo::ladder_path,O_RDWR|O_CREAT,0600);if(fd<0)return;
-    char b[16]={0};const ssize_t r=read(fd,b,sizeof b-1);int v=0;for(ssize_t i=0;i<r && b[i]>='0' && b[i]<='9';i++)v=v*10+(b[i]-'0');
-    v=v<9?v+1:9;char o[4]={char('0'+v),'\n',0,0};lseek(fd,0,SEEK_SET);if(ftruncate(fd,0)==0 && write(fd,o,2)==2){}close(fd);
-    fprintf(stderr,"[dm] crash: PowerVR driver crash inside dm-record: gfx-pvr-ladder -> %d (the next start turns on workaround step %d)\n",v,v<3?v:3);}
-// [pvr-ladder] before the family policies are read (init, after gpu_policy): the workarounds of this boot's step
-void pvr_ladder_apply(){
-    const char *fd=getenv("DM_FILES_DIR");if(fd && *fd)snprintf(crashinfo::ladder_path,sizeof crashinfo::ladder_path,"%s/gfx-pvr-ladder",fd);
-    if(const char *f=getenv("DM_PVR_LADDER_FAKE");f && *f && atoi(f)>0)crashinfo::fake_at_ns=timing_clock()+uint64_t(atoi(f))*1000000000ull;
-    if(gpu_policy!=XBG_GPU_POWERVR)return;
-    int lv=0;const char *e=getenv("DM_PVR_LADDER");
-    if(e && *e)lv=atoi(e);
-    else if(crashinfo::ladder_path[0]){if(FILE *f=fopen(crashinfo::ladder_path,"rb")){if(fscanf(f,"%d",&lv)!=1)lv=0;fclose(f);}}
-    lv=std::clamp(lv,0,3);crashinfo::ladder_level=lv;
-    std::string set;auto on=[&](const char *k,const char *v){if(getenv(k)){set+=" ";set+=k;set+="(player's)";return;}setenv(k,v,0);set+=" ";set+=k;set+="=";set+=v;};
-    if(lv>=1){on("DM_GFX_NOLOAD","0");on("DM_GFX_STORE_DEAD","0");on("DM_GFX_STORE_NONE","0");on("DM_GFX_LEAN_USAGE","0");on("DM_GFX_TILE_BARRIER","0");on("DM_GFX_LAZY_CLEAR","0");}
-    if(lv>=2){on("DM_GFX_COMPILE_LOCK","2");on("DM_GFX_NOOUT_MASK","0");}
-    if(lv>=3)on("DM_GFX_GS_PASSTHRU","0");
-    xbg_logf("NVN pvr ladder: step %d (%s; file %s, DM_PVR_LADDER=%s)%s",lv,e && *e?"forced":"crashes counted in the file",crashinfo::ladder_path[0]?crashinfo::ladder_path:"-",e && *e?e:"-",set.empty()?" nothing changed":set.c_str());}
-extern "C" void xbg_drvc_lock(void){if(drvc::level>0)drvc::mu.lock();}
-extern "C" void xbg_drvc_unlock(void){if(drvc::level>0)drvc::mu.unlock();}
+}
+// [safe-mode] engine init, after gpu_policy (before the family switches are read): the boot decision if the presenter made none, the policy
+// family as the authority for recording (the same family the presenter computed: real + DM_GFX_SIM_GPU), the test timers.
+void safe_mode_engine_init(){
+    using namespace safemode;
+    if(!booted)xbg_safe_mode_boot(properties.vendorID,properties.deviceName);
+    if(xbg_safe_family(gpu_policy)!=eligible){xbg_logf("NVN safe mode: the engine's policy family %s differs from the boot's %s; recording follows the engine",xbg_gpu_family_name(gpu_policy),xbg_gpu_family_name(family));
+        eligible=xbg_safe_family(gpu_policy);family=gpu_policy;}
+    const uint64_t now=timing_clock();
+    fake_at_ns=eligible && fake_kind?now+uint64_t(fake_s)*1000000000ull:0;
+    fb_fence_at=eligible && fb_fence_s>=0?now+uint64_t(fb_fence_s)*1000000000ull:0;fb_pipe_at=eligible && fb_pipe_s>=0?now+uint64_t(fb_pipe_s)*1000000000ull:0;
+}
+// [safe-mode] the level may be raised while the present thread is between lock and unlock: unlock releases only what this thread took
+static thread_local bool drvc_held=false;
+extern "C" void xbg_drvc_lock(void){if(drvc::level>0){drvc::mu.lock();drvc_held=true;}}
+extern "C" void xbg_drvc_unlock(void){if(drvc_held){drvc_held=false;drvc::mu.unlock();}}
 namespace vkrec {
 int mode=0;bool on=false;   // on: the slot being recorded goes through packets (decided when a slot starts recording: A/B target recthread)
 enum Op:uint32_t{K_SKIP,K_BEGIN,K_END,K_SUBMIT,K_PRESENT,K_BARRIER,K_BEGIN_QUERY,K_END_QUERY,K_BEGIN_RP,K_END_RP,K_RESET_QP,K_TIMESTAMP,K_COPY_QP,K_COPY_BUF,
@@ -990,7 +1077,7 @@ void exec(const Hdr *h){
     case K_COPY_QP:{const PCopyQP &q=*reinterpret_cast<const PCopyQP*>(p);vkCmdCopyQueryPoolResults(c,q.pool,q.first,q.count,q.dst,q.off,q.stride,q.flags);break;}
     case K_BEGIN_RP:{const PBeginRP &q=*reinterpret_cast<const PBeginRP*>(p);crashinfo::rec_begin(q.rp);VkRenderPassBeginInfo b{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};b.renderPass=q.rp;b.framebuffer=q.fb;b.renderArea=q.area;
         b.clearValueCount=q.nclear;b.pClearValues=q.nclear?reinterpret_cast<const VkClearValue*>(&q+1):nullptr;vkCmdBeginRenderPass(c,&b,VkSubpassContents(q.contents));break;}
-    case K_END_RP:if(crashinfo::fake_at_ns && timing_clock()>=crashinfo::fake_at_ns){crashinfo::fake_at_ns=0;raise(SIGBUS);}   // [pvr-ladder] DM_PVR_LADDER_FAKE
+    case K_END_RP:if(safemode::fake_kind==XBG_FAKE_REC && safemode::fake_at_ns && timing_clock()>=safemode::fake_at_ns){safemode::fake_at_ns=0;raise(SIGBUS);}   // [safe-mode] DM_GFX_FAKE_GPU_CRASH=<s>[:rec] / DM_PVR_LADDER_FAKE
         vkCmdEndRenderPass(c);break;
     case K_COPY_BUF:{const PCopyBuf &q=*reinterpret_cast<const PCopyBuf*>(p);vkCmdCopyBuffer(c,q.src,q.dst,q.n,reinterpret_cast<const VkBufferCopy*>(&q+1));break;}
     case K_COPY_B2I:{const PB2I &q=*reinterpret_cast<const PB2I*>(p);vkCmdCopyBufferToImage(c,q.buf,q.img,VkImageLayout(q.layout),q.n,reinterpret_cast<const VkBufferImageCopy*>(&q+1));break;}
@@ -1378,7 +1465,7 @@ VkResult wait(VkFence f,uint64_t timeout_ns,uint64_t *waited_ns,const char *who)
     if(recover.load(std::memory_order_relaxed) && xbg_fence_wait_early(r,t1-t0,timeout_ns)){
         // A real VK_TIMEOUT only comes after the timeout. Poll up to the deadline, at most 10 s more (an endless wait stays bounded).
         const uint64_t left=std::min<uint64_t>(timeout_ns-(t1-t0),10000000000ull);const uint64_t n=early.fetch_add(1,std::memory_order_relaxed);
-        const VkResult p=poll(f,left);if(p==VK_SUCCESS)early_recovered.fetch_add(1,std::memory_order_relaxed);
+        const VkResult p=poll(f,left);if(p==VK_SUCCESS){early_recovered.fetch_add(1,std::memory_order_relaxed);safemode::live_fence("an early VK_TIMEOUT of a fence wait, polled to success");}
         if(n<8 || p!=VK_SUCCESS)vkrec::rlog("NVN fence wait (%s): vkWaitForFences returned VK_TIMEOUT after %.1f ms of its %.0f ms timeout (the driver gave up early: a fence error, not a GPU hang); polled the status for up to %.0f ms more: %d (%s; early waits %llu, recovered %llu)",
             who,(t1-t0)/1e6,timeout_ns/1e6,left/1e6,int(p),p==VK_SUCCESS?"signalled":p==VK_TIMEOUT?"still not signalled":"error",(unsigned long long)n+1,(unsigned long long)early_recovered.load());
         r=p;}
@@ -1428,7 +1515,7 @@ void drain(){if(!worker)return;{std::lock_guard<std::mutex> l(mu);stop=true;}cv.
 void pool_reset_failed(Slot &s){
     const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);
     if(!fguard::recover.load(std::memory_order_relaxed))fence_fatal(s,s.reset_result,s.reset_wait_ns,timeout,"pool reset worker");
-    const uint64_t n=fguard::pool_recovered.fetch_add(1,std::memory_order_relaxed);
+    const uint64_t n=fguard::pool_recovered.fetch_add(1,std::memory_order_relaxed);safemode::live_fence("the pool-reset worker's fence wait failed, the retire wait succeeded");   // [safe-mode]
     if(n<8 || (n&(n+1))==0)xbg_logf("NVN command pool reset: the worker's fence wait failed (%d after %.1f ms of %.0f ms), but retire_slot then waited for the same fence: the pool is reset here (a driver fence error, not a GPU hang; %llu so far, DM_GFX_FENCE_RECOVER)",
         int(s.reset_result),s.reset_wait_ns/1e6,timeout/1e6,(unsigned long long)n+1);
     s.reset_result=VK_SUCCESS;s.reset_fence_failed=false;VK(vkResetCommandPool(cfg.device,s.pool,0));
@@ -1741,6 +1828,19 @@ void retire(uint64_t t0,bool busy,uint64_t t1){
 void done(uint64_t t0,uint64_t b0,uint64_t t1){
     if(!t0 || t1<b0+100000 || t1<=t0 || !enabled())return;std::lock_guard<std::mutex> l(mu);add(t0,t1);}
 }
+// [safe-mode] once per retired slot (translation thread): the test triggers that are due (DM_GFX_FAKE_GPU_CRASH lost / hang,
+// DM_GFX_FAKE_FALLBACK fence / pipe; rec fires in the dm-record vkCmdEndRenderPass packet).
+namespace gpguard{void live_pipe(const std::string &combo,VkResult r);}
+inline void safe_mode_retire_tick(VkResult &fr,uint64_t &waited,uint64_t timeout){
+    using namespace safemode;
+    if(!fb_fence_at && !fb_pipe_at && !(fake_at_ns && fake_kind!=XBG_FAKE_REC))return;
+    const uint64_t now=timing_clock();
+    if(fake_at_ns && fake_kind!=XBG_FAKE_REC && now>=fake_at_ns){fake_at_ns=0;
+        if(fake_kind==XBG_FAKE_LOST)check(VK_ERROR_DEVICE_LOST,"the retire fence wait (test: DM_GFX_FAKE_GPU_CRASH=lost)");
+        xbg_logf("NVN safe mode test: DM_GFX_FAKE_GPU_CRASH=hang: this retire's fence wait counts as its whole timeout");fr=VK_TIMEOUT;waited=timeout;}
+    if(fb_fence_at && now>=fb_fence_at){fb_fence_at=0;live_fence("test: DM_GFX_FAKE_FALLBACK=fence");}
+    if(fb_pipe_at && now>=fb_pipe_at){fb_pipe_at=0;gpguard::live_pipe("test:DM_GFX_FAKE_FALLBACK=pipe",VK_ERROR_INITIALIZATION_FAILED);}
+}
 void retire_slot(Slot &s){
     if(!s.pending)return;
     poolreset::finish(s);
@@ -1748,7 +1848,7 @@ void retire_slot(Slot &s){
     bool fence_busy=false;uint64_t fence_done=0;   // [gpuclk] the fence was still unsignalled here, and when the wait returned
     {CPU_SCOPE(Fence);bool busy=fguard::status(s.fence,s.rec_ticket)==VK_NOT_READY;uint64_t b0=busy?timing_clock():0;
      const uint64_t timeout=std::max<uint64_t>(cfg.fence_timeout_ns,10000000000ull);uint64_t waited=0;
-     const VkResult fr=fguard::wait(s.fence,timeout,&waited,"retire");if(fr!=VK_SUCCESS)fence_fatal(s,fr,waited,timeout,"retire");   // [pvr] was VK(vkWaitForFences(...))
+     VkResult fr=fguard::wait(s.fence,timeout,&waited,"retire");safe_mode_retire_tick(fr,waited,timeout);if(fr!=VK_SUCCESS)fence_fatal(s,fr,waited,timeout,"retire");   // [pvr] was VK(vkWaitForFences(...))
      if(busy){fence_done=timing_clock();block_ns[sync_site]+=fence_done-b0;++block_calls[sync_site];fence_busy=true;}}
     gpuclk::retire(s.diag.submit_t,fence_busy,fence_done);
     ++perf.waits;
@@ -2481,8 +2581,62 @@ int recv_fd(int sock){char buf[512];char ctrl[CMSG_SPACE(sizeof(int)*8)];iovec i
 // process puts there next. map_chunk moves a view twice (driver address -> spare range, fill, -> guest address): the first move proves
 // mremap works on this mapping before the guest range is touched (MREMAP_FIXED unmaps the target before it can fail). Moved chunks have
 // no fd, so the dirty tracker cannot coalesce their split VMAs (issue #21); "[perf] memory 60s: maps=" shows the cost.
-enum ZcMap{ZC_MAP_FD=0,ZC_MAP_VKMAP=1,ZC_MAP_VKALLOC=2};int map_method=ZC_MAP_FD;
-const char *map_name(int m){return m==ZC_MAP_FD?"fd":m==ZC_MAP_VKMAP?"vkmap":"vkalloc";}
+// [zc-dmabuf] v0.5.2: two views with a writable fd of our own, mapped MAP_FIXED exactly like ZC_MAP_FD (nothing of the driver moves):
+//  ZC_MAP_DMAHEAP  a buffer from /dev/dma_heap (system-uncached, mtk_mm-uncached, system, mtk_mm: the first that opens), imported into
+//                  Vulkan as a dma-buf (VK_EXT_external_memory_dma_buf, VkImportMemoryFdInfoKHR);
+//  ZC_MAP_VKEXPORT Vulkan memory exported as a dma-buf fd (VkExportMemoryAllocateInfo + vkGetMemoryFdKHR).
+// Both need dm_vk_dmabuf (vulkan_present.cpp); a step that fails is an ordinary error (logged, the next view is tried).
+enum ZcMap{ZC_MAP_FD=0,ZC_MAP_VKMAP=1,ZC_MAP_VKALLOC=2,ZC_MAP_DMAHEAP=3,ZC_MAP_VKEXPORT=4};int map_method=ZC_MAP_FD;
+const char *map_name(int m){return m==ZC_MAP_FD?"fd":m==ZC_MAP_VKMAP?"vkmap":m==ZC_MAP_VKALLOC?"vkalloc":m==ZC_MAP_DMAHEAP?"dmaheap":"vkexport";}
+const char *heap_used="";
+// n bytes of dma-buf for method (dmaheap / vkexport) bound to a new VkBuffer; *fd: our writable fd of it. false + why.
+}
+extern "C" int dm_vk_dmabuf __attribute__((weak));   // [zc-dmabuf] vulkan_present.cpp
+namespace zc {
+bool dmabuf_chunk(int method,size_t n,bool cached,VkBuffer *buffer,VkDeviceMemory *memory,int *fd,uint32_t *type,char *why,size_t why_n){
+    *buffer=VK_NULL_HANDLE;*memory=VK_NULL_HANDLE;*fd=-1;*type=32;
+    if(!&dm_vk_dmabuf || !dm_vk_dmabuf){snprintf(why,why_n,"VK_EXT_external_memory_dma_buf / VK_KHR_external_memory_fd not enabled");return false;}
+    static auto get_fd=(PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(cfg.device,"vkGetMemoryFdKHR");
+    static auto fd_props=(PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(cfg.device,"vkGetMemoryFdPropertiesKHR");
+    VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};eb.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bc.pNext=&eb;bc.size=n;bc.usage=arena_usage;
+    if(vkCreateBuffer(cfg.device,&bc,nullptr,buffer)){snprintf(why,why_n,"dma-buf buffer create failed");return false;}
+    auto fail=[&](const char *what,long e){snprintf(why,why_n,"%s (%ld)",what,e);if(*memory)vkFreeMemory(cfg.device,*memory,nullptr);*memory=VK_NULL_HANDLE;vkDestroyBuffer(cfg.device,*buffer,nullptr);*buffer=VK_NULL_HANDLE;if(*fd>=0)close(*fd);*fd=-1;return false;};
+    VkMemoryRequirements q;vkGetBufferMemoryRequirements(cfg.device,*buffer,&q);
+    VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};ded.buffer=*buffer;
+    VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    const int want=cached?XBG_ZC_CACHED:XBG_ZC_UNCACHED;
+    if(method==ZC_MAP_DMAHEAP){
+        if(!fd_props)return fail("no vkGetMemoryFdPropertiesKHR",0);
+        static const char *heaps_uc[]={"system-uncached","mtk_mm-uncached","system","mtk_mm"},*heaps_c[]={"system","mtk_mm","system-uncached","mtk_mm-uncached"};
+        const char **hl=cached?heaps_c:heaps_uc;int hfd=-1,last=0;
+        for(int k=0;k<4 && hfd<0;k++){char path[64];snprintf(path,sizeof path,"/dev/dma_heap/%s",hl[k]);hfd=open(path,O_RDONLY|O_CLOEXEC);if(hfd<0)last=errno;else heap_used=hl[k];}
+        if(hfd<0)return fail("no /dev/dma_heap opens, errno",last);
+        dma_heap_allocation_data al{};al.len=(q.size+4095)&~uint64_t(4095);al.fd_flags=O_RDWR|O_CLOEXEC;
+        const int ar=ioctl(hfd,DMA_HEAP_IOCTL_ALLOC,&al);const int ae=errno;close(hfd);
+        if(ar<0)return fail("DMA_HEAP_IOCTL_ALLOC failed, errno",ae);
+        *fd=int(al.fd);
+        VkMemoryFdPropertiesKHR fp{VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+        if(fd_props(cfg.device,VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,*fd,&fp)!=VK_SUCCESS)return fail("vkGetMemoryFdPropertiesKHR failed",0);
+        const uint32_t bits=fp.memoryTypeBits&q.memoryTypeBits;if(!bits)return fail("no memory type for the imported dma-buf, bits",long(fp.memoryTypeBits));
+        *type=xbg_zc_pick_type(bits,memories,want);
+        const int dupfd=dup(*fd);if(dupfd<0)return fail("dup failed, errno",errno);
+        VkImportMemoryFdInfoKHR im{VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};im.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;im.fd=dupfd;im.pNext=&ded;   // the import owns dupfd
+        a.pNext=&im;a.allocationSize=al.len;a.memoryTypeIndex=*type;
+        VkResult r=vkAllocateMemory(cfg.device,&a,nullptr,memory);if(r){close(dupfd);return fail("dma-buf import failed, VkResult",r);}
+    }else{
+        if(!get_fd)return fail("no vkGetMemoryFdKHR",0);
+        const VkMemoryPropertyFlags hv=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,hc=VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,ca=VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        auto find=[&](VkMemoryPropertyFlags w,VkMemoryPropertyFlags avoid){for(uint32_t t=0;t<memories.memoryTypeCount;t++){const VkMemoryPropertyFlags f=memories.memoryTypes[t].propertyFlags;if(q.memoryTypeBits>>t&1 && (f&w)==w && !(f&avoid))return t;}return 32u;};
+        *type=cached?find(hv|hc|ca,0):find(hv|hc,ca);if(*type==32)*type=cached?find(hv|ca,0):find(hv|hc,0);if(*type==32)return fail("no HOST_VISIBLE type",0);
+        VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};ex.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;ex.pNext=&ded;
+        a.pNext=&ex;a.allocationSize=q.size;a.memoryTypeIndex=*type;
+        VkResult r=vkAllocateMemory(cfg.device,&a,nullptr,memory);if(r)return fail("exportable allocation failed, VkResult",r);
+        VkMemoryGetFdInfoKHR gi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};gi.memory=*memory;gi.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        r=get_fd(cfg.device,&gi,fd);if(r || *fd<0){*fd=-1;return fail("vkGetMemoryFdKHR failed, VkResult",r);}
+    }
+    if(vkBindBufferMemory(cfg.device,*buffer,*memory,0))return fail("bind failed",0);
+    return true;}
 // the driver's view of mem moved to dst (nullptr: a fresh range); copy_from: n bytes written into it before the move. MAP_FAILED + *err.
 void *moved_view(VkDeviceMemory mem,size_t n,void *dst,const void *copy_from,int *err){
     void *p=nullptr;const VkResult r=vkMapMemory(cfg.device,mem,0,VK_WHOLE_SIZE,0,&p);if(r!=VK_SUCCESS || !p){*err=1000+int(-r);return MAP_FAILED;}
@@ -2505,6 +2659,18 @@ bool alloc_plain(size_t n,bool cached,VkBuffer *buffer,VkDeviceMemory *memory,ui
     if(vkAllocateMemory(cfg.device,&a,nullptr,memory) || vkBindBufferMemory(cfg.device,*buffer,*memory,0)){if(*memory)vkFreeMemory(cfg.device,*memory,nullptr);*memory=VK_NULL_HANDLE;vkDestroyBuffer(cfg.device,*buffer,nullptr);*buffer=VK_NULL_HANDLE;return false;}
     return true;}
 bool map_chunk(uint8_t *lo,size_t n){
+    if(map_method==ZC_MAP_DMAHEAP || map_method==ZC_MAP_VKEXPORT){VkBuffer buffer{};VkDeviceMemory memory{};int fd=-1;uint32_t type=32;char why[160];   // [zc-dmabuf]
+        if(!dmabuf_chunk(map_method,n,mode==XBG_ZC_CACHED,&buffer,&memory,&fd,&type,why,sizeof why)){xbg_logf("NVN zero-copy: %s chunk of %zu bytes failed: %s",map_name(map_method),n,why);return false;}
+        void *tmp=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+        if(tmp==MAP_FAILED){xbg_logf("NVN zero-copy: %s mmap failed errno=%d",map_name(map_method),errno);close(fd);vkDestroyBuffer(cfg.device,buffer,nullptr);vkFreeMemory(cfg.device,memory,nullptr);return false;}
+        memcpy(tmp,lo,n);
+        void *fixed=mmap(lo,n,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_FIXED,fd,0);munmap(tmp,n);
+        if(fixed!=lo)xbg_fatalf("NVN zero-copy: MAP_FIXED of guest pool %p+%zu failed errno=%d",(void*)lo,n,errno);
+        {static unsigned told=0;if(told++<2)xbg_logf("NVN zero-copy memory: %s%s%s type %u flags %#x",map_name(map_method),map_method==ZC_MAP_DMAHEAP?" heap ":"",map_method==ZC_MAP_DMAHEAP?heap_used:"",type,type<memories.memoryTypeCount?unsigned(memories.memoryTypes[type].propertyFlags):0u);}
+        nvn_dirty_zc_chunk(lo,n,fd,0);   // the tracker keeps the fd (VMA coalescing, issue #21)
+        int i=count.load();if(i>=512)xbg_fatalf("NVN zero-copy: chunk table full");
+        Chunk &c=table[i];c.lo=uintptr_t(lo);c.n=n;c.buffer=buffer;c.memory=memory;c.ahb=nullptr;c.sticky.assign((n+4095)/4096,0);count.store(i+1,std::memory_order_release);mapped_bytes+=n;
+        return true;}
     if(map_method==ZC_MAP_VKALLOC){VkBuffer buffer{};VkDeviceMemory memory{};uint32_t type=32;   // [zc-map]
         if(!alloc_plain(n,mode==XBG_ZC_CACHED,&buffer,&memory,&type)){xbg_logf("NVN zero-copy: vkalloc of %zu bytes failed",n);return false;}
         int err=0;void *tmp=moved_view(memory,n,nullptr,lo,&err);
@@ -2592,7 +2758,8 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n,int maint=ZC_MAINT_NONE,
     *why=0;const size_t n=1u<<20;const uint32_t half=uint32_t(n/8);   // words per half
     uint64_t maint_ns=0;const char *maint_fail=nullptr;uint32_t ztype=32,allowed=0;
     AHardwareBuffer_Desc d{};d.width=uint32_t(n);d.height=1;d.layers=1;d.format=AHARDWAREBUFFER_FORMAT_BLOB;d.usage=usage|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
-    AHardwareBuffer *ahb=nullptr;if(method!=ZC_MAP_VKALLOC && AHardwareBuffer_allocate(&d,&ahb)){snprintf(why,why_n,"AHardwareBuffer_allocate failed");return ~0ull;}
+    const bool own_fd=method==ZC_MAP_DMAHEAP || method==ZC_MAP_VKEXPORT;   // [zc-dmabuf]
+    AHardwareBuffer *ahb=nullptr;if(method!=ZC_MAP_VKALLOC && !own_fd && AHardwareBuffer_allocate(&d,&ahb)){snprintf(why,why_n,"AHardwareBuffer_allocate failed");return ~0ull;}
     int sv[2]={-1,-1},fd=-1;if(ahb && !socketpair(AF_UNIX,SOCK_STREAM,0,sv)){if(!AHardwareBuffer_sendHandleToUnixSocket(ahb,sv[0]))fd=recv_fd(sv[1]);close(sv[0]);close(sv[1]);}
     VkBuffer zb{},rb{};VkDeviceMemory zm{},rm{};VkCommandPool pool{};VkFence zt_fence{};void *cpu=MAP_FAILED,*rmap=nullptr;uint64_t bad=~0ull;
     auto done=[&](uint64_t r){if(cpu!=MAP_FAILED)munmap(cpu,n);if(zt_fence)vkDestroyFence(cfg.device,zt_fence,nullptr);if(pool)vkDestroyCommandPool(cfg.device,pool,nullptr);
@@ -2600,7 +2767,9 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n,int maint=ZC_MAINT_NONE,
         if(fd>=0)close(fd);if(ahb)AHardwareBuffer_release(ahb);return r;};
     if(fd<0 && method==ZC_MAP_FD){snprintf(why,why_n,"no dma-buf fd");return done(~0ull);}
     VkResult r=VK_SUCCESS;
-    if(method==ZC_MAP_VKALLOC){if(!alloc_plain(n,prefer_cached || mode==XBG_ZC_CACHED,&zb,&zm,&ztype)){snprintf(why,why_n,"vkalloc: no HOST_VISIBLE memory of the mode");return done(~0ull);}}
+    if(own_fd){char w2[160];if(!dmabuf_chunk(method,n,prefer_cached || mode==XBG_ZC_CACHED,&zb,&zm,&fd,&ztype,w2,sizeof w2)){snprintf(why,why_n,"%s: %s",map_name(method),w2);return done(~0ull);}
+        allowed=1u<<ztype;}
+    else if(method==ZC_MAP_VKALLOC){if(!alloc_plain(n,prefer_cached || mode==XBG_ZC_CACHED,&zb,&zm,&ztype)){snprintf(why,why_n,"vkalloc: no HOST_VISIBLE memory of the mode");return done(~0ull);}}
     else{
     VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};eb.handleTypes=VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
     VkBufferCreateInfo bc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};bc.pNext=&eb;bc.size=n;bc.usage=arena_usage;
@@ -2615,7 +2784,7 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n,int maint=ZC_MAINT_NONE,
     if(r || vkBindBufferMemory(cfg.device,zb,zm,0)){snprintf(why,why_n,"import failed %d (allowed=%#x type=%u)",int(r),props.memoryTypeBits,a.memoryTypeIndex);return done(~0ull);}
     }
     const unsigned flags=ztype<memories.memoryTypeCount?unsigned(memories.memoryTypes[ztype].propertyFlags):0u;
-    if(method==ZC_MAP_FD){cpu=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
+    if(method==ZC_MAP_FD || own_fd){cpu=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
         if(cpu==MAP_FAILED){const int e=errno,fl=fcntl(fd,F_GETFL);void *ro=mmap(nullptr,n,PROT_READ,MAP_SHARED,fd,0);if(ro!=MAP_FAILED)munmap(ro,n);   // [zc-map] why: a read-only fd, or no mmap at all
             snprintf(why,why_n,"dma-buf mmap failed errno=%d (fd access %s, read-only mmap %s)",e,fl<0?"?":(fl&O_ACCMODE)==O_RDONLY?"read-only":(fl&O_ACCMODE)==O_WRONLY?"write-only":"read-write",ro!=MAP_FAILED?"works":"fails too");return done(~0ull);}}
     else{int err=0;cpu=moved_view(zm,n,nullptr,nullptr,&err);if(cpu==MAP_FAILED){snprintf(why,why_n,"%s view failed err=%d (1000+n: vkMapMemory VkResult -n, else mremap errno)",map_name(method),err);return done(~0ull);}}
@@ -2678,7 +2847,8 @@ void decide(){
     // The self-test: everywhere but real-Adreno cached (unchanged there; under DM_GFX_SIM_GPU the family is the simulated one, so it runs).
     const char *t=getenv("DM_GFX_ZC_SELFTEST");const int st=t && *t?std::clamp(atoi(t),0,2):1;
     // [zc-map] DM_GFX_ZC_MAP=fd|vkmap|vkalloc forces the CPU-view method (and runs the self-test with it, real Adreno included)
-    const char *mm=getenv("DM_GFX_ZC_MAP");const int fmap=!mm || !*mm?-1:!strcmp(mm,"fd")?ZC_MAP_FD:!strcmp(mm,"vkmap")?ZC_MAP_VKMAP:!strcmp(mm,"vkalloc")?ZC_MAP_VKALLOC:-1;
+    const char *mm=getenv("DM_GFX_ZC_MAP");const int fmap=!mm || !*mm?-1:!strcmp(mm,"fd")?ZC_MAP_FD:!strcmp(mm,"vkmap")?ZC_MAP_VKMAP:!strcmp(mm,"vkalloc")?ZC_MAP_VKALLOC:
+        !strcmp(mm,"dmaheap")?ZC_MAP_DMAHEAP:!strcmp(mm,"vkexport")?ZC_MAP_VKEXPORT:-1;
     if(fmap>=0)map_method=fmap;
     if(enabled && st && !(gpu_policy==XBG_GPU_ADRENO && mode==XBG_ZC_CACHED && fmap<0)){
         // uncached: write-combined candidates in order; cached: the pages map_chunk allocates. [zc-map] Each usage with the fd view, then
@@ -2690,14 +2860,23 @@ void decide(){
         // SEGV_ACCERR at the moved view's old address: the driver still touches its own mapping, which is now the PROT_NONE placeholder).
         // auto tries the fd view only again; vkmap / vkalloc only when DM_GFX_ZC_MAP forces them.
         std::vector<std::pair<uint64_t,int>> tries;
-        for(uint64_t u:cands)if(fmap<0 || fmap==ZC_MAP_FD || fmap==ZC_MAP_VKMAP)tries.push_back({u,fmap<0?int(ZC_MAP_FD):fmap});
+        for(uint64_t u:cands)if(fmap<0 || fmap==ZC_MAP_FD || fmap==ZC_MAP_VKMAP)tries.push_back({u,fmap<0?int(ZC_MAP_FD):fmap});   // dmaheap / vkexport: below
         if(fmap==ZC_MAP_VKALLOC)tries.push_back({cands[0],ZC_MAP_VKALLOC});
+        // [zc-dmabuf] v0.5.2: after the AHB fd view, our own writable dma-buf (a Vulkan export, then dma-heap): no driver mapping moves.
+        // vkexport first: on the Mi 14 model it ran a level at 60 fps; dmaheap passed the self-test but its level run was not seen.
+        if(fmap<0 || fmap==ZC_MAP_VKEXPORT)tries.push_back({cands[0],ZC_MAP_VKEXPORT});
+        if(fmap<0 || fmap==ZC_MAP_DMAHEAP)tries.push_back({cands[0],ZC_MAP_DMAHEAP});
         bool pass=false;uint64_t used=cands[0];
-        for(auto [u,m]:tries){char why[400];const uint64_t t0=timing_clock();const uint64_t bad=selftest(u,why,sizeof why,ZC_MAINT_NONE,false,m);
+        std::string last_why;   // [safe-mode] for the live message
+        for(auto [u,m]:tries){char why[400];const uint64_t t0=timing_clock();uint64_t bad=selftest(u,why,sizeof why,ZC_MAINT_NONE,false,m);
+            if(!bad && safemode::eligible && safemode::fb_zc){bad=1;snprintf(why,sizeof why,"passed, but DM_GFX_FAKE_FALLBACK=zc counts it as failed (test)");}
+            last_why=std::string(map_name(m))+": "+(bad==~0ull?"not run, ":"failed, ")+why;
             xbg_logf("NVN zero-copy self-test: mode=%s view=%s usage=%#llx -> %s (%s; %.1f ms)",mode==XBG_ZC_UNCACHED?"uncached":"cached",map_name(m),(unsigned long long)u,bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);
             if(bad==0){pass=true;used=u;map_method=m;break;}}
         if(mode==XBG_ZC_UNCACHED)ahb_usage=used;
-        if(!pass && st==1){enabled=0;xbg_logf("NVN zero-copy: self-test failed, off (snapshot path; DM_GFX_ZC_SELFTEST=2 keeps zero-copy anyway)");}
+        if(!pass && st==1){enabled=0;xbg_logf("NVN zero-copy: self-test failed, off (snapshot path; DM_GFX_ZC_SELFTEST=2 keeps zero-copy anyway)");
+            if(!forced && safemode::eligible && !safemode::zc_done.exchange(true)){xbg_logf("NVN safe mode (live): zero-copy (an experimental 0.5.x speed-up) is off for this run: its self-test did not pass (%s)",last_why.c_str());
+                safemode::event("zc",last_why.substr(0,300));}}   // [safe-mode] 2.57: before the first pool, so no restart
         else if(!pass)xbg_logf("NVN zero-copy: self-test failed, kept on (DM_GFX_ZC_SELFTEST=2)");}
     else if(mode==XBG_ZC_UNCACHED)ahb_usage=AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
     // [zc3] Log only, changes nothing: would CPU-cached pages work if the CPU caches were kept in step by hand (a possible zero-copy
@@ -4854,6 +5033,8 @@ static void fence_slot_log(const Slot &o,const char *what,uint64_t now){
 }
 [[noreturn]] void fence_fatal(Slot &s,VkResult r,uint64_t waited_ns,uint64_t timeout_ns,const char *who){
     const bool early=xbg_fence_wait_early(r,waited_ns,timeout_ns),timeout=r==VK_TIMEOUT;const uint64_t now=timing_clock();
+    {char w[200];snprintf(w,sizeof w,"%s: the %s fence wait returned %d after %.0f ms of %.0f ms",timeout && !early?"GPU hang":r==VK_ERROR_DEVICE_LOST?"VK_ERROR_DEVICE_LOST":"fence error",who,int(r),waited_ns/1e6,timeout_ns/1e6);
+     xbg_safe_mode_record(w);}   // [safe-mode] 2.57: counted before the fatal (the crash handler then finds it recorded)
     // [tileopt] crumbs are off by default now: ask for them on the next boots (crumbs::init reads gfx-crumbs-auto)
     if(const char *fd=getenv("DM_FILES_DIR");fd && *fd){if(FILE *w=fopen((std::string(fd)+"/gfx-crumbs-auto").c_str(),"wb")){fprintf(w,"%d\n",xbg_crumbs_auto_boots);fclose(w);}}
     xbg_logf("NVN fence failure (%s): result=%d after %.1f ms of a %.0f ms timeout (%s); fence guard=%d recover=%d, early waits %llu (recovered %llu), worker waits recovered %llu; record thread ran SUBMIT tickets through %llu",
@@ -4869,7 +5050,26 @@ static void fence_slot_log(const Slot &o,const char *what,uint64_t now){
 } // namespace
 
 extern "C" void xbg_logf(const char *fmt,...){CPU_SCOPE(Log);char text[1024];va_list a;va_start(a,fmt);vsnprintf(text,sizeof(text),fmt,a);va_end(a);if(cfg.log)cfg.log(cfg.userdata,text);else fprintf(stderr,"[xbg] %s\n",text);}
-extern "C" __attribute__((noreturn)) void xbg_fatalf(const char *fmt,...){va_list a;va_start(a,fmt);vsnprintf(error_text,sizeof(error_text),fmt,a);va_end(a);failed=true;xbg_logf("FATAL: %s",error_text);crumbs::report("fatal");if(cfg.fatal)cfg.fatal(cfg.userdata,error_text);abort();}
+extern "C" __attribute__((noreturn)) void xbg_fatalf(const char *fmt,...){va_list a;va_start(a,fmt);vsnprintf(error_text,sizeof(error_text),fmt,a);va_end(a);failed=true;xbg_logf("FATAL: %s",error_text);if(xbg_safe_text_device_lost(error_text)){char w[200];snprintf(w,sizeof w,"VK_ERROR_DEVICE_LOST fatal: %.150s",error_text);xbg_safe_mode_record(w);}crumbs::report("fatal");if(cfg.fatal)cfg.fatal(cfg.userdata,error_text);abort();}
+// [safe-mode] 2.57, host/crash.c (weak), in the signal handler after the "crash thread" line and the pass detail: is this crash a graphics
+// failure? Inside a dm-record packet, a fault in zero-copy guest memory, a graphics / GPU-driver thread, pc (or lr) in a GPU driver library,
+// or an engine abort with VK_ERROR_DEVICE_LOST. Then counted (xbg_safe_mode_record). Only table reads and string compares.
+extern "C" void xbg_crash_classify(int sig,const char *thread,const char *rec,uint64_t addr,const char *pc_lib,const char *lr_lib){
+    using namespace safemode;
+    if(!eligible)return;
+    char why[200];size_t n=0;why[0]=0;
+    bool zcmem=false;if(sig==SIGSEGV || sig==SIGBUS){const int c=zc::count.load(std::memory_order_relaxed);
+        for(int i=0;i<c && i<512;i++){const uintptr_t lo=zc::table[i].lo;const size_t sz=zc::table[i].n;if(lo && addr>=lo && addr<lo+sz){zcmem=true;break;}}}
+    if(rec){n=cat(why,n,sizeof why,"driver crash inside the dm-record packet ");n=cat(why,n,sizeof why,rec);}
+    else if(zcmem){n=cat(why,n,sizeof why,"fault in zero-copy guest memory on thread ");n=cat(why,n,sizeof why,thread);}
+    else if(xbg_safe_gfx_thread(thread)){n=cat(why,n,sizeof why,"crash on the graphics thread ");n=cat(why,n,sizeof why,thread);}
+    else if(xbg_safe_gfx_lib(pc_lib) || xbg_safe_gfx_lib(lr_lib)){const char *lib=xbg_safe_gfx_lib(pc_lib)?pc_lib:lr_lib,*b=strrchr(lib,'/');n=cat(why,n,sizeof why,"crash in the GPU driver ");n=cat(why,n,sizeof why,b?b+1:lib);
+        n=cat(why,n,sizeof why," on thread ");n=cat(why,n,sizeof why,thread);}
+    else if(sig==SIGABRT && failed && xbg_safe_text_device_lost(error_text))n=cat(why,n,sizeof why,"VK_ERROR_DEVICE_LOST fatal");
+    if(!why[0]){fprintf(stderr,"[dm] safe mode: crash (signal %d, thread %s) not counted as a graphics failure: not in a dm-record packet, not a graphics thread, pc / lr not in a GPU driver, not zero-copy memory\n",sig,thread?thread:"?");return;}
+    n=cat(why,n,sizeof why,", signal ");n=dec(why,n,sizeof why,sig);
+    if(!xbg_safe_mode_record(why))fprintf(stderr,"[dm] safe mode: %s (this run's failure is already counted)\n",why);
+}
 extern "C" int xbg_backend_failed(){return failed;}
 // [r3] DM_GFX_PRESENT_FLIP_FOLD: implemented by the Android presenter (vulkan_present.cpp); 1 = it mirrors the next present itself.
 extern "C" __attribute__((weak)) int dm_present_mirror_next(int on);
@@ -4945,7 +5145,7 @@ void report_pipeline_cache(){
 //   retry);
 // - DM_GFX_PIPE_SERIAL (default: PowerVR, whose compiler is not thread-safe): one driver pipeline build at a time, warm-up included.
 namespace gpguard{
-bool serial=false,guard=false,careful=false,loaded=false;
+std::atomic<bool> serial{false};bool guard=false,careful=false,loaded=false;   // [safe-mode] serial atomic: turned on live (live_pipe)
 std::mutex &create_mu=drvc::mu;std::mutex mu;std::unordered_set<std::string> skip,told,proven;   // [pvr] create_mu = the DM_GFX_COMPILE_LOCK mutex
 std::atomic<int> next_slot{0};
 std::atomic<uint64_t> failures{0},skipped_draws{0};std::atomic<bool> any{false};   // any: the skip set is not empty (read without the lock)
@@ -4982,9 +5182,18 @@ void load(){   // once, at initialization (before the warm-up threads start)
     xbg_logf("NVN graphics pipeline guard=1 serial=%d careful=%d skipped=%zu dir=%s",int(serial),int(careful),skip.size(),d.c_str());
 }
 bool skipped(const std::string &combo){std::lock_guard<std::mutex> l(mu);if(!skip.count(combo))return false;if(told.insert(combo).second)xbg_logf("NVN draws with graphics pipeline %s skipped (gfx-gpipe-skip or a failed build)",combo.c_str());return true;}
-void record(const std::string &combo,VkResult r){++failures;std::lock_guard<std::mutex> l(mu);if(!skip.insert(combo).second)return;any=true;
+// [safe-mode] 2.57 live: a graphics pipeline the driver failed to build (its draws are skipped, as before): on Mali / PowerVR the rest of the
+// run builds pipelines one at a time (DM_GFX_PIPE_SERIAL) under the driver compiler lock at level >= 1 (DM_GFX_COMPILE_LOCK; each Lock
+// decides when it is made, xbg_drvc_lock / unlock pair by thread). Once per run; no restart.
+void live_pipe(const std::string &combo,VkResult r){
+    if(!safemode::eligible || safemode::pipe_done.exchange(true))return;
+    const bool was=serial.exchange(true);const int lv=drvc::level.load();if(lv<1)drvc::level.store(1);
+    xbg_logf("NVN safe mode (live): graphics pipeline %s failed to build (result=%d): DM_GFX_PIPE_SERIAL %d -> 1, DM_GFX_COMPILE_LOCK %d -> %d for the rest of this run (no restart)",combo.c_str(),int(r),int(was),lv,lv<1?1:lv);
+    char d[200];snprintf(d,sizeof d,"%.160s result=%d",combo.c_str(),int(r));safemode::event("pipe",d);}
+void record(const std::string &combo,VkResult r){++failures;{std::lock_guard<std::mutex> l(mu);if(!skip.insert(combo).second)return;any=true;
     xbg_logf("NVN graphics pipeline %s failed to build (result=%d): its draws are skipped",combo.c_str(),int(r));
     if(guard){char why[64];snprintf(why,sizeof why,"failed to build (result=%d)",int(r));xbg_pg::append_list(skip_list(),pgv2::header(),pgv2::mode(),combo,why,pgv2::combo_spv(combo),(long long)time(nullptr));}}
+    live_pipe(combo,r);}   // [safe-mode] outside gpguard::mu
 thread_local int slot=-1;
 std::string inflight_path(){return dir()+"/gfx-gpipe-inflight"+pgv2::drv()+"."+std::to_string(slot);}   // [DOOM] pipeguard v2: per driver
 // Marker around one build; returns whether a marker was written (end() must then be called).
@@ -8248,11 +8457,11 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      gpu_policy=xbg_effective_family(gpu_family,sim_gpu);
      xbg_logf("NVN gpu family=%s (vendor=%#x \"%s\") policy family=%s DM_GFX_SIM_GPU=%s sim=%#x%s%s",xbg_gpu_family_name(gpu_family),properties.vendorID,properties.deviceName,
               xbg_gpu_family_name(gpu_policy),se&&*se?se:"-",sim_gpu,*unknown?" unknown token: ":"",unknown);
-     pvr_ladder_apply();   // [pvr-ladder] this boot's workaround step (before the switches below are read)
+     safe_mode_engine_init();   // [safe-mode] 2.57 (was the PowerVR ladder): this boot's step, before the switches below are read
      // Per-family defaults (xbg_vendor_policy.h), each overridable by its DM_GFX_* switch ("0" / "1"); on Adreno they equal the old behaviour.
      gpguard::serial=xbg_env_or(getenv("DM_GFX_PIPE_SERIAL"),xbg_pipe_serial_default(gpu_policy));gpguard::guard=xbg_env_or(getenv("DM_GFX_PIPE_GUARD"),xbg_pipe_guard_default(gpu_policy));
      drvc::level=xbg_env_level(getenv("DM_GFX_COMPILE_LOCK"),xbg_compile_lock_default(gpu_policy),0,2);   // [pvr] before the warm-up / record / present threads
-     xbg_logf("NVN compile lock=%d (DM_GFX_COMPILE_LOCK: 0 off, 1 shader modules + render-pass / copy / blit / clear packets + the present blit share the pipeline lock, 2 every packet but submit / present; default 1 on PowerVR)",drvc::level);
+     xbg_logf("NVN compile lock=%d (DM_GFX_COMPILE_LOCK: 0 off, 1 shader modules + render-pass / copy / blit / clear packets + the present blit share the pipeline lock, 2 every packet but submit / present; default 1 on PowerVR)",drvc::level.load());
      gpguard::careful=false;gpguard::loaded=false;gpguard::skip.clear();gpguard::told.clear();gpguard::proven.clear();gpguard::any=false;gpguard::load();
      ubo_dynamic_level=xbg_env_level(getenv("DM_GFX_UBO_DYNAMIC"),xbg_ubo_dynamic_level_default(gpu_policy),0,2);ubo_dynamic_on=ubo_dynamic_level>0;   // [tileopt] 2 on PowerVR: only blocks the stage readsnoout_mask_on=xbg_env_or(getenv("DM_GFX_NOOUT_MASK"),xbg_noout_mask_default(gpu_policy));
      xbg_logf("NVN gpu policy: pipe_serial=%d pipe_guard=%d ubo_dynamic=%d noout_mask=%d zero-copy default=%d (DM_GFX_PIPE_SERIAL / PIPE_GUARD / UBO_DYNAMIC: 0 none, 1 all that fit, 2 only blocks the stage reads / NOOUT_MASK / ZEROCOPY)",

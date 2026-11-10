@@ -18,6 +18,7 @@ import java.util.ArrayList;
 //   sharpen        FSR RCAS sharpening (DM_GFX_SHARPEN, vulkan_present.cpp)                                                       next launch
 //   upscale        GSR upscale to the screen (DM_GFX_UPSCALE=gsr; only DOOM 2016's vulkan_present.cpp has it so far)              next launch
 //   driver         Vulkan driver list + what runs now + "Manage drivers…" (VkDrivers, DriverManager; DM_VK_DRIVER)                 next launch
+//   safeMode       [safe-mode] safe graphics mode off / auto / on on Mali / PowerVR (pref "safe_mode", DM_SAFE_MODE; SafeMode.java)  next launch
 //   gameLanguage   the game's language (DM_LANG -> hle_oe.c GetDesiredLanguage); the codes / names are the game's                  next launch
 //   rumble         vibration (DM_RUMBLE, haptics_android.c; off by default)                                                       next launch
 //   opmode         Switch mode docked / handheld (pref "front_opmode", DM_OPMODE=0; live through FrontMenu.Host.setDocked)         both
@@ -97,6 +98,31 @@ final class GearPages {
             public void env(GearSettings s) throws ErrnoException {
                 if (s.gamePrefs().getBoolean("upscale", false)) Os.setenv("DM_GFX_UPSCALE", "gsr", true); else Os.unsetenv("DM_GFX_UPSCALE");
             }
+        };
+    }
+
+    // ---- [safe-mode] safe graphics mode (DOOM BUGS_AND_FIXES 2.57, SafeMode.java): off = the 0.5.x speed-ups always (DM_SAFE_MODE=0), auto
+    // (default) = steps after graphics crashes (unset), on = always at least step 1 (DM_SAFE_MODE=on: the speed-ups off by hand, for picture
+    // problems no crash reveals). Shown only on Mali / PowerVR (simulated included) and only for a port with GearHost.safeMode; the row says
+    // the step of the running game. A changed choice starts the crash count again.
+    static GearSettings.Section safeMode(GearHost h) {
+        return new GearSettings.Section() {
+            RadioGroup g; int was = SafeMode.AUTO;
+            public void build(GearSettings s, LinearLayout box) {
+                SafeMode sm = h.safeMode(); if (sm == null || !sm.eligible()) return;
+                s.heading(box, s.whenKey("gear_safe_mode", false));
+                was = s.gamePrefs().getInt("safe_mode", SafeMode.AUTO);
+                g = s.radios(box, s.keys("gear_safe_off", "gear_safe_auto", "gear_safe_on"), was, true);
+                String now = sm.nowLine(); if (now != null) s.text(box, now);
+                s.text(box, s.s("gear_safe_note"));
+            }
+            public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) {
+                if (g == null) return;
+                int p = GearSettings.picked(g); game.putInt("safe_mode", p);
+                SafeMode sm = h.safeMode(); if (p != was && sm != null) sm.choiceChanged(was, p);
+                was = p;
+            }
+            public void env(GearSettings s) throws ErrnoException { if (h.safeMode() != null) SafeMode.env(s.gamePrefs()); }
         };
     }
 
@@ -197,12 +223,16 @@ final class GearPages {
 
     // ---- picture shape (XC2 / D3 / TL2): pref "aspect" = an index into labels; bars (the 16:9 one) and stretched apply at once (the port's
     // relayout, which calls GearDisplay.fitSurface), a widescreen mode needs a restart (the port's env says so to its game: env(value))
-    static GearSettings.Section pictureShape(String[] labels, int def, String note, Runnable relayout, Env env) {
+    static GearSettings.Section pictureShape(String[] labels, int def, String note, Runnable relayout, Env env) { return pictureShape(labels, def, note, relayout, env, null); }
+    // onPick (null = none): called with the index whenever the player picks another shape in the open dialog, before Save (TL2: the Switch mode
+    // rows above it show the render size of the picked shape)
+    static GearSettings.Section pictureShape(String[] labels, int def, String note, Runnable relayout, Env env, java.util.function.IntConsumer onPick) {
         return new GearSettings.Section() {
             RadioGroup g;
             public void build(GearSettings s, LinearLayout box) {
                 s.heading(box, s.t("Формат картинки:", "Picture shape:"));
                 g = s.radios(box, labels, s.gamePrefs().getInt("aspect", def), false);
+                if (onPick != null) g.setOnCheckedChangeListener((rg, id) -> onPick.accept(GearSettings.picked(rg)));
                 if (note != null) s.note(box, note);
             }
             public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) { game.putInt("aspect", GearSettings.picked(g)); }

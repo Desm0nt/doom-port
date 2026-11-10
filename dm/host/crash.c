@@ -229,7 +229,10 @@ static int crash_read_words(const uint64_t *src, uint64_t *dst, int n) {
 // Download/DOOM Mobile/logs/crash.txt from them at the next start).
 static void (*g_report_hook)(int phase, int sig, uint64_t addr, uint64_t pc);
 extern const char *xbg_crash_rec_op(void) __attribute__((weak));   // [pvr] xbg_game.cpp: the dm-record packet being executed, or NULL
-extern void xbg_crash_rec_detail(void) __attribute__((weak));     // [pvr-ladder] xbg_game.cpp: that packet's render pass / pipelines + the PowerVR ladder step
+extern void xbg_crash_rec_detail(void) __attribute__((weak));     // [pvr-ladder] xbg_game.cpp: that packet's render pass / pipelines
+// [safe-mode] xbg_game.cpp (BUGS_AND_FIXES 2.57): on Mali / PowerVR, is this crash a graphics failure (dm-record packet, graphics / driver thread,
+// pc or lr in a GPU driver library, zero-copy memory, DEVICE_LOST abort)? Then DM_FILES_DIR/gfx-safe-mode counts it for the next start
+extern void xbg_crash_classify(int sig, const char *thread, const char *rec, uint64_t addr, const char *pc_lib, const char *lr_lib) __attribute__((weak));
 void crash_set_report_hook(void (*fn)(int phase, int sig, uint64_t addr, uint64_t pc)) { g_report_hook = fn; }
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
@@ -258,6 +261,11 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         const char *rec = xbg_crash_rec_op ? xbg_crash_rec_op() : 0;
         fprintf(stderr, "[dm] crash thread %s tid=%d; dm-record in %s\n", tn, fault_tid(), rec ? rec : "(no packet)");
         if (rec && xbg_crash_rec_detail) xbg_crash_rec_detail();
+        if (xbg_crash_classify) {   // [safe-mode] the libraries of pc and lr (a jump through a bad pointer from driver code), not guest modules
+            const char *lib[2] = {0, 0}; Dl_info li; uint64_t at[2] = {UC_PC(uc), strip_pac(UC_LR(uc))};
+            for (int k = 0; k < 2; k++) if (!module_of((void *)(uintptr_t)at[k]) && dladdr((void *)(uintptr_t)at[k], &li) && li.dli_fname) lib[k] = li.dli_fname;
+            xbg_crash_classify(sig, tn, rec, (uint64_t)(uintptr_t)si->si_addr, lib[0], lib[1]);
+        }
     }
     // [DOOM] issues #12/#20: a fault in the page of sp or up to 64 KiB below it is the thread running off its stack into the guard
     // page (sp itself may already point there). Said plainly, and the stack scan below, which reads upward from sp, is skipped:

@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">En uso ahora: controlador del sistema (%1$s no arrancó)</string>
     <string name="toast_driver_fallback">El controlador Vulkan %1$s no arrancó en este dispositivo (%2$s); se usa el controlador del sistema.</string>
     <string name="toast_driver_crashed">El último inicio con el controlador Vulkan %1$s se cerró o se congeló, así que ahora se usa el del sistema. Puedes volver a elegirlo en Ajustes.</string>
+    <string name="toast_driver_init_failed">El controlador Vulkan %1$s no pudo iniciarse en este dispositivo, así que el juego ahora usa el controlador del sistema. Los controladores personalizados son experimentales. Puedes volver a elegirlo en ⚙ → Controlador Vulkan.</string>
     <string name="gear_lang">Idioma del juego (textos y voces)</string>
     <string name="gear_lang_system">Como en el sistema</string>
     <string name="gear_aa">Asistencia de apuntado</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: disponible cuando el juego haya cargado su perfil (o cámbialo en el menú del juego)</string>
     <string name="gear_game_settings_note">La asistencia de apuntado, el apuntado por movimiento y su sensibilidad son ajustes del propio juego (ajustes del mando en el menú del juego): un cambio aquí o allí se ve en ambos sitios y se guarda en el perfil del juego.</string>
     <string name="toast_game_setting_failed">No se pudo cambiar aquí un ajuste del juego; usa los ajustes del mando en el menú del juego</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Modo gráfico seguro (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Desactivado</string>
+    <string name="gear_safe_auto">Auto</string>
+    <string name="gear_safe_on">Activado</string>
+    <string name="gear_safe_note">Desactivado: siempre los ajustes rápidos de la versión 0.5 (experimental). Auto: se desactivan paso a paso tras un fallo en el controlador gráfico. Activado: siempre desactivados (más lento, pero más compatible); pruébalo si ves parpadeos, colores incorrectos u otros problemas de imagen.</string>
+    <string name="gear_safe_now">Este inicio: paso %1$d de 3 (fallos gráficos contados: %2$d)</string>
+    <string name="safe_title">Modo gráfico seguro</string>
+    <string name="safe_crash">La última ejecución terminó con un fallo en el controlador gráfico.</string>
+    <string name="safe_step_1">Ahora está activo el paso 1 de 3: las aceleraciones experimentales de la versión 0.5 para Mali / PowerVR (memoria zero-copy y otras) están desactivadas.</string>
+    <string name="safe_step_2">Ahora está activo el paso 2 de 3: las aceleraciones de la versión 0.5 y las optimizaciones para GPU por teselas están desactivadas.</string>
+    <string name="safe_step_3">Ahora está activo el paso 3 de 3: el modo más compatible (y más lento); las aceleraciones, las optimizaciones para GPU por teselas y algunos atajos de shaders están desactivados.</string>
+    <string name="safe_step_0">El modo seguro está desactivado (⚙ o dm/env), así que no se cambió nada.</string>
+    <string name="safe_next">Si el juego vuelve a fallar, se probará el siguiente paso.</string>
+    <string name="safe_last">Este es el último paso.</string>
+    <string name="safe_gear">Puedes cambiarlo en ⚙ → Modo gráfico seguro.</string>
+    <string name="safe_logs">Si sigue fallando, envía los archivos de %1$s con un informe del error.</string>
+    <string name="safe_relaunched">El juego se reinició automáticamente.</string>
+    <string name="safe_ok">Aceptar</string>
+    <string name="toast_safe_zc">La memoria zero-copy (una aceleración experimental) no superó su prueba en este dispositivo y está desactivada en esta ejecución.</string>
+    <string name="toast_safe_fence">El controlador gráfico informó de un error de sincronización; el juego se recuperó y usa un modo de sincronización más seguro en esta ejecución.</string>
+    <string name="toast_safe_pipe">El controlador gráfico no pudo compilar un shader; pueden faltar algunos efectos. Los shaders se compilan ahora de uno en uno en esta ejecución.</string>
+    <string name="notif_safe_channel">Recuperación tras un fallo</string>
+    <string name="notif_safe_title">%1$s falló en el controlador gráfico</string>
+    <string name="notif_safe_text">Toca para reiniciar en modo seguro.</string>
 </resources>

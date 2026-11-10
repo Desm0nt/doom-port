@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">Şu an kullanılan: sistem sürücüsü (%1$s başlamadı)</string>
     <string name="toast_driver_fallback">Vulkan sürücüsü %1$s bu cihazda başlamadı (%2$s); sistem sürücüsü kullanılıyor.</string>
     <string name="toast_driver_crashed">Vulkan sürücüsü %1$s ile son açılış çöktü veya dondu, bu yüzden şimdi sistem sürücüsü kullanılıyor. Ayarlar\'dan yeniden seçebilirsiniz.</string>
+    <string name="toast_driver_init_failed">Vulkan sürücüsü %1$s bu cihazda başlatılamadı, bu yüzden oyun artık sistem sürücüsünü kullanıyor. Özel sürücüler deneyseldir. Onu ⚙ → Vulkan sürücüsü bölümünden yeniden seçebilirsiniz.</string>
     <string name="gear_lang">Oyun dili (metinler ve seslendirme)</string>
     <string name="gear_lang_system">Sistemdeki gibi</string>
     <string name="gear_aa">Nişan yardımı</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: oyun profilini yükledikten sonra kullanılabilir (ya da oyun menüsünden değiştirin)</string>
     <string name="gear_game_settings_note">Nişan yardımı, hareketle nişan alma ve hassasiyeti oyunun kendi ayarlarıdır (oyun menüsündeki kumanda ayarları): burada ya da orada yapılan değişiklik iki yerde de görünür ve oyun profiline kaydedilir.</string>
     <string name="toast_game_setting_failed">Bir oyun ayarı burada değiştirilemedi; oyun menüsündeki kumanda ayarlarını kullanın</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Güvenli grafik modu (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Kapalı</string>
+    <string name="gear_safe_auto">Otomatik</string>
+    <string name="gear_safe_on">Açık</string>
+    <string name="gear_safe_note">Kapalı: her zaman 0.5 sürümünün hızlı ayarları (deneysel). Otomatik: grafik sürücüsünde bir çökmeden sonra adım adım kapatılır. Açık: her zaman kapalı (daha yavaş ama daha uyumlu) – titreme, yanlış renkler veya başka görüntü sorunları görürseniz deneyin.</string>
+    <string name="gear_safe_now">Bu açılış: adım %1$d / 3 (sayılan grafik çökmeleri: %2$d)</string>
+    <string name="safe_title">Güvenli grafik modu</string>
+    <string name="safe_crash">Son çalıştırma grafik sürücüsünde bir çökmeyle bitti.</string>
+    <string name="safe_step_1">Şu an adım 1 / 3 açık: Mali / PowerVR için 0.5 sürümünün deneysel hızlandırmaları (zero-copy bellek ve diğerleri) kapatıldı.</string>
+    <string name="safe_step_2">Şu an adım 2 / 3 açık: 0.5 sürümünün hızlandırmaları ve döşemeli GPU optimizasyonları kapatıldı.</string>
+    <string name="safe_step_3">Şu an adım 3 / 3 açık: en uyumlu (ve en yavaş) mod – hızlandırmalar, döşemeli GPU optimizasyonları ve bazı gölgelendirici kısayolları kapatıldı.</string>
+    <string name="safe_step_0">Güvenli mod kapalı (⚙ veya dm/env), bu yüzden hiçbir şey değiştirilmedi.</string>
+    <string name="safe_next">Oyun yine çökerse sonraki adım denenecek.</string>
+    <string name="safe_last">Bu son adım.</string>
+    <string name="safe_gear">Bunu ⚙ → Güvenli grafik modu bölümünden değiştirebilirsiniz.</string>
+    <string name="safe_logs">Çökmeler sürerse lütfen %1$s içindeki dosyaları bir hata raporuyla gönderin.</string>
+    <string name="safe_relaunched">Oyun otomatik olarak yeniden başlatıldı.</string>
+    <string name="safe_ok">Tamam</string>
+    <string name="toast_safe_zc">Zero-copy bellek (deneysel bir hızlandırma) bu cihazda testi geçemedi ve bu çalıştırmada kapalı.</string>
+    <string name="toast_safe_fence">Grafik sürücüsü bir eşitleme hatası bildirdi; oyun toparlandı ve bu çalıştırmada daha güvenli bir eşitleme moduna geçti.</string>
+    <string name="toast_safe_pipe">Grafik sürücüsü bir gölgelendiriciyi derleyemedi; bazı efektler eksik olabilir. Bu çalıştırmada gölgelendiriciler artık tek tek derleniyor.</string>
+    <string name="notif_safe_channel">Çökme sonrası kurtarma</string>
+    <string name="notif_safe_title">%1$s grafik sürücüsünde çöktü</string>
+    <string name="notif_safe_text">Güvenli modda yeniden başlatmak için dokunun.</string>
 </resources>

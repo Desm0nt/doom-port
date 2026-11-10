@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">현재 사용 중: 시스템 드라이버(%1$s 시작 실패)</string>
     <string name="toast_driver_fallback">Vulkan 드라이버 %1$s이(가) 이 기기에서 시작되지 않았습니다(%2$s). 시스템 드라이버를 사용합니다.</string>
     <string name="toast_driver_crashed">지난번 Vulkan 드라이버 %1$s(으)로 실행했을 때 충돌하거나 멈췄기 때문에 지금은 시스템 드라이버를 사용합니다. 설정에서 다시 선택할 수 있습니다.</string>
+    <string name="toast_driver_init_failed">Vulkan 드라이버 %1$s을(를) 이 기기에서 시작할 수 없어 게임이 이제 시스템 드라이버를 사용합니다. 사용자 지정 드라이버는 실험적 기능입니다. ⚙ → Vulkan 드라이버에서 다시 선택할 수 있습니다.</string>
     <string name="gear_lang">게임 언어(텍스트 및 음성)</string>
     <string name="gear_lang_system">시스템 설정과 동일</string>
     <string name="gear_aa">조준 보조</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: 게임이 프로필을 불러온 뒤 사용할 수 있습니다 (또는 게임 메뉴에서 변경)</string>
     <string name="gear_game_settings_note">조준 보조, 모션 조준과 그 감도는 게임 자체 설정입니다 (게임 메뉴의 컨트롤러 설정). 여기서 바꾸든 게임에서 바꾸든 양쪽에 표시되고 게임 프로필에 저장됩니다.</string>
     <string name="toast_game_setting_failed">여기서 게임 설정을 변경할 수 없습니다. 게임 메뉴의 컨트롤러 설정을 사용하세요</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">그래픽 안전 모드(Mali / PowerVR)</string>
+    <string name="gear_safe_off">끄기</string>
+    <string name="gear_safe_auto">자동</string>
+    <string name="gear_safe_on">켜기</string>
+    <string name="gear_safe_note">끄기: 항상 0.5 버전의 빠른 설정 사용(실험적). 자동: 그래픽 드라이버 충돌 후 단계적으로 끕니다. 켜기: 항상 끔(느리지만 호환성이 더 높음). 깜빡임, 잘못된 색상 또는 기타 화면 문제가 보이면 사용해 보세요.</string>
+    <string name="gear_safe_now">이번 실행: 3단계 중 %1$d단계(기록된 그래픽 충돌: %2$d)</string>
+    <string name="safe_title">그래픽 안전 모드</string>
+    <string name="safe_crash">지난 실행이 그래픽 드라이버 충돌로 종료되었습니다.</string>
+    <string name="safe_step_1">지금 3단계 중 1단계가 켜졌습니다: Mali / PowerVR용 0.5 버전의 실험적 가속(제로 카피 메모리 등)을 껐습니다.</string>
+    <string name="safe_step_2">지금 3단계 중 2단계가 켜졌습니다: 0.5 버전의 가속과 타일 기반 GPU 최적화를 껐습니다.</string>
+    <string name="safe_step_3">지금 3단계 중 3단계가 켜졌습니다: 호환성이 가장 높은(가장 느린) 모드로, 가속, 타일 기반 GPU 최적화, 일부 셰이더 단축 처리를 껐습니다.</string>
+    <string name="safe_step_0">안전 모드가 꺼져 있어(⚙ 또는 dm/env) 아무것도 바꾸지 않았습니다.</string>
+    <string name="safe_next">게임이 다시 충돌하면 다음 단계를 시도합니다.</string>
+    <string name="safe_last">이것이 마지막 단계입니다.</string>
+    <string name="safe_gear">⚙ → 그래픽 안전 모드에서 바꿀 수 있습니다.</string>
+    <string name="safe_logs">계속 충돌하면 %1$s의 파일을 버그 보고와 함께 보내 주세요.</string>
+    <string name="safe_relaunched">게임이 자동으로 다시 시작되었습니다.</string>
+    <string name="safe_ok">확인</string>
+    <string name="toast_safe_zc">제로 카피 메모리(실험적 가속)가 이 기기에서 테스트를 통과하지 못해 이번 실행에서는 꺼졌습니다.</string>
+    <string name="toast_safe_fence">그래픽 드라이버가 동기화 오류를 보고했습니다. 게임이 복구되었고 이번 실행에서는 더 안전한 동기화 모드를 사용합니다.</string>
+    <string name="toast_safe_pipe">그래픽 드라이버가 셰이더를 만들지 못했습니다. 일부 효과가 빠질 수 있습니다. 이번 실행에서는 셰이더를 하나씩 만듭니다.</string>
+    <string name="notif_safe_channel">충돌 복구</string>
+    <string name="notif_safe_title">%1$s이(가) 그래픽 드라이버에서 충돌했습니다</string>
+    <string name="notif_safe_text">탭하면 안전 모드로 다시 시작합니다.</string>
 </resources>

@@ -21,7 +21,9 @@ import java.util.concurrent.TimeUnit;
 
 // [DOOM] Crash reports the player can open with a file manager (BUGS_AND_FIXES 2.22), no button, nothing per frame.
 //   where: <game folder>/logs/crash.txt (Download/DOOM Mobile by default, GameFolder.java) when the app can write there (all files access; the storage permission on the Android 10
-//     build), else Android/data/<package>/files/logs/crash.txt. Overwritten each time; the one before is kept as crash.prev.txt.
+//     build), else Android/data/<package>/files/logs/crash.txt. Overwritten each time; the two before are kept as crash.prev.txt and
+//     crash.prev2.txt (2.56). Next to them: boot.log / boot.prev.log / boot.prev2.log (the last three runs) and boot-<driver>.log, the latest
+//     run with each Vulkan driver (mirrorBootLogs, archiveAtStart).
 //   when: (1) a Java exception (DmActivity's uncaught exception handler: written at once); (2) a start / boot failure that shows an error
 //     screen (written at once, the screen names the file); (3) at the next start, when the last run did not end cleanly: the native crash
 //     handler (crash.c -> jni_android.c) left files/dm-crash.txt, or the session marker files/dm-session.txt (written while the game runs,
@@ -77,35 +79,90 @@ final class CrashLog {
         if (String.valueOf(stamp).equals(readSmall(mark))) return;
         File d = dir(c), ext = c.getExternalFilesDir(null); int n = 0;
         List<File> gone = new ArrayList<>();
-        for (String f : new String[] {"crash.txt", "crash.prev.txt", "boot.log", "boot.prev.log", "logcat.txt", "logcat.txt.1", "logcat.prev.txt"}) gone.add(new File(d, f));
+        for (String f : new String[] {"crash.txt", "crash.prev.txt", "crash.prev2.txt", "boot.log", "boot.prev.log", "boot.prev2.log", "logcat.txt", "logcat.txt.1", "logcat.prev.txt"}) gone.add(new File(d, f));
+        File[] perDriver = d.listFiles((x, nm) -> nm.startsWith("boot-") && nm.endsWith(".log")); if (perDriver != null) for (File f : perDriver) gone.add(f);   // 2.56
         for (File root : new File[] {c.getFilesDir(), ext}) if (root != null) {
-            gone.add(new File(root, "dm/boot.log")); gone.add(new File(root, "dm/boot.prev.log")); gone.add(new File(root, "logs/crash.txt")); gone.add(new File(root, "logs/crash.prev.txt")); }
+            gone.add(new File(root, "dm/boot.log")); gone.add(new File(root, "dm/boot.prev.log")); gone.add(new File(root, "dm/boot.prev2.log"));
+            gone.add(new File(root, "logs/crash.txt")); gone.add(new File(root, "logs/crash.prev.txt")); gone.add(new File(root, "logs/crash.prev2.txt")); }
         gone.add(new File(c.getFilesDir(), NATIVE_MARK)); gone.add(new File(c.getFilesDir(), SESSION));
+        for (String sm : new String[] {SafeMode.MARKER, SafeMode.SEEN, SafeMode.FIRST, SafeMode.RELAUNCH, SafeMode.GUARD_LOG}) gone.add(new File(c.getFilesDir(), sm));   // [safe-mode] 2.57: the count starts again
         for (File f : gone) if (f.delete()) n++;
         try (OutputStream os = new FileOutputStream(mark)) { os.write(String.valueOf(stamp).getBytes(StandardCharsets.UTF_8)); } catch (IOException e) { /* wipes again next time */ }
         android.util.Log.i("dm", "[diag] old logs and crash markers deleted: " + n + " files");
     }
 
     // ---- the native logs next to the crash reports (GitHub issue #3: Android/data is out of a file manager's reach on Android 11+):
-    // boot.log and boot.prev.log of <files or external files>/dm are copied to dir() as they are, overwriting the copies; a log above
-    // MIRROR_MAX keeps its head and its last MIRROR_MAX bytes. Called when the app goes to the background and before it quits.
+    // boot.log, boot.prev.log and boot.prev2.log (2.56) of <files or external files>/dm are copied to dir() as they are, overwriting the
+    // copies; a log above MIRROR_MAX keeps its head and its last MIRROR_MAX bytes. Called when the app goes to the background and before it
+    // quits. (2.56, issue #33) this run's log also goes to boot-<driver>.log (driverLogName): one file per Vulkan driver, replaced only by a
+    // later run with the same driver, so a run with another driver never overwrites it.
     static final long MIRROR_MAX = 8L << 20;
-    static void mirrorBootLogs(Context c) {
+    static final String[] RUNS = {"boot.prev2.log", "boot.prev.log", "boot.log"};   // oldest first: a newer run of a driver is copied last
+    static synchronized void mirrorBootLogs(Context c) {
         File log = bootLog(c), d = dir(c);
-        copyLog(log, new File(d, "boot.log"));
-        copyLog(new File(log.getParentFile(), "boot.prev.log"), new File(d, "boot.prev.log"));
+        for (String n : RUNS) copyLog(new File(log.getParentFile(), n), new File(d, n));
+        copyPerDriver(log, d);
+    }
+    // 2.56: at the start, before the native side moves boot.log to boot.prev.log: the last three runs (a crashed one included, it never reached
+    // onStop) to their boot-<driver>.log. The files are opened here, at once (a rename does not touch an open file), and copied on a
+    // background thread; a copy already newer than its run is left alone.
+    static void archiveAtStart(Context c) {
+        File log = bootLog(c); final File d = dir(c);
+        final List<RandomAccessFile> open = new ArrayList<>(); final List<File> src = new ArrayList<>();
+        for (String n : RUNS) { File f = new File(log.getParentFile(), n); if (!f.isFile()) continue;
+            try { open.add(new RandomAccessFile(f, "r")); src.add(f); } catch (IOException e) { /* gone meanwhile */ } }
+        if (open.isEmpty()) return;
+        final long[] mod = new long[src.size()]; for (int i = 0; i < mod.length; i++) mod[i] = src.get(i).lastModified();
+        new Thread(() -> {
+            synchronized (CrashLog.class) {
+                for (int i = 0; i < open.size(); i++) {
+                    try (RandomAccessFile in = open.get(i)) {
+                        String name = driverLogName(in); if (name == null) continue;
+                        File to = new File(d, name);
+                        if (to.isFile() && to.lastModified() >= mod[i]) continue;   // already a copy of this run or of a later one
+                        copyLog(in, to);
+                        android.util.Log.i("dm", "crash log: " + src.get(i).getName() + " -> " + to);
+                    } catch (IOException e) { android.util.Log.w("dm", "crash log: per-driver copy: " + e); }
+                }
+            }
+        }, "dm-logarchive").start();
+    }
+    private static void copyPerDriver(File log, File d) {
+        if (!log.isFile()) return;
+        try (RandomAccessFile in = new RandomAccessFile(log, "r")) { String name = driverLogName(in); if (name != null) copyLog(in, new File(d, name)); }
+        catch (IOException e) { android.util.Log.w("dm", "crash log: per-driver copy " + log + ": " + e); }
+    }
+    // "boot-<driver>.log" for a native log: the driver the run asked for, from the first "[vk] driver choice: requested=<name>" line
+    // (vk_driver.c; after a fallback to the system driver the run stays the failed driver's), else boot.log's header line "Vulkan driver
+    // asked: <name>" (jni_android.c log_header: a run that ended before the driver loaded); "system" for the system driver. A path keeps its
+    // last part; characters other than [A-Za-z0-9._-] become '_'. null when the head names no driver.
+    static String driverLogName(RandomAccessFile in) throws IOException {
+        long n = Math.min(in.length(), 1L << 20); byte[] b = new byte[(int) n]; in.seek(0); in.readFully(b);
+        String head = new String(b, StandardCharsets.UTF_8), drv = null;
+        final String choice = "[vk] driver choice: requested=", asked = "Vulkan driver asked: ";
+        int at = head.indexOf(choice);
+        if (at >= 0) { int s0 = at + choice.length(), e = s0; while (e < head.length() && head.charAt(e) > ' ') e++; drv = head.substring(s0, e); }
+        else if ((at = head.indexOf(asked)) >= 0) { int s0 = at + asked.length(), e = s0; while (e < head.length() && head.charAt(e) > ' ') e++; drv = head.substring(s0, e); }
+        if (drv == null || drv.isEmpty()) return null;
+        int sl = drv.lastIndexOf('/'); if (sl >= 0 && sl < drv.length() - 1) drv = drv.substring(sl + 1);
+        drv = drv.replaceAll("[^A-Za-z0-9._-]", "_"); if (drv.length() > 96) drv = drv.substring(0, 96);
+        return "boot-" + drv + ".log";
     }
     private static void copyLog(File from, File to) {
         if (!from.isFile()) return;
-        try (RandomAccessFile in = new RandomAccessFile(from, "r"); OutputStream out = new FileOutputStream(to)) {
-            long n = in.length(); byte[] buf = new byte[1 << 16];
+        try (RandomAccessFile in = new RandomAccessFile(from, "r")) { copyLog(in, to); }
+        catch (IOException e) { android.util.Log.w("dm", "crash log: copy " + from + ": " + e); }
+    }
+    private static void copyLog(RandomAccessFile in, File to) {
+        try (OutputStream out = new FileOutputStream(to)) {
+            in.seek(0); long n = in.length(); byte[] buf = new byte[1 << 16];
             if (n > MIRROR_MAX) {   // head (device / driver / GPU lines), a marker, then the tail
                 byte[] head = new byte[HEAD_BYTES]; in.readFully(head); out.write(head);
                 out.write(("\n---- [" + (n - HEAD_BYTES - MIRROR_MAX) + " bytes left out] ----\n").getBytes(StandardCharsets.UTF_8));
                 in.seek(n - MIRROR_MAX);
             }
             for (int k; (k = in.read(buf)) > 0; ) out.write(buf, 0, k);
-        } catch (IOException e) { android.util.Log.w("dm", "crash log: copy " + from + ": " + e); }
+        } catch (IOException e) { android.util.Log.w("dm", "crash log: copy to " + to + ": " + e); }
     }
 
     // The native log of the last run: the newer of <files>/dm/boot.log and <external files>/dm/boot.log (jni_android.c picks one by the
@@ -190,7 +247,7 @@ final class CrashLog {
 
     // ---- writing
     private static File write(Context c, String reason, String details, File log, byte[][] snap, int pid, String exit) {
-        File f = report(c), prev = new File(f.getParentFile(), "crash.prev.txt");
+        File f = report(c), prev = new File(f.getParentFile(), "crash.prev.txt"), prev2 = new File(f.getParentFile(), "crash.prev2.txt");
         StringBuilder sb = new StringBuilder(1 << 20);
         sb.append("DOOM Mobile crash report\n").append("reason: ").append(reason).append('\n');
         if (exit != null && !reason.contains(exit)) sb.append("exit: ").append(exit).append('\n');
@@ -206,6 +263,7 @@ final class CrashLog {
         sb.append("\n---- logcat of the process").append(pid > 0 ? " " + pid : "").append(" (main + crash buffers, last ").append(LOGCAT_LINES).append(" lines) ----\n");
         sb.append(logcat(pid));
         try {
+            if (prev.isFile()) { prev2.delete(); if (!prev.renameTo(prev2)) prev.delete(); }   // 2.56: two earlier reports kept
             if (f.isFile()) { prev.delete(); if (!f.renameTo(prev)) f.delete(); }
             try (OutputStream os = new FileOutputStream(f)) { os.write(sb.toString().getBytes(StandardCharsets.UTF_8)); }
             try { android.media.MediaScannerConnection.scanFile(c, new String[] {f.getAbsolutePath()}, null, null); } catch (RuntimeException e) { /* only for MTP views */ }

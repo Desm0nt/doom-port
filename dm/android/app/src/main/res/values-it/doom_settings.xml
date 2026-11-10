@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">In uso ora: driver di sistema (%1$s non si è avviato)</string>
     <string name="toast_driver_fallback">Il driver Vulkan %1$s non si è avviato su questo dispositivo (%2$s); viene usato il driver di sistema.</string>
     <string name="toast_driver_crashed">L\'ultimo avvio con il driver Vulkan %1$s si è chiuso o bloccato, quindi ora viene usato il driver di sistema. Puoi selezionarlo di nuovo nelle Impostazioni.</string>
+    <string name="toast_driver_init_failed">Il driver Vulkan %1$s non è riuscito ad avviarsi su questo dispositivo, quindi ora il gioco usa il driver di sistema. I driver personalizzati sono sperimentali. Puoi selezionarlo di nuovo in ⚙ → Driver Vulkan.</string>
     <string name="gear_lang">Lingua del gioco (testi e voci)</string>
     <string name="gear_lang_system">Come nel sistema</string>
     <string name="gear_aa">Assistenza alla mira</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: disponibile quando il gioco avrà caricato il suo profilo (oppure modificala nel menu del gioco)</string>
     <string name="gear_game_settings_note">Mira assistita, mira con movimento e la sua sensibilità sono impostazioni del gioco stesso (impostazioni del controller nel menu del gioco): una modifica qui o lì si vede in entrambi i posti e viene salvata nel profilo del gioco.</string>
     <string name="toast_game_setting_failed">Impossibile modificare qui un\'impostazione del gioco; usa le impostazioni del controller nel menu del gioco</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Modalità grafica sicura (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Off</string>
+    <string name="gear_safe_auto">Auto</string>
+    <string name="gear_safe_on">On</string>
+    <string name="gear_safe_note">Off: sempre le impostazioni veloci della versione 0.5 (sperimentale). Auto: vengono disattivate un passo alla volta dopo un crash del driver grafico. On: sempre disattivate (più lento, ma più compatibile) – provala se vedi sfarfallii, colori sbagliati o altri problemi d\'immagine.</string>
+    <string name="gear_safe_now">Questo avvio: passo %1$d di 3 (crash grafici contati: %2$d)</string>
+    <string name="safe_title">Modalità grafica sicura</string>
+    <string name="safe_crash">L\'ultimo avvio è terminato con un crash del driver grafico.</string>
+    <string name="safe_step_1">Ora è attivo il passo 1 di 3: le accelerazioni sperimentali della versione 0.5 per Mali / PowerVR (memoria zero-copy e altre) sono disattivate.</string>
+    <string name="safe_step_2">Ora è attivo il passo 2 di 3: le accelerazioni della versione 0.5 e le ottimizzazioni per GPU a tile sono disattivate.</string>
+    <string name="safe_step_3">Ora è attivo il passo 3 di 3: la modalità più compatibile (e più lenta) – accelerazioni, ottimizzazioni per GPU a tile e alcune scorciatoie degli shader sono disattivate.</string>
+    <string name="safe_step_0">La modalità sicura è disattivata (⚙ o dm/env), quindi non è stato cambiato nulla.</string>
+    <string name="safe_next">Se il gioco va di nuovo in crash, verrà provato il passo successivo.</string>
+    <string name="safe_last">Questo è l\'ultimo passo.</string>
+    <string name="safe_gear">Puoi cambiarlo in ⚙ → Modalità grafica sicura.</string>
+    <string name="safe_logs">Se i crash continuano, invia i file di %1$s con una segnalazione del problema.</string>
+    <string name="safe_relaunched">Il gioco è stato riavviato automaticamente.</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">La memoria zero-copy (un\'accelerazione sperimentale) non ha superato il test su questo dispositivo ed è disattivata per questo avvio.</string>
+    <string name="toast_safe_fence">Il driver grafico ha segnalato un errore di sincronizzazione; il gioco si è ripreso e usa una modalità di sincronizzazione più sicura per questo avvio.</string>
+    <string name="toast_safe_pipe">Il driver grafico non è riuscito a compilare uno shader; alcuni effetti potrebbero mancare. Ora gli shader vengono compilati uno alla volta per questo avvio.</string>
+    <string name="notif_safe_channel">Ripristino dopo un crash</string>
+    <string name="notif_safe_title">%1$s si è bloccato nel driver grafico</string>
+    <string name="notif_safe_text">Tocca per riavviare in modalità sicura.</string>
 </resources>

@@ -25,6 +25,7 @@ import java.util.List;
 //                       DM_AA_STRENGTH (hle_hid.c; 0 = the game's weak MP-method assist)
 //   game folder         GameFolder (issue #11): the folder this run uses and "Choose…"
 //   updates             2.41: GearPages.updates (status line + "Check for new versions at start"; "Check for updates" is the pause menu's row)
+//   safe mode           2.57: GearPages.safeMode after the driver (Mali / PowerVR only: off / auto / on, DM_SAFE_MODE; SafeMode.java)
 //   diagnostics         -PdmDiag=1 environment (no row)
 //   live                no row: the Save's live calls in the order the old dialog made them (see live())
 // New DOOM rows go here as further sections, in the list below where they belong.
@@ -63,6 +64,7 @@ final class DoomGear {
         l.add(GearPages.fpsLimit("DM_DOOM_TICK_MAX"));   // the game's adaptive tick (hle_args.c) at the same value: game time stays real time
         l.add(aspect);
         if (a.drivers() != null) l.add(GearPages.driver(a.drivers()));
+        l.add(GearPages.safeMode(a));   // [safe-mode] 2.57: off / auto / on on Mali / PowerVR only (no row elsewhere); DM_SAFE_MODE
         l.add(GearPages.gameLanguage(LANG_CODES, LANG_LABELS, true));
         l.add(aim);   // issue #31: the game's aim assist, our aim assist strength, the game's motion aiming / gyro sensitivity
         l.add(GearPages.rumble());

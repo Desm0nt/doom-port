@@ -19,6 +19,7 @@
     <string name="gear_driver_active_fallback">Em uso agora: driver do sistema (%1$s não iniciou)</string>
     <string name="toast_driver_fallback">O driver Vulkan %1$s não iniciou neste aparelho (%2$s); o driver do sistema está sendo usado.</string>
     <string name="toast_driver_crashed">A última inicialização com o driver Vulkan %1$s travou ou fechou, então agora o driver do sistema é usado. Você pode escolhê-lo de novo nas Configurações.</string>
+    <string name="toast_driver_init_failed">O driver Vulkan %1$s não conseguiu iniciar neste aparelho, então o jogo agora usa o driver do sistema. Drivers personalizados são experimentais. Você pode escolhê-lo de novo em ⚙ → Driver Vulkan.</string>
     <string name="gear_lang">Idioma do jogo (textos e vozes)</string>
     <string name="gear_lang_system">Como no sistema</string>
     <string name="gear_aa">Assistência de mira</string>
@@ -93,4 +94,29 @@
     <string name="gear_game_unknown_fmt" formatted="true">%1$s: disponível quando o jogo carregar o perfil (ou altere no menu do jogo)</string>
     <string name="gear_game_settings_note">A assistência de mira, a mira por movimento e a sua sensibilidade são configurações do próprio jogo (configurações do controle no menu do jogo): uma alteração aqui ou lá aparece nos dois lugares e fica salva no perfil do jogo.</string>
     <string name="toast_game_setting_failed">Não foi possível alterar aqui uma configuração do jogo; use as configurações do controle no menu do jogo</string>
+    <!-- [safe-mode] BUGS_AND_FIXES 2.57 (frontend-common SafeMode / DmGuard / GearPages.safeMode; same text as i18n/gear_text.tsv) -->
+    <string name="gear_safe_mode">Modo gráfico seguro (Mali / PowerVR)</string>
+    <string name="gear_safe_off">Desligado</string>
+    <string name="gear_safe_auto">Auto</string>
+    <string name="gear_safe_on">Ligado</string>
+    <string name="gear_safe_note">Desligado: sempre as configurações rápidas da versão 0.5 (experimental). Auto: elas são desligadas passo a passo após uma falha no driver gráfico. Ligado: sempre desligadas (mais lento, mas mais compatível) – experimente se vir cintilação, cores erradas ou outros problemas de imagem.</string>
+    <string name="gear_safe_now">Esta execução: passo %1$d de 3 (falhas gráficas contadas: %2$d)</string>
+    <string name="safe_title">Modo gráfico seguro</string>
+    <string name="safe_crash">A última execução terminou com uma falha no driver gráfico.</string>
+    <string name="safe_step_1">O passo 1 de 3 está ativo agora: as acelerações experimentais da versão 0.5 para Mali / PowerVR (memória zero-copy e outras) estão desligadas.</string>
+    <string name="safe_step_2">O passo 2 de 3 está ativo agora: as acelerações da versão 0.5 e as otimizações para GPUs por blocos estão desligadas.</string>
+    <string name="safe_step_3">O passo 3 de 3 está ativo agora: o modo mais compatível (e mais lento) – as acelerações, as otimizações para GPUs por blocos e alguns atalhos de shaders estão desligados.</string>
+    <string name="safe_step_0">O modo seguro está desligado (⚙ ou dm/env), então nada foi alterado.</string>
+    <string name="safe_next">Se o jogo travar de novo, o próximo passo será tentado.</string>
+    <string name="safe_last">Este é o último passo.</string>
+    <string name="safe_gear">Você pode mudar isso em ⚙ → Modo gráfico seguro.</string>
+    <string name="safe_logs">Se continuar travando, envie os arquivos de %1$s com um relatório de erro.</string>
+    <string name="safe_relaunched">O jogo foi reiniciado automaticamente.</string>
+    <string name="safe_ok">OK</string>
+    <string name="toast_safe_zc">A memória zero-copy (uma aceleração experimental) não passou no teste neste aparelho e está desligada nesta execução.</string>
+    <string name="toast_safe_fence">O driver gráfico relatou um erro de sincronização; o jogo se recuperou e usa um modo de sincronização mais seguro nesta execução.</string>
+    <string name="toast_safe_pipe">O driver gráfico não conseguiu compilar um shader; alguns efeitos podem faltar. Os shaders agora são compilados um de cada vez nesta execução.</string>
+    <string name="notif_safe_channel">Recuperação após falha</string>
+    <string name="notif_safe_title">%1$s travou no driver gráfico</string>
+    <string name="notif_safe_text">Toque para reiniciar no modo seguro.</string>
 </resources>
