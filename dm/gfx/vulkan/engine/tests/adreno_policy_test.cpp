@@ -52,7 +52,30 @@ int main(){
     CHECK(!xbg_adreno_rewrite_option(false,-1,nullptr,false));
     CHECK(xbg_adreno_rewrite_option(false,-1,"2",false));
 
+    // [#39 / #47] Adreno 8xx policy: 8xx on by default, 0 turns it off, force reaches 740/750, never other vendors.
+    CHECK(xbg_adreno_8xx(0x5143,"Adreno (TM) 830"));
+    CHECK(xbg_adreno_8xx(0x5143,"Adreno (TM) 825"));
+    CHECK(xbg_adreno_8xx(0x5143,"Adreno (TM) 840"));
+    CHECK(xbg_adreno_8xx(0x5143,"Turnip Adreno (TM) 830"));
+    CHECK(!xbg_adreno_8xx(0x5143,"Adreno (TM) 750"));
+    CHECK(!xbg_adreno_8xx(0x5143,"Adreno (TM) 710"));
+    CHECK(!xbg_adreno_8xx(0x5143,"Adreno X1-85"));
+    CHECK(!xbg_adreno_8xx(0x13b5,"Adreno (TM) 830"));
+    CHECK(xbg_adreno8_policy(0x5143,"Adreno (TM) 830",nullptr));
+    CHECK(xbg_adreno8_policy(0x5143,"Adreno (TM) 830",""));
+    CHECK(xbg_adreno8_policy(0x5143,"Adreno (TM) 830","auto"));
+    CHECK(xbg_adreno8_policy(0x5143,"Adreno (TM) 830","1"));
+    CHECK(!xbg_adreno8_policy(0x5143,"Adreno (TM) 830","0"));
+    CHECK(!xbg_adreno8_policy(0x5143,"Adreno (TM) 750",nullptr));
+    CHECK(!xbg_adreno8_policy(0x5143,"Adreno (TM) 750","1"));
+    CHECK(xbg_adreno8_policy(0x5143,"Adreno (TM) 750","force"));
+    CHECK(!xbg_adreno8_policy(0x13b5,"Mali-G715","force"));
+    // With the policy on, an 8xx takes the 740-799 path of xbg_adreno_rewrite_option (marker still wins, JNI env "1" does not).
+    CHECK(!xbg_adreno_rewrite_option(false,-1,"1",xbg_adreno_rewrites_fault(0x5143,"Adreno (TM) 830") || xbg_adreno8_policy(0x5143,"Adreno (TM) 830",nullptr)));
+    CHECK(xbg_adreno_rewrite_option(false,-1,"1",xbg_adreno_rewrites_fault(0x5143,"Adreno (TM) 830") || xbg_adreno8_policy(0x5143,"Adreno (TM) 830","0")));
+    CHECK(xbg_adreno_rewrite_option(true,'1',"1",xbg_adreno_rewrites_fault(0x5143,"Adreno (TM) 830") || xbg_adreno8_policy(0x5143,"Adreno (TM) 830",nullptr)));
+
     if(failures){printf("FAIL %d check(s)\n",failures);return 1;}
-    printf("PASS Adreno policy: 740/750 default off, 730/830 and other vendors unchanged, marker file still wins\n");
+    printf("PASS Adreno policy: 740/750 default off, 8xx off by the #39/#47 policy (0 restores), 730 and other vendors unchanged, marker file still wins\n");
     return 0;
 }

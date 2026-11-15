@@ -30,6 +30,10 @@ t_dirty_enomem: t_dirty_enomem.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
 #   make t_dirty_coalesce && ./t_dirty_coalesce
 t_dirty_coalesce: t_dirty_coalesce.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
 	gcc -O1 -g -Wall -Wno-unused-function -I../../android/compat/include -include dm_android_compat.h -o $@ t_dirty_coalesce.c -lpthread
+# [zc3mode] zero-copy mode 3: nvn_dirty_take_written (written pages since the last call, re-protected) under writers, texture protects,
+# host pre-writes and the coalescer; Linux only like t_dirty_gone: make t_dirty_zc3 && ./t_dirty_zc3 && ./t_dirty_zc3 nowin
+t_dirty_zc3: t_dirty_zc3.c ../nvn/nvn_dirty.c ../nvn/nvn_dirty.h
+	gcc -O1 -g -Wall -Wno-unused-function -I../../android/compat/include -include dm_android_compat.h -o $@ t_dirty_zc3.c -lpthread
 # [r5] DM_GFX_DESWZ_DIRECT: GOB-wise deswizzle == nvn_deswizzle byte for byte (formats, targets, sizes, mips, block heights);
 #   make t_deswz_direct && ./t_deswz_direct
 t_deswz_direct: t_deswz_direct.c ../tex/nvn_deswizzle.c ../tex/nvn_deswizzle.h ../nvn/nvn_tex.c ../nvn/nvn_tex.h

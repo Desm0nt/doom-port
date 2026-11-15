@@ -68,6 +68,7 @@ Adreno 750), драйвер Qualcomm, если не сказано иное.
 | 56 | Issue #40 (OnePlus Pad 2): (а) левый стик фиксированный — «персонаж не идёт, пока палец внутри круга», маленький стик трудно попасть; (б) 3D-карту нельзя крутить пальцем (только правым стиком геймпада / раскладки «два стика») | (а) стик движения — круг на месте, наклон от его центра; (б) карта крутится правым стиком, а тач-обзор идёт в канал гироскопа (как колесо, №46) | (а) плавающий стик движения (как D3PadView): появляется под пальцем в левых 45 % экрана, наклон — от точки касания; pref `float_stick` (DOOM: вкл.) и `float_zone` в «Экранный геймпад»; (б) хост вне геймплея (нет адаптивных кадров игры > 300 мс: карта, меню, пауза) не берёт `nativeLookDelta` → пад ведёт правый стик (`DM_TOUCH_LOOK_GAMEPLAY`=300) + «режим карты» по «−» (pref `map_key`, выход по «−» / B) (§2.51) | собрано 09.11, `check_frontend.sh` / `doom_prefs_check.py` / `doom_text_check.py` зелёные; на телефоне не проверено |
 | 57 | Issue #33 (Mali-G57): выбран PanVK zenith 26.3.1 в ⚙ → `Swapchain: VkResult -1000072003`, экран «Graphics initialization failed» без ⚙ — игрок заперт на драйвере до очистки данных; присланные логи другого драйвера перезаписаны (хранились только 2 запуска) | экран ошибки старта не даёт сменить драйвер, отката нет; ротация `boot.log` → `boot.prev.log` одна | откат на системный драйвер **в том же процессе** (`vk_fallback_to_system`: всё созданное уже уничтожено, таблица трамплинов сброшена, `DM_VK_DRIVER` снят, вторая инициализация), выбор в ⚙ сброшен, тост `toast_driver_init_failed` (13 языков, «сторонние драйверы экспериментальные»); если движок уже стартовал — перезапуск процесса; тест `DM_VK_FAKE_INIT_FAIL`; логи: 3 запуска (`boot.prev2.log`, `crash.prev2.txt`) + `logs/boot-<драйвер>.log` по последнему запуску каждого драйвера (§2.56) | собрано 10.11, `check_frontend.sh` / `doom_prefs_check.py` / `doom_text_check.py` зелёные, `tools/build_apk.ps1` → APK; на телефоне не проверено |
 | 58 | Mali / PowerVR: экспериментальные ускорения 0.5.x (zero-copy, UBO 2, fence trylock) могут ронять драйвер у игрока — лестница обходов была только на PowerVR и только для крэша в `dm-record`; после падения игрок видел только вылет | нет общего учёта графических сбоев и отката для Mali, нет перезапуска и объяснения | безопасный режим: `gfx-safe-mode` считает сбои (крэш в пакете / на графическом потоке / в драйвере / в zero-copy памяти, GPU hang, DEVICE_LOST) → ступени 1–3 (`DM_SAFE_MODE`, синоним `DM_PVR_LADDER`); откаты в процессе (zero-copy при самотесте, fence trylock, сборка пайплайнов по одному) с тостом; окно после сбоя; сторож `:guard` перезапускает или ставит уведомление; ⚙ Выкл/Авто/Вкл; тесты `DM_GFX_FAKE_GPU_CRASH`, `DM_GFX_FAKE_FALLBACK` | собрано 10.11, на телефоне не проверено (§2.57) |
+| 59 | PowerVR (moto g64): zero-copy невозможен — AHB-окно некогерентно (`vkmap` FAIL), окно `vkalloc` не даёт `mprotect` (§2.58); режим 2 без прохода | GPU не снупит кэши CPU, типа HOST_COHERENT\|CACHED нет | zero-copy **режим 3** (maint, §2.61): кэшируемые страницы (`0xb`), dirty tracker защищает все страницы чанков, перед каждым `vkQueueSubmit` — DC CVAC записанных страниц; NVN Flush/Invalidate сверху; самотест с DC + проверка `mprotect` во всех самотестах; auto: Mali / PowerVR, если режим 2 не прошёл; `DM_GFX_ZEROCOPY=3`, `DM_GFX_ZC3_CLEAN`, `DM_GFX_ZC3_NVN` | собрано 11.11, хост-тесты зелёные, на телефоне не проверено |
 
 ---
 
@@ -3518,3 +3519,257 @@ Aiming и ползунок чувствительности гироскопа �
   из фона без видимого окна: ожидаемый путь — уведомление, а без `POST_NOTIFICATIONS` — только окно при следующем ручном старте.
   (3) Ступень 3 на Mali выключает `NOOUT_MASK` — возможен чёрный цвет у depth-only draw (d2r #179); ступень 3 — крайняя мера по просьбе хозяина.
   (4) Классификатор по библиотеке pc/lr может посчитать сбоем крэш, где драйвер — лишь жертва (порча памяти игрой); цена — ступень обходов, не потеря.
+### 2.58 PanVK на Mali: серые полосы на весь экран через 1–2 минуты — буферы окна AFBC, драйвер пишет в них как в обычные (issue #33, Mali-G57 MC2 / MT6789, PanVK JimVulkan 1.6.0; 10.11; собрано, на Mali не проверено)
+- **Симптом (issue #33, логи и скриншоты v0.5.2; то же на 0.5.0-test2).** Игрок выбрал в ⚙ `panvk-jim-1.6.0` (Mesa 27.0.0-devel-58f2c55,
+  `verified=1 driverID=20`). Заставки и первые минуты идут нормально, затем весь экран — серый фон, чёрные горизонтальные полосы и мелкие
+  точки; HUD и экранный геймпад (Android-view поверх) целы, игра продолжает работать (звук, ввод, выход через меню паузы). С системным
+  драйвером ARM r32p1 такого нет. **Последняя версия без жалоб у игрока — v0.4.20 на системном драйвере**; PanVK у него корректно не работал
+  ни в одной версии (в 0.4.20 его в APK не было, zenith 26.3.1 не создаёт swapchain — §2.56).
+- **Что это не.** Тайловые политики (`TILE_AREA`, `NOLOAD`, `STORE_DEAD`, lean usage…) были включены уже в 0.4.20 с тем же результатом на
+  системном драйвере; `STORE_NONE` / `compression_query` / zero-copy `dmaheap` на PanVK активны, но картинка игры (вывод 960×720) до present
+  доходит целой — портится именно то, что показывает композитор. Ступени `DM_SAFE_MODE` (§2.57) это не лечат: падений нет, счётчик 0.
+- **Разбор скриншота (2000×1200, игрок сам выбрал в ⚙ «Соотношение сторон 4:3» → картинка 1600×1200 с чёрными полями по 200 px).** Период
+  узора по вертикали 64 px, чёрные полосы по 8 px в начале и в конце периода, три зоны по горизонтали с границами x=288 и x=1600. Это ровно
+  линейная строка RGBA8 со stride 2016 px, прочитанная как таблица заголовков **AFBC wide-block** (суперблок 32×8, 2016 / 32 = 63 в ряду,
+  заголовок 16 Б): строка 2016×4 = 8064 Б = 504 заголовка = 8 рядов суперблоков × 8 px = 64 px; левое поле (x 0..199) → заголовки 0..49 →
+  ряд 0, столбцы 0..49 → чёрная полоса строк 0..7 на x 0..1599; правое поле + паддинг (x 1800..2015) → заголовки 450..503 → ряд 7, столбцы
+  9..62 → чёрная полоса строк 56..63 на x 288..2015. Все четыре числа совпали с измеренными.
+- **Причина.** На Android буферы swapchain выделяет gralloc телефона: платформенный `libvulkan` (поверх него работает и пакет adrenotools)
+  берёт gralloc usage у драйвера (`vkGetSwapchainGrallocUsageANDROID` / `…2ANDROID`), а драйвер потом импортирует готовый буфер
+  (`VkNativeBufferANDROID`). Gralloc ARM (у MediaTek он же) сам решает, сжимать ли буфер AFBC. PanVK JimVulkan в namespace adrenotools не
+  видит `libui` («libui.so is not visible here; using the gralloc handle parsers») и разбирает handle сам: незнакомая раскладка — «taken as
+  linear», AFBC он не поддерживает вовсе («AFBC buffer … is not handled»). Итог: буфер выделен как AFBC (ширина 2000 выровнена до 2016), драйвер
+  рисует в него обычные строки, композитор декодирует их как AFBC.
+- **Почему не сразу.** Первый swapchain (2000×1200) получил обычные буферы; пересоздание с тем же размером (открытие / закрытие ⚙:
+  `boot.prev2.log` строки 1181, 1185) отдаёт те же буферы BufferQueue и картинку не ломает. Порча начинается после смены размера окна —
+  `Swapchain: window=2000x1176` (строка 2153, системная панель) и обратно на 2000×1200: BufferQueue выделяет новые буферы, уже AFBC. Какое
+  именно правило gralloc MediaTek выбирает AFBC для вторых аллокаций, не установлено (исходников нет), для фикса это не нужно.
+- **Фикс (`dm/android/vk_driver.c load_driver`, тот же файл в `frontend-common/native/vk/`).** Для пакета семейства Mali (panvk / panfrost /
+  mali в имени папки, `meta.json` или библиотеки) перед `adrenotools_open_libvulkan` — `setenv("MESA_GRALLOC_LINEAR", "1", 0)` и строка
+  `[vk] MESA_GRALLOC_LINEAR=1 (PanVK: 1 = plain window buffers, no AFBC; DM_VK_PANVK_LINEAR=…)`. Что делает переменная, проверено по
+  бинарнику `libvulkan_panfrost.so` (SHA-256 `80acd461…c7ac0d`; capstone, ссылки ADRP+ADD на строки): функция `0xe0668c` один раз считает
+  флаг и кэширует его — умолчание `ro.hardware.vulkan == "samsung"`, затем env `MESA_GRALLOC_LINEAR` (непустая: первый символ не `'0'` =
+  вкл), иначе property `debug.mesa_gralloc_linear`; при включении пишет «Samsung gralloc: swapchain and exported buffers get CPU usage (linear
+  layout)» (только при `RADV_XCLIPSE_LOG` > 0). Её вызывают четыре места: `vkGetSwapchainGrallocUsageANDROID` (`0xe05f54`),
+  `vkGetSwapchainGrallocUsage2ANDROID` (`0xe063a8`) и два расчёта usage AHB — везде к usage добавляется `0x22`
+  (`GRALLOC_USAGE_SW_READ_RARELY | SW_WRITE_RARELY`). С CPU-usage gralloc ARM AFBC не выбирает (CPU как потребитель не умеет AFBC) — ради
+  этого автор драйвера и сделал переключатель для Samsung.
+- **Переключатель.** `DM_VK_PANVK_LINEAR=0` — не трогать (умолчание драйвера); по умолчанию включено. `MESA_GRALLOC_LINEAR`, заданная в
+  `dm/env`, сохраняется (`setenv` без перезаписи). Игроку ничего делать не нужно — только поставить новую версию.
+- **Что не взято.** `PANVK_DEBUG=wsi_no_afbc` (бит 0x2000 таблицы отладочных опций PanVK, рядом `noafbc` 0x10, `linear` 0x20) — это выбор
+  модификаторов обычного WSI Mesa (X11 / Wayland / display); на Android формат буфера выбирает gralloc, опция туда не доходит. `noafbc` выключил
+  бы AFBC и для внутренних текстур — лишняя потеря скорости.
+- **Цена.** Буферы окна без сжатия: чуть больше трафика памяти у композитора на 4 буфера 2000×1200; на рендер игры не влияет.
+- **Проверка.** `cmake --build work/build-android --target dm` — без предупреждений; `tools/build_apk.ps1` → `work/DOOM-port-debug.apk`
+  (в `libdm.so` из APK есть обе строки). На Adreno ветка не исполняется: семейство пакета Turnip / Qualcomm — не Mali, а пакет Mali без
+  `/dev/mali0` отсекается раньше (`no-mali`). **На Mali не проверено — устройства нет**; подтвердить может только игрок #33: в `boot.log`
+  должна появиться строка `[vk] MESA_GRALLOC_LINEAR=1`, полосы — пропасть.
+- **Тест-сборка для игрока.** Локальный `work/DOOM-Mobile-v0.5.2-panvktest1-arm64.apk` (versionName 0.5.2, minSdk 31 — у игрока
+  Android 13; `pack_release.sh` — leaks=0; SHA-256 `2b86e450b127f173c6a659f4b89029cb02e8b0f215ba3894e7f77cee6fa255d4`). Собрана из рабочего
+  дерева, то есть вместе с §2.56, §2.57 и §2.60; тестовой строки BC (§2.59) в ней нет. Не опубликована, на телефон не ставилась.
+- **Если не поможет.** (1) `adb logcat -s MESA` у игрока покажет, какой парсер handle сработал, — но игроков о таком не просим; (2) для
+  PanVK вернуть swapchain по размеру вывода игры, как в 0.4.20 (GSR выкл): размер буферов тогда не зависит от окна и BufferQueue их не
+  перевыделяет; (3) подсказка в ⚙ у пакетов PanVK «экспериментальный, при искажениях выберите системный».
+
+### 2.59 RADV-Xclipse: тестовый переключатель «BC-текстуры: нативные / через декод» в меню паузы + `DM_GFX_TEX_DIAG` (issue #45, Xclipse 940; 10.11, v0.5.2-bctest1, на устройстве не проверено)
+- **Зачем.** На RADV-Xclipse 1.8.0 поверхности уровня (VT) в мазках, на системном драйвере Samsung (BC нет → декод / ASTC) чисто. Единственная
+  видимая по логам разница — нативный BC. Нужен способ дать игроку проверить это без adb и файла `dm/env`.
+- **Что сделано.** Красная строка в главном меню паузы (не в настройках игры): `DmActivity.bcRow/portRows/portRowColor/portRow`. Нажатие →
+  диалог с предупреждением о перезапуске (`FrontMenu.confirm`) → `bc_decoded` в prefs `doom_graphics` → `restartRunning`: `DmRestart`
+  получает `grace=2500` и сначала ждёт, пока процесс выйдет сам (`nativeQuit` → `dm_host_shutdown`), убивает только по истечении. При старте
+  `DoomGear.bcMode().env()` ставит `DM_GFX_NATIVE_BC=0` (маркер `gfx-native-bc` по-прежнему сильнее). Видимость: Xclipse — всегда, прочие GPU —
+  только сборка `tools/build_apk.ps1 -BcRow` (`BuildConfig.DM_BC_ROW`), чтобы диалог и перезапуск можно было пощупать на Adreno.
+- **Общие файлы.** `frontend-common/java/FrontMenu.java` (`Host.portRowColor`, `confirm`), `PauseMenu.java` (`setColors`) — скопированы в порт;
+  заодно порт получил `portRows/portRow` из общей версии. Остальные порты нужно синхронизировать (`frontend-common/tools/sync_frontend.sh`).
+- **Логи.** На Xclipse и в сборке `-BcRow` включаются `DM_GFX_VT_DIAG`, `DM_LOG_TIME` и новый `DM_GFX_TEX_DIAG` (см. SWITCHES): возможности
+  форматов драйвера одной строкой и первые 48 частичных нативных заливок блочных текстур.
+- **Проверка.** Нативная сборка и gradle — успешно; в APK есть строки `bc_decoded`, `DM_GFX_TEX_DIAG`, `NVN tex diag`; `pack_release.sh` — leaks=0.
+  **Меню, диалог и перезапуск на телефоне не запускались.** Ловушка сборки: в PowerShell `$bcrow` и параметр `[switch]$BcRow` — одна
+  переменная (регистр не важен), gradle получал задачу `True`; переменная названа `$bcArg`.
+- **Правка 10.11 (хозяин: «убери тестовую BC»).** Строка и её логи теперь только в тестовых сборках: `build_apk.ps1 -BcRowXclipse`
+  (`-PdmBcRow=xclipse`, `BuildConfig.DM_BC_ROW_XCLIPSE`) — на Xclipse, `-BcRow` — на любом GPU; условие одно, `DoomGear.bcTest()`. Обычная
+  сборка строки не показывает, `DM_GFX_*_DIAG` на Xclipse не включает и сохранённый `bc_decoded` не читает (иначе выбор из тестовой
+  сборки остался бы без способа вернуть). Следующую тест-сборку для issue #45 собирать с `-BcRowXclipse`.
+
+### 2.60 Zero-copy на Mali без прироста: переводчик читает наши записи команд из write-combined памяти → теневая командная память (issue #3, POCO X7 Pro / MT6899 / Mali-G720 MC7; 10.11; на Mi 14 в модели mali — работает; на Mali не проверено)
+- **Симптом.** RBGMX на v0.5.2 (папка `astc` есть): «разницы почти нет». boot.log: `fd` → errno=13, `vkexport` → `vkGetMemoryFdKHR` failed,
+  **`dmaheap` (heap `system-uncached`, тип 1 `0xb`) — самотест pass**, 28 чанков / 1574 МБ, крэшей и артефактов нет — первый реальный Mali с zero-copy.
+  В уровне против 0.5.0 (тот же телефон, та же папка astc, частоты одинаковые — p4/p7 держат 2.0 ГГц): снапшоты упали в ~5 раз
+  (`snap_mb` 3–4.9 ГБ → ≈0.75 ГБ на 60 кадров), `gpu_ms` как был ≈25–35, а `submit_cpu_ms` ≈13–20 → **27–30**, поток `nvn-translate`
+  30–38 % → 51–60 % ядра при меньшем fps; итог 25–38 → 23–27 fps (выборка 0.5.2 ≈20 с сразу после загрузки).
+- **Причина (по коду, на устройстве не измерено).** HLE пишет наши записи команд (с копиями объектов и uniform-данными) в командную память игры,
+  а `nvn-translate` читает каждую обратно. Командный пул DOOM, по всей видимости, CPU_UNCACHED (пул 29 МБ «Uncached» из `[pools]`; новая строка
+  лога это покажет), в режиме 2 он попадает в zero-copy, страницы dma-heap
+  `system-uncached` у CPU write-combined → каждое чтение записи идёт мимо кэша. На Switch командную память читает GPU, CPU только пишет; у нас
+  её не читает ни один GPU. На Mi 14 в модели (`vkexport`, тип 0x7) цена не видна (submit 5.6 мс) — видимо, системный кэш Snapdragon (SLC)
+  держит и некэшируемые чтения; у MTK, похоже, нет.
+- **Исправление (`hle_nvn.c` `[zc-cmdshadow]`, `xbg_game.cpp` `xbg_zc_wc`).** Командный пул, лежащий в write-combined zero-copy памяти
+  (`zc::enabled`, `mode==XBG_ZC_UNCACHED`, `zc::find`), получает кэшируемую тень хоста размером с пул (анонимный mmap, страницы по первому
+  касанию); `AddCommandMemory` пишет в тень + off вместо пул + off — те же смещения, размеры сегментов и колбэки; игра свою командную память не
+  читает. Тень живёт до `nvnMemoryPoolFinalize`. `DM_NVN_CMD_SHADOW`: не задан = auto (только WC-пулы), 0 — как раньше, 1 — каждый командный
+  пул (тест пути на Adreno). Одна строка лога на пул: `[nvn] command memory pool … write-combined zero-copy N -> …` (заодно видно, какой пул
+  командный и его флаги). На Adreno (режим 1, кэшируемый) auto ничего не меняет.
+- **Ловушка (поймана на Mi 14).** Переводчик сверяет каждый адрес команды с известными диапазонами (`command_available` / `command_avail_soft`:
+  пулы + `host_ranges`) — первая версия упала через секунду: `FATAL: NVN command address … is outside registered command pools` (abort в
+  `nvn-translate`). Тень регистрируется в `host_ranges` через `xbg_command_shadow_add` (та же очередь `gfx_enqueue`, что и пулы, — раньше
+  первого сабмита), снимается и `munmap` — `xbg_command_shadow_drop` там же.
+- **Проверено на Mi 14 Ultra (10.11, `tools/ab_run.sh`, модель `DM_GFX_SIM_GPU=mali DM_GFX_ZC_MAP=vkexport`, Turnip):** командный пул DOOM —
+  `flags 0x12, 34 МБ` (CPU_UNCACHED|GPU_UNCACHED), в WC zero-copy → `records go to a cached host shadow`; уровень, 81 окно 60 fps, картинка
+  чистая (скриншот), падений нет. Контроль `DM_NVN_CMD_SHADOW=0`: 59.6 fps, submit 7.8 мс. С тенью submit 6.4 мс, но сцена другая (draws 465
+  против 646) — на Snapdragon цена WC-чтений мала, прирост меряется только на MTK. `DM_NVN_CMDSTAT`: в бою **266 КБ / ~5700 записей на кадр**,
+  7 сегментов по ~1.6 МБ. Оценка: зависимые некэшируемые чтения такого объёма — единицы мс, а регрессия у игрока ≈13 мс ⇒ фикс, вероятно,
+  **частичный**. Второй кандидат — снапшоты: на Mi 14 в zero-copy `parts snapshot` ≈2–5 мс/кадр (~1586 вызовов), у игрока `wtrack` копирует
+  6 МБ/кадр и снапшоты просят ~12 МБ storage на кадр; что из этого читается из WC-пулов, покажет диагностическая сборка (`-PdmDiag=1`:
+  `parts_ms_per_frame` и GPASS в boot.log без правки dm/env).
+- **Попутно из лога игрока.** `dm-pad-draw` (экранный пад на своей поверхности) ест 36–44 % ядра в обеих версиях — отдельный кандидат.
+- Бэкапы: `hle_nvn.c.bak_cmdshadow`, `xbg_game.cpp.bak_cmdshadow`.
+
+### 2.58 PowerVR (moto g64), pvrdiag1 (база 0.5.0-test3): падение на заставке Bink — окно `vkalloc` + dirty tracker: `mprotect` EACCES (11.11; уже не в v0.5.2)
+- **Лог** (Google Drive, 2 прогона одинаково): `zero-copy self-test: view=fd … not run (errno=13 …)`, `view=vkmap … FAIL (round 0: 13296 of 262144
+  words wrong, first GPU-read (CPU wrote))`, `view=vkalloc … pass` → `guest memory=1 mode=uncached view=vkalloc`, пулы (в т. ч. 1350 МБ 0x22) на
+  перенесённой `mremap` памяти драйвера. На заставке: `dirty tracker: mprotect failed (unprotect 0x712a3b7000, 226 pages …), errno 13` →
+  `CRASH sig=11 … crash thread BinkDecode1` (декодер пишет в защищённую страницу TextureBuffer).
+- **Причина:** окно драйвера PowerVR после `mremap` не даёт менять права (`mprotect` → EACCES), а texdirty защищает страницы пулов. Самотест этого
+  не видит (он не делает `mprotect`).
+- **Статус:** `vkmap`/`vkalloc` убраны из auto в v0.5.1/0.5.2 (§2.54, §2.55); безопасный режим 0.5.2 (§2.57) считает SIGSEGV в zero-copy памяти
+  графическим сбоем. Урок для новых способов окна: самотест должен проверять и `mprotect` RW↔RO на окне (сделано в §2.61).
+- **Попутно о памяти PowerVR BXM-8-256 1.15:** AHB-окно некогерентно (`vkmap FAIL`, GPU не видит записи CPU); «режим 3» (кэшируемые страницы + DC
+  CVAC/CIVAC по VA) — `pass`, 0.06 мс на 512 КБ; `DMA_BUF_IOCTL_SYNC` → ENOTTY (25). Кандидат на рабочий zero-copy для PowerVR — режим 3 с Flush
+  NVN (как на Switch); реализован в §2.61 (dirty tracker + DC CVAC перед каждой отправкой).
+
+### 2.61 Zero-copy «режим 3» (maint) для GPU без IO-когерентности: кэшируемые страницы + DC CVAC страниц, записанных CPU, перед каждой отправкой (PowerVR moto g64; 11.11; собрано, хост-тесты зелёные, на телефоне не проверено)
+- **Зачем.** moto g64 (PowerVR BXM-8-256 1.15, §2.58): AHB fd не мапится (`errno=13`), окно `vkmap` — самотест FAIL (GPU не видит записи CPU:
+  AHB-память некогерентна), `vkalloc` — pass, но перенесённое окно не даёт `mprotect` (EACCES) → texdirty упал на заставке. Типы памяти `0x7`
+  (coherent, некэшируемый) и `0xb` (кэшируемый, не coherent). Log-only самотест «режима 3» (§2.52) с `dc-by-va` (DC CVAC перед отправкой /
+  DC CIVAC после записи GPU, по VA) — **pass, 0.06 мс на 512 КБ**; `DMA_BUF_IOCTL_SYNC` → ENOTTY. Режим 3 = то, что делает Switch для пулов
+  NVN CPU_CACHED: кэшируемая память, кэш CPU сводится вручную.
+- **Как сделано (`xbg_vendor_policy.h`, `xbg_game.cpp` ns `zc` `[zc3mode]`, `nvn_dirty.c`, `hle_nvn.c`).**
+  1. `XBG_ZC_MAINT=3` (`DM_GFX_ZEROCOPY=3`, `xbg_zero_copy_parse`): тип памяти — младший разрешённый HOST_CACHED (`xbg_zc_pick_type`, на Mali /
+     PowerVR `0xb`), AHB `CPU_READ_OFTEN|CPU_WRITE_OFTEN`, свой dma-buf — кэшируемый (`dmabuf_chunk`: `vkexport` HOST_CACHED, `dmaheap` сначала
+     `system` / `mtk_mm`), **все** пулы (`xbg_zc_pool_eligible`: страницы кэшируемые, трекер видит любую запись CPU, класс пула NVN не важен).
+     Окна — только `fd` / `vkexport` / `dmaheap` (`xbg_zc_view_allowed`): MAP_FIXED из своего fd, `mprotect` работает, VMA склеиваются (#21);
+     `vkmap` / `vkalloc` даже по `DM_GFX_ZC_MAP` не берутся (лог).
+  2. **CPU → GPU: источник истины — dirty tracker.** `nvn_dirty_take_written` (новая, `nvn_dirty.c`): страницы чанка, записанные с прошлого
+     вызова (каждая страница режима 3 защищена от записи; первая запись CPU — ошибка страницы → поколение, страница снова пишется), каждую
+     такую страницу снова защищает **до** возврата, затем `zc::maint_clean` чистит их DC CVAC по VA (по рунам, один `DSB SY` в конце).
+     Порядок «защитить → почистить» закрывает гонку: запись до `mprotect` уже в кэше и уходит чисткой, запись после — ошибка страницы → следующая
+     чистка. Обход — только окна по 64 страницы, чьё сводное поколение выше «пола» куки (довод `nvn_dirty_protect_gen` §r4: каждая NONE-страница
+     выше пола); пол двигается на `s`, только если в момент чтения `s` не было разблокировок в полёте, и **ниже любой страницы, найденной BUSY**
+     (чужой protect / unprotect / склейка в процессе: запись туда может лечь до их `mprotect`) — следующий вызов почистит её ещё раз. Первая
+     чистка чанка (и пул, перерегистрированный по тому же адресу: новый `reg`) — **целиком** (страницы, записанные до трекера, без поколения:
+     копия при `map_chunk`). Без сводок (`DM_DIRTY_PROTECT_BGEN=0` / `DM_DIRTY_BLOCKS=0`) — полный обход состояний и поколений (верно, дороже).
+     Где: перед **каждым** `vkQueueSubmit` игровой работы — пакет `K_SUBMIT` потока `dm-record` (vkrec on) или поток переводчика (vkrec off).
+     Другие отправки (present-blit, самотесты, BC-самотест, aux-очередь texdiscard) zero-copy память не читают.
+     Чанк, ещё не зарегистрированный в трекере (между `map_pool` и `nvn_dirty_add_range` в одном `nvnMemoryPoolInitialize`), пропускается до 8
+     отправок, дальше — целиком каждую отправку (красный лог, ждём только при переполнении таблицы трекера); пул, снятый `Finalize`, — не чистится.
+  3. **NVN Flush / Invalidate — сверху, не вместо:** `cache_maint_note` → `xbg_zc_cpu_maint` → `zc::maint_nvn_range`: Flush → DC CVAC диапазона,
+     Invalidate → DC CIVAC (`DM_GFX_ZC3_NVN=1`). Корректность от Flush не зависит: DOOM флашит только CPU_UNCACHED-пул 0x22 ≈ раз в кадр (§2.52),
+     а запись в пулы, которые игра считает некэшируемыми, Switch отдаёт GPU без Flush.
+  4. **GPU → CPU: делать нечего, проверено по коду.** GPU этого движка не пишет в zero-copy память: storage-записи идут в readback-буферы
+     (`Descriptors::written` → `readback_buffer`, chaining / prologue copy — тоже свои буферы), `OP_COPY_B2B` → `gpu_buffer_copy` (pending writeback
+     в свой буфер), копии image→buffer → `readback_buffer`, запросы → `query_results`. Результаты переносит в гостевую память **CPU** (memcpy после
+     fence) — это записи CPU, их видит трекер и чистит перед следующей отправкой. Устаревших линий CPU поверх данных GPU поэтому не бывает;
+     NVN Invalidate всё равно исполняется (DC CIVAC — clean+invalidate, данные CPU не теряются).
+  5. **Командный пул** (`0x12`, §2.60) в режиме 3 тоже уходит в кэшируемую тень хоста (`xbg_zc_wc` = режим 2 **или 3**): иначе каждая запись
+     команды HLE была бы ошибкой страницы трекера и чисткой впустую (GPU командную память не читает).
+  6. **wtrack** (storage-снапшоты со своим `mprotect`) не берёт регионы в памяти режима 3 (`zc::maint_owns`): его проверка «страница трекера» смотрит
+     на поколение > 0, а режим 3 защищает и ещё не записанные страницы.
+- **Самотест.** Режим 3 — существующий `zc::selftest` с `maint=ZC_MAINT_DC` и `prefer_cached` на выбранном окне и типе (CPU пишет 512 КБ → DC CVAC →
+  GPU копирует + заливает → DC CIVAC → проверка, 8 раундов). **Новое во всех самотестах zero-copy** (урок §2.58): перед раундами окно проходит
+  `mprotect` RW→RO→RW на странице; RO должен реально не писаться (`read()` из `/dev/zero` в страницу → EFAULT — запись ядра, без обработчиков
+  сигналов), запись после RW должна дойти. Отказ = FAIL с причиной (`… view: mprotect RO->RW failed (errno=13): the dirty-page tracker could not
+  protect it`). Это отсекло бы `vkalloc` на moto g64 ещё на самотесте.
+- **Auto (`zc::decide`, `xbg_zc_try_maint`).** Adreno и устройства с cached-coherent типом — без изменений (режим 1). Mali / PowerVR: режим 2, как
+  раньше (`fd` → `vkexport` → `dmaheap`); если ни одно окно не прошло (или не создалось) — `NVN zero-copy: mode 2 (uncached) has no view that passes;
+  trying mode 3 …` и тот же перебор окон с самотестом режима 3; прошёл → режим 3, нет → zero-copy выключен + событие безопасного режима `zc`, как
+  раньше. Принудительные `DM_GFX_ZEROCOPY=1/2/3` в другой режим не откатываются. Log-only самотест `DM_GFX_ZC3_SELFTEST` при работающем режиме 3
+  не идёт (свой уже был). **Безопасный режим**: ступень 1 ставит `DM_GFX_ZEROCOPY=0` — выключает и режим 3 (и dma-buf-расширения).
+  `vulkan_present.cpp`: при `DM_GFX_ZEROCOPY=3` dma-buf-расширения включаются и на Adreno (проверка `vkexport` / `dmaheap` в модели).
+- **Переключатели (SWITCHES).** `DM_GFX_ZEROCOPY=3`; `DM_GFX_ZC3_CLEAN` 1 (страницы трекера) / 2 (все чанки целиком перед каждой отправкой —
+  эталон для бисекции) / 0 (без чистки — тест); `DM_GFX_ZC3_NVN` 1 / 0; `DM_GFX_FAKE_FALLBACK=zc2` — проваливает только окна режима 2 (проверка
+  отката 2 → 3 в модели).
+- **Логи.** `NVN zero-copy self-test: mode=maint view=… -> pass (… view vkexport (mprotect RW<->RO ok), memory type 2 flags 0xb …; maintenance
+  0.0xx ms per round …)`, `NVN zero-copy mode 3 (maint): cached pages, DC CVAC … DM_GFX_ZC3_CLEAN=1 … tracker windows on …`,
+  **`NVN zero-copy guest memory=1 mode=maint view=…`**, `NVN zero-copy mode 3: cleaned N MB in X ms` (первые чистки чанков, ≤ 8 строк),
+  раз в 60 кадров `NVN PERF zc3 cleaned_kb= clean_ms= walk_ms= submits= runs= full= windows= kept= faults= mprotect= mprotect_ms= nvn_flush_kb=
+  nvn_inval_kb= nvn_ms= nvn_calls= whole_chunks=` (на кадр; `faults` / `mprotect` — все ошибки трекера, включая текстуры и vcache),
+  `[nvn] cache maintenance: pool flush … (zero-copy mode 3: DC CVAC done)`, `[nvn] command memory pool … write-combined / mode-3 zero-copy 1 -> records
+  go to a cached host shadow`.
+- **Цена (оценка, мерить по `NVN PERF zc3`).** Чистка: 0.06 мс / 512 КБ на moto g64 ⇒ ≈ 0.12 мс на МБ записанного. DOOM пишет в кадр ≈ 1.1 МБ в пул 0x22
+  (Flush-куски 0xe1000 + 0x38400, §2.52) ⇒ ≈ 0.15 мс чистки + ≈ 280 ошибок страниц (по ~3–6 мкс на A78/A55 — **не измерено**) ≈ 1–2 мс CPU на
+  кадр, + повторная защита (руны, единицы `mprotect`), обход окон — десятки мкс. Против режима 2: чтения CPU из пулов кэшируемые (WC-цена §2.60 уходит),
+  против снапшотов — копии уходят. Разовая цена: первая чистка всех чанков ≈ 1.5 ГБ × 0.12 мс/МБ ≈ 0.2 с на первой отправке после создания пулов.
+  VMA: каждая записанная страница делит VMA чанка, dma-buf VMA не склеиваются — склейщик #21 (`DM_DIRTY_COALESCE`, бюджет 16384) перемапливает чанки
+  из своего fd (поэтому только окна с fd).
+- **Проверка (без телефона).** WSL g++: `engine/tests/vendor_policy_test.cpp` (ASan/UBSan) — режим 3: разбор `3`/`4`, имя `maint`, тип `0xb` поверх
+  `0x7`, все пулы, окна, правило отката auto (только Mali / PowerVR, только auto-режим 2 без прохода; Adreno / принудительные — никогда), руны
+  битовой карты (`xbg_zc3_runs`: границы слов, целые слова, хвост за `np`, случайная карта = popcount) — зелёный; `safe_mode_test` — зелёный.
+  **`gfx/tests/t_dirty_zc3.c`** (новый, `make t_dirty_zc3`): memfd-чанк вместо dma-buf, «память GPU» — отдельный массив, чистка = копия страницы;
+  базовые случаи (первый вызов full и всё PROT; без записей — 0; одна запись — ровно эта страница и снова PROT; записанная и защищённая
+  «текстурой» до вызова — считается; перерегистрация пула — снова full; вне диапазона / мало слов — 0) + стресс 60 раундов: 3 писателя, поток
+  `nvn_dirty_protect` («текстуры»), host pre-write (`prep_write`), склейщик и параллельный «submit»; после остановки писателей одна чистка —
+  память GPU **побайтно** равна отображению. Окна: ≈3.2 тыс. вызовов, 146 тыс. ошибок страниц, 290 склеек — 0 устаревших страниц; `nowin`
+  (`DM_DIRTY_PROTECT_BGEN=0`) — тоже 0. `t_dirty_pbgen` — ALL OK. `t_dirty_coalesce` — нестабилен **и до правки** (1 из 12 прогонов со старым
+  `nvn_dirty.c`: `g_missed == 0`, гонка его «uploader»), с новым — 0 из 12. `t_vkrec` не собирается и до правки (блок vkrec с §2.57 тянет
+  `safemode`); заглушка `zc::maint_clean` в `t_vkrec.cpp` добавлена. `tools/build_apk.ps1` → `work/DOOM-port-debug.apk`, новых предупреждений нет,
+  строки `NVN PERF zc3`, `mprotect RW<->RO ok`, `zero-copy mode 3: DC CVAC done` в `libdm.so`. **На Adreno (Mi 14) ошибки режима 3 не видны:
+  память там IO-когерентна** (даже `DM_GFX_ZC3_CLEAN=0` даст чистую картинку) — там проверяется только механика (самотест, mprotect, трекер, цена).
+- **Риски.** (1) Цена ошибок страниц на слабом CPU (A55) не измерена: если `faults=` × время велико — кандидат: чистить ровно Flush-диапазоны пула
+  0x22 и защищать только остальные пулы (не сделано). (2) Окно `fd` в режиме 3 = AHB `CPU_READ_OFTEN`: gralloc может дать кэшируемые
+  страницы с другим атрибутом, чем ждёт импорт — самотест это ловит. (3) `kept=` растёт при частых BUSY (чужие protect / склейки) — тогда
+  страницы чистятся повторно (лишняя цена, не ошибка). (4) Записи CPU в страницы после чистки, но до чтения GPU той же отправкой, — гонка и на
+  Switch (данные отправки игра пишет до `nvnQueueSubmit`); у нас чистка идёт ещё позже (перед `vkQueueSubmit`). (5) Устройство с 16 КБ страниц:
+  размер страницы берётся у трекера (`nvn_dirty_page_shift`). (6) Prefetch CPU: кэшируемая линия, прочитанная CPU до записи GPU, устарела бы — но GPU
+  в zero-copy не пишет (п. 4).
+- **План проверки на телефоне — в отчёте 11.11 (KB [gpu-powervr.md](../../docs/port-kb/gpu-powervr.md) PVR-10).**
+- **Файлы.** `xbg_vendor_policy.h` (`XBG_ZC_MAINT`, `xbg_zc_mode_name`, `xbg_zc_try_maint`, `xbg_zc_view_allowed`, `xbg_zc_pool_eligible`,
+  `xbg_zc_pick_type`, `xbg_zc3_runs`), `xbg_game.cpp` (`zc::selftest` mprotect, `zc::decide`, `dmabuf_chunk`, `map_chunk`, `zc::maint_setup /
+  maint_clean / maint_nvn_range / maint_report / maint_owns`, `xbg_zc_wc`, `xbg_zc_cpu_maint`, `K_SUBMIT`, прямой submit, `wtrack::activate`,
+  `safemode::fb_zc2`), `nvn/nvn_dirty.c|h` (`nvn_dirty_take_written`), `nvn/hle_nvn.c` (`cache_maint_note`, тень команд), `android/vulkan_present.cpp`,
+  `xbg_safe_mode.h` (комментарий), тесты `vendor_policy_test.cpp`, `gfx/tests/t_dirty_zc3.c` (новый), `Makefile`, `t_vkrec.cpp`.
+  Бэкапы — `work/bak_zc3mode/` (пути относительно `doom-port`, KB — `_docs-port-kb/`).
+
+### 2.60 Откат на системный драйвер: диалог вместо тоста, слежение `VkDrivers.watch` не обрывается молча (issue #45; 11.11, на устройстве не проверено)
+- **Повод.** Игрок (Xclipse 940, v0.5.2) перебрал RADV-Xclipse 1.5–1.9 и написал, что «без проблем работает только 1.5». По логу 1.5
+  не видит GPU (`amdgpu: unknown (family_id, chip_external_rev)`, `reason=no-gpu`) и игра шла на системном драйвере Samsung.
+- **Что не так у нас.** Об откате сообщал тост в первые секунды загрузки. В логе игрока нет строк `Vulkan driver status` и
+  `first frames presented` — тик `VkDrivers.watch` не выполнился ни разу; причина не найдена (нативный статус `…	system	no-gpu	…`
+  выставлен верно, `vk_driver.c`).
+- **Сделано (`VkDrivers.java`, общий с frontend-common).** `fallbackNotice`: диалог с OK, запись `driver notice: …`; `watch`: до старта
+  игры ждёт, а не выходит; исключение тика → `driver watch: …`, три подряд → завершение (guard снят, `firstFrames` вызван).
+- **Проверка.** `:app:compileDebugJavaWithJavac` — успешно. Сценарий отката на устройстве не проверен; APK не собирался.
+
+### 2.62 Вылет «Couldn't get file size!» после неудачного bind UDP 27016: `nn::socket::Close(0)` закрывал stdin процесса (issue #52; 14.11, v0.5.3; на устройстве не проверено)
+- **Симптом.** FatalError игры «Couldn't get file size!» сразу после старта у игрока (#52).
+- **Причина.** Сетевой код игры после неудачного `bind` на UDP 27016 закрывает сокет 0 (у Horizon свои номера сокетов). Наш `h_sk_Close` звал
+  хостовый `close(0)` — закрывался stdin процесса, следующий `open()` файла получал fd 0, а в `hle_fs` 0 — «пустой» хэндл: GetFileSize отказывал.
+- **Фикс.** `hle_net.c`: `h_sk_Close` закрывает только сокеты, созданные игрой; новый сокет не получает fd 0..2 (`dm_fd_above_std`); лог неудачного
+  bind. `hle_fs.c` `h_fs_OpenFile`: fd 0..2 переносится выше. `DM_FD_GUARD=0` — старое поведение.
+- **Проверка.** Патч субагента `work/wt-52`; сборка 0.5.3. Воспроизведение (занятый 27016) на телефоне не делали.
+
+### 2.63 Синяя полоса сбоку на Android 11–14: отступ от выреза камеры (issue #38; 14.11, v0.5.3; на устройстве не проверено)
+- **Причина.** На API 30+ окно по умолчанию с `decorFitsSystemWindows=true`: содержимое сдвинуто на вырез, полоса — фон окна.
+- **Фикс.** `DmActivity.onCreate`: `setDecorFitsSystemWindows(false)` на SDK ≥ 30 и чёрный фон окна. Патч `work/wt-38`.
+- **Остальные порты.** У Eternal / D3 / TL2 тот же `DmActivity` — проверить.
+
+### 2.64 Зелёные вспышки на Adreno 8xx: шейдер частиц `cec755c4` на пути warp32 / quad-производных (issues #39, #47; 14.11, v0.5.3; на 8xx не проверено)
+- **Причина (вероятная).** На 740–799 переделки warp32 и quad-производных выключены, на 8xx — включены; с pipeguard v2 `cec755c4` на 8xx перестал
+  быть однополосным → путь warp32 с подгруппой 64, ни разу не проверенный. #39 (0.4.22) — скорее 3D-выборка из 2D (исправлено `DIM_FIX` в 0.5.0).
+- **Фикс.** `xbg_adreno_policy.h` `xbg_adreno8_policy()` / `DM_GFX_ADRENO8_POLICY` (по умолчанию вкл. на 8xx): обе переделки выкл. как на 750,
+  самотест cached zero-copy только в лог, строка подозреваемых в логе. `tests/adreno_policy_test.cpp`. Патч `work/wt-39-47`.
+
+### 2.65 Нет подсветки Glory Kill (issue #42; 14.11, v0.5.3, только лог)
+- Вероятно, у игрока выключена опция игры Glory Kill Highlight (`g_setting_gk_highlight`, хранится в профиле). `hle_doom_settings.c` `gk_watch()`
+  пишет `[gk] Glory Kill Highlight … 0: OFF` — следующий лог покажет. Патч `work/wt-42`.
+
+### 2.66 Ключи мемо наборов дескрипторов при `DM_GFX_UBO_DYNAMIC=0` (общее ядро; KB VK-DRIVER-KEY, VK-UBO-MEMO; 14–15.11, v0.5.3)
+- **VK-DRIVER-KEY** (найдено DOS2): ключ не-dynamic driver-блока брал `tex_gen` для DRIVER0 и `buf_gen` для DRIVER2 — наоборот → `DRIVER0 ? buf_gen : tex_gen`.
+- **VK-UBO-MEMO** (D3 #22): набор с не-dynamic UBO игры (снимок, ключ только адрес+размер) больше не мемоизируется (`desc_memo_why[3]`).
+  Применено модулем `port-common/modules/desc-memo-keys` (`sync_common.sh … --yes`).
+- Касается DOOM только при `UBO_DYNAMIC=0` (безопасный режим / переключатель). Проверка на Adreno с `DM_GFX_UBO_DYNAMIC=0` — не делалась.
+
+### 2.67 Mali: auto zero-copy выключен, если режим 2 прошёл только через свой write-combined dma-buf (issues #3, #27; 14.11, v0.5.3)
+- **Повод.** POCO X7 Pro / Mali-G720: режим 2 через `dmaheap` прошёл самотест, но уровень шёл на 26 % медленнее снапшотов (32.0 → 23.7 fps);
+  в #27 безопасный режим (zero-copy выкл.) дал +30 %.
+- **Фикс.** `xbg_game.cpp` `zc::decide`: на настоящем Mali (не `SIM_GPU`), auto, режим 2 с окном `vkexport` / `dmaheap` → zero-copy выкл.
+  Окно AHB `fd` (0.5.0) и режим 3 не тронуты. `DM_GFX_ZEROCOPY=2` или `DM_GFX_ZC_MAP=dmaheap|vkexport` включают принудительно.

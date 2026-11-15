@@ -62,3 +62,8 @@ void nvn_dirty_protect_gen(const void *addr, size_t len, nvn_dirty_cookie *ck, i
 // Pages of [addr, addr+len) written after stamp as a bitmap (bit i = i-th page from the page holding addr); returns the page
 // count, 0 when untracked or nwords is too small. *windows += block summaries above stamp that were read page by page.
 size_t nvn_dirty_since_bits(const void *addr, size_t len, uint64_t stamp, uint64_t *bits, size_t nwords, uint64_t *windows);
+// [zc3mode] Zero-copy mode 3 (engine zc::maint_clean): pages of [addr, addr+len) the CPU may have written since the cookie's last call
+// (bit i = i-th page), each written-and-writable one write-protected again before it returns, so the caller can clean them (DC CVAC)
+// and any later write faults into the next call. *full = 1: the caller must clean the whole range (first call, re-registered pool).
+// Returns the page count; 0 = not inside one tracked range (or nwords too small). One cookie per range, one caller at a time.
+size_t nvn_dirty_take_written(const void *addr, size_t len, nvn_dirty_cookie *ck, uint64_t *bits, size_t nwords, int *full, nvn_dirty_pstat *st);

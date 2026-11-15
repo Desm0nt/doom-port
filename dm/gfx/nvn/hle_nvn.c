@@ -53,6 +53,7 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include <sys/stat.h>
+#include <sys/mman.h>   // [zc-cmdshadow]
 
 // ---------- 槽表、跳板、未实现桩 ----------
 // ---------- Slot table, thunks, unimplemented stubs ----------
@@ -276,21 +277,28 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pool_flags_del(p); if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
-// [zc3] NVN CPU cache maintenance (Flush / InvalidateMappedRange on pools and buffers) stays a no-op here: the host pools are CPU-coherent.
-// Counted by the pool's CPU class, to see whether DOOM keeps its CPU_CACHED pools in step by hand, which a zero-copy mode with cached
-// pages on GPUs that do not snoop the CPU caches would rely on (xbg_game.cpp zc::selftest maint). One line for the first 4 calls of each
-// kind and class, then at every power of two.
+static void cmd_shadow_drop(const pool_t *pl);   // [zc-cmdshadow]
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pool_flags_del(p); if (((pool_t *)p)->mem) cmd_shadow_drop((const pool_t *)p);if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
+// [zc3] NVN CPU cache maintenance (Flush / InvalidateMappedRange on pools and buffers): a no-op where the host pools are CPU-coherent.
+// Counted by the pool's CPU class, to see whether DOOM keeps its CPU_CACHED pools in step by hand (DOOM flushes its CPU_UNCACHED pool
+// 0x22 about once a frame). [zc3mode] In zero-copy mode 3 (cached pages, GPU not IO-coherent; xbg_game.cpp zc::maint_nvn_range) the
+// range is cleaned (Flush: DC CVAC) or cleaned+invalidated (Invalidate: DC CIVAC) on top of the dirty-page tracker's per-submission
+// clean, which stays the source of truth (a pool the game treats as uncached gets no Flush at all). One line for the first 4 calls
+// of each kind and class, then at every power of two.
+int xbg_zc_cpu_maint(const void *p, size_t n, int invalidate) __attribute__((weak));   /* xbg_game.cpp: 1 = maintenance done (mode 3) */
 static _Atomic unsigned long long g_cm_calls[4][4], g_cm_bytes[4][4];
 static void cache_maint_note(int kind, const pool_t *pool, long long off, size_t n) {
     static const char *const kinds[4] = {"pool flush", "pool invalidate", "buffer flush", "buffer invalidate"};
     static const char *const classes[4] = {"CPU_CACHED", "CPU_UNCACHED", "CPU_NO_ACCESS", "unknown"};
     const unsigned f = pool ? pool->flags : 0u;
     const int cls = !pool ? 3 : (f & 4) ? 0 : (f & 2) ? 1 : (f & 1) ? 2 : 3;
+    const int done = pool && pool->mem && off >= 0 && n && (unsigned long long)off + n <= pool->size && xbg_zc_cpu_maint
+        ? xbg_zc_cpu_maint(pool->mem + off, n, kind & 1) : 0;
     const unsigned long long c = atomic_fetch_add(&g_cm_calls[kind][cls], 1) + 1, b = atomic_fetch_add(&g_cm_bytes[kind][cls], n) + n;
     if (c <= 4 || !(c & (c - 1)))
-        LOG("[nvn] cache maintenance: %s #%llu on a %s pool (flags %#x, %.1f MB) off %#llx size %#zx, %.1f MB in total (no-op on the host)",
-            kinds[kind], c, classes[cls], f, pool ? pool->size / 1048576.0 : 0.0, off, n, b / 1048576.0);
+        LOG("[nvn] cache maintenance: %s #%llu on a %s pool (flags %#x, %.1f MB) off %#llx size %#zx, %.1f MB in total (%s)",
+            kinds[kind], c, classes[cls], f, pool ? pool->size / 1048576.0 : 0.0, off, n, b / 1048576.0,
+            done ? (kind & 1 ? "zero-copy mode 3: DC CIVAC done" : "zero-copy mode 3: DC CVAC done") : "no-op on the host");
 }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { cache_maint_note(0, (const pool_t *)p, (long long)off, n); }
 NVN(nvnMemoryPoolInvalidateMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { cache_maint_note(1, (const pool_t *)p, (long long)off, n); }
@@ -763,12 +771,56 @@ static uint8_t *hostseg_take(void) {
     if (t == 1 || t % 256 == 0) LOG("[nvn] 游戏的命令内存池已空，宿主补段（累计 %u 次，帧 %llu）", t, (unsigned long long)f);
     return m;
 }
+// [zc-cmdshadow] Issue #3 (POCO X7 Pro, MT6899 / Mali-G720, v0.5.2): with uncached zero-copy (dma-heap system-uncached, write-combined CPU
+// pages) the translation thread got ~13 ms per frame slower (submit_cpu_ms 15 -> 28, nvn-translate 30-38 % -> 51-60 % of a core at fewer fps)
+// while snapshot copies fell 5x. Our command records live in the game's command memory, a CPU_UNCACHED pool, and the translation thread reads
+// every record back -- uncached reads on the CPU. On the Switch the GPU reads command memory and the CPU only writes it; here no GPU ever
+// reads it (the records become Vulkan calls), so it does not need to be the shared memory at all. A command pool that lies in write-combined
+// zero-copy memory gets a cached host shadow of the pool's size (anonymous mmap, pages committed on first use) and records go to shadow + off
+// instead of pool + off: the same offsets, segment sizes and callbacks, the game never reads its command memory back. Kept until the pool is
+// finalized (NVN: a pool is not finalized while submitted work may use it; the translation thread is done with a submission before its fence).
+// DM_NVN_CMD_SHADOW: unset = auto (only write-combined zero-copy pools: xbg_zc_wc), 0 = off (records in the game's memory, as before), 1 = every
+// command pool (a test of the path on Adreno / in the models).
+int xbg_zc_wc(const void *p, size_t n) __attribute__((weak));   /* xbg_game.cpp: [p, p+n) is write-combined (mode 2) or maint (mode 3: records would fault into the dirty-page tracker) zero-copy memory */
+void xbg_command_shadow_add(void *p, size_t n) __attribute__((weak));    /* xbg_game.cpp: the translator accepts command addresses in [p, p+n) */
+void xbg_command_shadow_drop(void *p, size_t n) __attribute__((weak));   /* xbg_game.cpp: forgets and unmaps it, in order with the submissions */
+#define CMDSHADOW_MAX 16
+static struct { const uint8_t *mem; uint64_t size; uint8_t *shadow; int on; } g_cmdshadow[CMDSHADOW_MAX];
+static pthread_mutex_t g_cmdshadow_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *cmd_shadow(const pool_t *pl) {
+    static int mode = -2; if (mode == -2) { const char *e = getenv("DM_NVN_CMD_SHADOW"); mode = e && *e ? atoi(e) : -1; }
+    if (!mode) return NULL;
+    uint8_t *r = NULL; int found = 0;
+    pthread_mutex_lock(&g_cmdshadow_mu);
+    for (int i = 0; i < CMDSHADOW_MAX && !found; i++) if (g_cmdshadow[i].mem == pl->mem && g_cmdshadow[i].size == pl->size) { found = 1; r = g_cmdshadow[i].shadow; }
+    if (!found) {
+        const int wc = xbg_zc_wc && xbg_zc_wc(pl->mem, 4096);
+        int on = mode > 0 || wc, slot = -1;
+        for (int i = 0; i < CMDSHADOW_MAX && slot < 0; i++) if (!g_cmdshadow[i].mem) slot = i;
+        if (on && slot >= 0) { void *m = mmap(NULL, pl->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); r = m == MAP_FAILED ? NULL : (uint8_t *)m;
+            if (r && xbg_command_shadow_add) xbg_command_shadow_add(r, pl->size); }   // the translator checks every command address against known ranges
+        if (slot >= 0) g_cmdshadow[slot] = (typeof(g_cmdshadow[0])){pl->mem, pl->size, r, r != NULL};
+        static unsigned told_noslot; if (slot >= 0 || !told_noslot++) LOG("[nvn] command memory pool %p+%#llx (flags %#x, %.1f MB): write-combined / mode-3 zero-copy %d -> %s (DM_NVN_CMD_SHADOW=%d: unset auto, 0 off, 1 every pool)",
+            (void *)pl->mem, (unsigned long long)pl->size, pl->flags, pl->size / 1048576.0, wc,
+            r ? "records go to a cached host shadow" : on ? "shadow NOT made (no slot / mmap failed), records stay in the pool" : "records stay in the pool", mode);
+    }
+    pthread_mutex_unlock(&g_cmdshadow_mu);
+    return r;
+}
+static void cmd_shadow_drop(const pool_t *pl) {
+    pthread_mutex_lock(&g_cmdshadow_mu);
+    for (int i = 0; i < CMDSHADOW_MAX; i++) if (g_cmdshadow[i].mem == pl->mem && g_cmdshadow[i].size == pl->size) {
+        if (g_cmdshadow[i].shadow) { if (xbg_command_shadow_drop) xbg_command_shadow_drop(g_cmdshadow[i].shadow, g_cmdshadow[i].size); else munmap(g_cmdshadow[i].shadow, g_cmdshadow[i].size); }
+        g_cmdshadow[i] = (typeof(g_cmdshadow[0])){0}; }
+    pthread_mutex_unlock(&g_cmdshadow_mu);
+}
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } cmd_new_segment(CB(c), hostseg_take(), HOSTSEG_SZ); return; }
     if (!pl->mem) { LOG("【红】AddCommandMemory 池没有 CPU 存储"); return; }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
-    cmd_new_segment(CB(c), pl->mem + off, n);
+    uint8_t *shadow = off >= 0 && (uint64_t)off + n <= pl->size ? cmd_shadow(pl) : NULL;   // [zc-cmdshadow]
+    cmd_new_segment(CB(c), (shadow ? shadow : pl->mem) + off, n);
 }
 NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) { (void)c; (void)m; (void)n; }
 // 取一条记录的空间；不够则按 NVN 约定回调游戏补命令内存

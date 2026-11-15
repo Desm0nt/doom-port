@@ -55,6 +55,7 @@ final class DoomGear {
     static List<GearSettings.Section> sections(DmActivity a, GearSettings g) {
         Drs drs = new Drs(a); Light light = new Light(a); Aspect aspect = new Aspect(a); AimAssist aim = new AimAssist(a);
         List<GearSettings.Section> l = new ArrayList<>();
+        l.add(bcMode());
         l.add(diag());
         l.add(drs);
         l.add(GearPages.renderScale(RES_FRACTIONS, RES_LABELS, "DM_DOOM_RES", g.str(R.string.gear_res_drs_note)));
@@ -220,6 +221,25 @@ final class DoomGear {
     // ---- the diagnostics APK (-PdmDiag=1, for testers who cannot edit dm/env): per-pass GPU timestamps (NVN GPASS) and the whole NVN PERF block
     // in boot.log; dm/env still wins (not overwritten). DM_LOG_TIME=1: every boot.log line starts with the wall-clock time it was written
     // (jni_android.c log_file_line); DM_GFX_PERF_SAMPLE=4: the NVN PERF parts timed every frame (windows of 60). No row.
+    // ---- [DOOM] issue 45: the pause menu's "BC textures" test row (DmActivity.portRow) and the texture diagnostics of an Xclipse phone. No row here.
+    // bc_decoded: DM_GFX_NATIVE_BC=0 (xbg_game.cpp: BC textures decoded / ASTC overlay instead of native blocks; a gfx-native-bc marker and dm/env
+    // still win). With the row: DM_GFX_VT_DIAG=1 (one NVN VT feedback line per 300 write-backs), DM_GFX_TEX_DIAG=1 (BC format features, the first
+    // native-BC partial uploads region by region) and DM_LOG_TIME=1, all only where nothing set them.
+    // Test builds only: -PdmBcRow=1 (every GPU) or -PdmBcRow=xclipse (Xclipse phones). A normal APK has no row, so it also ignores a choice
+    // saved by a test build (there would be no way to switch it back).
+    static boolean bcTest() { return BuildConfig.DM_BC_ROW || BuildConfig.DM_BC_ROW_XCLIPSE && "xclipse".equals(VkDrivers.phoneFamily()); }
+    static GearSettings.Section bcMode() {
+        return new GearSettings.Section() {
+            public void build(GearSettings g, LinearLayout box) {}
+            public void env(GearSettings g) throws ErrnoException {
+                if (!bcTest()) return;
+                boolean dec = g.gamePrefs().getBoolean("bc_decoded", false);
+                if (dec) Os.setenv("DM_GFX_NATIVE_BC", "0", true);
+                Os.setenv("DM_GFX_VT_DIAG", "1", false); Os.setenv("DM_GFX_TEX_DIAG", "1", false); Os.setenv("DM_LOG_TIME", "1", false);
+                android.util.Log.i("dm", "[java] BC textures: " + (dec ? "decoded (DM_GFX_NATIVE_BC=0, pause menu)" : "native where the driver has them (default)") + ", gpu family " + VkDrivers.phoneFamily());
+            }
+        };
+    }
     static GearSettings.Section diag() {
         return new GearSettings.Section() {
             public void build(GearSettings g, LinearLayout box) {}

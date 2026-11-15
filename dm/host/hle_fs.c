@@ -672,6 +672,12 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (mode & (MODE_WRITE | MODE_APPEND)) RW();
     int fd = open(hp, (mode & (MODE_WRITE | MODE_APPEND)) ? ((mode & MODE_READ) ? O_RDWR : O_WRONLY) : O_RDONLY);
     if (fd < 0) return err_res("open", hp);
+#ifdef DM_GAME_DOOM
+    // [DOOM] 2.62 (issue #52): a file handle is the host fd and 0 is the null handle here (ReadFile / GetFileSize / CloseFile reject it), while a
+    // Horizon FileHandle is never null. When something has closed the process's fd 0, open() returns 0 and the game dies on its own check
+    // ("Couldn't get file size!"): move such a descriptor above the std slots (hle_net.c, DM_FD_GUARD)
+    { extern int dm_fd_above_std(int fd, const char *what); fd = dm_fd_above_std(fd, "fs OpenFile"); }
+#endif
     struct stat st; fstat(fd, &st);
     if (S_ISDIR(st.st_mode)) { close(fd); return RES_PATH_NOT_FOUND; }
     if (fd >= (int)sizeof g_fmode) die("fd 超出表");

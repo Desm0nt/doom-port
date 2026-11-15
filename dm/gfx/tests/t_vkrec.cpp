@@ -28,6 +28,7 @@ uint64_t timing_clock(){return uint64_t(std::chrono::duration_cast<std::chrono::
 void xbg_logf(const char *fmt,...){va_list a;va_start(a,fmt);vprintf(fmt,a);va_end(a);printf("\n");}
 [[noreturn]] void xbg_fatalf(const char *fmt,...){va_list a;va_start(a,fmt);printf("FATAL: ");vprintf(fmt,a);va_end(a);printf("\n");exit(3);}
 bool g_ab_off=false;inline bool mt_off(const char*){return g_ab_off;}
+namespace zc{void maint_clean(){}}   // [zc3mode] zero-copy mode 3 clean before the SUBMIT packet's vkQueueSubmit (no zero-copy here)
 #define VK(call) do{if((call)!=VK_SUCCESS){printf("VK failed: %s\n",#call);exit(4);}}while(0)
 // The trace: every Vulkan call in execution order. One thread at a time touches it (the protocol orders them).
 std::string T;std::atomic<int> present_jobs{0};

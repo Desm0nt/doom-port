@@ -239,6 +239,36 @@ int main(){
      CHECK(xbg_zc_pick_type(0x5,m,XBG_ZC_UNCACHED)==0);   // 0x1 not coherent, 0xb not coherent -> lowest
      CHECK(xbg_zc_pick_type(0x4,m,XBG_ZC_UNCACHED)==2 && xbg_zc_pick_type(0,m,XBG_ZC_CACHED)==32);
      VkPhysicalDeviceMemoryProperties k=m;k.memoryTypes[0].propertyFlags=0xf;CHECK(xbg_zc_pick_type(0x7,k,XBG_ZC_UNCACHED)==1 && xbg_zc_pick_type(0x5,k,XBG_ZC_UNCACHED)==0);
+     // [zc3mode] mode 3 (maint): DM_GFX_ZEROCOPY=3, the lowest allowed HOST_CACHED type, every pool, only views the tracker can mprotect
+     CHECK(xbg_zero_copy_parse("3")==XBG_ZC_MAINT && xbg_zero_copy_parse("4")==XBG_ZC_MAINT && xbg_zero_copy_parse("2")==XBG_ZC_UNCACHED);
+     CHECK(!strcmp(xbg_zc_mode_name(XBG_ZC_MAINT),"maint") && !strcmp(xbg_zc_mode_name(XBG_ZC_UNCACHED),"uncached") && !strcmp(xbg_zc_mode_name(0),"off"));
+     CHECK(xbg_zc_pick_type(0x6,m,XBG_ZC_MAINT)==2 && xbg_zc_pick_type(0x7,m,XBG_ZC_MAINT)==2);   // 0xb over 0x7 and 0x1
+     CHECK(xbg_zc_pick_type(0x3,m,XBG_ZC_MAINT)==0 && xbg_zc_pick_type(0,m,XBG_ZC_MAINT)==32);   // no cached type allowed: the lowest
+     CHECK(xbg_zc_pick_type(0x5,k,XBG_ZC_MAINT)==0);   // a cached-coherent 0xf is cached too (mode 1 would be picked there anyway)
+     for(int f:{0x12,0x22,0xa2,0x62,0x24,0x20,-1})CHECK(xbg_zc_pool_eligible(XBG_ZC_MAINT,f));
+     CHECK(xbg_zc_view_allowed(XBG_ZC_MAINT,0) && xbg_zc_view_allowed(XBG_ZC_MAINT,3) && xbg_zc_view_allowed(XBG_ZC_MAINT,4));
+     CHECK(!xbg_zc_view_allowed(XBG_ZC_MAINT,1) && !xbg_zc_view_allowed(XBG_ZC_MAINT,2));
+     for(int v=0;v<5;v++)CHECK(xbg_zc_view_allowed(XBG_ZC_UNCACHED,v) && xbg_zc_view_allowed(XBG_ZC_CACHED,v));
+     // auto falls back to mode 3 only on Mali / PowerVR, only from an auto mode 2 that did not pass; Adreno and forced modes never
+     CHECK(xbg_zc_try_maint(XBG_GPU_POWERVR,false,XBG_ZC_UNCACHED,false) && xbg_zc_try_maint(XBG_GPU_MALI,false,XBG_ZC_UNCACHED,false));
+     CHECK(!xbg_zc_try_maint(XBG_GPU_POWERVR,false,XBG_ZC_UNCACHED,true) && !xbg_zc_try_maint(XBG_GPU_POWERVR,true,XBG_ZC_UNCACHED,false));
+     CHECK(!xbg_zc_try_maint(XBG_GPU_ADRENO,false,XBG_ZC_UNCACHED,false) && !xbg_zc_try_maint(XBG_GPU_MALI,false,XBG_ZC_CACHED,false));
+     for(XbgGpuFamily f:{XBG_GPU_XCLIPSE,XBG_GPU_MALEOON,XBG_GPU_OTHER})CHECK(!xbg_zc_try_maint(f,false,XBG_ZC_UNCACHED,false));
+     CHECK(!xbg_zc_try_maint(XBG_GPU_MALI,false,XBG_ZC_MAINT,false));   // forced 3 that failed: off, no other mode
+     // page bitmap -> runs (the mode-3 clean)
+     {auto runs=[](const std::vector<uint64_t> &b,size_t np){std::vector<std::pair<size_t,size_t>> r;size_t t=xbg_zc3_runs(b.data(),np,[&](size_t p,size_t n){r.push_back({p,n});});
+          size_t sum=0;for(auto &x:r)sum+=x.second;return t==sum?r:std::vector<std::pair<size_t,size_t>>{{999,999}};};
+      using R=std::vector<std::pair<size_t,size_t>>;
+      CHECK(runs({0,0},128).empty());
+      CHECK((runs({1},64)==R{{0,1}}) && (runs({1ull<<63},64)==R{{63,1}}) && (runs({0x0f0f},64)==R{{0,4},{8,4}}));
+      CHECK((runs({1ull<<63,1},128)==R{{63,2}}));   // a run across a word boundary
+      CHECK((runs({~0ull,~0ull,~0ull,1},256)==R{{0,193}}) && (runs({0,~0ull,~0ull,0},256)==R{{64,128}}));   // whole words, then a tail
+      CHECK((runs({~0ull},40)==R{{0,40}}) && (runs({~0ull,~0ull},100)==R{{0,100}}));   // bits past np never count
+      CHECK((runs({0x8000000000000001ull,0x8000000000000001ull,1},130)==R{{0,1},{63,2},{127,2}}));
+      std::vector<uint64_t> rnd(256);uint64_t x=0x9E3779B97F4A7C15ull;for(auto &w:rnd){x^=x<<13;x^=x>>7;x^=x<<17;w=x&(x>>3);}
+      R got=runs(rnd,16384);size_t pages=0,prev_end=0;bool ok=true;for(auto &g:got){ok=ok && g.second>0 && (pages==0 || g.first>prev_end);prev_end=g.first+g.second;pages+=g.second;
+          for(size_t i=g.first;i<g.first+g.second;i++)ok=ok && (rnd[i>>6]>>(i&63)&1);}
+      size_t pop=0;for(auto w:rnd)pop+=size_t(__builtin_popcountll(w));CHECK(ok && pages==pop);}
      // self-test words and check
      std::vector<uint32_t> cp(64),fl(64);for(uint32_t i=0;i<64;i++){cp[i]=xbg_zc_test_word(3,i);fl[i]=xbg_zc_fill_word(3);}
      uint32_t first=99;CHECK(xbg_zc_test_check(3,cp.data(),fl.data(),64,&first)==0 && first==99);

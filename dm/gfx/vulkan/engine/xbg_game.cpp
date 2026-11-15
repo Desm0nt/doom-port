@@ -76,6 +76,10 @@ __attribute__((weak)) int nvn_dirty_pbgen_mode(void);
 __attribute__((weak)) unsigned nvn_dirty_page_shift(void);
 __attribute__((weak)) void nvn_dirty_protect_gen(const void *addr,size_t len,nvn_dirty_cookie *ck,int mode,nvn_dirty_pstat *st);
 __attribute__((weak)) size_t nvn_dirty_since_bits(const void *addr,size_t len,uint64_t stamp,uint64_t *bits,size_t nwords,uint64_t *windows);
+// [zc3mode] zero-copy mode 3: pages written since the cookie's last call, re-protected (nvn_dirty.h); fault / mprotect totals for its PERF line
+__attribute__((weak)) size_t nvn_dirty_take_written(const void *addr,size_t len,nvn_dirty_cookie *ck,uint64_t *bits,size_t nwords,int *full,nvn_dirty_pstat *st);
+__attribute__((weak)) void nvn_dirty_stats(uint64_t *faults,uint64_t *preps);
+__attribute__((weak)) void nvn_dirty_mp_stats(uint64_t *calls,uint64_t *pages,uint64_t *ns);
 // DM_GFX_VT_ATOMIC: WriteTexels vs. partial re-upload exclusion (nvn_dirty.h); weak like the rest of the tracker.
 __attribute__((weak)) int nvn_texel_sync_on(void);
 __attribute__((weak)) void nvn_texel_lock(void);
@@ -143,6 +147,7 @@ __attribute__((weak)) float dm_bright_k(void);
 // the switch sim_gpu is 0 and this is the driver's answer unchanged.
 static uint32_t sim_gpu=0;
 static XbgGpuFamily gpu_family=XBG_GPU_OTHER,gpu_policy=XBG_GPU_OTHER;
+static bool adreno8_on=false;   // [#39/#47] xbg_adreno8_policy (DM_GFX_ADRENO8_POLICY), set before zc::decide and the shader rewrites
 static bool ubo_dynamic_on=true,noout_mask_on=false;static int ubo_dynamic_level=1;   // [tileopt] DM_GFX_UBO_DYNAMIC 0 / 1 / 2 (xbg_ubo_dynamic_level_default)
 static uint64_t depth_bounds_dropped=0,noout_masked=0;   // DM_GFX_UBO_DYNAMIC (dyn_mode_for), DM_GFX_NOOUT_MASK (draw); per-family defaults   // the real family / the one the per-family defaults use (sim)
 static void dm_sim_format_properties(VkPhysicalDevice d,VkFormat f,VkFormatProperties *p){vkGetPhysicalDeviceFormatProperties(d,f,p);if(sim_gpu)xbg_sim_format_features(sim_gpu,f,p);}
@@ -336,7 +341,7 @@ std::atomic<int> timing_any{0};bool tls_gate=true,img_fast=true;
 // the Android app sets to 1). Otherwise they are decoded on upload to RGBA8 / R16 / RG16 / RGBA16F (bcdec): 4-8x the bytes
 // in memory and in every texture fetch. Adreno 730 samples all of BC1-7. Exception kept: the iOS ASTC pack copies ASTC
 // blocks into the game's BC arrays, which needs a decoded destination.
-bool native_bc=false;uint64_t native_bc_images=0,decoded_bc_images=0;int64_t image_bytes_live=0,bc_image_bytes_live=0,bc_data_bytes_live=0;   // live image memory (driver sizes) and BC payload
+bool native_bc=false,tex_diag=false;uint64_t native_bc_images=0,decoded_bc_images=0;int64_t image_bytes_live=0,bc_image_bytes_live=0,bc_data_bytes_live=0;   // live image memory (driver sizes) and BC payload
 // [nonadreno] BC decode without device BC (issue #6; BcUpload, bcgpu): DM_GFX_BC_DECODE gpu (2, default) / cpu (1), resolved at the
 // first decoded image. Live memory of the decoded images (driver sizes) and of their BC payload (what native BC would take); per
 // perf window: GPU / CPU decode batches, GPU blocks, partial (dirty-block) decoded uploads, CPU decode time; run totals of raw
@@ -703,7 +708,7 @@ void gpu_add(uint64_t f,uint64_t ns){Gpu &g=gpu[f%64];if(g.frame.load(std::memor
 uint64_t cleanup_ns[5]={},writeback_bytes=0; // perf: cleanup phase split
 // [ETR perf, PERF-E09] DM_GFX_CPU_FIX (defined with the snapshot maps); NVN PERF snapfront walked= / big_checks= (0x1); the cleanup "writebacks"
 // bucket split into slot writebacks / known reports / publish (NVN PERF cleanup_ms_per_frame | writebacks:); NVN PERF fastlook (zc index)
-int cpu_fix();inline bool cpu_fix_on(int bit);uint64_t snap_inval_walk=0,snap_inval_big=0,cleanup_sub_ns[3]={},retire_ts_bulk=0,retire_ts_single=0;namespace zc{void fast_report(double f);}
+int cpu_fix();inline bool cpu_fix_on(int bit);uint64_t snap_inval_walk=0,snap_inval_big=0,cleanup_sub_ns[3]={},retire_ts_bulk=0,retire_ts_single=0;namespace zc{void fast_report(double f);void maint_clean();void maint_report(double f);bool maint_owns(uint64_t a,uint64_t n);}
 // Driver/support constant buffers are rebuilt only when their inputs change (iOS: reuse parameter
 // blocks for identical inputs). Generations bump on binding ops; slot_serial on every frame-slot switch.
 uint64_t tex_gen[6]={},buf_gen[6]={},slot_serial=1;
@@ -886,7 +891,7 @@ namespace safemode {
 char path[512]="";bool booted=false,eligible=false;int step=0,how=XBG_SAFE_NOT_ELIGIBLE,count=0;XbgGpuFamily family=XBG_GPU_OTHER;
 std::atomic<int> recorded{0};
 int fake_kind=0,fake_s=0;uint64_t fake_at_ns=0;   // DM_GFX_FAKE_GPU_CRASH / DM_PVR_LADDER_FAKE (armed at engine init)
-int fb_fence_s=-1,fb_pipe_s=-1;bool fb_zc=false;uint64_t fb_fence_at=0,fb_pipe_at=0;   // DM_GFX_FAKE_FALLBACK
+int fb_fence_s=-1,fb_pipe_s=-1;bool fb_zc=false,fb_zc2=false;uint64_t fb_fence_at=0,fb_pipe_at=0;   // DM_GFX_FAKE_FALLBACK
 char status[768]="";std::mutex ev_mu;std::deque<std::string> events;
 std::atomic<bool> fence_done{false},pipe_done{false},zc_done{false};
 // signal-safe text helpers
@@ -958,9 +963,9 @@ extern "C" void xbg_safe_mode_boot(uint32_t vendor,const char *name){
         set.empty()?"":" Set:",set.c_str(),player.empty()?"":" The player's own (dm/env) values kept:",player.c_str());
     // test triggers (only here: Mali / PowerVR, real or simulated)
     {const char *e=getenv("DM_GFX_FAKE_GPU_CRASH");if(!(e && *e))e=getenv("DM_PVR_LADDER_FAKE");fake_kind=xbg_safe_fake_parse(e,&fake_s);
-     const char *f=getenv("DM_GFX_FAKE_FALLBACK");fb_zc=xbg_safe_fallback_fake(f,"zc")>=0;fb_fence_s=xbg_safe_fallback_fake(f,"fence");fb_pipe_s=xbg_safe_fallback_fake(f,"pipe");
+     const char *f=getenv("DM_GFX_FAKE_FALLBACK");fb_zc=xbg_safe_fallback_fake(f,"zc")>=0;fb_zc2=xbg_safe_fallback_fake(f,"zc2")>=0;fb_fence_s=xbg_safe_fallback_fake(f,"fence");fb_pipe_s=xbg_safe_fallback_fake(f,"pipe");
      if(fake_kind)xbg_logf("NVN safe mode test: DM_GFX_FAKE_GPU_CRASH=%s: a fake %s %d s after the engine starts",e,fake_kind==XBG_FAKE_REC?"SIGBUS in the dm-record vkCmdEndRenderPass packet":fake_kind==XBG_FAKE_LOST?"VK_ERROR_DEVICE_LOST fatal":"GPU-hang fence fatal",fake_s);
-     if(f && *f)xbg_logf("NVN safe mode test: DM_GFX_FAKE_FALLBACK=%s (zc %d, fence %d s, pipe %d s)",f,int(fb_zc),fb_fence_s,fb_pipe_s);}
+     if(f && *f)xbg_logf("NVN safe mode test: DM_GFX_FAKE_FALLBACK=%s (zc %d, zc2 %d, fence %d s, pipe %d s)",f,int(fb_zc),int(fb_zc2),fb_fence_s,fb_pipe_s);}
 }
 // For the app (JNI nativeSafeModeStatus): "<eligible>\t<step>\t<how>\t<family>\t<count>\t<last why>\t<switches set>", "" before the boot decision.
 extern "C" const char *xbg_safe_mode_status(void){return safemode::booted?safemode::status:"";}
@@ -1059,7 +1064,8 @@ void exec(const Hdr *h){
     case K_BEGIN:{VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;const VkResult r=vkBeginCommandBuffer(c,&b);if(r)fail(K_BEGIN,r);break;}
     case K_END:{const VkResult r=vkEndCommandBuffer(c);if(r)fail(K_END,r);break;}
     case K_SUBMIT:{const PSubmit &q=*reinterpret_cast<const PSubmit*>(p);
-        if(!dead){const uint64_t t0=timing_clock();VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=q.n;si.pCommandBuffers=q.cbs;VkResult r=VK_SUCCESS;
+        if(!dead){zc::maint_clean();   /* [zc3mode] mode 3: what the CPU wrote reaches memory before the GPU reads it */
+            const uint64_t t0=timing_clock();VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=q.n;si.pCommandBuffers=q.cbs;VkResult r=VK_SUCCESS;
             if(q.pt){const uint64_t w=dm_present_wait_submitted();if(w)ptwait_ns.fetch_add(w,std::memory_order_relaxed);   // [mt 2a] after every handed present's blit
                 if(const int e=dm_present_last_error())fail(K_PRESENT,e);
                 if(!dead){dm_present_queue_lock();{fguard::Lock g;r=vkQueueSubmit(cfg.queue,1,&si,q.fence);}dm_present_queue_unlock();if(r)fail(K_SUBMIT,r);}}
@@ -2056,7 +2062,7 @@ void submit_slots(bool wait){
             vkrec::end(s.pro);cbs[0]=s.pro;cbs[1]=s.cmd;ncb=2;s.pro_ops.clear();}
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};si.commandBufferCount=ncb;si.pCommandBuffers=cbs;
         {CPU_SCOPE(Submit);if(vkrec::on)s.rec_ticket=vkrec::submit(ncb,cbs,s.fence,pt_mode!=0);   // [mtb] the record thread submits (after the present thread's blits, under the queue lock)
-         else{s.rec_ticket=0;if(pt_mode){pt_before_submit();dm_present_queue_lock();VkResult qr;{fguard::Lock g;qr=vkQueueSubmit(cfg.queue,1,&si,s.fence);}dm_present_queue_unlock();VK(qr);}else{fguard::Lock g;VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}}}++submit_by[sync_site];poolreset::queue(s);crumbs::submitted();
+         else{s.rec_ticket=0;zc::maint_clean();/* [zc3mode] */if(pt_mode){pt_before_submit();dm_present_queue_lock();VkResult qr;{fguard::Lock g;qr=vkQueueSubmit(cfg.queue,1,&si,s.fence);}dm_present_queue_unlock();VK(qr);}else{fguard::Lock g;VK(vkQueueSubmit(cfg.queue,1,&si,s.fence));}}}++submit_by[sync_site];poolreset::queue(s);crumbs::submitted();
         s.recording=false;s.pending=true;s.covers=submitted;s.serial=slot_serial;s.diag.submit_t=timing_clock();s.hud_frame=hud::frame.load(std::memory_order_relaxed);slot_index=slot_index+1<slot_count?slot_index+1:0;++perf.submits;snapshot_reset();++slot_serial;
         pending_events.insert(pending_events.end(),recording_events.begin(),recording_events.end());recording_events.clear();
     }
@@ -2233,7 +2239,7 @@ void perf_frame(){
     perf_vlogf("NVN PERF cleanup_ms_per_frame queries=%.2f writebacks=%.2f(%.1fMB) views=%.2f retire=%.2f arena_pools=%.2f | writebacks: slot_wb=%.2f reports=%.2f publish=%.2f",cleanup_ns[0]/1e6/f,cleanup_ns[1]/1e6/f,writeback_bytes/1048576.0/f,cleanup_ns[2]/1e6/f,cleanup_ns[3]/1e6/f,cleanup_ns[4]/1e6/f,cleanup_sub_ns[0]/1e6/f,cleanup_sub_ns[1]/1e6/f,cleanup_sub_ns[2]/1e6/f);for(auto &c:cleanup_ns)c=0;for(auto &c:cleanup_sub_ns)c=0;writeback_bytes=0;   // [ETR perf] | split
     // [ETR perf] PERF-E02 / E04 / E09: retired reports (REPORT_FAST), GPU-sync, snapshot invalidation walk and zero-copy index
     if(repfast::calls){perf_vlogf("NVN PERF reports fast=%d ab=%d per_frame resolves=%.1f written=%.1f pending_avg=%.1f epochs_avg=%.1f ts_reads bulk=%.1f single=%.1f verify checks=%llu bad=%llu",repfast::mode(),int(ab_frame_on),repfast::calls/f,repfast::written/f,double(repfast::pending_sum)/double(repfast::calls),double(repfast::epochs_sum)/double(repfast::calls),retire_ts_bulk/f,retire_ts_single/f,(unsigned long long)repfast::checks,(unsigned long long)repfast::bad);repfast::calls=repfast::pending_sum=repfast::epochs_sum=repfast::written=0;retire_ts_bulk=retire_ts_single=0;}
-    gsync::report(f);zc::fast_report(f);
+    gsync::report(f);zc::fast_report(f);zc::maint_report(f);
     perf_vlogf("NVN PERF xview views=%.2f races=%.2f guarded=%.2f guarded_kb=%.1f",xviews/f,xview_races/f,xview_guarded/f,xview_guarded_bytes/1024.0/f);xviews=xview_races=xview_guarded=xview_guarded_bytes=0;
     if(slot_begin_n){xbg_logf("NVN PERF slotbegin per_frame=%.2f ms=%.3f retire_ms=%.3f (slot starts: fence/pool-reset waits + trims; inside the first draw/op of each Vulkan submission)",slot_begin_n/f,slot_begin_ns/f/1e6,slot_retire_ns/f/1e6);slot_begin_n=slot_begin_ns=slot_retire_ns=0;}
     // [DOOM] round 1: chunk cuts a frame at the end of a guest submit / inside one, checks that found the next slot still busy,
@@ -2414,6 +2420,9 @@ bool activate(Tracked &t){
     unsigned n=nregions.load();if(n>=max_regions)return false;
     t.pbegin=uintptr_t(t.address)&~uintptr_t(4095);uintptr_t pend=(uintptr_t(t.address)+t.bytes+4095)&~uintptr_t(4095);
     for(unsigned i=0;i<n;i++){uintptr_t b=regions[i].begin.load(),e=regions[i].end.load();if(t.pbegin<e && pend>b)return false;} // overlapping regions unsupported
+    // [zc3mode] zero-copy mode 3: the dirty-page tracker owns every page of its chunks (protected even before the first write, so the
+    // generation check below would not see it); a protection of ours there would hide writes from the cache maintenance.
+    if(zc::maint_owns(t.pbegin,pend-t.pbegin)){static unsigned told=0;if(told++<4)xbg_logf("NVN wtrack region refused addr=%#llx: zero-copy mode 3 memory (the dirty-page tracker owns it)",(unsigned long long)t.address);return false;}
     // Pages the HLE's dirty-page tracker has ever protected (the vertex/index cache) are its for good: its fault hook runs
     // first and takes a fault on such a page as already handled, so a protection of ours there would re-fault forever.
     if(nvn_dirty_since && nvn_dirty_tracked)for(uintptr_t pg=t.pbegin;pg<pend;pg+=4096){const void *q=reinterpret_cast<const void*>(pg);if(nvn_dirty_tracked(q,1) && nvn_dirty_since(q,1,0)){xbg_logf("NVN wtrack region refused addr=%#llx: page %#llx belongs to the dirty-page tracker",(unsigned long long)t.address,(unsigned long long)pg);return false;}}
@@ -2558,7 +2567,7 @@ constexpr size_t CHUNK=64u<<20;
 struct Chunk{uintptr_t lo=0;size_t n=0;VkBuffer buffer{};VkDeviceMemory memory{};AHardwareBuffer *ahb=nullptr;std::vector<uint8_t> sticky;};
 Chunk table[512];std::atomic<int> count{0};std::mutex mu;int enabled=-1;
 int mode=0;uint64_t ahb_usage=0;   // [tileopt] XbgZcMode (xbg_vendor_policy.h) and the AHB CPU usage of the uncached mode (picked by the self-test)
-void decide();
+void decide();void maint_setup();   // [zc3mode]
 uint64_t hits=0,sticky_misses=0,align_misses=0,pending_misses=0,mapped_bytes=0;uint64_t sticky_gen=0;   // sticky_gen: [r4] moves when a page turns sticky (DM_GFX_UBO_VIEWCACHE validity)
 PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_props=nullptr;
 // [tileopt] decided once at engine init (zc::decide, with the self-test on non-Adreno); a later first call decides here.
@@ -2605,7 +2614,7 @@ bool dmabuf_chunk(int method,size_t n,bool cached,VkBuffer *buffer,VkDeviceMemor
     VkMemoryRequirements q;vkGetBufferMemoryRequirements(cfg.device,*buffer,&q);
     VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};ded.buffer=*buffer;
     VkMemoryAllocateInfo a{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    const int want=cached?XBG_ZC_CACHED:XBG_ZC_UNCACHED;
+    const int want=cached?(mode==XBG_ZC_CACHED?XBG_ZC_CACHED:XBG_ZC_MAINT):XBG_ZC_UNCACHED;   // [zc3mode] cached outside mode 1: the lowest HOST_CACHED type
     if(method==ZC_MAP_DMAHEAP){
         if(!fd_props)return fail("no vkGetMemoryFdPropertiesKHR",0);
         static const char *heaps_uc[]={"system-uncached","mtk_mm-uncached","system","mtk_mm"},*heaps_c[]={"system","mtk_mm","system-uncached","mtk_mm-uncached"};
@@ -2660,7 +2669,7 @@ bool alloc_plain(size_t n,bool cached,VkBuffer *buffer,VkDeviceMemory *memory,ui
     return true;}
 bool map_chunk(uint8_t *lo,size_t n){
     if(map_method==ZC_MAP_DMAHEAP || map_method==ZC_MAP_VKEXPORT){VkBuffer buffer{};VkDeviceMemory memory{};int fd=-1;uint32_t type=32;char why[160];   // [zc-dmabuf]
-        if(!dmabuf_chunk(map_method,n,mode==XBG_ZC_CACHED,&buffer,&memory,&fd,&type,why,sizeof why)){xbg_logf("NVN zero-copy: %s chunk of %zu bytes failed: %s",map_name(map_method),n,why);return false;}
+        if(!dmabuf_chunk(map_method,n,mode==XBG_ZC_CACHED || mode==XBG_ZC_MAINT,&buffer,&memory,&fd,&type,why,sizeof why)){xbg_logf("NVN zero-copy: %s chunk of %zu bytes failed: %s",map_name(map_method),n,why);return false;}
         void *tmp=mmap(nullptr,n,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
         if(tmp==MAP_FAILED){xbg_logf("NVN zero-copy: %s mmap failed errno=%d",map_name(map_method),errno);close(fd);vkDestroyBuffer(cfg.device,buffer,nullptr);vkFreeMemory(cfg.device,memory,nullptr);return false;}
         memcpy(tmp,lo,n);
@@ -2688,6 +2697,7 @@ bool map_chunk(uint8_t *lo,size_t n){
     {static int zc_cpu=-1;if(zc_cpu<0){const char *e=getenv("DM_GFX_ZC_CPU");zc_cpu=e?atoi(e):0;xbg_logf("NVN zero-copy DM_GFX_ZC_CPU=%d",zc_cpu);}
      if(zc_cpu==1)d.usage=AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;}
     if(mode==XBG_ZC_UNCACHED)d.usage=ahb_usage|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;   // [tileopt] the usage the self-test passed with (write-combined pages)
+    if(mode==XBG_ZC_MAINT)d.usage=AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN|AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;   // [zc3mode] cached pages
     AHardwareBuffer *ahb=nullptr;if(AHardwareBuffer_allocate(&d,&ahb)){xbg_logf("NVN zero-copy: AHardwareBuffer_allocate(%zu) failed",n);return false;}
     int sv[2]={-1,-1};if(socketpair(AF_UNIX,SOCK_STREAM,0,sv)){AHardwareBuffer_release(ahb);return false;}
     int fd=-1;if(!AHardwareBuffer_sendHandleToUnixSocket(ahb,sv[0]))fd=recv_fd(sv[1]);close(sv[0]);close(sv[1]);
@@ -2788,6 +2798,19 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n,int maint=ZC_MAINT_NONE,
         if(cpu==MAP_FAILED){const int e=errno,fl=fcntl(fd,F_GETFL);void *ro=mmap(nullptr,n,PROT_READ,MAP_SHARED,fd,0);if(ro!=MAP_FAILED)munmap(ro,n);   // [zc-map] why: a read-only fd, or no mmap at all
             snprintf(why,why_n,"dma-buf mmap failed errno=%d (fd access %s, read-only mmap %s)",e,fl<0?"?":(fl&O_ACCMODE)==O_RDONLY?"read-only":(fl&O_ACCMODE)==O_WRONLY?"write-only":"read-write",ro!=MAP_FAILED?"works":"fails too");return done(~0ull);}}
     else{int err=0;cpu=moved_view(zm,n,nullptr,nullptr,&err);if(cpu==MAP_FAILED){snprintf(why,why_n,"%s view failed err=%d (1000+n: vkMapMemory VkResult -n, else mremap errno)",map_name(method),err);return done(~0ull);}}
+    // [zc3mode] BUGS_AND_FIXES 2.58 (moto g64: the moved vkalloc view passed this test, then refused mprotect -> the dirty tracker
+    // crashed): the tracker write-protects zero-copy pages (texture / vertex caches; every page in mode 3), so the view must take
+    // RW -> RO -> RW on a page: RO must really stop writes (a read() from /dev/zero into it gets EFAULT: the kernel's own write, no
+    // signal handler involved), and a write after RW must land. Fails the self-test (1 word) with the reason.
+    {char *pg=static_cast<char*>(cpu);const int zfd=open("/dev/zero",O_RDONLY|O_CLOEXEC);
+     auto mfail=[&](const char *what,int e){if(zfd>=0)close(zfd);snprintf(why,why_n,"%s view: %s (errno=%d): the dirty-page tracker could not protect it",map_name(method),what,e);return done(1);};
+     if(mprotect(pg,4096,PROT_READ))return mfail("mprotect RW->RO failed",errno);
+     const ssize_t k0=zfd>=0?read(zfd,pg,4):-1;const int e0=errno;
+     if(mprotect(pg,4096,PROT_READ|PROT_WRITE))return mfail("mprotect RO->RW failed",errno);
+     if(zfd>=0 && !(k0<0 && e0==EFAULT))return mfail("still writable after mprotect RO",k0<0?e0:0);
+     volatile uint32_t *pw=reinterpret_cast<volatile uint32_t*>(pg);pw[1]=0x5A5AC3C3u;
+     if(pw[1]!=0x5A5AC3C3u)return mfail("write after mprotect RO->RW did not land",0);
+     if(zfd>=0)close(zfd);}
     VkBufferCreateInfo rc{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};rc.size=n/2;rc.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if(vkCreateBuffer(cfg.device,&rc,nullptr,&rb)){snprintf(why,why_n,"readback buffer failed");return done(~0ull);}
     {VkMemoryRequirements q;vkGetBufferMemoryRequirements(cfg.device,rb,&q);VkMemoryAllocateInfo ra{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ra.allocationSize=q.size;
@@ -2827,7 +2850,7 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n,int maint=ZC_MAINT_NONE,
         bad=xbg_zc_test_check(round,back,w+half,half,&first);
         if(maint==ZC_MAINT_SYNC)dmabuf_sync(fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ);
         if(bad)snprintf(why,why_n,"round %u: %llu of %u words wrong, first %s word %u",round,(unsigned long long)bad,2*half,first<half?"GPU-read (CPU wrote)":"CPU-read (GPU filled)",first%half);}
-    if(!bad)snprintf(why,why_n,"8 rounds x %u words both ways equal, view %s, memory type %u flags %#x (allowed %#x)",half,map_name(method),ztype,flags,allowed);
+    if(!bad)snprintf(why,why_n,"8 rounds x %u words both ways equal, view %s (mprotect RW<->RO ok), memory type %u flags %#x (allowed %#x)",half,map_name(method),ztype,flags,allowed);
     if(maint!=ZC_MAINT_NONE || prefer_cached){const size_t at=strlen(why);   // [zc3] what the maintenance cost: 512 KB each way per round
         snprintf(why+at,why_n-at,"; maintenance %.3f ms per round (512 KB each way, cache line %zu B)",maint_ns/1e6/8,dcache_line());}
     return done(bad);
@@ -2845,35 +2868,60 @@ void decide(){
     mode=m;enabled=m>0;
     if(enabled && !(get_props=(PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(cfg.device,"vkGetAndroidHardwareBufferPropertiesANDROID"))){enabled=0;mode=0;xbg_logf("NVN zero-copy: AHardwareBuffer import unavailable, off");}
     // The self-test: everywhere but real-Adreno cached (unchanged there; under DM_GFX_SIM_GPU the family is the simulated one, so it runs).
-    const char *t=getenv("DM_GFX_ZC_SELFTEST");const int st=t && *t?std::clamp(atoi(t),0,2):1;
+    const char *t=getenv("DM_GFX_ZC_SELFTEST");
     // [zc-map] DM_GFX_ZC_MAP=fd|vkmap|vkalloc forces the CPU-view method (and runs the self-test with it, real Adreno included)
-    const char *mm=getenv("DM_GFX_ZC_MAP");const int fmap=!mm || !*mm?-1:!strcmp(mm,"fd")?ZC_MAP_FD:!strcmp(mm,"vkmap")?ZC_MAP_VKMAP:!strcmp(mm,"vkalloc")?ZC_MAP_VKALLOC:
+    const char *mm=getenv("DM_GFX_ZC_MAP");int fmap=!mm || !*mm?-1:!strcmp(mm,"fd")?ZC_MAP_FD:!strcmp(mm,"vkmap")?ZC_MAP_VKMAP:!strcmp(mm,"vkalloc")?ZC_MAP_VKALLOC:
         !strcmp(mm,"dmaheap")?ZC_MAP_DMAHEAP:!strcmp(mm,"vkexport")?ZC_MAP_VKEXPORT:-1;
     if(fmap>=0)map_method=fmap;
-    if(enabled && st && !(gpu_policy==XBG_GPU_ADRENO && mode==XBG_ZC_CACHED && fmap<0)){
+    // [#39/#47] Adreno 8xx: the cached mode was never self-tested there; run it with the fd view only (the one in use) and only log
+    // the result: unset DM_GFX_ZC_SELFTEST = 2 (log only) there; 1 makes a failure turn zero-copy off, 0 skips it.
+    const bool a8_test=adreno8_on && gpu_policy==XBG_GPU_ADRENO && mode==XBG_ZC_CACHED && fmap<0;
+    const int st=t && *t?std::clamp(atoi(t),0,2):a8_test?2:1;
+    // [zc3mode] mode 3 needs the dirty-page tracker (every CPU write of its chunks is seen through a fault) and a view it can mprotect.
+    if(enabled && mode==XBG_ZC_MAINT && !nvn_dirty_take_written){enabled=0;xbg_logf("NVN zero-copy: mode 3 (maint) needs the dirty-page tracker (nvn_dirty_take_written), off");}
+    if(enabled && mode==XBG_ZC_MAINT && fmap>=0 && !xbg_zc_view_allowed(XBG_ZC_MAINT,fmap)){xbg_logf("NVN zero-copy: DM_GFX_ZC_MAP=%s is not allowed in mode 3 (a moved driver view refuses mprotect, BUGS_AND_FIXES 2.58); the fd / vkexport / dmaheap views are tried",map_name(fmap));fmap=-1;map_method=ZC_MAP_FD;}
+    if(enabled && st && (a8_test || !(gpu_policy==XBG_GPU_ADRENO && mode==XBG_ZC_CACHED && fmap<0))){
         // uncached: write-combined candidates in order; cached: the pages map_chunk allocates. [zc-map] Each usage with the fd view, then
         // the vkmap view; at last vkalloc (no AHB, so once). A forced DM_GFX_ZC_MAP tries only that view.
-        std::vector<uint64_t> cands;
-        if(mode==XBG_ZC_UNCACHED){cands={AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY};}
-        else cands={AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN};
-        // [zc-map] v0.5.1 (issue #46, OPPO Reno12 / Dimensity 7300 / Mali-G615): the vkmap view crashed every start on Mali (SIGSEGV
-        // SEGV_ACCERR at the moved view's old address: the driver still touches its own mapping, which is now the PROT_NONE placeholder).
-        // auto tries the fd view only again; vkmap / vkalloc only when DM_GFX_ZC_MAP forces them.
-        std::vector<std::pair<uint64_t,int>> tries;
-        for(uint64_t u:cands)if(fmap<0 || fmap==ZC_MAP_FD || fmap==ZC_MAP_VKMAP)tries.push_back({u,fmap<0?int(ZC_MAP_FD):fmap});   // dmaheap / vkexport: below
-        if(fmap==ZC_MAP_VKALLOC)tries.push_back({cands[0],ZC_MAP_VKALLOC});
-        // [zc-dmabuf] v0.5.2: after the AHB fd view, our own writable dma-buf (a Vulkan export, then dma-heap): no driver mapping moves.
-        // vkexport first: on the Mi 14 model it ran a level at 60 fps; dmaheap passed the self-test but its level run was not seen.
-        if(fmap<0 || fmap==ZC_MAP_VKEXPORT)tries.push_back({cands[0],ZC_MAP_VKEXPORT});
-        if(fmap<0 || fmap==ZC_MAP_DMAHEAP)tries.push_back({cands[0],ZC_MAP_DMAHEAP});
-        bool pass=false;uint64_t used=cands[0];
+        // [zc3mode] maint: cached pages (READ_OFTEN), the fd view, then vkexport, then dmaheap (never vkmap / vkalloc); each with the
+        // self-test's DC maintenance (DC CVAC of what the CPU wrote before the submission, DC CIVAC of what the GPU wrote after it).
+        auto build=[&](int md,int fm){std::vector<std::pair<uint64_t,int>> tries;std::vector<uint64_t> cands;
+            if(md==XBG_ZC_UNCACHED){cands={AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY};}
+            else cands={AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN};
+            // [zc-map] v0.5.1 (issue #46, OPPO Reno12 / Dimensity 7300 / Mali-G615): the vkmap view crashed every start on Mali (SIGSEGV
+            // SEGV_ACCERR at the moved view's old address: the driver still touches its own mapping, which is now the PROT_NONE placeholder).
+            // auto tries the fd view only again; vkmap / vkalloc only when DM_GFX_ZC_MAP forces them.
+            for(uint64_t u:cands)if(fm<0 || fm==ZC_MAP_FD || fm==ZC_MAP_VKMAP)tries.push_back({u,fm<0?int(ZC_MAP_FD):fm});   // dmaheap / vkexport: below
+            if(fm==ZC_MAP_VKALLOC)tries.push_back({cands[0],ZC_MAP_VKALLOC});
+            // [zc-dmabuf] v0.5.2: after the AHB fd view, our own writable dma-buf (a Vulkan export, then dma-heap): no driver mapping moves.
+            // vkexport first: on the Mi 14 model it ran a level at 60 fps; dmaheap passed the self-test but its level run was not seen.
+            if(fm<0 || fm==ZC_MAP_VKEXPORT)tries.push_back({cands[0],ZC_MAP_VKEXPORT});
+            if(fm<0 || fm==ZC_MAP_DMAHEAP)tries.push_back({cands[0],ZC_MAP_DMAHEAP});
+            std::vector<std::pair<uint64_t,int>> ok;for(auto &x:tries)if(xbg_zc_view_allowed(md,x.second))ok.push_back(x);
+            return ok;};
         std::string last_why;   // [safe-mode] for the live message
-        for(auto [u,m]:tries){char why[400];const uint64_t t0=timing_clock();uint64_t bad=selftest(u,why,sizeof why,ZC_MAINT_NONE,false,m);
-            if(!bad && safemode::eligible && safemode::fb_zc){bad=1;snprintf(why,sizeof why,"passed, but DM_GFX_FAKE_FALLBACK=zc counts it as failed (test)");}
-            last_why=std::string(map_name(m))+": "+(bad==~0ull?"not run, ":"failed, ")+why;
-            xbg_logf("NVN zero-copy self-test: mode=%s view=%s usage=%#llx -> %s (%s; %.1f ms)",mode==XBG_ZC_UNCACHED?"uncached":"cached",map_name(m),(unsigned long long)u,bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);
-            if(bad==0){pass=true;used=u;map_method=m;break;}}
+        auto run=[&](int md,const std::vector<std::pair<uint64_t,int>> &tries,uint64_t *used)->bool{
+            for(auto [u,m]:tries){char why[400];const uint64_t t0=timing_clock();
+                uint64_t bad=selftest(u,why,sizeof why,md==XBG_ZC_MAINT?ZC_MAINT_DC:ZC_MAINT_NONE,md==XBG_ZC_MAINT,m);
+                if(!bad && safemode::eligible && (safemode::fb_zc || (safemode::fb_zc2 && md==XBG_ZC_UNCACHED))){bad=1;snprintf(why,sizeof why,"passed, but DM_GFX_FAKE_FALLBACK=%s counts it as failed (test)",safemode::fb_zc?"zc":"zc2");}
+                last_why=std::string(xbg_zc_mode_name(md))+" "+map_name(m)+": "+(bad==~0ull?"not run, ":"failed, ")+why;
+                xbg_logf("NVN zero-copy self-test: mode=%s view=%s usage=%#llx -> %s (%s; %.1f ms)",xbg_zc_mode_name(md),map_name(m),(unsigned long long)u,bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);
+                if(bad==0){*used=u;map_method=m;return true;}}
+            return false;};
+        uint64_t used=AHARDWAREBUFFER_USAGE_CPU_READ_RARELY|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+        bool pass=run(mode,build(mode,a8_test?int(ZC_MAP_FD):fmap),&used);   // [#39/#47] 8xx: only the fd view the game uses
         if(mode==XBG_ZC_UNCACHED)ahb_usage=used;
+        // [DOOM] 2.67 v0.5.3 (issues #3 / #27, POCO X7 Pro / Mali-G720): on a real Mali, auto mode 2 through our own write-combined dma-buf
+        // (vkexport / dmaheap, the 0.5.2 views used when the AHB fd view is refused) passed the self-test but ran a level 26% slower than the
+        // snapshot path (32.0 -> 23.7 fps; the safe mode's zero-copy off gave the player +30% in #27). Auto leaves zero-copy off there;
+        // DM_GFX_ZEROCOPY=2 or DM_GFX_ZC_MAP=dmaheap|vkexport still force it. The AHB fd view (0.5.0) and mode 3 are unchanged.
+        if(pass && !forced && fmap<0 && gpu_policy==XBG_GPU_MALI && !sim_gpu && mode==XBG_ZC_UNCACHED && (map_method==ZC_MAP_DMAHEAP || map_method==ZC_MAP_VKEXPORT)){
+            enabled=0;xbg_logf("NVN zero-copy: Mali auto, mode 2 passed only with the %s view (write-combined dma-buf: slower than the snapshot path on Mali, BUGS_AND_FIXES 2.67), off; DM_GFX_ZEROCOPY=2 forces it",map_name(map_method));}
+        // [zc3mode] auto on Mali / PowerVR: mode 2 unavailable or failed -> mode 3 (cached pages + DC maintenance) if its self-test passes
+        if(!pass && st==1 && xbg_zc_try_maint(gpu_policy,forced,mode,pass) && nvn_dirty_take_written){
+            xbg_logf("NVN zero-copy: mode 2 (uncached) has no view that passes; trying mode 3 (maint: cached pages, DC CVAC of the pages the CPU wrote before every submission)");
+            const int fm=fmap>=0 && xbg_zc_view_allowed(XBG_ZC_MAINT,fmap)?fmap:-1;
+            if(run(XBG_ZC_MAINT,build(XBG_ZC_MAINT,fm),&used)){pass=true;mode=XBG_ZC_MAINT;}}
         if(!pass && st==1){enabled=0;xbg_logf("NVN zero-copy: self-test failed, off (snapshot path; DM_GFX_ZC_SELFTEST=2 keeps zero-copy anyway)");
             if(!forced && safemode::eligible && !safemode::zc_done.exchange(true)){xbg_logf("NVN safe mode (live): zero-copy (an experimental 0.5.x speed-up) is off for this run: its self-test did not pass (%s)",last_why.c_str());
                 safemode::event("zc",last_why.substr(0,300));}}   // [safe-mode] 2.57: before the first pool, so no restart
@@ -2882,10 +2930,10 @@ void decide(){
     // [zc3] Log only, changes nothing: would CPU-cached pages work if the CPU caches were kept in step by hand (a possible zero-copy
     // mode 3 for GPUs that do not snoop the CPU caches)? Three runs on READ_OFTEN pages in a HOST_CACHED type: no maintenance (is the
     // GPU coherent after all?), DC CVAC / CIVAC by VA, DMA_BUF_IOCTL_SYNC. DM_GFX_ZC3_SELFTEST: unset = on Mali / PowerVR (also
-    // simulated), 0 = off, 1 = everywhere.
+    // simulated), 0 = off, 1 = everywhere. [zc3mode] Not when mode 3 runs: its own self-test above already ran.
     {const char *z=getenv("DM_GFX_ZC3_SELFTEST");const int z3=z && *z?atoi(z):(gpu_policy==XBG_GPU_MALI || gpu_policy==XBG_GPU_POWERVR)?1:0;
      if(z3 && !get_props)get_props=(PFN_vkGetAndroidHardwareBufferPropertiesANDROID)vkGetDeviceProcAddr(cfg.device,"vkGetAndroidHardwareBufferPropertiesANDROID");
-     if(z3 && get_props){static const char *names[3]={"none","dc-by-va","dma-buf-sync"};
+     if(z3 && get_props && !(enabled && mode==XBG_ZC_MAINT)){static const char *names[3]={"none","dc-by-va","dma-buf-sync"};
          int view=ZC_MAP_FD;   // [zc-map] the fd view, or the vkmap view when the fd one cannot be made
          for(int k=0;k<3;k++){char why[400];const uint64_t t0=timing_clock();
              uint64_t bad=selftest(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,why,sizeof why,k,true,view);
@@ -2893,8 +2941,9 @@ void decide(){
 bad=selftest(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN|AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,why,sizeof why,k,true,view);}
              xbg_logf("NVN zero-copy mode-3 self-test (log only): cached pages, view=%s, maintenance=%s -> %s (%s; %.1f ms)",map_name(view),names[k],bad==0?"pass":bad==~0ull?"not run":"FAIL",why,(timing_clock()-t0)/1e6);}}}
     if(!enabled)mode=0;
-    xbg_logf("NVN zero-copy guest memory=%d mode=%s view=%s (DM_GFX_ZEROCOPY=%s: 0 off, 1 cached, 2 uncached, auto; cached-coherent memory type %s%s; DM_GFX_ZC_MAP=%s)",enabled,
-             mode==XBG_ZC_CACHED?"cached":mode==XBG_ZC_UNCACHED?"uncached":"off",map_name(map_method),e && *e?e:"auto",cc?"present":"absent",forced?", forced":"",mm && *mm?mm:"auto");
+    if(enabled && mode==XBG_ZC_MAINT)maint_setup();
+    xbg_logf("NVN zero-copy guest memory=%d mode=%s view=%s (DM_GFX_ZEROCOPY=%s: 0 off, 1 cached, 2 uncached, 3 maint, auto; cached-coherent memory type %s%s; DM_GFX_ZC_MAP=%s)",enabled,
+             xbg_zc_mode_name(mode),map_name(map_method),e && *e?e:"auto",cc?"present":"absent",forced?", forced":"",mm && *mm?mm:"auto");
 }
 // a whole guest pool, called synchronously from nvnMemoryPoolInitialize (before the game uses it as GPU memory); nvn_flags: the pool's
 // NVN flags (-1 unknown). [tileopt] The uncached mode takes only CPU_UNCACHED / CPU_NO_ACCESS pools (xbg_zc_pool_eligible).
@@ -2910,6 +2959,97 @@ void map_pool(void *p,size_t n,int nvn_flags){
     for(size_t at=0;at<n;at+=CHUNK)if(!map_chunk(static_cast<uint8_t*>(p)+at,std::min(CHUNK,n-at)))break;
     static unsigned told=0;if(told++<16)xbg_logf("NVN zero-copy pool %p+%#zx mapped (total %.1f MB in %d chunks)",p,n,mapped_bytes/1048576.0,count.load());
 }
+// [zc3mode] Zero-copy mode 3 (maint, BUGS_AND_FIXES 2.61): the chunks are CPU-cached pages the GPU reads without snooping the CPU
+// caches, so what the CPU wrote must reach memory before a submission can read it. The dirty-page tracker is the source of truth:
+// nvn_dirty_take_written hands out the pages of a chunk written since its last call (every CPU write of a protected page faults
+// once and gets a generation; the game, our HLE, the engine's write-backs and host file reads alike) and protects them again, and
+// maint_clean cleans them to the point of coherency (DC CVAC by VA, one DSB at the end) -- before every vkQueueSubmit of game work
+// (dm-record's SUBMIT packet, or the translation thread when vkrec is off). The first call of a chunk (and of a re-registered pool)
+// cleans it whole: pages written before the tracker knew them carry no generation. NVN's own Flush / InvalidateMappedRange calls
+// (DOOM flushes its CPU_UNCACHED pool 0x22 about once a frame) clean / clean+invalidate their range on top (DM_GFX_ZC3_NVN), never
+// instead. GPU -> CPU: nothing to do -- no GPU write lands in zero-copy memory here (storage / copy / query results go to readback
+// buffers that the CPU copies into guest memory after the fence: CPU writes, tracked like any other); the NVN invalidates are honoured
+// anyway. DM_GFX_ZC3_CLEAN: 1 (default) the tracker's pages; 2 every chunk whole before every submission (reference, slow); 0 none
+// (test: shows what the maintenance is worth; wrong output expected on a GPU that is really not coherent).
+void dc_range(const void *p,size_t n,bool invalidate){   // dcache_op without its DSB (the caller issues one after all ranges)
+#if defined(__aarch64__)
+    const size_t l=dcache_line();uintptr_t a=uintptr_t(p)&~uintptr_t(l-1);const uintptr_t e=uintptr_t(p)+n;
+    if(invalidate)for(;a<e;a+=l)asm volatile("dc civac, %0"::"r"(a):"memory");
+    else for(;a<e;a+=l)asm volatile("dc cvac, %0"::"r"(a):"memory");
+#else
+    (void)p;(void)n;(void)invalidate;
+#endif
+}
+void dc_sync(){
+#if defined(__aarch64__)
+    asm volatile("dsb sy":::"memory");
+#endif
+}
+struct MaintChunk{nvn_dirty_cookie ck{};bool armed=false,whole=false,retired=false;uint32_t untracked=0;};
+MaintChunk mchunk[512];std::mutex maint_mu;int maint_cfg=1,maint_nvn=1;
+std::atomic<uint64_t> m_bytes{0},m_clean_ns{0},m_walk_ns{0},m_calls{0},m_runs{0},m_full{0},m_nvn_flush{0},m_nvn_inval{0},m_nvn_ns{0},m_nvn_calls{0};
+nvn_dirty_pstat m_pst{};uint64_t m_pst_windows0=0,m_pst_kept0=0,m_faults0=0,m_mp_calls0=0,m_mp_ns0=0;int m_whole_chunks=0;
+void maint_setup(){
+    const char *e=getenv("DM_GFX_ZC3_CLEAN");maint_cfg=e && *e?std::clamp(atoi(e),0,2):1;
+    e=getenv("DM_GFX_ZC3_NVN");maint_nvn=e && *e?atoi(e)!=0:1;
+    const int pb=nvn_dirty_pbgen_mode?nvn_dirty_pbgen_mode():-1;
+    xbg_logf("NVN zero-copy mode 3 (maint): cached pages, DC CVAC by VA of the pages the CPU wrote (dirty-page tracker) before every submission; DM_GFX_ZC3_CLEAN=%d (1 tracked pages, 2 whole chunks, 0 none: test), DM_GFX_ZC3_NVN=%d (NVN Flush / Invalidate ranges on top), tracker windows %s (DM_DIRTY_PROTECT_BGEN=%d), cache line %zu B",
+        maint_cfg,maint_nvn,pb>0?"on":"off: full walks",pb,dcache_line());
+    {uint64_t pr=0,b=0;if(nvn_dirty_stats)nvn_dirty_stats(&m_faults0,&pr);if(nvn_dirty_mp_stats)nvn_dirty_mp_stats(&m_mp_calls0,&b,&m_mp_ns0);}   // PERF baselines
+    if(!maint_cfg)xbg_logf("NVN zero-copy mode 3: DM_GFX_ZC3_CLEAN=0 -- no cache maintenance at all (test only: stale GPU reads expected where the GPU does not snoop the CPU caches)");
+}
+bool maint_owns(uint64_t a,uint64_t n){   // [zc3mode] wtrack must not add a protection of its own on pages the tracker owns in mode 3
+    if(enabled<=0 || mode!=XBG_ZC_MAINT || !n)return false;
+    const int k=count.load(std::memory_order_acquire);for(int i=0;i<k;i++){const Chunk &c=table[i];if(a<c.lo+c.n && a+n>c.lo)return true;}
+    return false;}
+void maint_clean(){
+    if(enabled<=0 || mode!=XBG_ZC_MAINT || !maint_cfg)return;
+    std::lock_guard<std::mutex> l(maint_mu);
+    const uint64_t t0=timing_clock();uint64_t bytes=0,cl_ns=0,runs=0;
+    const unsigned sh=nvn_dirty_page_shift && nvn_dirty_page_shift()>=12?nvn_dirty_page_shift():12;
+    static uint64_t bits[(CHUNK>>12)/64];
+    const int n=count.load(std::memory_order_acquire);
+    for(int i=0;i<n;i++){const Chunk &c=table[i];MaintChunk &mc=mchunk[i];uint8_t *lo=reinterpret_cast<uint8_t*>(c.lo);
+        if(maint_cfg==2){const uint64_t c0=timing_clock();dc_range(lo,c.n,false);cl_ns+=timing_clock()-c0;bytes+=c.n;++runs;continue;}
+        int full=0;const size_t np=nvn_dirty_take_written(lo,c.n,&mc.ck,bits,sizeof bits/sizeof bits[0],&full,&m_pst);
+        if(!np){   // not inside one tracked pool
+            if(mc.armed){if(!mc.retired){mc.retired=true;xbg_logf("NVN zero-copy mode 3: chunk %p+%#zx is no longer a tracked pool (finalized?); not cleaned until a pool is registered there again",(void*)lo,c.n);}continue;}
+            if(++mc.untracked<8)continue;   // nvnMemoryPoolInitialize registers the pool right after mapping it: a submission in between
+            if(!mc.whole){mc.whole=true;++m_whole_chunks;xbg_logf("【红】NVN zero-copy mode 3: chunk %p+%#zx is not tracked by the dirty-page tracker (table full?): cleaned whole before every submission",(void*)lo,c.n);}
+            const uint64_t c0=timing_clock();dc_range(lo,c.n,false);cl_ns+=timing_clock()-c0;bytes+=c.n;++runs;continue;}
+        if(mc.whole){mc.whole=false;--m_whole_chunks;}
+        mc.armed=true;mc.retired=false;mc.untracked=0;
+        const uint64_t c0=timing_clock();
+        if(full){dc_range(lo,c.n,false);bytes+=c.n;++runs;m_full.fetch_add(1,std::memory_order_relaxed);}
+        else bytes+=uint64_t(xbg_zc3_runs(bits,np,[&](size_t p,size_t k){dc_range(lo+(size_t(p)<<sh),size_t(k)<<sh,false);++runs;}))<<sh;
+        cl_ns+=timing_clock()-c0;}
+    if(bytes){const uint64_t c0=timing_clock();dc_sync();cl_ns+=timing_clock()-c0;}
+    const uint64_t all=timing_clock()-t0;
+    m_bytes.fetch_add(bytes,std::memory_order_relaxed);m_clean_ns.fetch_add(cl_ns,std::memory_order_relaxed);m_walk_ns.fetch_add(all>cl_ns?all-cl_ns:0,std::memory_order_relaxed);
+    m_calls.fetch_add(1,std::memory_order_relaxed);m_runs.fetch_add(runs,std::memory_order_relaxed);
+    {static unsigned told=0;if(bytes>=(uint64_t(32)<<20) && told<8){++told;xbg_logf("NVN zero-copy mode 3: cleaned %.1f MB in %.2f ms (walk %.2f ms) in one submission (first use of new chunks, or DM_GFX_ZC3_CLEAN=2)",bytes/1048576.0,cl_ns/1e6,(all>cl_ns?all-cl_ns:0)/1e6);}}
+}
+// NVN nvnMemoryPool / nvnBuffer Flush (invalidate=0) / InvalidateMappedRange (1) on [p, p+n): clean / clean+invalidate the part in
+// mode-3 chunks. 1 = done, 0 = not mode 3 / outside zero-copy (a no-op, as on every other path).
+int maint_nvn_range(const void *p,size_t n,int invalidate){
+    if(enabled<=0 || mode!=XBG_ZC_MAINT || !maint_nvn || !p || !n)return 0;
+    const uint64_t a=uintptr_t(p),e=a+n,t0=timing_clock();uint64_t done=0;
+    const int k=count.load(std::memory_order_acquire);
+    for(int i=0;i<k;i++){const Chunk &c=table[i];const uint64_t lo=std::max<uint64_t>(a,c.lo),hi=std::min<uint64_t>(e,c.lo+c.n);if(lo<hi){dc_range(reinterpret_cast<const void*>(lo),size_t(hi-lo),invalidate!=0);done+=hi-lo;}}
+    if(!done)return 0;
+    dc_sync();
+    (invalidate?m_nvn_inval:m_nvn_flush).fetch_add(done,std::memory_order_relaxed);m_nvn_ns.fetch_add(timing_clock()-t0,std::memory_order_relaxed);m_nvn_calls.fetch_add(1,std::memory_order_relaxed);
+    return 1;}
+// Every 60 frames: NVN PERF zc3 (per frame; faults / mprotect are the tracker's totals, texture and vertex caches included)
+void maint_report(double f){
+    if(enabled<=0 || mode!=XBG_ZC_MAINT || f<=0)return;
+    uint64_t faults=0,preps=0,mpc=0,mpp=0,mpns=0;if(nvn_dirty_stats)nvn_dirty_stats(&faults,&preps);if(nvn_dirty_mp_stats)nvn_dirty_mp_stats(&mpc,&mpp,&mpns);
+    uint64_t win=0,kept=0;{std::lock_guard<std::mutex> l(maint_mu);win=m_pst.windows;kept=m_pst.kept;}
+    perf_vlogf("NVN PERF zc3 cleaned_kb=%.1f clean_ms=%.3f walk_ms=%.3f submits=%.1f runs=%.1f full=%llu windows=%.1f kept=%.2f faults=%.1f mprotect=%.1f mprotect_ms=%.3f nvn_flush_kb=%.1f nvn_inval_kb=%.1f nvn_ms=%.3f nvn_calls=%.1f whole_chunks=%d (per frame; DM_GFX_ZC3_CLEAN=%d)",
+        m_bytes.exchange(0)/1024.0/f,m_clean_ns.exchange(0)/1e6/f,m_walk_ns.exchange(0)/1e6/f,m_calls.exchange(0)/f,m_runs.exchange(0)/f,(unsigned long long)m_full.load(),
+        (win-m_pst_windows0)/f,(kept-m_pst_kept0)/f,(faults-m_faults0)/f,(mpc-m_mp_calls0)/f,(mpns-m_mp_ns0)/1e6/f,
+        m_nvn_flush.exchange(0)/1024.0/f,m_nvn_inval.exchange(0)/1024.0/f,m_nvn_ns.exchange(0)/1e6/f,m_nvn_calls.exchange(0)/f,m_whole_chunks,maint_cfg);
+    m_pst_windows0=win;m_pst_kept0=kept;m_faults0=faults;m_mp_calls0=mpc;m_mp_ns0=mpns;}
 // [ETR perf, KB PERF-E09] DM_GFX_FAST_LOOKUPS (boot; default 1, 0 = the table walk, 2 = index + compare every answer with the walk; A/B target
 // fastlook): find / tail answer from a sorted copy of the chunk table plus the last chunk hit (xbg_fast_lookup.h; exact while no chunks overlap,
 // else it turns itself off). Eternal's other two lookups are not ported: DOOM has ~250 images (the 1024-entry front hits) and no guest_ok scan.
@@ -4093,11 +4233,17 @@ bool partial_upload(Image &im,const tex_t *t,uint64_t since,uint64_t stamp=0){
         // used the image yet its dirty blocks are copied in the slot's prologue command buffer, ahead of the whole submission
         // (no earlier command read the old blocks). The in-pass path ended the open render pass and put two full barriers
         // around the copy: ~5 partial uploads a frame in the VT-streaming scenes (pass_end_lines L1373, prof31).
-        if(upload_prologue && partial_prologue_on() && im.slot_use!=slot_serial && !ab_off("partpro")){Slot &s=recording_slot();
+        const bool part_pro=upload_prologue && partial_prologue_on() && im.slot_use!=slot_serial && !ab_off("partpro");
+        if(part_pro){Slot &s=recording_slot();
             s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++mt_hz_gen;++partial_prologue;}
         else{Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkrec::CmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,uint32_t(copies.size()),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
         partial_bytes+=linear.size();++partial_uploads;texdiscard::note_upload(im,true);
         if(vt_diag_on()){auto &e=vtdiag::partial[t->serial];++e.first;e.second+=copies.size();}
+        if(tex_diag && bw>1){static unsigned told=0;if(told<48){++told;   // [DOOM] issue 45: the first native compressed partial uploads, three regions each
+            std::string s;char w[160];for(size_t i=0;i<copies.size() && i<3;i++){const VkBufferImageCopy &q=copies[i];snprintf(w,sizeof w," [L%u/%u at %d,%d,%d size %ux%ux%u row=%u rows=%u buf+%llu]",q.imageSubresource.mipLevel,q.imageSubresource.baseArrayLayer,
+                q.imageOffset.x,q.imageOffset.y,q.imageOffset.z,q.imageExtent.width,q.imageExtent.height,q.imageExtent.depth,q.bufferRowLength,q.bufferImageHeight,(unsigned long long)(q.bufferOffset-staging.offset));s+=w;}
+            xbg_logf("NVN tex diag: native partial upload #%u serial=%llu fmt=%#x vk=%d %ux%u levels=%u layers=%u %s block=%dx%d regions=%zu bytes=%zu path=%s:%s",told,(unsigned long long)t->serial,t->d.format,int(im.fmt),im.width,im.height,im.levels,im.layers,
+                im.subst?"astc-overlay":"bc",bw,bh,copies.size(),linear.size(),part_pro?"prologue":"in-pass",s.c_str());}}
         {static unsigned n=0;if(n++<5 || (n&255)==0)xbg_logf("NVN partial texture upload serial=%llu fmt=%#x %ux%ux%u target=%d blocks=%zu bytes=%zu (total uploads %llu)",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.depth,t->d.target,copies.size(),linear.size(),(unsigned long long)partial_uploads);}
     }
     return true;
@@ -6041,10 +6187,16 @@ void descriptors(Descriptors &out,Commands &commands,bool compute){storage_image
                     switch(b.source){
                     case XBG_SOURCE_UNIFORM:case XBG_SOURCE_STORAGE:{if(slot>=16){ok=false;break;}auto r=b.source==XBG_SOURCE_UNIFORM?state.ub[ns][slot]:state.sb[ns][slot];
                         if(UBO_DYN(dmode,b) && b.source==XBG_SOURCE_UNIFORM && r.address && r.size){size_t copy=std::min<size_t>(r.size,b.bytes?b.bytes:65536);key.push_back(copy);if(tags)ktag.push_back(2);dyn_ubos.push_back({(uint64_t(b.binding)<<32)|element,r.address,copy,bind_ssbo(b)});} // address only moves the dynamic offset
+                        // [D3] GitHub issue #22 (PowerVR BXM-8-256, DM_GFX_UBO_DYNAMIC=0, its default there; also any port's safe mode / switch 0):
+                        // a non-dynamic guest uniform buffer is a snapshot of its contents taken when the set is built, baked into the set at its
+                        // offset. The key only has the address and size, and the game rewrites the same address between draws (skinning bone
+                        // matrices, per-object constants), so a memo hit drew with the previous object's data: heroes and NPCs exploded into
+                        // spikes, floor tiles flew apart. Such a set is never memoized (dynamic mode copies the contents on every hit instead).
+                        else if(b.source==XBG_SOURCE_UNIFORM && r.address){ok=false;++desc_memo_why[3];break;}
                         else{key.push_back(r.address);key.push_back(r.size);if(tags){ktag.push_back(b.source==XBG_SOURCE_UNIFORM?3:10);ktag.push_back(4);}}break;}
                     case XBG_SOURCE_SUPPORT:key.push_back((uint64_t(uint32_t(state.viewport.width))<<32)|uint32_t(state.viewport.height));key.push_back(state.color.alpha_func);if(tags){ktag.push_back(5);ktag.push_back(6);}break;
                     case XBG_SOURCE_C1:break;
-                    case XBG_SOURCE_DRIVER0:case XBG_SOURCE_DRIVER2:key.push_back(UBO_DYN(dmode,b)?uint64_t(0xD0D0+b.source):(b.source==XBG_SOURCE_DRIVER0?tex_gen[ns]:buf_gen[ns]));if(tags)ktag.push_back(7);break; // dynamic: block rebuilt from the current state on every hit (driver_block); otherwise its offset is baked into the set
+                    case XBG_SOURCE_DRIVER0:case XBG_SOURCE_DRIVER2:key.push_back(UBO_DYN(dmode,b)?uint64_t(0xD0D0+b.source):(b.source==XBG_SOURCE_DRIVER0?buf_gen[ns]:tex_gen[ns]));if(tags)ktag.push_back(7);break; // dynamic: block rebuilt from the current state on every hit (driver_block); otherwise its offset is baked into the set
                     case XBG_SOURCE_TEXTURE:case XBG_SOURCE_IMAGE:{if(slot>=(b.source==XBG_SOURCE_IMAGE?16u:128u)){ok=false;break;}key.push_back(b.source==XBG_SOURCE_IMAGE?state.img[ns][slot]:state.tex[ns][slot]);if(tags)ktag.push_back(8);
                         if(b.sampler_slot!=UINT32_MAX){if(b.sampler_slot>=128){ok=false;break;}key.push_back(state.samp[ns][b.sampler_slot]);if(tags)ktag.push_back(9);}break;}
                     default:ok=false;}
@@ -8495,7 +8647,17 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string marker=(cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-sync-mode";FILE *m=fopen(marker.c_str(),"rb");sync_mode=false;if(m){sync_mode=fgetc(m)=='1';fclose(m);}}
      {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-defer-events").c_str(),"rb");defer_events=0;if(m){int c=fgetc(m);defer_events=c=='1'?1:c=='2'?2:0;fclose(m);}else if(const char *e=getenv("DM_GFX_DEFER_EVENTS")){int v=atoi(e);defer_events=v==1?1:v==2?2:0;}xbg_logf("NVN defer events=%d (marker gfx-defer-events)",int(defer_events));{FILE *eg=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-event-guard").c_str(),"rb");evguard::enabled=eg!=nullptr;if(eg)fclose(eg);if(evguard::enabled)xbg_logf("NVN event guard on (marker gfx-event-guard)");}{FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-vcache").c_str(),"rb");vcache::enabled=false;if(v){vcache::enabled=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_VCACHE"))vcache::enabled=atoi(e)!=0;xbg_logf("NVN vertex/index cross-frame cache=%d tracker=%d (marker gfx-vcache)",int(vcache::enabled),int(nvn_dirty_since!=nullptr));}
      {FILE *v=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-tex-dirty").c_str(),"rb");tex_dirty=false;if(v){tex_dirty=fgetc(v)!='0';fclose(v);}else if(const char *e=getenv("DM_GFX_TEX_DIRTY"))tex_dirty=atoi(e)!=0;
-      xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc)",int(native_bc));}
+      xbg_logf("NVN texture checks through the dirty tracker=%d (marker gfx-tex-dirty)",int(tex_dirty));}{FILE *b=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-native-bc").c_str(),"rb");native_bc=false;if(b){native_bc=fgetc(b)!='0';fclose(b);}else if(const char *e=getenv("DM_GFX_NATIVE_BC"))native_bc=atoi(e)!=0;xbg_logf("NVN native BC textures=%d (marker gfx-native-bc; DM_GFX_NATIVE_BC=%s)",int(native_bc),getenv("DM_GFX_NATIVE_BC")?getenv("DM_GFX_NATIVE_BC"):"unset");}
+     // [DOOM] issue 45 DM_GFX_TEX_DIAG=1 (set by the app on Xclipse): what the driver says about every BC format, once; and the first native
+     // compressed partial uploads region by region (upload_partial). RADV-Xclipse 1.8.0 garbles the virtual-textured surfaces with native BC blocks.
+     {const char *e=getenv("DM_GFX_TEX_DIAG");tex_diag=e && atoi(e) && gdiag::allow();if(tex_diag){
+        static const struct{VkFormat f;const char *n;} bcf[]={{VK_FORMAT_BC1_RGBA_UNORM_BLOCK,"bc1"},{VK_FORMAT_BC1_RGBA_SRGB_BLOCK,"bc1s"},{VK_FORMAT_BC2_UNORM_BLOCK,"bc2"},{VK_FORMAT_BC3_UNORM_BLOCK,"bc3"},{VK_FORMAT_BC3_SRGB_BLOCK,"bc3s"},
+            {VK_FORMAT_BC4_UNORM_BLOCK,"bc4"},{VK_FORMAT_BC5_UNORM_BLOCK,"bc5"},{VK_FORMAT_BC5_SNORM_BLOCK,"bc5n"},{VK_FORMAT_BC6H_UFLOAT_BLOCK,"bc6u"},{VK_FORMAT_BC7_UNORM_BLOCK,"bc7"},{VK_FORMAT_BC7_SRGB_BLOCK,"bc7s"},
+            {VK_FORMAT_ASTC_4x4_UNORM_BLOCK,"astc4x4"},{VK_FORMAT_R8G8B8A8_UNORM,"rgba8"},{VK_FORMAT_R16G16_UNORM,"rg16"},{VK_FORMAT_R8G8_UNORM,"rg8"},{VK_FORMAT_R16_UINT,"r16ui"},{VK_FORMAT_R32_UINT,"r32ui"}};
+        std::string s;char w[48];for(const auto &x:bcf){VkFormatProperties q{};vkGetPhysicalDeviceFormatProperties(cfg.physical,x.f,&q);snprintf(w,sizeof w," %s=%#x",x.n,unsigned(q.optimalTilingFeatures));s+=w;}
+        xbg_logf("NVN tex diag: device=\"%s\" driver=%#x api=%#x bc=%u native_bc=%d copyOffsetAlign=%llu copyRowPitchAlign=%llu; optimal-tiling features (0x1 sampled, 0x1000 linear filter, 0x4000 transfer src, 0x8000 transfer dst):%s (DM_GFX_TEX_DIAG)",
+            properties.deviceName,unsigned(properties.driverVersion),unsigned(properties.apiVersion),unsigned(cfg.enabled_core.textureCompressionBC),int(native_bc),
+            (unsigned long long)properties.limits.optimalBufferCopyOffsetAlignment,(unsigned long long)properties.limits.optimalBufferCopyRowPitchAlignment,s.c_str());}}
      {astc_ov_mask=xbg_astc_formats_mask(getenv("DM_GFX_ASTC_FORMATS"));astc_cpu_mask=astc_ov_mask?xbg_astc_formats_mask(getenv("DM_GFX_ASTC_CPU"))&astc_ov_mask&~uint32_t(XBG_AO_BC6H|XBG_AO_BC1):0;
       if(const char *bs=getenv("DM_GFX_BC_SERIAL")){std::string list;   // [nonadreno] 2.37 "103=drop,1848=native"
         for(const char *q=bs;*q;){char *e=nullptr;const unsigned long long v=strtoull(q,&e,10);if(e==q){++q;continue;}q=e;if(*q!='='){continue;}++q;
@@ -8537,7 +8699,12 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
     {std::string dir=cfg.shader_directory;size_t cut=dir.find_last_of('/');std::string base=cut==std::string::npos?dir:dir.substr(0,cut);
      const bool rewrites_fault=xbg_adreno_rewrites_fault(properties.vendorID,properties.deviceName);
      if(rewrites_fault)xbg_logf("NVN Adreno 740/750 (device \"%s\"): the quad-derivative and warp32 rewrites default off; a marker file still turns either on",properties.deviceName);
-     auto sw=[&](const char *marker,const char *env){FILE *q=fopen((base+marker).c_str(),"rb");const bool present=q!=nullptr;int c=-1;if(q){c=fgetc(q);fclose(q);}return xbg_adreno_rewrite_option(present,c,getenv(env),rewrites_fault);};
+     // [#39/#47] Adreno 8xx: the same defaults as 740-799 (GPU particles cec755c4 lone-lane, native quad shuffles), see xbg_adreno_policy.h
+     {const char *a8e=getenv("DM_GFX_ADRENO8_POLICY");adreno8_on=xbg_adreno8_policy(properties.vendorID,properties.deviceName,a8e);
+      if(adreno8_on || xbg_adreno_8xx(properties.vendorID,properties.deviceName))
+          xbg_logf("NVN Adreno 8xx policy (issues #39/#47, green flashes)=%d (device \"%s\", DM_GFX_ADRENO8_POLICY=%s: auto/1 on for 8xx, 0 off as 0.5.2, force any Adreno): quad-derivative and warp32 rewrites default %s, cached zero-copy self-test %s",
+                   int(adreno8_on),properties.deviceName,a8e && *a8e?a8e:"auto",adreno8_on?"off like 740-799 (GPU particles cec755c4 lone-lane)":"as before",adreno8_on?"log only":"skipped");}
+     auto sw=[&](const char *marker,const char *env){FILE *q=fopen((base+marker).c_str(),"rb");const bool present=q!=nullptr;int c=-1;if(q){c=fgetc(q);fclose(q);}return xbg_adreno_rewrite_option(present,c,getenv(env),rewrites_fault || adreno8_on);};
      quad_derivatives=sw("/gfx-quad-derivatives","DM_GFX_QUAD_DERIVATIVES");
      // [nonadreno] the rewrite emits subgroup quad operations in fragment shaders: they need quad ops there and quads of 4 lanes
      // (PowerVR BXM-4-64 reports subgroupSize 1). Every Adreno has them, so this only ever turns it off elsewhere.
@@ -8907,7 +9074,18 @@ extern "C" void xbg_legacy_read_texels(const tex_t *t,unsigned level,unsigned la
     else{p_copy_b2t p{};p.src=uint64_t(dst);p.tex=t;p.has_view=1;p.view.set_levels=p.view.set_layers=1;p.view.base_level=level;p.view.nlevels=1;p.view.min_layer=layer;p.view.nlayers=1;p.r=*r;int64_t old=state.copy_stride,old_image=state.copy_image_stride;state.copy_stride=row;state.copy_image_stride=image;copy_texture_buffer(p,true);state.copy_stride=old;state.copy_image_stride=old_image;}}
 
 // ---- public entry points (queued in order on the graphics thread) ----
+// [zc-cmdshadow] hle_nvn.c AddCommandMemory: 1 when [p, p+n) lies in a zero-copy chunk of the uncached mode (write-combined CPU pages), where
+// the translation thread's reads of our command records are uncached reads; such command pools get a cached host shadow.
+// [zc-cmdshadow] [zc3mode] 1 = [p, p+n) is zero-copy memory a command pool should not hold our records in: write-combined (mode 2: the
+// translator's reads are uncached) or maint (mode 3: every record write would fault into the dirty-page tracker and be cleaned for nothing)
+extern "C" int xbg_zc_wc(const void *p,size_t n){return zc::enabled>0 && (zc::mode==XBG_ZC_UNCACHED || zc::mode==XBG_ZC_MAINT) && zc::find(uintptr_t(p),n)!=nullptr;}
+// [zc3mode] hle_nvn.c: NVN Flush (invalidate 0) / InvalidateMappedRange (1) of [p, p+n); 1 = cache maintenance done (mode 3)
+extern "C" int xbg_zc_cpu_maint(const void *p,size_t n,int invalidate){return zc::maint_nvn_range(p,n,invalidate);}
 extern "C" void xbg_zc_pool_map(void *p,size_t n,int nvn_flags){if(initialized)zc::map_pool(p,n,nvn_flags);else{static int told=0;if(!told++)xbg_logf("NVN zero-copy: pool %p+%#zx before the engine is initialized, not mapped",p,n);}}
+// [zc-cmdshadow] hle_nvn.c's cached shadow of a command pool: command addresses inside it are valid like host segments (command_available),
+// registered through the same queue as the pools so it lands before the first submission that uses it. Removal unmaps it on that queue too.
+extern "C" void xbg_command_shadow_add(void *p,size_t n){gfx_enqueue([p,n]{std::lock_guard<std::recursive_mutex> lock(mutex);host_ranges[uintptr_t(p)]=n;cmd_range_lo=0;cmd_range_bytes=0;});}
+extern "C" void xbg_command_shadow_drop(void *p,size_t n){gfx_enqueue([p,n]{{std::lock_guard<std::recursive_mutex> lock(mutex);host_ranges.erase(uintptr_t(p));cmd_range_lo=0;cmd_range_bytes=0;}munmap(p,n);});}
 extern "C" void xbg_legacy_pool_add(void *p,size_t n){gfx_enqueue([p,n]{xbg_legacy_pool_add_now(p,n);});}
 extern "C" void xbg_legacy_pool_del(void *p){gfx_enqueue([p]{xbg_legacy_pool_del_now(p);});}
 extern "C" void xbg_register_texture(const dpool_t *p,int id,const tex_t *t,const view_t *v){

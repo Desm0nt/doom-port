@@ -874,7 +874,8 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     {bool fdx=false,dbx=false;for(const auto &x:available){if(!strcmp(x.extensionName,VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME))fdx=true;if(!strcmp(x.extensionName,VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME))dbx=true;}
      VkPhysicalDeviceProperties pp{};vkGetPhysicalDeviceProperties(physical,&pp);const char *se=getenv("DM_GFX_SIM_GPU"),*zm=getenv("DM_GFX_ZC_MAP");
      const char *zo=getenv("DM_GFX_ZEROCOPY");const bool zc_off=zo && !strcmp(zo,"0");   // [safe-mode] zero-copy off (safe-mode step >= 1 or the player): no dma-buf views
-     if(fdx && dbx && !zc_off && (pp.vendorID!=0x5143 || (se && *se) || (zm && *zm))){dext.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);dext.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);dm_vk_dmabuf=1;}}
+     const bool zc3=zo && atoi(zo)>=3;   // [zc3mode] DM_GFX_ZEROCOPY=3 forced: its vkexport / dmaheap views can be tried on Adreno too
+     if(fdx && dbx && !zc_off && (pp.vendorID!=0x5143 || (se && *se) || (zm && *zm) || zc3)){dext.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);dext.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);dm_vk_dmabuf=1;}}
     // [nonadreno][afbc] VK_EXT_image_compression_control: query only (never requests a compression), so the engine can log whether the
     // driver compressed each image (AFBC / fixed rate / none; NVN afbc summary); plus a per-format probe here. VK_EXT/KHR_load_store_op_none:
     // STORE_OP_NONE for attachment aspects a render pass does not write (DM_GFX_STORE_NONE). Both off on Adreno unless DM_GFX_AFBC_QUERY=1 /

@@ -325,6 +325,21 @@ static void load_driver(void) {
             if (!getenv("TU_DEBUG")) setenv("TU_DEBUG", "sysmem", 0);
             LOG("[vk] TU_DEBUG=%s (Turnip reads it when the driver loads)", getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "(unset)");
         }
+        // [DOOM] PanVK (the JimVulkan kbase build) and the window's buffers (BUGS_AND_FIXES 2.58, issue #33: Mali-G57 MT6789, the whole
+        // picture turned into grey stripes and dots a minute or two into the game). The buffers of a swapchain come from the phone's
+        // gralloc, and ARM's gralloc may hand out AFBC ones (compressed; it decides per allocation, so the first buffers can be plain and
+        // the ones made after the window changed its size compressed). This driver cannot write AFBC window buffers: it draws into them
+        // as plain RGBA8 rows, and the compositor then decodes those rows as AFBC headers. It has a switch that makes it ask gralloc for
+        // CPU-readable buffers (SW_READ_RARELY | SW_WRITE_RARELY added in vkGetSwapchainGrallocUsage[2]ANDROID), which gralloc never
+        // compresses; the driver turns it on by itself on Samsung only. MESA_GRALLOC_LINEAR: first character not '0' = on; an empty or
+        // unset value falls back to the property debug.mesa_gralloc_linear. Read once, at the first swapchain. DM_VK_PANVK_LINEAR=0
+        // leaves the driver's own default; a MESA_GRALLOC_LINEAR from dm/env is kept.
+        if (fam == FAM_MALI) {
+            const char *pl = getenv("DM_VK_PANVK_LINEAR");
+            if (!(pl && *pl == '0')) setenv("MESA_GRALLOC_LINEAR", "1", 0);
+            LOG("[vk] MESA_GRALLOC_LINEAR=%s (PanVK: 1 = plain window buffers, no AFBC; DM_VK_PANVK_LINEAR=%s)",
+                getenv("MESA_GRALLOC_LINEAR") ? getenv("MESA_GRALLOC_LINEAR") : "(unset)", pl ? pl : "(unset: on)");
+        }
         const char *slash = strrchr(drv, '/');
         char dir[1024], hookdir[1024];
         snprintf(hookdir, sizeof hookdir, "%s/", hooks);

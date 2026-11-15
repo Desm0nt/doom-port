@@ -136,6 +136,13 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         // [DOOM] Android 10 (the minSdk 29 build) has no ALWAYS: SHORT_EDGES is the same in landscape
         getWindow().getAttributes().layoutInDisplayCutoutMode = android.os.Build.VERSION.SDK_INT >= 30
             ? WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS : WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        // [DOOM] issue #38: ALWAYS only lets the window reach into the cutout. On Android 11-14 the decor still "fits system windows" and pads
+        // the content by getSystemWindowInsets() = systemBars | displayCutout (InsetsState.calculateInsets compat types): bars are hidden (0),
+        // the cutout is not, so the game surface ended a cutout's width short (ZTE Z2352N: display 2400x1080, view 2302x1080) and the theme's
+        // window background showed there as a blue strip. Android 15+ never saw it: targetSdk 36 enforces edge to edge (no decor fitting).
+        // Same layout on every version now; black under anything that is still uncovered (the dark DeviceDefault theme keeps light text).
+        if (android.os.Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
+        getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK));
         drivers = new VkDrivers(this);   // [front] the Vulkan driver choice, crash guard and the gear's driver list (frontend-common)
         if (DOOM) GearDisplay.applyDisplayMode(this, doomPrefs());   // [DOOM] frame rate limit above 60: ask for a display mode at a multiple of it
         view = new SurfaceView(this);
@@ -182,6 +189,29 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // [DOOM] the mode row is the r6 light mode: the game's own Switch handheld quality preset, live (nativeSetLight); docked (full quality) stays the
     // default (BUGS_AND_FIXES 2.18); the gear dialog's "light mode" box is the same setting
     @Override public int modeKind() { return FrontMenu.MODE_LIGHT; }
+    // [DOOM] issue 45 (docs/port-kb gpu-xclipse.md XCL-05): the pause menu's red test row "BC textures: native / decoded". Native BC blocks are the
+    // default where the driver has them (DM_GFX_NATIVE_BC=1); RADV-Xclipse 1.8.0 shows the level's virtual-textured surfaces garbled with them, while
+    // the stock driver (no BC: decoded / ASTC) is clean. The storage is chosen per texture when it is made, so a change needs a new process:
+    // the choice is saved (doom_graphics "bc_decoded"), DoomGear.bcMode sets DM_GFX_NATIVE_BC=0 from it at the next start. Test builds only
+    // (DoomGear.bcTest): -PdmBcRow=xclipse on Xclipse, -PdmBcRow=1 on any GPU (to try the row itself); a normal APK has no row.
+    private boolean bcRow() { return DoomGear.bcTest(); }
+    @Override public String[] portRows() {
+        if (!bcRow()) return null;
+        return new String[]{doomPrefs().getBoolean("bc_decoded", false) ? Ui.t(this, "BC-текстуры: через декод (тест)", "BC textures: decoded (test)") : Ui.t(this, "BC-текстуры: нативные (тест)", "BC textures: native (test)")};
+    }
+    @Override public int portRowColor(int i) { return 0xffff4d4d; }
+    @Override public void portRow(int i) {
+        if (front == null) return;
+        final boolean to = !doomPrefs().getBoolean("bc_decoded", false);
+        front.confirm(to ? Ui.t(this, "Переключить BC-текстуры на декод? Игра перезапустится, несохранённый прогресс пропадёт. Памяти под текстуры нужно больше.",
+                "Switch BC textures to decoded? The game restarts, unsaved progress is lost. Textures take more memory.")
+            : Ui.t(this, "Вернуть нативные BC-текстуры? Игра перезапустится, несохранённый прогресс пропадёт.", "Back to native BC textures? The game restarts, unsaved progress is lost."),
+            Ui.t(this, "Перезапустить", "Restart"), () -> {
+                doomPrefs().edit().putBoolean("bc_decoded", to).commit();   // commit: the process ends right after
+                android.util.Log.i("dm", "[java] BC textures -> " + (to ? "decoded" : "native") + ", restart");
+                restartRunning("BC textures " + (to ? "decoded" : "native"));
+            });
+    }
     @Override public boolean docked() { return !doomPrefs().getBoolean("light", false); }
     @Override public boolean setDocked(boolean on) {
         boolean ok = false;
@@ -691,6 +721,16 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         CrashLog.sessionEnd(this);   // not a crash
         if (libraryLoaded) CrashLog.mirrorBootLogs(this);
         startActivity(new Intent(this, DmRestart.class).putExtra("pid", android.os.Process.myPid()));
+    }
+
+    // the same while the game runs (the pause menu holds it): DmRestart first, it waits for this process; then the game's graceful exit (nativeQuit:
+    // audio and graphics stopped, _exit(0) within 1.5 s) as for "Quit game". DmRestart ends the process itself after 2.5 s if that never came.
+    private void restartRunning(String why) {
+        crumb("restart in a new process for " + why);
+        CrashLog.sessionEnd(this);   // not a crash
+        if (libraryLoaded) CrashLog.mirrorBootLogs(this);
+        startActivity(new Intent(this, DmRestart.class).putExtra("pid", android.os.Process.myPid()).putExtra("grace", 2500));
+        try { if (libraryLoaded) nativeQuit(); } catch (UnsatisfiedLinkError e) { /* an older library: DmRestart ends the process */ }
     }
 
     // ---- [DOOM] 2.41: "a new version is out" and "re-run setup" notices (UpdateNotice.java, the same file in frontend-common/java). Started once

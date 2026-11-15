@@ -20,6 +20,7 @@ final class PauseMenu extends View {
     private String title = "", game = "", note = "";
     private String[] rows = new String[0];
     private int danger = -1, hi = 0, down = -1;
+    private int[] colors;   // a row's own text colour (ARGB), 0 = the usual one; null = none (FrontMenu: Host.portRowColor)
     static final int ACCENT = 0xff35c4d6, ACCENT_DARK = 0xff1b8fa1;
 
     PauseMenu(Context c, Listener l) {
@@ -28,7 +29,8 @@ final class PauseMenu extends View {
         setFocusable(true);
     }
     // title: "Пауза"; game: the game's name at the panel's top right; rows: the labels; danger: the row drawn in red (quit), -1 none
-    void setRows(String title, String game, String[] rows, int danger) { this.title = title; this.game = game; this.rows = rows; this.danger = danger; if (hi >= rows.length) hi = 0; invalidate(); }
+    void setRows(String title, String game, String[] rows, int danger) { this.title = title; this.game = game; this.rows = rows; this.danger = danger; colors = null; if (hi >= rows.length) hi = 0; invalidate(); }
+    void setColors(int[] c) { colors = c; invalidate(); }   // after setRows, one entry per row
     void open() { hi = 0; down = -1; note = ""; setVisibility(VISIBLE); invalidate(); }
     void setNote(String s) { note = s == null ? "" : s; invalidate(); }
 
@@ -58,7 +60,7 @@ final class PauseMenu extends View {
         for (int i = 0; i < rows.length; i++) {
             RectF r = row(i); boolean on = i == hi || i == down;
             if (on) { fill.setShader(new LinearGradient(r.left, 0, r.right, 0, ACCENT_DARK, 0x331b8fa1, Shader.TileMode.CLAMP)); c.drawRoundRect(r, r.height() / 2, r.height() / 2, fill); fill.setShader(null); }
-            text.setColor(i == danger ? 0xffffb4a8 : 0xffffffff);
+            text.setColor(colors != null && i < colors.length && colors[i] != 0 ? colors[i] : i == danger ? 0xffffb4a8 : 0xffffffff);
             c.drawText(rows[i], r.left + H * 0.03f, r.centerY() + text.getTextSize() * 0.35f, text);
         }
         text.setColor(0xffffffff);

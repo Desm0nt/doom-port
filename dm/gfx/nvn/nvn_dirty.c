@@ -427,6 +427,60 @@ void nvn_dirty_protect_gen(const void *addr, size_t len, nvn_dirty_cookie *ck, i
     if (windows) { if (quiet) ck->floor = s; else { if (!same) ck->floor = 0; ++st->kept; } }
     ck->reg = r->reg; ck->addr = a; ck->len = len;
 }
+// [zc3mode] Zero-copy mode 3 (CPU-cached pages, GPU not IO-coherent; engine xbg_game.cpp zc::maint_clean, BUGS_AND_FIXES 2.61): the
+// pages of [addr, addr+len) the CPU may have written since the cookie's last call, which the caller then cleans to memory (DC CVAC),
+// and every one of them write-protected again first, so a write after this call faults and is seen by the next one.
+// bits: page i set = clean it. *full = 1: a full walk (first call of the cookie, a re-registered pool, no window summaries): the caller
+// cleans the whole range (pages written before the tracker knew them, e.g. the copy into a new chunk, carry no generation).
+// Which pages: every NONE page (writable: taken NONE -> BUSY -> protected, as nvn_dirty_protect does) and every page whose generation
+// is above the floor (written since; others may have protected it meanwhile, e.g. a texture re-upload). The walk visits only the
+// 64-page windows whose summary is above the floor (the nvn_dirty_protect_gen argument: every NONE page has a generation above the
+// floor), and moves the floor to s when nothing was in flight as s was read -- but below every page the walk found BUSY (a protect,
+// unprotect or coalesce in progress: its page may still take a write that lands before its mprotect, so the next call must visit and
+// clean it again: floor = min(s, its generation - 1); a page with generation 0 there keeps the old floor). Without window summaries (DM_DIRTY_BLOCKS=0 / DM_DIRTY_PROTECT_BGEN=0) every call is a full walk of states and
+// generations (correct, slower). Returns the page count, 0 when [addr, addr+len) is not inside one tracked range (or nwords is short).
+size_t nvn_dirty_take_written(const void *addr, size_t len, nvn_dirty_cookie *ck, uint64_t *bits, size_t nwords, int *full, nvn_dirty_pstat *st) {
+    *full = 0;
+    if (!len) return 0;
+    range_t *r = find((uintptr_t)addr);
+    if (!r || (uintptr_t)addr + len > r->end) return 0;
+    uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    const size_t np = q - p + 1, nw = (np + 63) >> 6;
+    if (nw > nwords) return 0;
+    memset(bits, 0, nw * sizeof *bits);
+    const int same = ck->reg == r->reg && ck->addr == a && ck->len == len;
+    const int windows = g_pbgen > 0 && r->bgen != NULL;
+    const uint64_t floor = same ? ck->floor : 0;
+    uint64_t s = atomic_load(&g_now); int quiet = atomic_load(&g_unprot_inflight) == 0;
+    for (int k = 0; !quiet && windows && k < 32; k++) { sched_yield(); s = atomic_load(&g_now); quiet = atomic_load(&g_unprot_inflight) == 0; }
+    uint64_t minbusy = UINT64_MAX;
+    ++st->calls;
+    const int walk_all = !floor || !windows;
+    if (!floor) { *full = 1; ++st->full; }
+    for (uintptr_t b = p >> BLK_SHIFT, bq = q >> BLK_SHIFT; b <= bq; b++) {
+        if (!walk_all && atomic_load(&r->bgen[b]) <= floor) continue;
+        uintptr_t lo = b << BLK_SHIFT, hi = lo + (1u << BLK_SHIFT) - 1; if (lo < p) lo = p; if (hi > q) hi = q;
+        if (!walk_all) ++st->windows;
+        uintptr_t run = 0; int open = 0;
+        for (uintptr_t i = lo; i <= hi + 1; i++) {
+            int took = 0;
+            if (i <= hi) {
+                uint8_t sv = atomic_load(&r->state[i]);
+                if (sv == PG_BUSY && atomic_load(&g_coal_active) && busy_wait(r, i)) sv = atomic_load(&r->state[i]);   // wait out the coalescer, as protect_run does
+                if (sv == PG_NONE) took = atomic_compare_exchange_strong(&r->state[i], &sv, PG_BUSY);
+                if (sv == PG_BUSY && !took) { uint64_t g = atomic_load(&r->gen[i]); if (g < minbusy) minbusy = g; }
+                if (took || (floor && atomic_load(&r->gen[i]) > floor) || (!floor && sv != PG_GONE && sv != PG_REST)) bits[(i - p) >> 6] |= 1ull << ((i - p) & 63);
+                st->pages++;
+            }
+            if (took && !open) { run = i; open = 1; }
+            if (!took && open) { protect_flush(r, run, i - 1); open = 0; }
+        }
+    }
+    const uint64_t nf = minbusy == UINT64_MAX ? s : minbusy ? (minbusy - 1 < s ? minbusy - 1 : s) : 0;
+    if (quiet && nf) { ck->floor = nf; if (nf < s) ++st->kept; } else { if (!same) ck->floor = 0; ++st->kept; }
+    ck->reg = r->reg; ck->addr = a; ck->len = len;
+    return np;
+}
 size_t nvn_dirty_since_bits(const void *addr, size_t len, uint64_t stamp, uint64_t *bits, size_t nwords, uint64_t *windows) {
     if (!len) return 0;
     range_t *r = find((uintptr_t)addr);

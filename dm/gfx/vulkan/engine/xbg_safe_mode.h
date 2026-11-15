@@ -6,7 +6,7 @@
 // driver's code or in zero-copy memory; a GPU-hang fence fatal; a VK_ERROR_DEVICE_LOST fatal) adds one to DM_FILES_DIR/gfx-safe-mode
 // (xbg_game.cpp xbg_safe_mode_record, signal-safe). The next start (xbg_safe_mode_boot, before the Vulkan device exists) turns on the step
 // that count asks for, a switch the player set (dm/env) always winning:
-//   step 1  the experimental 0.5.x speed-ups off: zero-copy (mode 2 and every view, the mode-3 self-test) DM_GFX_ZEROCOPY=0 /
+//   step 1  the experimental 0.5.x speed-ups off: zero-copy (modes 2 / 3 and every view, the log-only mode-3 self-test) DM_GFX_ZEROCOPY=0 /
 //           DM_GFX_ZC3_SELFTEST=0, fence trylock DM_GFX_FENCE_TRYLOCK=0, dynamic UBOs at their 0.4.22 value (PowerVR DM_GFX_UBO_DYNAMIC=0,
 //           Mali keeps 1 = its 0.4.22 value and today's default);
 //   step 2  + the tile policies off (the old PowerVR ladder step 1): NOLOAD, STORE_DEAD, STORE_NONE, LEAN_USAGE, TILE_BARRIER, LAZY_CLEAR,

@@ -43,6 +43,7 @@ final class VkDrivers {
     final GearHost host;
     private String notice;   // shown once the game view is up (started)
     private boolean guardDone, statusDone, firstFrameDone, initFailHandled;
+    private int watchErrors;
     private long startedAt;
     private Runnable onFirstFrames;   // gameStarted's callback, run once right after the "first frames presented" line (DOOM: UpdateNotice.start, 2.41)
 
@@ -125,7 +126,17 @@ final class VkDrivers {
     // fell back to the system driver (vk_driver.c status). Polls every second until both are settled.
     private final float[] stats0 = new float[4];
     private void watch(View v) {
-        if (!host.started() || a().isDestroyed()) return;
+        if (a().isDestroyed()) return;
+        if (!host.started()) { v.postDelayed(() -> watch(v), 1000); return; }
+        // issue 45: a run whose driver fell back (no-gpu) left neither the status line nor the notice; whatever stops a tick is logged and the
+        // watch goes on, after three such ticks it ends as if the first frames had come
+        try { watchTick(v); } catch (Throwable e) {
+            host.crumb("driver watch: " + e);
+            if (++watchErrors < 3) v.postDelayed(() -> watch(v), 1000);
+            else { statusDone = guardDone = true; guardFile().delete(); if (!firstFrameDone) { firstFrameDone = true; firstFrames(); } }
+        }
+    }
+    private void watchTick(View v) {
         String[] st = status();
         // 2.56: the native side fell back to the system driver after the custom one failed to initialize (possibly after a first status line
         // that still named the custom driver, so this is looked at until the first frames)
@@ -135,7 +146,7 @@ final class VkDrivers {
             host.crumb("Vulkan driver status: requested \"" + st[0] + "\" active " + st[1] + " reason " + st[2] + (st.length > 3 ? " " + st[3] : ""));
             if (!st[0].isEmpty() && "system".equals(st[1])) {
                 android.util.Log.w("dm", "driver " + st[0] + " did not start (" + st[2] + "): system driver");
-                Toast.makeText(a(), GearText.s(a(), "toast_driver_fallback", label(st[0]), reasonText(st[2])), Toast.LENGTH_LONG).show();
+                fallbackNotice(GearText.s(a(), "toast_driver_fallback", label(st[0]), reasonText(st[2])));
                 guardFile().delete(); guardDone = true;   // not a crash: the native side already chose the system driver
             }
         }
@@ -153,6 +164,15 @@ final class VkDrivers {
             }
         }
         if (!(guardDone && statusDone && firstFrameDone)) v.postDelayed(() -> watch(v), 1000);
+    }
+    // The chosen driver did not start and the system driver runs: a dialog the player has to close (issue 45: a player took the system driver
+    // for a working custom one, the toast in the first seconds of loading is easy to miss); the toast when no dialog can be shown.
+    private void fallbackNotice(String text) {
+        host.crumb("driver notice: " + text);
+        try {
+            new android.app.AlertDialog.Builder(a()).setMessage(text).setPositiveButton(android.R.string.ok, (d, w) -> host.immersive())
+                .setOnCancelListener(d -> host.immersive()).show();
+        } catch (Throwable e) { host.crumb("driver notice: no dialog (" + e + "), toast"); Toast.makeText(a(), text, Toast.LENGTH_LONG).show(); }
     }
     // 2.56: the port's Vulkan boot failure (DOOM: DmActivity.showBootFailure, code -6). true = the native side could not retry with the system
     // driver in this process (init-failed-restart): the saved choice is already the system driver, the port restarts the app now and the

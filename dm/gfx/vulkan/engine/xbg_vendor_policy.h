@@ -190,7 +190,16 @@ inline bool xbg_zero_copy_default(XbgGpuFamily f){return f==XBG_GPU_ADRENO;}
 //    the memory is what it is on the Switch (DOOM's GPU pools are 0x12 / 0x22 / 0xa2 / 0x62 = CPU_UNCACHED; the one CPU_CACHED pool, 0x24,
 //    keeps the snapshot path). Write-combined, coherent memory is what Arm, Imagination ("no host cached coherent memory types"), Skia, Dawn
 //    and Eden use for CPU-written GPU data. A start-up self-test (zc::selftest, xbg_zc_test_*) must pass on the device, else zero-copy is off.
-enum XbgZcMode{XBG_ZC_OFF=0,XBG_ZC_CACHED=1,XBG_ZC_UNCACHED=2};
+//  3 maint ([zc3mode], 11.11, BUGS_AND_FIXES 2.61): CPU-cached pages in a HOST_CACHED (not coherent) memory type, kept in step with the
+//    GPU by hand, as the Switch does for NVN CPU_CACHED pools: before every vkQueueSubmit the engine cleans (DC CVAC by VA) the guest
+//    pages the CPU wrote since the last clean -- the dirty-page tracker (nvn_dirty.c) write-protects every page of a mode-3 chunk and
+//    learns of each write through its fault; NVN Flush / InvalidateMappedRange calls clean / clean+invalidate their ranges on top.
+//    The GPU never writes zero-copy memory in this engine (its results land in readback buffers the CPU copies back), so there is
+//    nothing to invalidate after a fence. For GPUs whose host-visible memory is not IO-coherent and whose mode 2 is unavailable or
+//    fails its self-test (PowerVR BXM-8-256 1.15: AHB views not coherent, DC CVAC/CIVAC self-test passes). Only views with an fd of
+//    our own mapped MAP_FIXED (fd / vkexport / dmaheap): the tracker must be able to mprotect them (2.58: a moved vkalloc view refused).
+enum XbgZcMode{XBG_ZC_OFF=0,XBG_ZC_CACHED=1,XBG_ZC_UNCACHED=2,XBG_ZC_MAINT=3};
+inline const char *xbg_zc_mode_name(int m){return m==XBG_ZC_CACHED?"cached":m==XBG_ZC_UNCACHED?"uncached":m==XBG_ZC_MAINT?"maint":"off";}
 inline bool xbg_mem_cached_coherent(const VkPhysicalDeviceMemoryProperties &m){
     const VkMemoryPropertyFlags want=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT|VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     for(uint32_t t=0;t<m.memoryTypeCount && t<VK_MAX_MEMORY_TYPES;t++)if((m.memoryTypes[t].propertyFlags&want)==want)return true;
@@ -204,23 +213,45 @@ inline int xbg_zero_copy_auto(XbgGpuFamily f,bool cached_coherent){
 // DM_GFX_ZEROCOPY text -> mode; -1 = unset / "auto" (xbg_zero_copy_auto decides).
 inline int xbg_zero_copy_parse(const char *e){
     if(!e || !*e || !strcmp(e,"auto"))return -1;
-    const int v=atoi(e);return v<=0?XBG_ZC_OFF:v==1?XBG_ZC_CACHED:XBG_ZC_UNCACHED;}
+    const int v=atoi(e);return v<=0?XBG_ZC_OFF:v==1?XBG_ZC_CACHED:v==2?XBG_ZC_UNCACHED:XBG_ZC_MAINT;}
+// [zc3mode] auto on Mali / PowerVR without a cached-coherent type: mode 2 first (as before); when none of its views passes the
+// self-test (or none can be made), mode 3 if one of its views passes the self-test with DC maintenance; else off. Forced modes
+// (DM_GFX_ZEROCOPY=1/2/3) never fall back to another mode. Adreno and every cached-coherent device: unchanged (mode 1).
+inline bool xbg_zc_try_maint(XbgGpuFamily f,bool forced,int mode,bool mode_passed){
+    return !forced && !mode_passed && mode==XBG_ZC_UNCACHED && (f==XBG_GPU_MALI || f==XBG_GPU_POWERVR);}
+// The CPU views a mode may use (ZcMap numbering of xbg_game.cpp: 0 fd, 1 vkmap, 2 vkalloc, 3 dmaheap, 4 vkexport). Mode 3 only views
+// with our own fd mapped MAP_FIXED, which the dirty tracker can mprotect (BUGS_AND_FIXES 2.58: a moved vkalloc view refused it).
+inline bool xbg_zc_view_allowed(int mode,int view){return mode!=XBG_ZC_MAINT || view==0 || view==3 || view==4;}
 // May a pool with these NVN flags (CPU_NO_ACCESS 1, CPU_UNCACHED 2, CPU_CACHED 4; -1 unknown) live on zero-copy pages in this mode?
+// [zc3mode] maint: every pool (cached CPU pages, the tracker sees every CPU write whatever the pool's NVN class).
 inline bool xbg_zc_pool_eligible(int mode,int nvn_flags){
-    if(mode==XBG_ZC_CACHED)return true;
+    if(mode==XBG_ZC_CACHED || mode==XBG_ZC_MAINT)return true;
     if(mode!=XBG_ZC_UNCACHED || nvn_flags<0 || (nvn_flags&4))return false;
     return (nvn_flags&3)!=0;}
 // The memory type an AHB import takes: cached mode the lowest allowed (the old pick: bit-identical on Adreno); uncached mode the lowest
 // allowed HOST_COHERENT type without HOST_CACHED, then any allowed HOST_COHERENT one, then the lowest allowed. 32 when none is allowed.
 inline uint32_t xbg_zc_pick_type(uint32_t allowed,const VkPhysicalDeviceMemoryProperties &m,int mode){
-    uint32_t lowest=32,coherent=32,coherent_uc=32;
+    uint32_t lowest=32,coherent=32,coherent_uc=32,cached=32;
     for(uint32_t t=0;t<32;t++){if(!(allowed>>t&1))continue;if(lowest==32)lowest=t;
-        if(mode!=XBG_ZC_UNCACHED || t>=m.memoryTypeCount)continue;
+        if((mode!=XBG_ZC_UNCACHED && mode!=XBG_ZC_MAINT) || t>=m.memoryTypeCount)continue;
         const VkMemoryPropertyFlags f=m.memoryTypes[t].propertyFlags;
         if((f&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && coherent==32)coherent=t;
-        if((f&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && !(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && coherent_uc==32)coherent_uc=t;}
+        if((f&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) && !(f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && coherent_uc==32)coherent_uc=t;
+        if((f&VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && cached==32)cached=t;}
     if(mode==XBG_ZC_UNCACHED){if(coherent_uc<32)return coherent_uc;if(coherent<32)return coherent;}
+    if(mode==XBG_ZC_MAINT && cached<32)return cached;   // [zc3mode] the lowest allowed HOST_CACHED type (0xb on Mali / PowerVR)
     return lowest;}
+// [zc3mode] Runs of set bits in a page bitmap (bit i = page i, np pages): fn(first_page, page_count) once per maximal run, in order.
+// Returns the pages covered. The mode-3 clean turns the tracker's "written since" bitmap into a few DC CVAC loops this way.
+template<class F> inline size_t xbg_zc3_runs(const uint64_t *bits,size_t np,F fn){
+    size_t total=0;
+    for(size_t i=0;i<np;){
+        const uint64_t w=bits[i>>6]>>(i&63);
+        if(!w){i=(i|63)+1;continue;}
+        i+=size_t(__builtin_ctzll(w));if(i>=np)break;
+        size_t e=i;while(e<np && (bits[e>>6]>>(e&63)&1)){if(!(e&63) && bits[e>>6]==~0ull && e+64<=np){e+=64;continue;}++e;}
+        fn(i,e-i);total+=e-i;i=e;}
+    return total;}
 // Self-test words: round r, word i of the half the CPU writes; the GPU fills the other half with xbg_zc_fill_word(r).
 inline uint32_t xbg_zc_test_word(uint32_t r,uint32_t i){uint32_t x=i*0x9E3779B1u^(r+1)*0x85EBCA77u;x^=x>>15;x*=0x2C1B3C6Du;x^=x>>12;return x;}
 inline uint32_t xbg_zc_fill_word(uint32_t r){return 0xA5000000u|((r+1)*0x010203u&0xFFFFFFu);}

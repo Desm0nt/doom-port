@@ -194,6 +194,27 @@ static void settings_loaded(int last[GS_N]) {
     atomic_store(&g_ready, 1);
 }
 
+// [issue #42] Game Options "Glory Kill Highlight" (#str_gameoptions_glory_kill_highlight, idGameSettings GAME_FIELD_GK_HIGHLIGHT):
+// cvar g_setting_gk_highlight (GOT 0x48d9ef8, registered at main+0x1f2690c, default "1", "show or hide the GK highlight"). The value
+// is kept per save slot in the profile (saveData_N.GAME_FIELD_GK_HIGHLIGHT). Before v0.4.21 a port-made profile was never written
+// (2.40), so every start had the defaults; since then the profile keeps whatever the slot holds. Log-only: the value at each profile
+// load and every change (slot load, game menu), so a "staggered demons do not flash" report shows whether the setting is off.
+enum { GOT_GK_HIGHLIGHT = 0x48d9ef8 };
+static int gk_highlight(void) {
+    static uint8_t *cv;
+    if (!cv) { if (!find_main() || g_size <= GOT_GK_HIGHLIGHT + 8) return -1; cv = cvar_at(GOT_GK_HIGHLIGHT, "g_setting_gk_highlight"); }
+    return cv ? cvar_value(cv, 1) != 0 : -1;
+}
+static void gk_watch(int loaded) {
+    static int last = -2, nlog; static unsigned n;
+    if (!loaded && (n++ % 15)) return;
+    int v = gk_highlight();
+    if (v == last && !loaded) return;
+    if (nlog++ < 32) LOG("[gk] Glory Kill Highlight (Game Options, g_setting_gk_highlight) %d%s%s", v, loaded ? " at profile load" : "",
+                         v == 0 ? ": OFF, staggered demons do not flash (the slot's setting in the profile)" : "");
+    last = v;
+}
+
 // hle_doom_drs.c drs_frame_obs (idCommonLocal::Frame entry, the game's main thread). player = the profile has loaded and is idle, so a
 // change now is the player's (the game menu); loaded = a profile load finished a few frames ago.
 void doom_settings_frame(int player, int loaded) {
@@ -201,6 +222,7 @@ void doom_settings_frame(int player, int loaded) {
     if (!find_main()) return;
     frames++;
     if (loaded) settings_loaded(last);
+    gk_watch(loaded);
     if (!atomic_load(&g_ready)) return;
     for (int k = 0; k < GS_N; k++) {
         int v = atomic_exchange(&g_pending[k], -1);

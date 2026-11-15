@@ -75,7 +75,39 @@ SKF("_ZN2nn6socket7ConnectEiPKNS0_8SockAddrEj", h_sk_Connect, int s, const void 
 SKF("_ZN2nn6socket6ListenEii", h_sk_Listen, int s, int n) { (void)s; (void)n; return sk_fail(); }
 SKF("_ZN2nn6socket6AcceptEiPNS0_8SockAddrEPj", h_sk_Accept, int s, void *a, unsigned *n) { (void)s; (void)a; (void)n; return sk_fail(); }
 #ifdef DM_GAME_DOOM
-HLE_FORCE("_ZN2nn6socket5CloseEi", "bsd close -> host close", int, h_sk_Close, int s) { int r = close(s); if (r < 0) t_skerr = errno; return r; }
+// [DOOM] 2.62 (issue #52): socket descriptors are their own namespace on Horizon (the bsd service's table), apart from nn::fs file handles and
+// from the host's stdin / stdout / stderr. Here a guest socket is a host fd, so the host keeps the set of descriptors it handed out (Socket /
+// Accept) and Close only closes a member of it; anything else gets EBADF, as a descriptor the bsd service does not know. DOOM needs it: its
+// NET_IPSocket (main+0xa74f0) returns 0, not -1, when socket / setsockopt / bind fails (bind of UDP port 27016 on a phone where that port is
+// taken), idUDP::InitForPort (main+0xa7d90) only treats a negative value as a failure and stores the 0, and idUDP::Close (main+0xa7d00) then
+// calls nn::socket::Close(0): on the host that closed fd 0, the next socket / file got descriptor 0, and nn::fs handle 0 is the host's null
+// handle (GetFileSize -> failure -> the game's FatalError "Couldn't get file size!", main+0x1101ac right after the intro videos).
+// A new socket never lands on 0..2 either (dm_fd_above_std). DM_FD_GUARD=0 turns both off (the old behaviour).
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+int dm_fd_guard(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_FD_GUARD"); on = !e || atoi(e) != 0; } return on; }
+// A descriptor the kernel placed on 0..2 (a std slot something closed) moves to 3 or above and the slot is plugged with /dev/null, so that a
+// guest handle is never 0 and a later open cannot land there again. Returns the descriptor to use.
+int dm_fd_above_std(int fd, const char *what) {
+    if (fd < 0 || fd > 2 || !dm_fd_guard()) return fd;
+    int n = fcntl(fd, F_DUPFD, 3);
+    if (n < 0) { LOG("[fd] %s got host descriptor %d (a closed std slot), moving it failed: errno %d", what, fd, errno); return fd; }
+    int z = open("/dev/null", O_RDWR);
+    if (z >= 0) { dup2(z, fd); if (z != fd) close(z); } else close(fd);
+    LOG("[fd] %s got host descriptor %d (a closed std slot): moved to %d, slot %d plugged with /dev/null", what, fd, n, fd);
+    return n;
+}
+#define SK_FDS 4096
+static _Atomic unsigned char g_skfd[SK_FDS];   // 1 = a socket the host handed to the game
+static int sk_own(int fd) { fd = dm_fd_above_std(fd, "socket"); if (fd >= 0 && fd < SK_FDS) atomic_store(&g_skfd[fd], 1); return fd; }
+HLE_FORCE("_ZN2nn6socket5CloseEi", "bsd close -> host close (only a descriptor Socket / Accept returned)", int, h_sk_Close, int s) {
+    if (dm_fd_guard() && (s < 0 || s >= SK_FDS || !atomic_exchange(&g_skfd[s], 0))) {
+        static _Atomic int said; if (atomic_fetch_add(&said, 1) < 8) LOG("[net] Close(%d): not a socket of the game -> EBADF (the host descriptor is left alone)", s);
+        t_skerr = 9; return -1;   // EBADF
+    }
+    int r = close(s); if (r < 0) t_skerr = errno; return r;
+}
 #else
 SKF("_ZN2nn6socket5CloseEi", h_sk_Close, int s) { (void)s; return sk_fail(); }
 #endif
@@ -212,9 +244,14 @@ static int msg_flags(int f) { int r = f & 3; if (f & 0x80) r |= MSG_DONTWAIT; if
 SKD("_ZN2nn6socket6SocketEiii", h_d_sk_Socket, int a, int b, int c) {
     int t = b & 0x0fffffff;                                   // FreeBSD type flags: SOCK_NONBLOCK 0x20000000, SOCK_CLOEXEC 0x10000000
     if (b & 0x20000000) t |= SOCK_NONBLOCK; if (b & 0x10000000) t |= SOCK_CLOEXEC;
-    int fd = sk_ret(socket(a, t, c)); LOG("[net] socket(%d, %#x, %d) -> %d", a, b, c, fd); return fd;
+    int fd = sk_own(sk_ret(socket(a, t, c))); LOG("[net] socket(%d, %#x, %d) -> %d", a, b, c, fd); return fd;
 }
-SKD("_ZN2nn6socket4BindEiPK8sockaddrj", h_d_sk_Bind, int s, const uint8_t *a, unsigned l) { struct sockaddr_storage ss; socklen_t n = sa_in(a, l, &ss); return sk_ret(bind(s, (struct sockaddr *)&ss, n)); }
+SKD("_ZN2nn6socket4BindEiPK8sockaddrj", h_d_sk_Bind, int s, const uint8_t *a, unsigned l) {
+    struct sockaddr_storage ss; socklen_t n = sa_in(a, l, &ss); int r = sk_ret(bind(s, (struct sockaddr *)&ss, n));
+    if (r < 0) { int e = errno; static _Atomic int said;   // DOOM answers a failed bind with socket "0" (see h_sk_Close): keep the cause in the log
+        if (atomic_fetch_add(&said, 1) < 8) LOG("[net] bind(%d, port %d) failed: errno %d (%s)", s, ss.ss_family == AF_INET ? ntohs(((struct sockaddr_in *)&ss)->sin_port) : -1, e, strerror(e)); }
+    return r;
+}
 // Offline build: only loopback traffic may leave a socket (lobby / voice / HTTP all stay local, like D2R's offline port).
 static int sa_offline(const struct sockaddr_storage *ss) {
     if (ss->ss_family == AF_INET) return (ntohl(((const struct sockaddr_in *)ss)->sin_addr.s_addr) >> 24) != 127;
@@ -226,7 +263,7 @@ SKD("_ZN2nn6socket7ConnectEiPK8sockaddrj", h_d_sk_Connect, int s, const uint8_t 
     return sk_ret(connect(s, (struct sockaddr *)&ss, n));
 }
 SKD("_ZN2nn6socket6AcceptEiP8sockaddrPj", h_d_sk_Accept, int s, uint8_t *a, unsigned *l) {
-    struct sockaddr_storage ss; socklen_t n = sizeof ss; int r = sk_ret(accept(s, (struct sockaddr *)&ss, &n)); if (r >= 0) sa_out(&ss, n, a, l); return r;
+    struct sockaddr_storage ss; socklen_t n = sizeof ss; int r = sk_own(sk_ret(accept(s, (struct sockaddr *)&ss, &n))); if (r >= 0) sa_out(&ss, n, a, l); return r;
 }
 HLE_FORCE("_ZN2nn6socket4RecvEiPvmi", "bsd recv -> host", long, h_d_sk_Recv, int s, void *b, unsigned long n, int f) { long r = recv(s, b, n, msg_flags(f)); if (r < 0) { sk_ret(r); return -1; } return r; }
 HLE_FORCE("_ZN2nn6socket8RecvFromEiPvmiP8sockaddrPj", "bsd recvfrom -> host", long, h_d_sk_RecvFrom, int s, void *b, unsigned long n, int f, uint8_t *a, unsigned *l) {

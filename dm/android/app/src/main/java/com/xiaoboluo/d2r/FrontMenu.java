@@ -43,6 +43,9 @@ final class FrontMenu implements PauseMenu.Listener {
         void immersive();
         default boolean updates() { return false; }   // the port has an update check (UpdateNotice): the "Check for updates" row
         default void checkUpdates() { }
+        default String[] portRows() { return null; }   // extra port rows after "Game settings…" (e.g. TL2 "Mods…"), labels already translated
+        default void portRow(int i) { }                // one of them picked (the game stays held, as for gameSettings)
+        default int portRowColor(int i) { return 0; }  // its text colour (ARGB), 0 = white like the rest (DOOM: the red "BC textures" test row)
     }
     static final int MODE_NONE = 0, MODE_OPMODE = 1, MODE_LIGHT = 2;   // OPMODE: Switch dock / handheld (dm_set_opmode); LIGHT: DOOM's handheld quality preset
     interface Saves { String export(); String[] list(); String requestImport(String name); String where(); }
@@ -58,6 +61,7 @@ final class FrontMenu implements PauseMenu.Listener {
     private final Activity act; private final Host host; private final Pad pad; private final PauseMenu menu;
     private boolean open, dialog;
     private int[] ids = new int[0];
+    static final int R_PORT = 100;   // R_PORT + i: the port's own row i (Host.portRows)
     static final int R_RESUME = 0, R_SETTINGS = 1, R_PAD = 2, R_EDIT = 3, R_MODE = 4, R_EXPORT = 5, R_IMPORT = 6, R_QUIT = 7, R_UPDATES = 8;
 
     FrontMenu(Activity a, Host h, Pad p, FrameLayout frame) {
@@ -69,15 +73,22 @@ final class FrontMenu implements PauseMenu.Listener {
     private String t(String ru, String en) { return Ui.t(act, ru, en); }
 
     private void rebuild() {
-        int[] all = {R_RESUME, R_SETTINGS, R_PAD, R_EDIT, R_MODE, R_EXPORT, R_IMPORT, R_UPDATES, R_QUIT};
+        String[] port = host.portRows(); int np = port == null ? 0 : port.length;
+        int[] all = new int[9 + np]; int k = 0; all[k++] = R_RESUME; all[k++] = R_SETTINGS;
+        for (int i = 0; i < np; i++) all[k++] = R_PORT + i;
+        for (int r : new int[]{R_PAD, R_EDIT, R_MODE, R_EXPORT, R_IMPORT, R_UPDATES, R_QUIT}) all[k++] = r;
         int n = 0; int[] use = new int[all.length];
         for (int r : all) { if (r == R_MODE && host.modeKind() == MODE_NONE) continue; if ((r == R_EXPORT || r == R_IMPORT) && host.saves() == null) continue; if (r == R_EDIT && pad == null) continue; if (r == R_UPDATES && !host.updates()) continue; use[n++] = r; }
         ids = java.util.Arrays.copyOf(use, n);
         String[] labels = new String[n]; int danger = -1;
-        for (int i = 0; i < n; i++) { labels[i] = label(ids[i]); if (ids[i] == R_QUIT) danger = i; }
+        int[] colors = null;
+        for (int i = 0; i < n; i++) { labels[i] = label(ids[i]); if (ids[i] == R_QUIT) danger = i;
+            if (ids[i] >= R_PORT) { int c = host.portRowColor(ids[i] - R_PORT); if (c != 0) { if (colors == null) colors = new int[n]; colors[i] = c; } } }
         menu.setRows(t("Пауза", "Paused"), host.gameName(), labels, danger);
+        if (colors != null) menu.setColors(colors);
     }
     private String label(int r) {
+        if (r >= R_PORT) { String[] port = host.portRows(); return port != null && r - R_PORT < port.length ? port[r - R_PORT] : "?"; }
         switch (r) {
             case R_RESUME: return t("Продолжить", "Resume");
             case R_SETTINGS: return t("Настройки игры…", "Game settings…");
@@ -110,6 +121,7 @@ final class FrontMenu implements PauseMenu.Listener {
     @Override public void onResume() { close(); }
     @Override public void onPick(int row) {
         int r = row >= 0 && row < ids.length ? ids[row] : R_RESUME;
+        if (r >= R_PORT) { host.portRow(r - R_PORT); return; }
         switch (r) {
             case R_RESUME: close(); break;
             case R_SETTINGS: host.gameSettings(); break;
@@ -130,6 +142,10 @@ final class FrontMenu implements PauseMenu.Listener {
                     .setPositiveButton(t("Выйти", "Quit"), (d, w) -> host.quit()).setNegativeButton(t("Отмена", "Cancel"), null).create());
                 break;
         }
+    }
+    // a port row's question over the menu (Host.portRow): yes runs the action, anything else leaves the menu as it was
+    void confirm(String message, String yes, Runnable onYes) {
+        dialog(new AlertDialog.Builder(act).setMessage(message).setPositiveButton(yes, (d, w) -> onYes.run()).setNegativeButton(t("Отмена", "Cancel"), null).create());
     }
     // a dialog over the menu: the game stays held until both are gone
     private void dialog(AlertDialog d) {

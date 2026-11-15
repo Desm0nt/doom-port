@@ -8,12 +8,14 @@ import java.io.File;
 // [DOOM] Restart of the app in a new process (BUGS_AND_FIXES 2.28): a game folder chosen after nativeStart already ran (and failed)
 // needs a fresh process, because the native side keeps its first DM_ROMFS / runtime / log paths. This activity runs in its own process
 // (":restart", AndroidManifest.xml), ends the game's process (pid in the intent), waits until it is gone, starts DmActivity in a new task
-// and ends itself. Only used while the game is not running (a start error screen), so no save can be cut off.
+// and ends itself. Used while the game is not running (a start error screen), so no save can be cut off; and from the pause menu's "BC textures" row
+// (DmActivity.restartRunning, issue 45) with "grace" ms: the game's own graceful exit (nativeQuit) gets that long before the process is ended here.
 public class DmRestart extends Activity {
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
         int pid = getIntent().getIntExtra("pid", 0);
         if (pid > 0 && pid != android.os.Process.myPid()) {
+            for (int i = getIntent().getIntExtra("grace", 0) / 20; i > 0 && new File("/proc/" + pid).exists(); i--) android.os.SystemClock.sleep(20);
             android.os.Process.killProcess(pid);
             for (int i = 0; i < 100 && new File("/proc/" + pid).exists(); i++) android.os.SystemClock.sleep(20);
         }
