@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">Счётчик FPS и времени кадра</string>
     <string name="gear_res">Разрешение 3D (интерфейс остаётся 720p)</string>
     <string name="gear_sharpen">Резкость (FSR RCAS)</string>
-    <string name="gear_upscale">Масштабировать до разрешения экрана (GSR): чётче края, чуть больше нагрузка на GPU</string>
+    <string name="gear_upscale">Масштабировать до разрешения экрана (FSR): чётче края, чуть больше нагрузка на GPU</string>
+    <string name="gear_upscaler">Апскейл до разрешения экрана</string>
+    <string name="gear_upscaler_fsr">FSR 1: чётче края, чуть больше нагрузка на GPU</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2 (экспериментально): временной, вместо сглаживания игры</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2 при 3D 75% (экспериментально): быстрее</string>
+    <string name="gear_upscaler_note">SGSR 2 собирает картинку из нескольких кадров. В меню и роликах работает FSR 1.</string>
     <string name="gear_off">Выкл</string>
     <string name="gear_low">Слабая</string>
     <string name="gear_medium">Средняя</string>

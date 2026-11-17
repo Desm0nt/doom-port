@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">FPS とフレーム時間の表示</string>
     <string name="gear_res">3D 解像度（UI は 720p のまま）</string>
     <string name="gear_sharpen">シャープネス（FSR RCAS）</string>
-    <string name="gear_upscale">画面解像度にアップスケール（GSR）：輪郭がくっきり、GPU負荷はやや増加</string>
+    <string name="gear_upscale">画面解像度にアップスケール（FSR）：輪郭がくっきり、GPU負荷はやや増加</string>
+    <string name="gear_upscaler">画面解像度へアップスケール</string>
+    <string name="gear_upscaler_fsr">FSR 1：輪郭がシャープに、GPU 負荷がやや増加</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2（実験的）：テンポラル方式、ゲームのアンチエイリアスを置き換え</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2、3D 75%（実験的）：より高速</string>
+    <string name="gear_upscaler_note">SGSR 2 は複数フレームから画像を作ります。メニューと動画では FSR 1 を使います。</string>
     <string name="gear_off">オフ</string>
     <string name="gear_low">弱</string>
     <string name="gear_medium">中</string>

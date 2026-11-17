@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">帧率和帧时间显示</string>
     <string name="gear_res">3D 分辨率（界面保持 720p）</string>
     <string name="gear_sharpen">锐化（FSR RCAS）</string>
-    <string name="gear_upscale">放大到屏幕分辨率（GSR）：边缘更清晰，GPU 负载略增</string>
+    <string name="gear_upscale">放大到屏幕分辨率（FSR）：边缘更清晰，GPU 负载略增</string>
+    <string name="gear_upscaler">放大到屏幕分辨率</string>
+    <string name="gear_upscaler_fsr">FSR 1：边缘更清晰，GPU 负载略增</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2（实验性）：时域放大，取代游戏自带的抗锯齿</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2，3D 为 75%（实验性）：更快</string>
+    <string name="gear_upscaler_note">SGSR 2 用多帧合成画面。菜单和视频中使用 FSR 1。</string>
     <string name="gear_off">关</string>
     <string name="gear_low">弱</string>
     <string name="gear_medium">中</string>

@@ -5,6 +5,7 @@
 //                          the UI stays at full resolution. 0.75 = 960x540 at 16:9. [r6] Works with dynamic resolution off only with
 //                          the CUT at main+0x1c26ec4 (before it the rs_enable 0 exit skipped the fraction); 1.0 adds nothing (a forced
 //                          1.0 overrode DRS); while DRS is on hle_doom_drs.c sets the fraction to 0 so DRS decides (BUGS_AND_FIXES 2.18).
+//   DM_GFX_TU_INPUT=reduced  [2.74] with DM_GFX_TU=sgsr2: the fraction is at most 75 % (DM_GFX_TU_FRACTION), see build().
 //   DM_DOOM_LIGHT=1, DM_DOOM_DRS_FPS=30|45|60, DM_DOOM_DRS_GPU=0  light mode / DRS target / DRS on the game's own GPU timer
 //                          (hle_doom_drs.c, read by doom_drs_init below).
 //   DM_DOOM_WIDE=1|0|<w>   widescreen Hor+ output W x 720 (default off; 1 = screen aspect; see doom_wide below).
@@ -223,6 +224,21 @@ static int doom_drs_default_off(void) {
 static void build(void) {
     if (g_argc >= 0) return;
     g_argc = 0; add("doom");
+    // [2.74] DM_GFX_TU=sgsr2 with DM_GFX_TU_INPUT=reduced (the gear's "SGSR 2, reduced 3D resolution"): the temporal upscaler brings the
+    // picture to the screen size, so the game renders the 3D view at 75 % (DM_GFX_TU_FRACTION=<0.5..1> for tests), or at the gear's own
+    // 3D resolution when that is lower still. It is DM_DOOM_RES itself that is set, before doom_drs_init reads it: one mechanism
+    // (rs_forceFractionX / Y), one rule -- with the game's dynamic resolution on, hle_doom_drs.c clears the forced fraction and DRS
+    // decides (the upscaler follows the size of each frame).
+    {
+        const char *tu = getenv("DM_GFX_TU"), *in = getenv("DM_GFX_TU_INPUT"), *have_e = getenv("DM_DOOM_RES");
+        if (tu && (!strcmp(tu, "sgsr2") || !strcmp(tu, "1")) && in && !strcmp(in, "reduced")) {
+            const char *fe = getenv("DM_GFX_TU_FRACTION");
+            double want = fe && *fe ? atof(fe) : 0.75, have = have_e && *have_e ? atof(have_e) : 1.0;
+            if (!(want >= 0.5 && want <= 1.0)) want = 0.75;
+            if (!(have >= 0.25 && have < want)) { char v[32]; snprintf(v, sizeof v, "%.3f", want); setenv("DM_DOOM_RES", v, 1); }
+            LOG("[tu] DM_GFX_TU_INPUT=reduced: 3D render fraction %s (DM_DOOM_RES)", getenv("DM_DOOM_RES"));
+        }
+    }
     doom_drs_init();     // live rs_enable bridge for the gear checkbox (hle_doom_drs.c)
     doom_wide();         // r_mode table (DM_DOOM_WIDE)
     doom_pools_args();   // +set nvn_VRAM*HeapSizeMB (DM_DOOM_POOL_MARGIN, and the wide RenderTarget minimum)

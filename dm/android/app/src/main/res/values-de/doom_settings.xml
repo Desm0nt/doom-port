@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">FPS- und Frametime-Anzeige</string>
     <string name="gear_res">3D-Auflösung (die Oberfläche bleibt bei 720p)</string>
     <string name="gear_sharpen">Schärfe (FSR RCAS)</string>
-    <string name="gear_upscale">Auf Bildschirmauflösung hochskalieren (GSR): schärfere Kanten, etwas mehr GPU-Last</string>
+    <string name="gear_upscale">Auf Bildschirmauflösung hochskalieren (FSR): schärfere Kanten, etwas mehr GPU-Last</string>
+    <string name="gear_upscaler">Auf Bildschirmauflösung hochskalieren</string>
+    <string name="gear_upscaler_fsr">FSR 1: schärfere Kanten, etwas mehr GPU-Last</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2 (experimentell): temporal, ersetzt die Kantenglättung des Spiels</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2 mit 3D bei 75 % (experimentell): schneller</string>
+    <string name="gear_upscaler_note">SGSR 2 setzt das Bild aus mehreren Frames zusammen. In Menüs und Videos wird FSR 1 verwendet.</string>
     <string name="gear_off">Aus</string>
     <string name="gear_low">Schwach</string>
     <string name="gear_medium">Mittel</string>

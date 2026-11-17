@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">FPS and frame time counter</string>
     <string name="gear_res">3D resolution (the interface stays at 720p)</string>
     <string name="gear_sharpen">Sharpening (FSR RCAS)</string>
-    <string name="gear_upscale">Upscale to screen resolution (GSR): sharper edges, a bit more GPU load</string>
+    <string name="gear_upscale">Upscale to screen resolution (FSR): sharper edges, a bit more GPU load</string>
+    <string name="gear_upscaler">Upscale to screen resolution</string>
+    <string name="gear_upscaler_fsr">FSR 1: sharper edges, a bit more GPU load</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2 (experimental): temporal, replaces the game\'s anti-aliasing</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2 with 3D at 75% (experimental): faster</string>
+    <string name="gear_upscaler_note">SGSR 2 builds the picture from several frames. In menus and videos FSR 1 is used.</string>
     <string name="gear_off">Off</string>
     <string name="gear_low">Low</string>
     <string name="gear_medium">Medium</string>

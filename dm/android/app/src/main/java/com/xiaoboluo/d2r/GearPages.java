@@ -16,7 +16,7 @@ import java.util.ArrayList;
 //   fpsLimit       frame rate limit 30 / 60 / 90 / 120 (GearDisplay; DM_PRESENT_MAX_HZ, + mirrors like DOOM's DM_DOOM_TICK_MAX)   next launch
 //   renderScale    3D resolution as a fraction (pref "res"; DOOM / Eternal: DM_DOOM_RES)                                          next launch
 //   sharpen        FSR RCAS sharpening (DM_GFX_SHARPEN, vulkan_present.cpp)                                                       next launch
-//   upscale        GSR upscale to the screen (DM_GFX_UPSCALE=gsr; only DOOM 2016's vulkan_present.cpp has it so far)              next launch
+//   upscale        FSR 1 upscale to the screen (DM_GFX_UPSCALE=fsr; only DOOM 2016's vulkan_present.cpp has it so far)              next launch
 //   driver         Vulkan driver list + what runs now + "Manage drivers…" (VkDrivers, DriverManager; DM_VK_DRIVER)                 next launch
 //   safeMode       [safe-mode] safe graphics mode off / auto / on on Mali / PowerVR (pref "safe_mode", DM_SAFE_MODE; SafeMode.java)  next launch
 //   gameLanguage   the game's language (DM_LANG -> hle_oe.c GetDesiredLanguage); the codes / names are the game's                  next launch
@@ -98,14 +98,14 @@ final class GearPages {
             }
         };
     }
-    // ---- upscale to the screen resolution (vulkan_present.cpp DM_GFX_UPSCALE): the swapchain at the window size + a GSR pass; off by default
+    // ---- upscale to the screen resolution (vulkan_present.cpp DM_GFX_UPSCALE): the swapchain at the window size + an FSR 1 EASU pass (+ RCAS with sharpening); off by default
     static GearSettings.Section upscale() {
         return new GearSettings.Section() {
             CheckBox c;
             public void build(GearSettings s, LinearLayout box) { c = s.check(box, s.whenKey("gear_upscale", false), s.gamePrefs().getBoolean("upscale", false)); }
             public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) { game.putBoolean("upscale", c.isChecked()); }
             public void env(GearSettings s) throws ErrnoException {
-                if (s.gamePrefs().getBoolean("upscale", false)) Os.setenv("DM_GFX_UPSCALE", "gsr", true); else Os.unsetenv("DM_GFX_UPSCALE");
+                if (s.gamePrefs().getBoolean("upscale", false)) Os.setenv("DM_GFX_UPSCALE", "fsr", true); else Os.unsetenv("DM_GFX_UPSCALE");
             }
         };
     }

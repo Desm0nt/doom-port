@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">Contador de FPS e tempo de quadro</string>
     <string name="gear_res">Resolução 3D (a interface continua em 720p)</string>
     <string name="gear_sharpen">Nitidez (FSR RCAS)</string>
-    <string name="gear_upscale">Ampliar para a resolução da tela (GSR): bordas mais nítidas, um pouco mais de carga na GPU</string>
+    <string name="gear_upscale">Ampliar para a resolução da tela (FSR): bordas mais nítidas, um pouco mais de carga na GPU</string>
+    <string name="gear_upscaler">Ampliar para a resolução da tela</string>
+    <string name="gear_upscaler_fsr">FSR 1: bordas mais nítidas, um pouco mais de carga na GPU</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2 (experimental): temporal, substitui o antisserrilhamento do jogo</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2 com 3D a 75% (experimental): mais rápido</string>
+    <string name="gear_upscaler_note">O SGSR 2 monta a imagem a partir de vários quadros. Em menus e vídeos é usado o FSR 1.</string>
     <string name="gear_off">Desligada</string>
     <string name="gear_low">Baixa</string>
     <string name="gear_medium">Média</string>

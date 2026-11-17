@@ -312,46 +312,54 @@ bool record(VkCommandBuffer cmd,unsigned f,VkImage source,VkFormat format,uint32
     return true;
 }
 }
-// [DOOM] DM_GFX_UPSCALE=gsr (default off; gear "Upscale to screen resolution (GSR)", next launch; docs/SWITCHES.md, BUGS_AND_FIXES 2.19):
-// the swapchain takes the window's own size (e.g. 2400x1080) instead of the game's output size (1600x720), and one fragment pass
-// upscales the game's frame into it with a Snapdragon-GSR-style edge-adaptive filter (shaders/gsr.frag, BSD-3-Clause, docs/THIRD_PARTY.md)
-// instead of the 1:1 blit + the compositor's bilinear. With DM_GFX_SHARPEN the same pass also RCAS-sharpens (no separate RCAS pass).
+// [DOOM] DM_GFX_UPSCALE=fsr (default off; gear "Upscale to screen resolution (FSR)", next launch; docs/SWITCHES.md, BUGS_AND_FIXES 2.19,
+// 2.73): the swapchain takes the window's own size (e.g. 2400x1080) instead of the game's output size (1600x720), and a fragment pass
+// upscales the game's frame into it with AMD FSR 1 EASU (shaders/fsr_easu.frag, MIT, docs/THIRD_PARTY.md) instead of the 1:1 blit +
+// the compositor's bilinear. With DM_GFX_SHARPEN, EASU renders into an image of the window size and a second pass RCAS-sharpens it into
+// the swapchain (shaders/fsr_rcas.frag), the order FSR 1 is made for. The Snapdragon GSR pass of 2.19 is gone (issue #44: worse than
+// FSR); DM_GFX_UPSCALE=gsr from an old dm/env means fsr now.
 // The crop (wide-live crop169, the engine's crop), the letterbox bars (render pass clear), the vertical mirror of
 // DM_GFX_PRESENT_FLIP_FOLD and DM_PRESENT_STRETCH are all in the pass's coordinate mapping (push constants). Two timestamps per present;
-// every ~3 s "NVN present upscale gsr WxH -> WxH gpu_us=..". Only 8-bit / 10-bit UNORM frames; any other format, a frame that is not
+// every ~3 s "NVN present upscale fsr WxH -> WxH gpu_us=..". Only 8-bit / 10-bit UNORM frames; any other format, a frame that is not
 // enlarged, or a setup failure falls back to the old blit (linear filter, since the buffer is the window size). Off: nothing here runs.
 namespace upscale {
 const uint32_t vert_code[]={
 #include "shaders/upscale.vert.spv.inc"
 };
 const uint32_t frag_code[]={
-#include "shaders/gsr.frag.spv.inc"
+#include "shaders/fsr_easu.frag.spv.inc"
 };
-int on=-1;const float edge_sharpness=2.0f;   // SGSR EdgeSharpness
-VkSampler sampler{};VkDescriptorSetLayout set_layout{};VkPipelineLayout layout{};VkDescriptorPool pool{};VkDescriptorSet sets[2]{};VkImageView source_views[2]{};
+const uint32_t rcas_frag_code[]={
+#include "shaders/fsr_rcas.frag.spv.inc"
+};
+int on=-1;
+VkSampler sampler{};VkDescriptorSetLayout set_layout{};VkPipelineLayout layout{};VkDescriptorPool pool{};VkDescriptorSet sets[4]{};VkImageView source_views[2]{};   // sets 0/1: EASU per flight, 2/3: RCAS
 VkFormat target_format=VK_FORMAT_UNDEFINED;VkRenderPass passes[2]{};VkPipeline pipeline{};   // passes[0] load DONT_CARE, [1] load CLEAR (letterbox bars); compatible
+// [2.73] with DM_GFX_SHARPEN: EASU into `mid` (window size, the swapchain's format; mid_passes end in SHADER_READ_ONLY_OPTIMAL), then RCAS
+VkRenderPass mid_passes[2]{};VkPipeline rcas_pipeline{};VkImage mid{};VkDeviceMemory mid_memory{};VkImageView mid_view{};VkFramebuffer mid_fb{};
 std::vector<VkImageView> views;std::vector<VkFramebuffer> framebuffers;VkExtent2D fb_extent{};
 VkQueryPool queries{};bool stamped[2]{};double tick_ns=0;double sum_ns=0,max_ns=0;unsigned timed=0;int64_t window_t0=0;int last_sw=0,last_sh=0,last_dw=0,last_dh=0;
 int64_t mono_ns(){timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return int64_t(ts.tv_sec)*1000000000+ts.tv_nsec;}
 bool enabled(){
-    if(on<0){const char *e=getenv("DM_GFX_UPSCALE");on=e && (!strcmp(e,"gsr") || !strcmp(e,"1"));
-        if(on)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale gsr on (DM_GFX_UPSCALE=%s): swapchain at the window size, Snapdragon GSR-style pass%s",e,rcas::enabled()?" with RCAS in the same pass (DM_GFX_SHARPEN)":"");
-        else if(e && *e && strcmp(e,"0") && strcmp(e,"off"))__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","NVN present upscale: DM_GFX_UPSCALE=%s is not known (gsr | 0): off",e);}
+    if(on<0){const char *e=getenv("DM_GFX_UPSCALE");on=e && (!strcmp(e,"fsr") || !strcmp(e,"1") || !strcmp(e,"gsr"));   // gsr: an old dm/env, now fsr
+        if(on)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale fsr on (DM_GFX_UPSCALE=%s): swapchain at the window size, FSR 1 EASU pass%s",e,rcas::enabled()?" + RCAS pass at the window size (DM_GFX_SHARPEN)":"");
+        else if(e && *e && strcmp(e,"0") && strcmp(e,"off"))__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","NVN present upscale: DM_GFX_UPSCALE=%s is not known (fsr | 0): off",e);}
     return on>0;
 }
 void fail(const char *what,int r){if(on>0)__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","NVN present upscale off: %s failed (VkResult %d); the plain blit from now on",what,r);on=0;}
 // Frames the pass takes: sampled as UNORM and written to the UNORM swapchain (sRGB / float frames keep the blit).
 bool takes(VkFormat f,VkFormatFeatureFlags features){return enabled() && (f==VK_FORMAT_R8G8B8A8_UNORM || f==VK_FORMAT_B8G8R8A8_UNORM || f==VK_FORMAT_A2B10G10R10_UNORM_PACK32) && (features&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);}
-void drop_targets(){for(auto fb:framebuffers)if(fb)vkDestroyFramebuffer(device,fb,nullptr);for(auto v:views)if(v)vkDestroyImageView(device,v,nullptr);framebuffers.clear();views.clear();fb_extent={};}
+void drop_mid(){if(mid_fb)vkDestroyFramebuffer(device,mid_fb,nullptr);if(mid_view)vkDestroyImageView(device,mid_view,nullptr);if(mid)vkDestroyImage(device,mid,nullptr);if(mid_memory)vkFreeMemory(device,mid_memory,nullptr);mid_fb={};mid_view={};mid={};mid_memory={};}
+void drop_targets(){for(auto fb:framebuffers)if(fb)vkDestroyFramebuffer(device,fb,nullptr);for(auto v:views)if(v)vkDestroyImageView(device,v,nullptr);framebuffers.clear();views.clear();fb_extent={};drop_mid();}
 bool setup(){
     if(layout)return true;VkResult r;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};si.magFilter=si.minFilter=VK_FILTER_LINEAR;si.mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST;si.addressModeU=si.addressModeV=si.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     if((r=vkCreateSampler(device,&si,nullptr,&sampler))){fail("sampler",r);return false;}
     VkDescriptorSetLayoutBinding b{};b.binding=0;b.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;b.descriptorCount=1;b.stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT;
     VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};dl.bindingCount=1;dl.pBindings=&b;if((r=vkCreateDescriptorSetLayout(device,&dl,nullptr,&set_layout))){fail("descriptor set layout",r);return false;}
-    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,2};VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dp.maxSets=2;dp.poolSizeCount=1;dp.pPoolSizes=&ps;
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,4};VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};dp.maxSets=4;dp.poolSizeCount=1;dp.pPoolSizes=&ps;
     if((r=vkCreateDescriptorPool(device,&dp,nullptr,&pool))){fail("descriptor pool",r);return false;}
-    VkDescriptorSetLayout ls[2]={set_layout,set_layout};VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};ai.descriptorPool=pool;ai.descriptorSetCount=2;ai.pSetLayouts=ls;
+    VkDescriptorSetLayout ls[4]={set_layout,set_layout,set_layout,set_layout};VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};ai.descriptorPool=pool;ai.descriptorSetCount=4;ai.pSetLayouts=ls;
     if((r=vkAllocateDescriptorSets(device,&ai,sets))){fail("descriptor sets",r);return false;}
     VkPushConstantRange pc{VK_SHADER_STAGE_FRAGMENT_BIT,0,32};VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};pl.setLayoutCount=1;pl.pSetLayouts=&set_layout;pl.pushConstantRangeCount=1;pl.pPushConstantRanges=&pc;
     if((r=vkCreatePipelineLayout(device,&pl,nullptr,&layout))){fail("pipeline layout",r);return false;}
@@ -366,6 +374,17 @@ bool setup(){
 bool make_pipeline(VkFormat format){
     if(pipeline && format==target_format)return true;
     if(pipeline)vkDestroyPipeline(device,pipeline,nullptr);pipeline={};for(auto &p:passes){if(p)vkDestroyRenderPass(device,p,nullptr);p={};}target_format=VK_FORMAT_UNDEFINED;VkResult r;
+    if(rcas_pipeline)vkDestroyPipeline(device,rcas_pipeline,nullptr);rcas_pipeline={};for(auto &p:mid_passes){if(p)vkDestroyRenderPass(device,p,nullptr);p={};}
+    // [2.73] the EASU target of the RCAS variant: same format, ends sampled; the next frame's EASU waits for this frame's RCAS reads
+    for(int k=0;k<2 && rcas::enabled();k++){
+        VkAttachmentDescription a{};a.format=format;a.samples=VK_SAMPLE_COUNT_1_BIT;a.loadOp=k?VK_ATTACHMENT_LOAD_OP_CLEAR:VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+        a.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;a.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;a.finalLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkAttachmentReference ref{0,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};VkSubpassDescription sp{};sp.pipelineBindPoint=VK_PIPELINE_BIND_POINT_GRAPHICS;sp.colorAttachmentCount=1;sp.pColorAttachments=&ref;
+        VkSubpassDependency d[2]{};d[0].srcSubpass=VK_SUBPASS_EXTERNAL;d[0].dstSubpass=0;d[0].srcStageMask=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT|VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;d[0].dstStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;d[0].dstAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        d[1].srcSubpass=0;d[1].dstSubpass=VK_SUBPASS_EXTERNAL;d[1].srcStageMask=VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;d[1].dstStageMask=VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;d[1].srcAccessMask=VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;d[1].dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        VkRenderPassCreateInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};rp.attachmentCount=1;rp.pAttachments=&a;rp.subpassCount=1;rp.pSubpasses=&sp;rp.dependencyCount=2;rp.pDependencies=d;
+        if((r=vkCreateRenderPass(device,&rp,nullptr,&mid_passes[k]))){mid_passes[k]={};fail("RCAS target render pass",r);return false;}
+    }
     for(int k=0;k<2;k++){
         VkAttachmentDescription a{};a.format=format;a.samples=VK_SAMPLE_COUNT_1_BIT;a.loadOp=k?VK_ATTACHMENT_LOAD_OP_CLEAR:VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
         a.stencilLoadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE;a.stencilStoreOp=VK_ATTACHMENT_STORE_OP_DONT_CARE;a.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;a.finalLayout=VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
@@ -378,7 +397,7 @@ bool make_pipeline(VkFormat format){
     }
     VkShaderModule m[2]{};VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize=sizeof vert_code;mi.pCode=vert_code;if((r=vkCreateShaderModule(device,&mi,nullptr,&m[0]))){fail("vertex shader",r);return false;}
-    mi.codeSize=sizeof frag_code;mi.pCode=frag_code;if((r=vkCreateShaderModule(device,&mi,nullptr,&m[1]))){vkDestroyShaderModule(device,m[0],nullptr);fail("GSR shader",r);return false;}
+    mi.codeSize=sizeof frag_code;mi.pCode=frag_code;if((r=vkCreateShaderModule(device,&mi,nullptr,&m[1]))){vkDestroyShaderModule(device,m[0],nullptr);fail("EASU shader",r);return false;}
     VkPipelineShaderStageCreateInfo st[2]{};for(int k=0;k<2;k++){st[k].sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;st[k].stage=k?VK_SHADER_STAGE_FRAGMENT_BIT:VK_SHADER_STAGE_VERTEX_BIT;st[k].module=m[k];st[k].pName="main";}
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};ia.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -390,8 +409,14 @@ bool make_pipeline(VkFormat format){
     VkDynamicState dyn[2]={VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};VkPipelineDynamicStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};ds.dynamicStateCount=2;ds.pDynamicStates=dyn;
     VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};gp.stageCount=2;gp.pStages=st;gp.pVertexInputState=&vi;gp.pInputAssemblyState=&ia;gp.pViewportState=&vp;gp.pRasterizationState=&rs;
     gp.pMultisampleState=&ms;gp.pColorBlendState=&cb;gp.pDynamicState=&ds;gp.layout=layout;gp.renderPass=passes[0];gp.subpass=0;
-    {DrvcLock compile;r=vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&pipeline);}vkDestroyShaderModule(device,m[0],nullptr);vkDestroyShaderModule(device,m[1],nullptr);
-    if(r){pipeline={};fail("GSR pipeline",r);return false;}
+    {DrvcLock compile;r=vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&pipeline);}vkDestroyShaderModule(device,m[1],nullptr);
+    if(r){vkDestroyShaderModule(device,m[0],nullptr);pipeline={};fail("EASU pipeline",r);return false;}
+    if(rcas::enabled()){   // [2.73] the RCAS pass: same vertex shader and layout, into the swapchain (render pass compatible with passes[0])
+        mi.codeSize=sizeof rcas_frag_code;mi.pCode=rcas_frag_code;if((r=vkCreateShaderModule(device,&mi,nullptr,&m[1]))){vkDestroyShaderModule(device,m[0],nullptr);fail("RCAS shader",r);return false;}
+        st[1].module=m[1];{DrvcLock compile;r=vkCreateGraphicsPipelines(device,VK_NULL_HANDLE,1,&gp,nullptr,&rcas_pipeline);}vkDestroyShaderModule(device,m[1],nullptr);
+        if(r){rcas_pipeline={};__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","NVN present upscale: RCAS pipeline failed (VkResult %d), EASU only",int(r));}
+    }
+    vkDestroyShaderModule(device,m[0],nullptr);
     target_format=format;return true;
 }
 // After a swapchain (re)creation: one view + framebuffer per image (create_swap; the old ones went with destroy_present_semaphores).
@@ -403,7 +428,21 @@ bool targets(const std::vector<VkImage> &imgs,VkFormat format,VkExtent2D ext){
         VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};fi.renderPass=passes[0];fi.attachmentCount=1;fi.pAttachments=&v;fi.width=ext.width;fi.height=ext.height;fi.layers=1;
         VkFramebuffer fb{};if((r=vkCreateFramebuffer(device,&fi,nullptr,&fb))){drop_targets();fail("framebuffer",r);return false;}framebuffers.push_back(fb);
     }
-    fb_extent=ext;__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale gsr targets: %zu swapchain images %ux%u format %d",imgs.size(),ext.width,ext.height,int(format));
+    fb_extent=ext;
+    if(rcas_pipeline && mid_passes[0]){   // [2.73] the EASU target for the RCAS pass; any failure = EASU straight into the swapchain
+        VkFormatProperties fp;vkGetPhysicalDeviceFormatProperties(physical,format,&fp);
+        const VkFormatFeatureFlags need=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;bool ok=(fp.optimalTilingFeatures&need)==need;
+        VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};ic.imageType=VK_IMAGE_TYPE_2D;ic.format=format;ic.extent={ext.width,ext.height,1};ic.mipLevels=ic.arrayLayers=1;ic.samples=VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling=VK_IMAGE_TILING_OPTIMAL;ic.usage=VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
+        if(ok)ok=!vkCreateImage(device,&ic,nullptr,&mid);
+        if(ok){VkMemoryRequirements mr;vkGetImageMemoryRequirements(device,mid,&mr);VkMemoryAllocateInfo ma{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ma.allocationSize=mr.size;ma.memoryTypeIndex=rcas::memory_type(mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            ok=!vkAllocateMemory(device,&ma,nullptr,&mid_memory) && !vkBindImageMemory(device,mid,mid_memory,0);}
+        if(ok){VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};vi.image=mid;vi.viewType=VK_IMAGE_VIEW_TYPE_2D;vi.format=format;vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};ok=!vkCreateImageView(device,&vi,nullptr,&mid_view);}
+        if(ok){VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};fi.renderPass=mid_passes[0];fi.attachmentCount=1;fi.pAttachments=&mid_view;fi.width=ext.width;fi.height=ext.height;fi.layers=1;ok=!vkCreateFramebuffer(device,&fi,nullptr,&mid_fb);}
+        if(ok)for(int k=2;k<4;k++){VkDescriptorImageInfo ii{sampler,mid_view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};wr.dstSet=sets[k];wr.dstBinding=0;wr.descriptorCount=1;wr.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;wr.pImageInfo=&ii;vkUpdateDescriptorSets(device,1,&wr,0,nullptr);}
+        if(!ok){drop_mid();__android_log_print(ANDROID_LOG_WARN,"dm-vulkan","NVN present upscale: no RCAS target for format %d, EASU only",int(format));}
+    }
+    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale fsr targets: %zu swapchain images %ux%u format %d rcas=%s",imgs.size(),ext.width,ext.height,int(format),mid_fb?"window-size pass":"off");
     return true;
 }
 // Once the flight's fence has signalled: its two timestamps; every ~3 s the average / max GPU time of the pass.
@@ -413,7 +452,7 @@ void collect(unsigned f){
     const double ns=double(t[1]-t[0])*tick_ns;sum_ns+=ns;max_ns=std::max(max_ns,ns);++timed;
     const int64_t now=mono_ns();if(!window_t0)window_t0=now;
     if(now-window_t0<3000000000ll)return;
-    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale gsr %dx%d -> %dx%d gpu_us=%.0f max_us=%.0f presents=%u rcas=%s",last_sw,last_sh,last_dw,last_dh,sum_ns/timed/1e3,max_ns/1e3,timed,rcas::enabled()?"on":"off");
+    __android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN present upscale fsr %dx%d -> %dx%d gpu_us=%.0f max_us=%.0f presents=%u rcas=%s",last_sw,last_sh,last_dw,last_dh,sum_ns/timed/1e3,max_ns/1e3,timed,mid_fb?"on":"off");
     sum_ns=max_ns=0;timed=0;window_t0=now;
 }
 // Records the pass into swapchain image `index`: render pass (clear only with letterbox bars), the source sampled in
@@ -430,14 +469,21 @@ bool record(VkCommandBuffer cmd,unsigned f,uint32_t index,VkImage source,VkForma
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;b.image=source;b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
     b.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;b.newLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;b.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,0,0,nullptr,0,nullptr,1,&b);
-    VkClearValue black{};VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};rb.renderPass=passes[bars?1:0];rb.framebuffer=framebuffers[index];rb.renderArea={{0,0},ext};rb.clearValueCount=1;rb.pClearValues=&black;
+    const bool two=mid_fb!=VK_NULL_HANDLE;   // [2.73] EASU into mid, then RCAS into the swapchain
+    VkClearValue black{};VkRenderPassBeginInfo rb{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};rb.renderPass=two?mid_passes[bars?1:0]:passes[bars?1:0];rb.framebuffer=two?mid_fb:framebuffers[index];rb.renderArea={{0,0},ext};rb.clearValueCount=1;rb.pClearValues=&black;
     vkCmdBeginRenderPass(cmd,&rb,VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&sets[f],0,nullptr);
     VkViewport v{float(dx),float(dy),float(dw),float(dh),0,1};VkRect2D sc{{dx,dy},{uint32_t(dw),uint32_t(dh)}};vkCmdSetViewport(cmd,0,1,&v);vkCmdSetScissor(cmd,0,1,&sc);
-    // source position p = gl_FragCoord * scale + offset (pixels); mirrored: stored row = height - upright row (gsr.frag)
+    // source position p = gl_FragCoord * scale + offset (pixels); mirrored: stored row = height - upright row (fsr_easu.frag)
     const double sx=double(w)/dw,sy=double(h)/dh;
-    struct{float sx,sy,ox,oy,tx,ty,rcas,edge;}pc{float(sx),float(mirror?-sy:sy),float(x-dx*sx),float(mirror?double(height)-y+dy*sy:y-dy*sy),1.f/float(width),1.f/float(height),rcas::enabled()?rcas::sharpness:0.f,edge_sharpness};
+    struct{float sx,sy,ox,oy,tx,ty,rcas,pad;}pc{float(sx),float(mirror?-sy:sy),float(x-dx*sx),float(mirror?double(height)-y+dy*sy:y-dy*sy),1.f/float(width),1.f/float(height),rcas::enabled()?rcas::sharpness:0.f,0.f};
     vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof pc,&pc);vkCmdDraw(cmd,3,1,0,0);vkCmdEndRenderPass(cmd);
+    if(two){   // RCAS over the whole window-size image (the bars are black in it already) into the swapchain image
+        rb.renderPass=passes[0];rb.framebuffer=framebuffers[index];rb.clearValueCount=0;rb.pClearValues=nullptr;vkCmdBeginRenderPass(cmd,&rb,VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,rcas_pipeline);vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,layout,0,1,&sets[2+f],0,nullptr);
+        VkViewport fv{0,0,float(ext.width),float(ext.height),0,1};VkRect2D fs{{0,0},ext};vkCmdSetViewport(cmd,0,1,&fv);vkCmdSetScissor(cmd,0,1,&fs);
+        vkCmdPushConstants(cmd,layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,sizeof pc,&pc);vkCmdDraw(cmd,3,1,0,0);vkCmdEndRenderPass(cmd);
+    }
     // back to the engine's layout; later writes to the source wait for these reads
     b.oldLayout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;b.newLayout=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;b.srcAccessMask=0;b.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
     vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&b);
@@ -452,6 +498,9 @@ static std::atomic<int> crop169{-1};
 // [4:3] hle_args.c (DOOM builds): the initial crop from the resolved aspect choice (DM_DOOM_ASPECT / DM_DOOM_WIDE; BUGS_AND_FIXES 2.20).
 extern "C" int dm_doom_live_crop_initial(void) __attribute__((weak));
 static std::atomic<int> mirror_next{0};   // [r3] DM_GFX_PRESENT_FLIP_FOLD: mirror the next present vertically (dm_present_mirror_next)
+// [2.74] DM_GFX_TU (xbg_tu.h): the window's size as the last present saw it with DM_GFX_UPSCALE on (the swapchain is then made at that
+// size), for the engine's temporal upscaler, which renders its output at it. 0 until such a present ran (dm_present_window_size).
+static std::atomic<int> window_w{0},window_h{0};
 // [mt 2a] DM_GFX_PRESENT_THREAD (xbg_game.cpp reads it and calls dm_present_thread_set; docs/SWITCHES.md, BUGS_AND_FIXES 3.20). 1: the
 // engine hands each present (source image, format, size, crop, the mirror flag captured on its thread) to a present thread that runs the
 // same present_body as before: wait for the flight's fence, acquire, letterbox clear, RCAS, blit, submit, queue present, swapchain and
@@ -495,7 +544,7 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
     int bw=w,bh=h;{static int stretch=-1;if(stretch<0){const char*e=getenv("DM_PRESENT_STRETCH");stretch=e&&*e=='1';}stretched=stretch>0;
         int ww=active?ANativeWindow_getWidth(active):0,wh=active?ANativeWindow_getHeight(active):0;
         if(!stretch&&ww>0&&wh>0){if(int64_t(ww)*h>int64_t(wh)*w)bw=int((int64_t(h)*ww/wh+1)&~1);else bh=int((int64_t(w)*wh/ww+1)&~1);}
-        if(up_want&&ww>0&&wh>0){bw=ww;bh=wh;}}
+        if(up_want&&ww>0&&wh>0){bw=ww;bh=wh;window_w.store(ww,std::memory_order_relaxed);window_h.store(wh,std::memory_order_relaxed);}}
     if(present_native && surface && active && (native_w!=bw || native_h!=bh)){   // the next swapchain takes this size (currentExtent follows the buffer geometry)
         int g=ANativeWindow_setBuffersGeometry(active,bw,bh,0);native_w=bw;native_h=bh;swap_dirty=true;
         if(up_want)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","Present upscale: the game's output %dx%d into a %dx%d window-size buffer result=%d (DM_GFX_UPSCALE)",w,h,bw,bh,g);
@@ -611,6 +660,9 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
 }
 // [DOOM] JNI nativeWideLive (jni_android.c): 1 = show the centre 16:9 of the wide frame, 0 = the whole wide frame. Takes effect at the next present.
 extern "C" void dm_present_crop169(int on){crop169.store(on?1:0,std::memory_order_relaxed);__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","[wide] live: %s",on?"centre 16:9 crop":"full wide frame");}
+// [2.74] DM_GFX_TU: 1 and the window's size when presents go to a window-size swapchain (DM_GFX_UPSCALE=fsr and a format its pass takes),
+// else 0. A frame of exactly that size is then copied 1:1 by present_body (no FSR pass: nothing to enlarge).
+extern "C" int dm_present_window_size(int *w,int *h){const int ww=window_w.load(std::memory_order_relaxed),wh=window_h.load(std::memory_order_relaxed);if(!upscale::enabled() || ww<=0 || wh<=0)return 0;*w=ww;*h=wh;return 1;}
 // [r3] DM_GFX_PRESENT_FLIP_FOLD (xbg_game.cpp xbg_present_texture_now): the engine asks the next present to mirror the source
 // vertically in the swapchain blit instead of blitting it upside down into a flip image first (one full-screen blit and the
 // 3 flip images less). Declined (0) while RCAS sharpening is on: its pass reads the source as given. [DOOM] Taken with DM_GFX_UPSCALE:

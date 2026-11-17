@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">Licznik FPS i czasu klatki</string>
     <string name="gear_res">Rozdzielczość 3D (interfejs zostaje w 720p)</string>
     <string name="gear_sharpen">Wyostrzanie (FSR RCAS)</string>
-    <string name="gear_upscale">Skalowanie do rozdzielczości ekranu (GSR): ostrzejsze krawędzie, nieco większe obciążenie GPU</string>
+    <string name="gear_upscale">Skalowanie do rozdzielczości ekranu (FSR): ostrzejsze krawędzie, nieco większe obciążenie GPU</string>
+    <string name="gear_upscaler">Skalowanie do rozdzielczości ekranu</string>
+    <string name="gear_upscaler_fsr">FSR 1: ostrzejsze krawędzie, nieco większe obciążenie GPU</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2 (eksperymentalne): czasowe, zastępuje wygładzanie krawędzi gry</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2 przy 3D 75% (eksperymentalne): szybciej</string>
+    <string name="gear_upscaler_note">SGSR 2 składa obraz z kilku klatek. W menu i filmach działa FSR 1.</string>
     <string name="gear_off">Wył.</string>
     <string name="gear_low">Słabe</string>
     <string name="gear_medium">Średnie</string>

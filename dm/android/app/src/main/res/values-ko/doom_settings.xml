@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">FPS 및 프레임 시간 표시</string>
     <string name="gear_res">3D 해상도(인터페이스는 720p 유지)</string>
     <string name="gear_sharpen">선명도(FSR RCAS)</string>
-    <string name="gear_upscale">화면 해상도로 업스케일(GSR): 윤곽이 선명해지고 GPU 부하가 약간 늘어남</string>
+    <string name="gear_upscale">화면 해상도로 업스케일(FSR): 윤곽이 선명해지고 GPU 부하가 약간 늘어남</string>
+    <string name="gear_upscaler">화면 해상도로 업스케일</string>
+    <string name="gear_upscaler_fsr">FSR 1: 더 선명한 가장자리, GPU 부하 약간 증가</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2(실험적): 시간적 방식, 게임의 안티앨리어싱을 대체</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2, 3D 75%(실험적): 더 빠름</string>
+    <string name="gear_upscaler_note">SGSR 2는 여러 프레임으로 화면을 만듭니다. 메뉴와 동영상에서는 FSR 1을 사용합니다.</string>
     <string name="gear_off">끄기</string>
     <string name="gear_low">약하게</string>
     <string name="gear_medium">보통</string>

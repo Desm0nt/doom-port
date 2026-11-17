@@ -65,7 +65,7 @@ final class DoomGear {
         l.add(GearPages.renderScale(RES_FRACTIONS, RES_LABELS, "DM_DOOM_RES", g.str(R.string.gear_res_drs_note)));
         l.add(light);
         l.add(GearPages.sharpen());
-        l.add(GearPages.upscale());
+        l.add(new Upscaler());   // [2.74] off / FSR 1 / SGSR 2 / SGSR 2 with 3D at 75 % (was GearPages.upscale(), the FSR checkbox)
         l.add(GearPages.fpsLimit(FPS_LIMITS, GearDisplay.FPS_LIMIT_DEFAULT, FPS_UNEVEN, "DM_DOOM_TICK_MAX"));   // + 40 / 45 (issue #36)   // the game's adaptive tick (hle_args.c) at the same value: game time stays real time
         l.add(aspect);
         if (a.drivers() != null) l.add(GearPages.driver(a.drivers()));
@@ -139,6 +139,41 @@ final class DoomGear {
             if (!ok) g.toast(g.str(R.string.toast_light_failed), true);
         }
         public void env(GearSettings g) throws ErrnoException { if (g.gamePrefs().getBoolean("light", false)) Os.setenv("DM_DOOM_LIGHT", "1", true); else Os.unsetenv("DM_DOOM_LIGHT"); }
+    }
+    // ---- [2.74] upscale to the screen resolution: one choice (they exclude each other), applied at the next launch. Pref "upscaler":
+    //   0 off                          nothing set: the presenter shows the game's output as before
+    //   1 FSR 1                        DM_GFX_UPSCALE=fsr (vulkan_present.cpp: swapchain at the window size + the FSR 1 EASU pass)
+    //   2 SGSR 2 (experimental)        + DM_GFX_TU=sgsr2, DM_GFX_TU_INPUT=full (xbg_tu.h: the temporal upscaler replaces the game's TAA and FSR 1
+    //                                  in 3D frames; DM_GFX_UPSCALE=fsr stays set: it sizes the swapchain and FSR 1 shows menus / videos)
+    //   3 SGSR 2 with 3D at 75 %       the same with DM_GFX_TU_INPUT=reduced (hle_args.c: 3D render fraction at most 75 %, i.e. DM_DOOM_RES;
+    //                                  a lower "3D resolution" above is kept; with dynamic resolution on, the game's DRS decides)
+    // The old checkbox pref "upscale" (true = FSR 1) is taken over once and kept in step, so an older build still finds its value.
+    static final int UPSCALER_FSR = 1, UPSCALER_SGSR2 = 2, UPSCALER_SGSR2_LOW = 3;
+    static int upscalerPref(SharedPreferences p) {
+        if (!p.contains("upscaler")) {   // migrate the FSR checkbox once
+            int u = p.getBoolean("upscale", false) ? UPSCALER_FSR : 0;
+            p.edit().putInt("upscaler", u).apply();
+            return u;
+        }
+        return Math.min(Math.max(0, p.getInt("upscaler", 0)), UPSCALER_SGSR2_LOW);
+    }
+    static final class Upscaler implements GearSettings.Section {
+        RadioGroup r;
+        public void build(GearSettings g, LinearLayout box) {
+            g.heading(box, g.whenKey("gear_upscaler", false));
+            r = g.radios(box, g.keys("gear_off", "gear_upscaler_fsr", "gear_upscaler_sgsr2", "gear_upscaler_sgsr2_low"), upscalerPref(g.gamePrefs()), false);
+            g.text(box, g.s("gear_upscaler_note"));
+        }
+        public void save(GearSettings g, SharedPreferences.Editor game, SharedPreferences.Editor pad) {
+            int v = GearSettings.picked(r);
+            game.putInt("upscaler", v); game.putBoolean("upscale", v == UPSCALER_FSR);
+        }
+        public void env(GearSettings g) throws ErrnoException {
+            int v = upscalerPref(g.gamePrefs());
+            if (v != 0) Os.setenv("DM_GFX_UPSCALE", "fsr", true); else Os.unsetenv("DM_GFX_UPSCALE");
+            if (v >= UPSCALER_SGSR2) { Os.setenv("DM_GFX_TU", "sgsr2", true); Os.setenv("DM_GFX_TU_INPUT", v == UPSCALER_SGSR2_LOW ? "reduced" : "full", true); }
+            else { Os.unsetenv("DM_GFX_TU"); Os.unsetenv("DM_GFX_TU_INPUT"); }
+        }
     }
     // ---- [4:3] aspect ratio; BUGS_AND_FIXES 2.12: native answers whether it switched live (needs DM_DOOM_WIDE_LIVE=1); only auto <-> 16:9 on a
     // screen wider than 16:9 (a presenter crop); 4:3 needs a restart. DM_DOOM_WIDE mirrors it for the presenter's old crop rule and older tools.

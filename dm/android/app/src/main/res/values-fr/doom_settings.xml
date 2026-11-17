@@ -31,7 +31,12 @@
     <string name="gear_fps_counter">Compteur d\'IPS et de temps d\'image</string>
     <string name="gear_res">Résolution 3D (l\'interface reste en 720p)</string>
     <string name="gear_sharpen">Netteté (FSR RCAS)</string>
-    <string name="gear_upscale">Mise à l\'échelle à la résolution de l\'écran (GSR) : contours plus nets, un peu plus de charge GPU</string>
+    <string name="gear_upscale">Mise à l\'échelle à la résolution de l\'écran (FSR) : contours plus nets, un peu plus de charge GPU</string>
+    <string name="gear_upscaler">Mise à l\'échelle à la résolution de l\'écran</string>
+    <string name="gear_upscaler_fsr">FSR 1 : contours plus nets, un peu plus de charge GPU</string>
+    <string name="gear_upscaler_sgsr2">SGSR 2 (expérimental) : temporel, remplace l\'anticrénelage du jeu</string>
+    <string name="gear_upscaler_sgsr2_low" formatted="false">SGSR 2 avec 3D à 75 % (expérimental) : plus rapide</string>
+    <string name="gear_upscaler_note">SGSR 2 compose l\'image à partir de plusieurs images. Dans les menus et les vidéos, FSR 1 est utilisé.</string>
     <string name="gear_off">Désactivée</string>
     <string name="gear_low">Faible</string>
     <string name="gear_medium">Moyenne</string>
