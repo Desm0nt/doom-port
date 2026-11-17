@@ -4520,7 +4520,7 @@ struct Shader {std::string key;uint32_t stage;VkShaderModule module{};VkShaderMo
     Buffer c1_buffer{};bool c1_ready=false;
     std::string unusable;   // [nonadreno] non-empty: the device lacks a capability this module needs; no VkShaderModule, its draws are skipped
     int gs_gate_slot=-1;uint32_t gs_gate_offset=0,gs_gate_value=0; // [perf3] pass-through GS: uniform slot / byte / value of its switch (xbg_spirv_gs_passthru_gate)
-    uint8_t tu_role=0;   // [2.74] DM_GFX_TU (xbg_tu.h): 1 the TAA resolve ps, 2 the viewcolorupsample ps, 3 a motion-vector pre-pass vs (tu_shader_role)
+    uint8_t tu_role=0;   // [2.74] DM_GFX_TU (xbg_tu.h): 1 the TAA resolve ps, 2 the viewcolorupsample ps, 3 a motion-vector pre-pass vs, [2.75] 4 the motion blur ps, 5 the postprocess ps (tu_shader_role)
     ~Shader(){if(module)vkDestroyShaderModule(cfg.device,module,nullptr);for(VkShaderModule m:{module_ab,module_np,module_ab_np})if(m)vkDestroyShaderModule(cfg.device,m,nullptr);}};
 // [r3] The module a pipeline takes: the A/B off phase of a round-3 shader rewrite uses the module without it (when the rewrite
 // changed this shader); np (DM_GFX_NO_PSIZE: vertex stage of a pipeline that rasterizes no points and has no later geometry
@@ -5092,7 +5092,7 @@ bool spv_override(const std::string &key,std::vector<uint32_t> &words){
 // [2.74] DM_GFX_TU (xbg_tu.h): the three kinds of DOOM shaders the temporal upscaler takes its inputs from, by bundle key. Set for every
 // load (one byte); read only with the switch on.
 inline uint8_t tu_shader_role(const std::string &key,uint32_t stage){
-    if(stage==4)return key=="615e5352a9db7427"?1:key=="270b1b7a7fe4d8ab"?2:0;   // taa_vsps, viewcolorupsample_vsps
+    if(stage==4)return key=="615e5352a9db7427"?1:key=="270b1b7a7fe4d8ab"?2:key=="5b8eb6217af85abb"?4:key=="daa747b766d39197"?5:0;   // taa_vsps, viewcolorupsample_vsps; [2.75] motionblurlowq_vsps, postprocess_vsps (replayed at the output size)
     if(stage==0)return key=="e2ce6d304e5c6428" || key=="33d4832875fe8d4a" || key=="8ef76adc155d9a2a" || key=="95babbdb3b73dfd2"?3:0;   // prezdraw[deathfade]motionvector*: mvpmatrix + mvpmatrixnojitter
     return 0;}
 Shader *load_shader(const void *control){
@@ -7832,7 +7832,7 @@ void after_dispatch(Commands &c){
 }
 }
 const Buffer *dispatch_indirect=nullptr;   // [DOOM] DispatchComputeIndirect whose arguments are pending GPU results (see gpu_indirect_try)
-void dispatch(const p_dispatch &p){if(skip_unusable("compute dispatch"))return;preflight_cpu_reads();
+void dispatch(const p_dispatch &p){if(skip_unusable("compute dispatch"))return;preflight_cpu_reads();if(tu::diag_frame!=UINT64_MAX && tu::diag_now())tu::diag_line("dispatch",state.shader[5],5);/* [2.75] DM_GFX_TU_DIAG */
     if(draw_log_fp)fprintf(draw_log_fp,"DISPATCH %u cs=%s %dx%dx%d\n",draw_log_n++,state.shader[5]?state.shader[5]->key.c_str():"-",p.x,p.y,p.z);CPU_SCOPE(Dispatch);provenance_log("DISPATCH shader=%s",state.shader[5]?state.shader[5]->key.c_str():"null");need(state.shader[5],"Dispatch has no genuine compute shader");need(p.x>=0 && p.y>=0 && p.z>=0,"Negative compute dispatch");if(!p.x||!p.y||!p.z)return;if(pipeguard::skipped(state.shader[5]->key))return;need(uint32_t(p.x)<=properties.limits.maxComputeWorkGroupCount[0] && uint32_t(p.y)<=properties.limits.maxComputeWorkGroupCount[1] && uint32_t(p.z)<=properties.limits.maxComputeWorkGroupCount[2],"Compute dispatch exceeds device limit");
     // [ETR perf] DM_GFX_DISPATCH_RUNS (xbg_gsync.h): indirect dispatches and the DM_GFX_BRIGHT colour-table dispatch keep both full barriers
     const bool run_excluded=dispatch_indirect || (bright::enabled && !state.shader[5]->key.compare(0,16,"552f45c348a61b86"));const bool run_skip=gsync::dispatch_pre(run_excluded);
@@ -8093,7 +8093,7 @@ void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu
         }
     }else im.gpu_written=true,provenance_write(im,__LINE__);
 }
-void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
+void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();if(tu::rp.hdr || tu::diag_frame!=UINT64_MAX)tu::copied(p);/* [2.75] DM_GFX_TU route A-replay: a copy of a replayed target is followed */Image &s=get_image(p.src,true),&d=get_image(p.dst,false);{static unsigned n=0;if(n++<60)xbg_logf("NVN COPYT2T src=%llu fmt=%#x %ux%ux%u L%u lv%u -> dst=%llu fmt=%#x %ux%u L%u lv%u decoded=%d/%d region=%d,%d,%d %dx%dx%d -> %d,%d,%d sv=%d/%u/%u dv=%d/%u/%u",(unsigned long long)p.src->serial,p.src->d.format,s.width,s.height,s.depth,s.layers,s.levels,(unsigned long long)p.dst->serial,p.dst->d.format,d.width,d.height,d.layers,d.levels,int(s.decoded),int(d.decoded),p.sr.xoffset,p.sr.yoffset,p.sr.zoffset,p.sr.width,p.sr.height,p.sr.depth,p.dr.xoffset,p.dr.yoffset,p.dr.zoffset,int(p.has_sv),p.has_sv?p.sv.base_level:0,p.has_sv?p.sv.min_layer:0,int(p.has_dv),p.has_dv?p.dv.base_level:0,p.has_dv?p.dv.min_layer:0);}
     if(p.has_sv && p.sv.set_format)(void)s.view_format(&p.sv);
     if(p.has_dv && p.dv.set_format)(void)d.view_format(&p.dv);
     // [nonadreno] ASTC overlay: a copy between a substituted texture (overlay blocks) and a BC texture that is not substituted (real BC
@@ -8265,12 +8265,12 @@ size_t command_available(const uint8_t *p){uintptr_t address=uintptr_t(p);if(add
 void execute_draw_call(const xbg_draw_call &p){
     need(p.index_type>=-1 && p.index_type<=2 && p.first>=0 && p.count>=0 && p.instances>=0 && p.base_instance>=0,"Invalid recorded draw plan");
     if(!p.count || !p.instances)return;
-    if(p.index_type<0)draw(p.primitive,p.first,p.count,nullptr,uint32_t(p.instances),uint32_t(p.base_instance));
+    if(p.index_type<0){draw(p.primitive,p.first,p.count,nullptr,uint32_t(p.instances),uint32_t(p.base_instance));if(tu::rp.pending)tu::replay([&]{draw(p.primitive,p.first,p.count,nullptr,uint32_t(p.instances),uint32_t(p.base_instance));});}   // [2.75] DM_GFX_TU route A-replay: a post draw once more at the output size
     else{
         uint64_t bytes=uint64_t(p.count)<<p.index_type;
         need(bytes<=command_available(reinterpret_cast<const uint8_t*>(p.index_address)),"Indirect index read exceeds registered storage");
         p_draw_idx indexed{p.primitive,p.index_type,p.count,p.base_vertex,p.base_instance,p.instances,p.index_address};
-        draw(p.primitive,0,p.count,&indexed);
+        draw(p.primitive,0,p.count,&indexed);if(tu::rp.pending)tu::replay([&]{draw(p.primitive,0,p.count,&indexed);});   // [2.75]
     }
 }
 // [DOOM] id Tech 6 culls on the GPU: a geometry-shader pass compacts index lists and writes DrawElementsIndirect arguments
@@ -8478,8 +8478,8 @@ void execute(const uint8_t *pc,unsigned depth,uint64_t &budget){
         case OP_BIND_TEX:case OP_BIND_SAMP:case OP_BIND_IMG:{auto a=variable_payload<p_bind_handles>(p,n);need(a.stage>=0 && a.stage<6 && a.first>=0 && a.n>=0 && a.n<=32 && a.first+a.n<=(h.op==OP_BIND_IMG?16:128) && n>=offsetof(p_bind_handles,h)+size_t(a.n)*8,"Invalid descriptor binding record");uint64_t *dst=h.op==OP_BIND_IMG?state.img[a.stage]:h.op==OP_BIND_SAMP?state.samp[a.stage]:state.tex[a.stage];memcpy(dst+a.first,a.h,a.n*8);++tex_gen[a.stage];break;}
         case OP_STENCIL:{auto a=payload<p_stencil>(p,n);need(a.face>=0 && a.face<=3 && a.which>=0 && a.which<=2,"Invalid stencil state");for(unsigned i=0;i<2;i++)if(a.face&(1<<i)){if(a.which==0)state.stencil_compare[i]=a.value_mask;else if(a.which==1)state.stencil_write[i]=a.mask;else state.stencil_ref[i]=a.ref;}break;}
         case OP_POLY_OFFSET:{auto a=payload<p_poly_offset>(p,n);state.bias[0]=a.factor;state.bias[1]=a.units;state.bias[2]=a.clamp;break;}
-        case OP_DRAW:{auto a=payload<p_draw>(p,n);draw(a.prim,a.first,a.count,nullptr);break;}
-        case OP_DRAW_IDX:{auto a=payload<p_draw_idx>(p,n);draw(a.prim,0,a.count,&a);break;}
+        case OP_DRAW:{auto a=payload<p_draw>(p,n);draw(a.prim,a.first,a.count,nullptr);if(tu::rp.pending)tu::replay([&]{draw(a.prim,a.first,a.count,nullptr);});break;}   // [2.75] DM_GFX_TU route A-replay: a motion blur / postprocess draw once more at the output size (rp.pending is set only with the upscaler live)
+        case OP_DRAW_IDX:{auto a=payload<p_draw_idx>(p,n);draw(a.prim,0,a.count,&a);if(tu::rp.pending)tu::replay([&]{draw(a.prim,0,a.count,&a);});break;}
         case OP_DISPATCH:dispatch(payload<p_dispatch>(p,n));break;
         // Commands ends the open pass and records a full barrier. The explicit barrier and finish() recorded the same barrier
         // twice more with no command between them (3 per game barrier, ~130 per D2R fight frame), which Vulkan treats as one.

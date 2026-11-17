@@ -30,6 +30,12 @@
 //    its outputs upside down (par.z), so the presented frame is upright and needs no flip blit; only the history read
 //    and the output position are mirrored;
 //  - debug views (par.w, DM_GFX_TU_DEBUG).
+// [DOOM] TU_HDR (BUGS_AND_FIXES 2.75, route A-replay, DM_GFX_TU_ROUTE=replay): the same pass compiled a second time
+// (sgsr2_upscale_hdr.frag.spv.inc) for the TAA point. There the colour input is the game's linear HDR scene before its own
+// TAA resolve (R11G11B10F, jittered) and the single output is the accumulated scene at the output size, linear HDR again,
+// which the game's post chain then reads. The accumulation works on c / (1 + max(c)) (the game's TAA weighs tone-mapped
+// colours the same way), so the published constants keep their [0, 1] meaning; the history image is the lower-left
+// part of a larger target (the game's targets times the upscale ratio), hence the uv scale in ui.xy. No UI, no mirror.
 layout(push_constant) uniform PC{
     vec4 rsz;   // render size: w, h, 1/w, 1/h (the 3D view inside the game's targets)
     vec4 osz;   // output size: w, h, 1/w, 1/h
@@ -37,13 +43,22 @@ layout(push_constant) uniform PC{
     vec4 par;   // x: minLerpContribution; y: reset; z: 1 = output rows are the game's rows mirrored; w: debug view
     vec4 tsz;   // xy: 1 / size of the colour target; zw: 1 / size of the motion image
     vec4 ui;    // x: gamma (1 = none); y: UI colour scale; z: 1 = blend the UI; w: 1 = location 1 is an sRGB attachment
+                // TU_HDR: xy = the part of the history image the output covers (output size / image size); z: 1 = no tone map
 }pc;
 layout(set=0,binding=0) uniform sampler2D PrevOutput;                   // history, output size, linear filter
 layout(set=0,binding=1) uniform sampler2D MotionDepthClipAlphaBuffer;   // pass 1, linear filter
 layout(set=0,binding=2) uniform sampler2D InputColor;                   // texel fetches
+#ifdef TU_HDR
+layout(location=0) out vec4 History;
+// ui.z = 1 (DM_GFX_TU_HDRTM=0, for A/B): no tone map around the accumulation. Either way the colour is kept finite and inside
+// what an R11G11B10F / RGBA16F image holds: one Inf or NaN texel in the history would otherwise spread from frame to frame.
+vec3 toLdr(vec3 c){c=clamp(c,vec3(0.0),vec3(64000.0));return pc.ui.z>0.5?c:c/(1.0+max(c.r,max(c.g,c.b)));}
+vec3 toHdr(vec3 c){c=max(c,vec3(0.0));return min(pc.ui.z>0.5?c:c/max(1.0-max(c.r,max(c.g,c.b)),1.0/32768.0),vec3(64000.0));}
+#else
 layout(set=0,binding=3) uniform sampler2D UiColor;                      // the game's UI layer, premultiplied, linear filter
 layout(location=0) out vec4 History;
 layout(location=1) out vec4 Final;
+#endif
 float FastLanczos(float base){float y=base-1.0,y2=y*y,y_temp=0.75*y+y2;return y_temp*y2;}
 vec3 SRGBlinear(vec3 c){return mix(pow(c/1.055+0.0521327,vec3(2.4)),c/12.92,lessThanEqual(c,vec3(0.04045)));}
 vec3 linearSRGB(vec3 c){return mix(c*12.92,pow(c,vec3(1.0/2.4))*1.055-0.055,greaterThan(c,vec3(0.0031308)));}
@@ -60,7 +75,11 @@ void main(){
     float depthfactor=mda.z;
 
     vec2 PrevUV=clamp(Hruv-0.5*Motion,0.0,1.0);
+#ifdef TU_HDR
+    vec3 HistoryColor=toLdr(textureLod(PrevOutput,min(PrevUV,vec2(1.0)-0.5*pc.osz.zw)*pc.ui.xy,0.0).xyz);
+#else
     vec3 HistoryColor=textureLod(PrevOutput,mirror?vec2(PrevUV.x,1.0-PrevUV.y):PrevUV,0.0).xyz;
+#endif
 
     float biasmax=pc.jit.z,scalefactor=pc.jit.w;
     float biasmin=max(1.0,0.3+0.3*biasmax);
@@ -79,6 +98,9 @@ void main(){
     float rectboxweight=0.0;
     for(int i=0;i<5;i++){
         vec3 samplecolor=texelFetch(InputColor,clamp(InputPos+tap[i],ivec2(0),hi),0).xyz;
+#ifdef TU_HDR
+        samplecolor=toLdr(samplecolor);
+#endif
         vec2 baseoffset=srcpos_srcOutputPos+vec2(tap[i]);
         float baseoffset_dot=dot(baseoffset,baseoffset);
         float weight=FastLanczos(clamp(baseoffset_dot*kernelbias2,0.0,1.0));
@@ -122,14 +144,20 @@ void main(){
     float alphasum=max(EPSILON,basealpha+Upsampledcw.w);
     float alpha=clamp(Upsampledcw.w/alphasum+pc.par.y,0.0,1.0);
     vec3 color=mix(HistoryColor,Upsampledcw.xyz,alpha);
+#ifndef TU_HDR
     History=vec4(color,1.0);
+#endif
 
-    // [DOOM] the presented frame
+    // [DOOM] the presented frame (TU_HDR: what the post chain gets)
     vec3 shown=color;
     int dbg=int(pc.par.w+0.5);
     if(dbg==1)shown=vec3(abs(Motion)*pc.osz.xy*0.02,0.25);        // motion: 25 output pixels a frame = full red / green
     else if(dbg==2)shown=vec3(depthfactor);                         // depth-clip factor (edges / disocclusion)
     else if(dbg==3)shown=Upsampledcw.xyz;                           // this frame's samples only (no history)
+#ifdef TU_HDR
+    else if(dbg==4)shown=toLdr(texelFetch(InputColor,InputPos,0).xyz);   // the nearest input pixel (the jittered input as it is)
+    History=vec4(toHdr(shown),1.0);   // the debug views replace the scene, so they also become the next frame's history
+#else
     else if(dbg==4)shown=texelFetch(InputColor,InputPos,0).xyz;     // the nearest input pixel (the jittered input as it is)
     if(pc.ui.z>0.5){
         vec4 gui=textureLod(UiColor,Hruv,0.0);
@@ -139,4 +167,5 @@ void main(){
     if(pc.ui.x!=1.0)shown=pow(max(shown,vec3(0.0)),vec3(pc.ui.x));
     if(pc.ui.w>0.5)shown=SRGBlinear(clamp(shown,0.0,1.0));
     Final=vec4(shown,1.0);
+#endif
 }
