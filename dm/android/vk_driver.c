@@ -351,6 +351,11 @@ static void load_driver(void) {
             if (be && *be == '0') setenv("RADV_XCLIPSE_NO_BC_EMU", "1", 0);
             LOG("[vk] RADV_XCLIPSE_NO_BC_EMU=%s (RADV-Xclipse: 1 = BC4-BC7 not exposed, decoded by us; DM_VK_RADV_BC_EMU=%s)",
                 getenv("RADV_XCLIPSE_NO_BC_EMU") ? getenv("RADV_XCLIPSE_NO_BC_EMU") : "(unset)", be ? be : "(unset: driver converts)");
+            // issue 45 test row (DoomGear.radvTest, test builds): the variant and what it set before this driver loads
+            const char *rt = getenv("DM_RADV_TEST"), *mt = getenv("RADV_XCLIPSE_MTYPE"), *dc = getenv("RADV_XCLIPSE_DCC"), *tf = getenv("RADV_XCLIPSE_TFQ"), *ua = getenv("DM_GFX_UBO_ALIGN");
+            if (rt || mt || dc || tf || ua)
+                LOG("[vk] RADV test variant %s: RADV_XCLIPSE_MTYPE=%s RADV_XCLIPSE_DCC=%s RADV_XCLIPSE_TFQ=%s DM_GFX_UBO_ALIGN=%s", rt ? rt : "-",
+                    mt ? mt : "-", dc ? dc : "-", tf ? tf : "-", ua ? ua : "-");
         }
         const char *slash = strrchr(drv, '/');
         char dir[1024], hookdir[1024];

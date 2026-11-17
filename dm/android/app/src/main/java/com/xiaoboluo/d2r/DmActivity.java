@@ -189,7 +189,8 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // [DOOM] the mode row is the r6 light mode: the game's own Switch handheld quality preset, live (nativeSetLight); docked (full quality) stays the
     // default (BUGS_AND_FIXES 2.18); the gear dialog's "light mode" box is the same setting
     @Override public int modeKind() { return FrontMenu.MODE_LIGHT; }
-    // [DOOM] issue 45 (docs/port-kb gpu-xclipse.md XCL-05): the pause menu's red test row "BC textures: native / decoded". Native BC blocks are the
+    // [DOOM] issue 45 (docs/port-kb gpu-xclipse.md XCL-05): the pause menu's red test row; 0.5.5-test1: "RADV test 0..5" (DoomGear.RADV_TEST_ENV),
+    // before (0.5.4-test1) "BC textures: native / decoded". Native BC blocks are the
     // default where the driver has them (DM_GFX_NATIVE_BC=1); RADV-Xclipse 1.8.0 shows the level's virtual-textured surfaces garbled with them, while
     // the stock driver (no BC: decoded / ASTC) is clean. The storage is chosen per texture when it is made, so a change needs a new process:
     // the choice is saved (doom_graphics "bc_decoded"), DoomGear.bcMode sets DM_GFX_NATIVE_BC=0 from it at the next start. Test builds only
@@ -197,19 +198,21 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     private boolean bcRow() { return DoomGear.bcTest(); }
     @Override public String[] portRows() {
         if (!bcRow()) return null;
-        return new String[]{doomPrefs().getBoolean("bc_decoded", false) ? Ui.t(this, "BC-текстуры: через декод (тест)", "BC textures: decoded (test)") : Ui.t(this, "BC-текстуры: нативные (тест)", "BC textures: native (test)")};
+        int v = DoomGear.radvTest(doomPrefs());
+        return new String[]{Ui.t(this, "RADV тест: " + v + " из 5 (" + DoomGear.RADV_TEST_NAME[v] + ")", "RADV test: " + v + " of 5 (" + DoomGear.RADV_TEST_NAME[v] + ")")};
     }
     @Override public int portRowColor(int i) { return 0xffff4d4d; }
     @Override public void portRow(int i) {
         if (front == null) return;
-        final boolean to = !doomPrefs().getBoolean("bc_decoded", false);
-        front.confirm(to ? Ui.t(this, "Переключить BC-текстуры на декод? Игра перезапустится, несохранённый прогресс пропадёт. Памяти под текстуры нужно больше.",
-                "Switch BC textures to decoded? The game restarts, unsaved progress is lost. Textures take more memory.")
-            : Ui.t(this, "Вернуть нативные BC-текстуры? Игра перезапустится, несохранённый прогресс пропадёт.", "Back to native BC textures? The game restarts, unsaved progress is lost."),
+        // [DOOM] issue 45, 0.5.5-test1: each tap moves to the next variant (0..5, then 0 again). The driver reads its switches only when it loads,
+        // so the game restarts itself after a confirmation window; the variant is in boot.log ("[vk] RADV test variant N").
+        final int to = (DoomGear.radvTest(doomPrefs()) + 1) % DoomGear.RADV_TEST_ENV.length;
+        front.confirm(Ui.t(this, "Включить RADV тест " + to + " из 5 (" + DoomGear.RADV_TEST_NAME[to] + ")? Для этого игра сейчас сама перезапустится, несохранённый прогресс пропадёт. После перезапуска продолжите с последнего сохранения и посмотрите, остались ли мазки.",
+                "Switch to RADV test " + to + " of 5 (" + DoomGear.RADV_TEST_NAME[to] + ")? The game will restart itself now to apply it, unsaved progress is lost. After the restart continue from your last save and check if the smears are still there."),
             Ui.t(this, "Перезапустить", "Restart"), () -> {
-                doomPrefs().edit().putBoolean("bc_decoded", to).commit();   // commit: the process ends right after
-                android.util.Log.i("dm", "[java] BC textures -> " + (to ? "decoded" : "native") + ", restart");
-                restartRunning("BC textures " + (to ? "decoded" : "native"));
+                doomPrefs().edit().putInt("radv_test", to).commit();   // commit: the process ends right after
+                android.util.Log.i("dm", "[java] RADV test -> " + to + ", restart");
+                restartRunning("RADV test " + to);
             });
     }
     @Override public boolean docked() { return !doomPrefs().getBoolean("light", false); }

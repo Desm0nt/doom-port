@@ -232,15 +232,30 @@ final class DoomGear {
     // Test builds only: -PdmBcRow=1 (every GPU) or -PdmBcRow=xclipse (Xclipse phones). A normal APK has no row, so it also ignores a choice
     // saved by a test build (there would be no way to switch it back).
     static boolean bcTest() { return BuildConfig.DM_BC_ROW || BuildConfig.DM_BC_ROW_XCLIPSE && "xclipse".equals(VkDrivers.phoneFamily()); }
+    // [DOOM] issue 45, 0.5.5-test1: the pause menu's red "RADV test" row (DmActivity.portRow) picks one of these, saved as doom_graphics
+    // "radv_test", applied at the next start (the driver reads its switches when it loads; the UBO alignment is fixed at device creation).
+    // 1-3: RADV-Xclipse README "Runtime switches"; 4: ours (xbg_game.cpp DM_GFX_UBO_ALIGN, Samsung's driver reports 16, RADV 4); 5: all four.
+    static final String[][][] RADV_TEST_ENV = {
+        {},
+        {{"RADV_XCLIPSE_MTYPE", "3"}},
+        {{"RADV_XCLIPSE_DCC", "0"}},
+        {{"RADV_XCLIPSE_TFQ", "0"}},
+        {{"DM_GFX_UBO_ALIGN", "16"}},
+        {{"RADV_XCLIPSE_MTYPE", "3"}, {"RADV_XCLIPSE_DCC", "0"}, {"RADV_XCLIPSE_TFQ", "0"}, {"DM_GFX_UBO_ALIGN", "16"}},
+    };
+    static final String[] RADV_TEST_NAME = {"off", "MTYPE=3", "DCC=0", "TFQ=0", "UBO 16", "all 1-4"};
+    static int radvTest(SharedPreferences p) { int v = p.getInt("radv_test", 0); return v < 0 || v >= RADV_TEST_ENV.length ? 0 : v; }
     static GearSettings.Section bcMode() {
         return new GearSettings.Section() {
             public void build(GearSettings g, LinearLayout box) {}
             public void env(GearSettings g) throws ErrnoException {
                 if (!bcTest()) return;
-                boolean dec = g.gamePrefs().getBoolean("bc_decoded", false);
-                if (dec) Os.setenv("DM_GFX_NATIVE_BC", "0", true);
+                // 0.5.4-test1's "BC textures" choice (bc_decoded) is no longer applied: both ways showed the same smears (BUGS_AND_FIXES 2.68).
+                int v = radvTest(g.gamePrefs());
+                Os.setenv("DM_RADV_TEST", String.valueOf(v), true);
+                for (String[] e : RADV_TEST_ENV[v]) Os.setenv(e[0], e[1], false);   // dm/env still wins
                 Os.setenv("DM_GFX_VT_DIAG", "1", false); Os.setenv("DM_GFX_TEX_DIAG", "1", false); Os.setenv("DM_LOG_TIME", "1", false);
-                android.util.Log.i("dm", "[java] BC textures: " + (dec ? "decoded (DM_GFX_NATIVE_BC=0, pause menu)" : "native where the driver has them (default)") + ", gpu family " + VkDrivers.phoneFamily());
+                android.util.Log.i("dm", "[java] RADV test variant " + v + ", gpu family " + VkDrivers.phoneFamily());
             }
         };
     }
