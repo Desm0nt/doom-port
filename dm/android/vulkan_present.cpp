@@ -809,6 +809,8 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     // [DOOM] Frame rate limit above 60 (DM_PRESENT_MAX_HZ 90 / 120, DmActivity): vote that rate, so a panel offering 60/90/120 runs at 90
     // for a 90 cap (a 120 vote would leave 120 Hz, where the cap paces at 60). DmActivity also asks for that display mode.
     if(const char *cap=getenv("DM_PRESENT_MAX_HZ")){float c=float(atof(cap));if(c>60.5f && c<=240)frame_rate_vote=c;}
+    // [DOOM] issue #36: a 40 / 45 limit votes the display mode DmActivity asked for (120 / 90 Hz; GearDisplay.voteHz), set by the gear.
+    if(const char *vh=getenv("DM_PRESENT_VOTE_HZ")){float c=float(atof(vh));if(c>=30 && c<=240)frame_rate_vote=c;}
     {std::string dir=path;size_t cut=dir.find_last_of('/');if(FILE *m=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-frame-rate").c_str(),"rb")){float v=0;frame_rate_vote=fscanf(m,"%f",&v)==1 && v>=0 && v<=240?v:0;fclose(m);}}
 
     VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};ai.pApplicationName="dm-android";ai.apiVersion=VK_API_VERSION_1_1;

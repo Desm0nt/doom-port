@@ -35,22 +35,31 @@ final class GearPages {
     interface Env { void set(GearSettings g, int value) throws ErrnoException; }
 
     // ---- frame rate limit: only the values this display can show evenly; above 60 the note "experimental"
-    static GearSettings.Section fpsLimit(int[] limits, int def, String... mirrorEnv) {
+    static GearSettings.Section fpsLimit(int[] limits, int def, String... mirrorEnv) { return fpsLimit(limits, def, 0, mirrorEnv); }
+    // uneven: a limit also listed where the display has no mode for it, labelled "<n> (uneven)" there (GearDisplay.fpsLimit; DOOM 2016: 45)
+    static GearSettings.Section fpsLimit(int[] limits, int def, int uneven, String... mirrorEnv) {
         return new GearSettings.Section() {
             final ArrayList<Integer> lims = new ArrayList<>(); RadioGroup g;
             public void build(GearSettings s, LinearLayout box) {
-                for (int l : limits) if (GearDisplay.fpsLimitAvailable(s.a, l)) lims.add(l);
-                String[] labels = new String[lims.size()]; int at = 0, cur = GearDisplay.fpsLimit(s.a, s.gamePrefs(), limits, def);
-                for (int i = 0; i < labels.length; i++) { labels[i] = String.valueOf(lims.get(i)); if (lims.get(i) == cur) at = i; }
+                for (int l : limits) if (GearDisplay.fpsLimitAvailable(s.a, l) || l == uneven) lims.add(l);
+                String[] labels = new String[lims.size()]; int at = 0, cur = GearDisplay.fpsLimit(s.a, s.gamePrefs(), limits, def, uneven);
+                for (int i = 0; i < labels.length; i++) {
+                    int l = lims.get(i);
+                    labels[i] = GearDisplay.fpsLimitAvailable(s.a, l) ? String.valueOf(l) : s.s("gear_fps_uneven", l);
+                    if (l == cur) at = i;
+                }
                 s.heading(box, s.whenKey("gear_fps_limit", false));
                 g = s.radios(box, labels, at, true);
                 if (!lims.isEmpty() && lims.get(lims.size() - 1) > 60) s.text(box, s.s("gear_fps_note"));
             }
             public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) { if (!lims.isEmpty()) game.putInt("fps_limit", lims.get(GearSettings.picked(g))); }
             public void env(GearSettings s) throws ErrnoException {
-                int lim = GearDisplay.fpsLimit(s.a, s.gamePrefs(), limits, def);
+                int lim = GearDisplay.fpsLimit(s.a, s.gamePrefs(), limits, def, uneven);
+                if (uneven > 0 && lim == uneven) Os.setenv("DM_PRESENT_UNEVEN", "1", true); else Os.unsetenv("DM_PRESENT_UNEVEN");   // also when the mode is refused
                 Os.setenv("DM_PRESENT_MAX_HZ", String.valueOf(lim), true);
                 for (String e : mirrorEnv) Os.setenv(e, String.valueOf(lim), true);
+                float v = GearDisplay.voteHz(s.a, lim);   // 40 / 45: the surface votes the mode's rate (120 / 90), not its 120 default
+                if (v > 0) Os.setenv("DM_PRESENT_VOTE_HZ", String.valueOf(Math.round(v)), true); else Os.unsetenv("DM_PRESENT_VOTE_HZ");
             }
         };
     }

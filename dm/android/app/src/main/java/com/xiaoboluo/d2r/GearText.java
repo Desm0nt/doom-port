@@ -13,21 +13,22 @@ final class GearText {
     static final String[] LANGS = {"en", "ru", "uk", "de", "fr", "es", "pt", "it", "pl", "tr", "zh", "ja", "ko"};
     private static final String[] KEYS = {
         "gear_title", "gear_save", "gear_cancel", "gear_label_fmt", "gear_when_now", "gear_when_next",
-        "gear_fps_limit", "gear_fps_note", "gear_driver", "gear_driver_system", "gear_driver_system_short", "gear_driver_active",
-        "gear_driver_active_fallback", "toast_driver_fallback", "toast_driver_crashed", "toast_driver_init_failed", "gear_lang", "gear_lang_system",
-        "gear_aa", "gear_aa_switch", "gear_drs_target", "gear_aspect", "gear_aspect_auto", "gear_aspect_note",
-        "toast_wide_now", "toast_wide_next", "gear_rumble", "gear_fps_counter", "gear_res", "gear_sharpen",
-        "gear_upscale", "gear_off", "gear_low", "gear_medium", "gear_high", "gear_none",
-        "gear_small", "gear_medium_dz", "gear_large", "gear_look", "gear_deadzone", "gear_button",
-        "gear_button_normal", "gear_button_faded", "gear_button_note", "gear_button_alpha", "folder_no_picker", "upd_heading",
-        "upd_version_line", "upd_check_now", "upd_check_start", "upd_checking", "upd_title", "upd_message",
-        "upd_whats_new", "upd_open", "upd_close", "upd_latest", "upd_failed", "upd_err_offline",
-        "upd_err_limit", "gf_title", "gf_message", "gf_howto", "gf_note", "gf_guide",
-        "gf_line_ok", "gf_line_nostamp", "gf_line_old", "gf_line_none", "gear_safe_mode", "gear_safe_off",
-        "gear_safe_auto", "gear_safe_on", "gear_safe_note", "gear_safe_now", "safe_title", "safe_crash",
-        "safe_step_1", "safe_step_2", "safe_step_3", "safe_step_0", "safe_next", "safe_last",
-        "safe_gear", "safe_logs", "safe_relaunched", "safe_ok", "toast_safe_zc", "toast_safe_fence",
-        "toast_safe_pipe", "notif_safe_channel", "notif_safe_title", "notif_safe_text",
+        "gear_fps_limit", "gear_fps_note", "gear_fps_uneven", "gear_driver", "gear_driver_system", "gear_driver_system_short",
+        "gear_driver_active", "gear_driver_active_fallback", "toast_driver_fallback", "toast_driver_crashed", "toast_driver_init_failed", "gear_lang",
+        "gear_lang_system", "gear_aa", "gear_aa_switch", "gear_drs_target", "gear_aspect", "gear_aspect_auto",
+        "gear_aspect_note", "toast_wide_now", "toast_wide_next", "gear_rumble", "gear_fps_counter", "gear_res",
+        "gear_sharpen", "gear_upscale", "gear_off", "gear_low", "gear_medium", "gear_high",
+        "gear_none", "gear_small", "gear_medium_dz", "gear_large", "gear_look", "gear_deadzone",
+        "gear_button", "gear_button_normal", "gear_button_faded", "gear_button_note", "gear_button_alpha", "folder_no_picker",
+        "upd_heading", "upd_version_line", "upd_check_now", "upd_check_start", "upd_checking", "upd_title",
+        "upd_message", "upd_whats_new", "upd_open", "upd_close", "upd_latest", "upd_failed",
+        "upd_err_offline", "upd_err_limit", "gf_title", "gf_message", "gf_howto", "gf_note",
+        "gf_guide", "gf_line_ok", "gf_line_nostamp", "gf_line_old", "gf_line_none", "gear_safe_mode",
+        "gear_safe_off", "gear_safe_auto", "gear_safe_on", "gear_safe_note", "gear_safe_now", "safe_title",
+        "safe_crash", "safe_step_1", "safe_step_2", "safe_step_3", "safe_step_0", "safe_next",
+        "safe_last", "safe_gear", "safe_logs", "safe_relaunched", "safe_ok", "toast_safe_zc",
+        "toast_safe_fence", "toast_safe_pipe", "notif_safe_channel", "notif_safe_title", "notif_safe_text", "gear_mp_pads",
+        "gear_mp_pads_off", "gear_mp_pads_each", "gear_mp_pads_touch", "gear_mp_pads_note", "gear_mp_lan", "gear_mp_lan_note",
     };
     private static final String[][] T = {   // T[key][language], LANGS order
         {"Settings", "Настройки", "Налаштування", "Einstellungen", "Paramètres", "Ajustes", "Configurações", "Impostazioni", "Ustawienia", "Ayarlar", "设置", "設定", "설정"},   // gear_title
@@ -38,6 +39,7 @@ final class GearText {
         {"applies on next launch", "со следующего запуска", "з наступного запуску", "ab dem nächsten Start", "au prochain lancement", "en el próximo inicio", "na próxima inicialização", "al prossimo avvio", "od następnego uruchomienia", "sonraki açılışta", "下次启动生效", "次回起動時に反映", "다음 실행 시 적용"},   // gear_when_next
         {"Frame rate limit", "Ограничение частоты кадров", "Обмеження частоти кадрів", "Bildratenbegrenzung", "Limite d'images par seconde", "Límite de fotogramas por segundo", "Limite de quadros por segundo", "Limite di fotogrammi al secondo", "Limit klatek na sekundę", "Kare hızı sınırı", "帧率上限", "フレームレート上限", "프레임 속도 제한"},   // gear_fps_limit
         {"Above 60 fps is experimental.", "Выше 60 кадров/с — экспериментально.", "Понад 60 кадрів/с — експериментально.", "Über 60 FPS ist experimentell.", "Au-delà de 60 i/s, c'est expérimental.", "Por encima de 60 FPS es experimental.", "Acima de 60 FPS é experimental.", "Oltre 60 FPS è sperimentale.", "Powyżej 60 kl./s — eksperymentalnie.", "60 FPS üstü deneyseldir.", "高于 60 帧为实验性功能。", "60 fps を超える設定は実験的です。", "60fps 초과는 실험적 기능입니다."},   // gear_fps_note
+        {"%d (uneven)", "%d (неровно)", "%d (нерівно)", "%d (ungleichmäßig)", "%d (irrégulier)", "%d (irregular)", "%d (irregular)", "%d (irregolare)", "%d (nierówno)", "%d (düzensiz)", "%d（不均匀）", "%d（不均一）", "%d (불균일)"},   // gear_fps_uneven
         {"Vulkan driver", "Драйвер Vulkan", "Драйвер Vulkan", "Vulkan-Treiber", "Pilote Vulkan", "Controlador Vulkan", "Driver Vulkan", "Driver Vulkan", "Sterownik Vulkan", "Vulkan sürücüsü", "Vulkan 驱动", "Vulkan ドライバー", "Vulkan 드라이버"},   // gear_driver
         {"System (vendor driver; also the fallback if another driver fails)", "Системный (драйвер производителя; запасной, если другой драйвер не запустился)", "Системний (драйвер виробника; запасний, якщо інший драйвер не запустився)", "System (Herstellertreiber; auch Ersatz, wenn ein anderer Treiber nicht startet)", "Système (pilote du fabricant ; aussi de secours si un autre pilote ne démarre pas)", "Sistema (controlador del fabricante; también de respaldo si otro controlador no arranca)", "Sistema (driver do fabricante; também reserva se outro driver não iniciar)", "Sistema (driver del produttore; anche di riserva se un altro driver non si avvia)", "Systemowy (sterownik producenta; także zapasowy, gdy inny sterownik się nie uruchomi)", "Sistem (üretici sürücüsü; başka bir sürücü başlamazsa yedek olarak da kullanılır)", "系统（厂商驱动；其他驱动无法启动时也用它兜底）", "システム（メーカー製ドライバー。他のドライバーが起動しないときの予備にもなります）", "시스템(제조사 드라이버, 다른 드라이버가 시작되지 않을 때의 대체 드라이버)"},   // gear_driver_system
         {"system driver", "системный драйвер", "системний драйвер", "Systemtreiber", "pilote système", "controlador del sistema", "driver do sistema", "driver di sistema", "sterownik systemowy", "sistem sürücüsü", "系统驱动", "システムドライバー", "시스템 드라이버"},   // gear_driver_system_short
@@ -124,6 +126,13 @@ final class GearText {
         {"Crash recovery", "Восстановление после падения", "Відновлення після збою", "Wiederherstellung nach Absturz", "Récupération après plantage", "Recuperación tras un fallo", "Recuperação após falha", "Ripristino dopo un crash", "Przywracanie po awarii", "Çökme sonrası kurtarma", "崩溃恢复", "クラッシュからの復旧", "충돌 복구"},   // notif_safe_channel
         {"%1$s crashed in the graphics driver", "Игра %1$s упала в графическом драйвере", "Гра %1$s впала в графічному драйвері", "%1$s ist im Grafiktreiber abgestürzt", "%1$s a planté dans le pilote graphique", "%1$s falló en el controlador gráfico", "%1$s travou no driver gráfico", "%1$s si è bloccato nel driver grafico", "%1$s – awaria sterownika grafiki", "%1$s grafik sürücüsünde çöktü", "%1$s 在图形驱动中崩溃", "%1$s がグラフィックドライバーでクラッシュしました", "%1$s이(가) 그래픽 드라이버에서 충돌했습니다"},   // notif_safe_title
         {"Tap to restart in safe mode.", "Нажмите, чтобы перезапустить в безопасном режиме.", "Торкніться, щоб перезапустити в безпечному режимі.", "Tippen, um im sicheren Modus neu zu starten.", "Touchez pour redémarrer en mode sûr.", "Toca para reiniciar en modo seguro.", "Toque para reiniciar no modo seguro.", "Tocca per riavviare in modalità sicura.", "Dotknij, aby uruchomić ponownie w trybie bezpiecznym.", "Güvenli modda yeniden başlatmak için dokunun.", "点按以安全模式重新启动。", "タップすると安全モードで再起動します。", "탭하면 안전 모드로 다시 시작합니다."},   // notif_safe_text
+        {"Local co-op: controllers", "Локальный кооп: геймпады", "Локальний кооп: геймпади", "", "", "", "", "", "", "", "本地合作：手柄", "", ""},   // gear_mp_pads
+        {"Off (every controller is player 1)", "Выкл. (любой геймпад — игрок 1)", "Вимк. (будь-який геймпад — гравець 1)", "", "", "", "", "", "", "", "关（所有手柄都是玩家 1）", "", ""},   // gear_mp_pads_off
+        {"Each controller is a player (the first one is player 1)", "Каждый геймпад — свой игрок (первый — игрок 1)", "Кожен геймпад — свій гравець (перший — гравець 1)", "", "", "", "", "", "", "", "每个手柄一名玩家（第一个是玩家 1）", "", ""},   // gear_mp_pads_each
+        {"Touch screen is player 1, controllers are players 2–4", "Экран — игрок 1, геймпады — игроки 2–4", "Екран — гравець 1, геймпади — гравці 2–4", "", "", "", "", "", "", "", "触屏是玩家 1，手柄是玩家 2–4", "", ""},   // gear_mp_pads_touch
+        {"Players 2–4 join the way they do on a docked Switch: press a button on their controller in the game. Docked mode only.", "Игроки 2–4 входят так же, как на Switch в доке: нажать кнопку на своём геймпаде в игре. Только режим «В доке».", "Гравці 2–4 входять так само, як на Switch у доку: натиснути кнопку на своєму геймпаді в грі. Лише режим «У доку».", "", "", "", "", "", "", "", "玩家 2–4 的加入方式与 Switch 底座模式相同：在游戏中按下自己手柄上的按键。仅限底座模式。", "", ""},   // gear_mp_pads_note
+        {"Local wireless play over Wi-Fi", "Локальная беспроводная игра по Wi-Fi", "Локальна бездротова гра через Wi-Fi", "", "", "", "", "", "", "", "通过 Wi-Fi 进行本地无线联机", "", ""},   // gear_mp_lan
+        {"The game's local wireless play works between phones on the same Wi-Fi or hotspot. Nothing is opened until you start or search for a local game.", "«Локальная беспроводная» игра работает между телефонами в одной сети Wi-Fi или на одной точке доступа. Пока не создана или не ищется локальная игра, ничего не открывается.", "«Локальна бездротова» гра працює між телефонами в одній мережі Wi-Fi або на одній точці доступу. Доки не створено або не шукається локальна гра, нічого не відкривається.", "", "", "", "", "", "", "", "游戏的本地无线联机可在连接同一 Wi-Fi 或热点的手机之间进行。在你创建或搜索本地游戏之前，不会开启任何连接。", "", ""},   // gear_mp_lan_note
     };
     private static final HashMap<String, Integer> AT = new HashMap<>();
     static { for (int i = 0; i < KEYS.length; i++) AT.put(KEYS[i], i); }

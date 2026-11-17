@@ -144,7 +144,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (android.os.Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
         getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK));
         drivers = new VkDrivers(this);   // [front] the Vulkan driver choice, crash guard and the gear's driver list (frontend-common)
-        if (DOOM) GearDisplay.applyDisplayMode(this, doomPrefs());   // [DOOM] frame rate limit above 60: ask for a display mode at a multiple of it
+        if (DOOM) GearDisplay.applyDisplayMode(this, doomPrefs(), DoomGear.FPS_LIMITS, GearDisplay.FPS_LIMIT_DEFAULT, DoomGear.FPS_UNEVEN);   // [DOOM] frame rate limit above 60: ask for a display mode at a multiple of it
         view = new SurfaceView(this);
         view.getHolder().addCallback(this);
         gameFrame = new FrameLayout(this);

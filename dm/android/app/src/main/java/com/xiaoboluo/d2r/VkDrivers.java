@@ -117,7 +117,7 @@ final class VkDrivers {
     // none) runs once when the game has presented its first frames (DOOM 2016 starts its update / game-files checks there: BUGS_AND_FIXES 2.41)
     void gameStarted(View v) { gameStarted(v, null); }
     void gameStarted(View v, Runnable firstFrames) {
-        if (notice != null) { Toast.makeText(a(), notice, Toast.LENGTH_LONG).show(); notice = null; }
+        if (notice != null) { fallbackNotice(notice); notice = null; }   // a dialog: a toast is cut to two lines (issue D3 #23: the driver name filled them)
         onFirstFrames = firstFrames;
         startedAt = android.os.SystemClock.uptimeMillis();
         if (v != null) v.postDelayed(() -> watch(v), 1000);
@@ -197,7 +197,7 @@ final class VkDrivers {
                 : "by restarting the app (no retry in this process: the engine had started)")
             + (reset ? "; the saved choice is now the system driver" : "; the saved choice (" + p.getString("driver", "") + ") was changed meanwhile, left as is"));
         android.util.Log.w("dm", "driver " + drv + " failed to start (" + how + "): system driver");
-        if ("init-failed".equals(how)) Toast.makeText(a(), GearText.s(a(), "toast_driver_init_failed", label(drv)), Toast.LENGTH_LONG).show();
+        if ("init-failed".equals(how)) fallbackNotice(GearText.s(a(), "toast_driver_init_failed", label(drv)));   // dialog, not a two-line toast
         else if ("init-failed-restart".equals(how)) {
             try (OutputStream os = new FileOutputStream(fallbackFile())) { os.write(drv.getBytes(StandardCharsets.UTF_8)); }
             catch (IOException e) { android.util.Log.e("dm", "driver fallback note: " + e); }

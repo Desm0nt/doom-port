@@ -13,6 +13,9 @@ import android.widget.FrameLayout;
 //   - the frame rate limit (pref "fps_limit"): DM_PRESENT_MAX_HZ caps the present pacing (hle_nvn.c: the largest integer fraction of the
 //     refresh rate not above it). Above 60 the window asks for a display mode at a multiple of the limit (applyDisplayMode, from the port's
 //     onCreate) and the surface votes for it (vulkan_present.cpp); a limit above 60 is offered only when the display has such a mode.
+//     A limit that is not a divisor of 60 (DOOM 2016's 40 / 45, issue #36) needs a display mode at a multiple of it too (40 -> 120 Hz,
+//     45 -> 90 / 180 Hz: each frame stays the same whole number of refreshes); it is offered only when the display has one, the window asks
+//     for that mode and the surface votes its rate (env DM_PRESENT_VOTE_HZ, vulkan_present.cpp).
 //     DOOM 2016 also mirrors it to DM_DOOM_TICK_MAX (the game's adaptive tick, hle_args.c): GearPages.fpsLimit(..., "DM_DOOM_TICK_MAX");
 //   - the picture shape on a screen wider (or narrower) than 16:9 (fitSurface): 16:9 with black bars = the SurfaceView itself sized 16:9 and
 //     centred (the compositor still scales the game's buffer), stretched / the game's own widescreen = the whole screen (XC2, Diablo III,
@@ -42,30 +45,41 @@ final class GearDisplay {
         }
         return best;
     }
-    static boolean fpsLimitAvailable(Activity a, int hz) { return hz <= 60 || modeFor(a, hz) != null; }
+    // Whether a limit needs a display mode of its own: above 60, or not an integer fraction of a 60 Hz screen (40, 45).
+    static boolean needsMode(int hz) { return hz > 60 || hz <= 0 || 60 % hz != 0; }
+    static boolean fpsLimitAvailable(Activity a, int hz) { return !needsMode(hz) || modeFor(a, hz) != null; }
     // The saved limit, lowered to the highest one this display supports (another screen / the system's refresh setting changed). No display yet
     // (or no mode list): keep the saved limit; the native pacer clamps it to an integer fraction of the real refresh rate anyway (hle_nvn.c
     // nvn_pace_cap_hz). The choice is logged ("fps limit ...") because a silent drop to 60 went unnoticed (DOOM 2016).
-    static int fpsLimit(Activity a, SharedPreferences p, int[] limits, int def) {
+    static int fpsLimit(Activity a, SharedPreferences p, int[] limits, int def) { return fpsLimit(a, p, limits, def, 0); }
+    // uneven = a limit the port also offers without a display mode for it (DOOM 2016: 45 on a 60 Hz screen, issue #36): the native pacer
+    // then presents at the limit itself (env DM_PRESENT_UNEVEN=1, hle_nvn.c present_auto_hz) and the screen shows the frames 1-1-2 refreshes.
+    static int fpsLimit(Activity a, SharedPreferences p, int[] limits, int def, int uneven) {
         int want = p.getInt("fps_limit", def);
-        if (want <= 60) return want == 30 ? 30 : 60;
+        if (!needsMode(want)) return want == 30 ? 30 : 60;
         Display d = display(a);
         if (d == null) { android.util.Log.i("dm", "fps limit " + want + ": no display yet, kept"); return want; }
-        int got = 60; for (int l : limits) if (l > got && l <= want && fpsLimitAvailable(a, l)) got = l;
+        int got = want < 60 ? 30 : 60; for (int l : limits) if (l > got && l <= want && (fpsLimitAvailable(a, l) || l == uneven)) got = l;
         StringBuilder modes = new StringBuilder();
         for (Display.Mode m : d.getSupportedModes()) modes.append(' ').append(m.getModeId()).append('@').append(m.getRefreshRate());
         android.util.Log.i("dm", "fps limit " + want + " -> " + got + " (modes" + modes + ", current " + d.getMode().getModeId() + ")");
         return got;
     }
-    // Above 60 the window asks the system for a display mode at a multiple of the limit (e.g. 90 Hz for 90, 120 Hz for 120); at 30 / 60 nothing is
+    // Above 60 (or at 40 / 45) the window asks the system for a display mode at a multiple of the limit (e.g. 90 Hz for 90 and 45, 120 Hz for 120 and 40); at 30 / 60 nothing is
     // requested (the surface's own 120 Hz vote and the system decide). Call from onCreate, before setContentView.
-    static void applyDisplayMode(Activity a, SharedPreferences p, int[] limits, int def) {
-        int lim = fpsLimit(a, p, limits, def); if (lim <= 60) return;
+    static void applyDisplayMode(Activity a, SharedPreferences p, int[] limits, int def) { applyDisplayMode(a, p, limits, def, 0); }
+    static void applyDisplayMode(Activity a, SharedPreferences p, int[] limits, int def, int uneven) {
+        int lim = fpsLimit(a, p, limits, def, uneven); if (!needsMode(lim)) return;
         Display.Mode m = modeFor(a, lim); if (m == null) return;
         WindowManager.LayoutParams lp = a.getWindow().getAttributes(); lp.preferredDisplayModeId = m.getModeId(); a.getWindow().setAttributes(lp);
         android.util.Log.i("dm", "frame rate limit " + lim + ": display mode " + m.getModeId() + " " + m.getPhysicalWidth() + "x" + m.getPhysicalHeight() + " @ " + m.getRefreshRate() + " Hz");
     }
     static void applyDisplayMode(Activity a, SharedPreferences p) { applyDisplayMode(a, p, FPS_LIMITS, FPS_LIMIT_DEFAULT); }
+    // The refresh rate the surface should vote for a limit that needs its own display mode (0 = none: the native default vote / the limit).
+    static float voteHz(Activity a, int lim) {
+        if (!needsMode(lim) || lim > 60) return 0;
+        Display.Mode m = modeFor(a, lim); return m == null ? 0 : m.getRefreshRate();
+    }
 
     // [XC2 / D3] The game's SurfaceView sized for the picture shape: bars = 16:9 centred in the frame (black around it: give the frame a black
     // background), else the whole frame. Call again from the frame's layout listener (rotation, window size) and after the gear's Save.

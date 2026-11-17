@@ -711,10 +711,12 @@ NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; x_drain(); mtl_finish(); }
 #define CB(c) ((cmd_t *)(c))
 #define OP_RESERVE 24                             // 段尾永远留够一条 JUMP / END | Always keep enough room at the segment end for one JUMP / END
 
+static void ctl_drop(const void *cmd);   // [pc nvn-ctlmem]
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
+    ctl_drop(c);   // [pc nvn-ctlmem]
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; return 1;
 }
-NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { CB(c)->magic = 0; }
+NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { CB(c)->magic = 0; ctl_drop(c); }   // [pc nvn-ctlmem] ctl_drop
 NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
 NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
@@ -753,23 +755,100 @@ static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
 // Host-supplied segment when the game's own command memory runs out: when the game's out-of-memory callback cannot allocate from its command memory pool, it calls AddCommandMemory with an empty pool (p = NULL, n = 0)
 // (opening the advanced stats page on the level 88 sorceress save: many list items in one frame, and the original implementation segfaulted here reading NULL+8). Our records are larger than real-device NVN commands, so the budget the game reserved for real-device usage is not necessarily enough,
 // so this is not an error state of the game but something we must catch: provide a segment of host memory to keep recording. The segment is replayed in place at submit and reclaimed after being kept for 8 frames (submit is in the same frame as recording or the next one).
+// [pc nvn-ctlmem] Lifetime of host segments, from nx2android (MIT): the guest-range model and 5857659 / 7913b79 (#350); KB HLE-38, NXH-D06.
+// Reclaim follows the game's own memory, not a frame count: the game caches recorded handles and CALLs them every frame until it re-records
+// them, so "reclaim 8 frames after lending" rewrote segments the game still CALLed (garbage commands at replay). A segment remembers the guest
+// range of the recording it hangs off ([BEGIN, end of the JUMP) in guest command memory; overflowing out of a host segment keeps its range) and
+// is reclaimed when the game gives out command or control memory overlapping it. An empty command pool with guest control memory
+// (AddControlMemory, a no-op before) gives every recording its own 16-byte anchor in the control block and its own host chain: without it Super
+// Mario Odyssey piled up ~11 unknown-origin segments per frame up to the 1 GiB cap, and scanning the pool slowed the main thread. With neither
+// kind of guest storage the lifetime stays unknown (never reclaimed) rather than recycling cached handles by age. The pool grows on demand up
+// to HOSTSEG_CAP in total; a segment is as large as the game asked (HOSTSEG_MIN .. HOSTSEG_SZ) when it says. cmd_t has no room for the control
+// state (DOOM Eternal holds it at 80 bytes), so it lives in a side table keyed by the command buffer. DM_NVN_CTLMEM=0: the old model
+// (64 segments of 1 MiB reclaimed 8 frames after lending, AddControlMemory ignored, control memory used 0 / free 1 MiB, abort when the game's
+// callback adds nothing).
 #define HOSTSEG_SZ (1u << 20)
+#define HOSTSEG_MIN (4u << 10)
+#define HOSTSEG_CAP (1u << 30)
 #define HOSTSEG_MAX 64
 uint64_t dm_nvn_frame_count(void);
-static struct { uint8_t *mem; uint64_t frame; int busy; } g_hostseg[HOSTSEG_MAX];
+static int ctlmem_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_CTLMEM"); on = !(e && *e == '0'); } return on; }
+typedef struct { const void *cmd; uint8_t *ctl_mem, *ctl_end; uint64_t ctl_used; uintptr_t ctl_anchor; uint32_t host_control, host_sz; } ctl_t;
+static ctl_t **g_ctl; static unsigned g_ctl_cap, g_ctl_n; static int g_ctl_host;   // g_ctl_host: some command buffer records into control-owned host chains
+static pthread_mutex_t g_ctl_mu = PTHREAD_MUTEX_INITIALIZER;
+static unsigned ctl_slot(const void *cmd, unsigned cap) { return (unsigned)((((uintptr_t)cmd >> 3) * 0x9E3779B97F4A7C15ull) >> 32) & (cap - 1); }
+// The control state of command buffer `cmd` (make: create it). Entries never move (only the table of pointers does), and only the thread that
+// records into `cmd` changes its fields (NVN: one recording thread per command buffer).
+static ctl_t *ctl_get(const void *cmd, int make) {
+    ctl_t *e = NULL; pthread_mutex_lock(&g_ctl_mu);
+    if (g_ctl_cap) for (unsigned i = ctl_slot(cmd, g_ctl_cap); g_ctl[i]; i = (i + 1) & (g_ctl_cap - 1)) if (g_ctl[i]->cmd == cmd) { e = g_ctl[i]; break; }
+    if (!e && make) {
+        if ((g_ctl_n + 1) * 2 > g_ctl_cap) {
+            unsigned cap = g_ctl_cap ? g_ctl_cap * 2 : 256; ctl_t **t = calloc(cap, sizeof *t);
+            if (t) { for (unsigned k = 0; k < g_ctl_cap; k++) if (g_ctl[k]) { unsigned i = ctl_slot(g_ctl[k]->cmd, cap); while (t[i]) i = (i + 1) & (cap - 1); t[i] = g_ctl[k]; }
+                     free(g_ctl); g_ctl = t; g_ctl_cap = cap; }
+        }
+        if ((g_ctl_n + 1) * 2 <= g_ctl_cap && (e = calloc(1, sizeof *e))) {
+            e->cmd = cmd; unsigned i = ctl_slot(cmd, g_ctl_cap); while (g_ctl[i]) i = (i + 1) & (g_ctl_cap - 1);
+            g_ctl[i] = e; __atomic_store_n(&g_ctl_n, g_ctl_n + 1, __ATOMIC_RELAXED); }
+    }
+    pthread_mutex_unlock(&g_ctl_mu); return e;
+}
+// Initialize / Finalize forget the control state; the segments stay (a cached handle outlives its recorder)
+static void ctl_drop(const void *cmd) {
+    if (!__atomic_load_n(&g_ctl_n, __ATOMIC_RELAXED)) return;
+    pthread_mutex_lock(&g_ctl_mu);
+    if (g_ctl_cap) for (unsigned i = ctl_slot(cmd, g_ctl_cap); g_ctl[i]; i = (i + 1) & (g_ctl_cap - 1)) if (g_ctl[i]->cmd == cmd) {
+        free(g_ctl[i]); g_ctl[i] = NULL; __atomic_store_n(&g_ctl_n, g_ctl_n - 1, __ATOMIC_RELAXED);
+        for (unsigned j = (i + 1) & (g_ctl_cap - 1); g_ctl[j]; j = (j + 1) & (g_ctl_cap - 1)) {   // re-insert the rest of the run: no probe chain breaks
+            ctl_t *m = g_ctl[j]; g_ctl[j] = NULL; unsigned k = ctl_slot(m->cmd, g_ctl_cap); while (g_ctl[k]) k = (k + 1) & (g_ctl_cap - 1); g_ctl[k] = m; }
+        break; }
+    pthread_mutex_unlock(&g_ctl_mu);
+}
+typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; uint32_t sz; } hostseg_t;   // org: guest range of the recording it hangs off (0 = unknown)
+static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg; static uint64_t g_hostseg_bytes, g_hostseg_freed;
 static pthread_mutex_t g_hostseg_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t *hostseg_take(void) {
-    static unsigned total; uint64_t f = dm_nvn_frame_count(); uint8_t *m = NULL;
+// A segment of sz bytes for o. Origin: the current recording's guest bytes [BEGIN, end of the JUMP) (no record yet: the write position); writing
+// in a host segment already (overflowing again): that segment's origin; a control-owned recording: its anchor.
+static uint8_t *hostseg_take(const cmd_t *o, uint32_t sz) {
+    static unsigned total; uint64_t f = dm_nvn_frame_count(); uint8_t *m = NULL; const int on = ctlmem_on();
+    const ctl_t *e = on && o && __atomic_load_n(&g_ctl_host, __ATOMIC_RELAXED) ? ctl_get(o, 0) : NULL;
+    uintptr_t lo = 0, hi = 0, cur = o ? (uintptr_t)o->cur : 0;
+    if (!on) sz = HOSTSEG_SZ;
     pthread_mutex_lock(&g_hostseg_mu);
-    for (int i = 0; i < HOSTSEG_MAX; i++) if (g_hostseg[i].busy && g_hostseg[i].frame + 8 < f) g_hostseg[i].busy = 0;
-    for (int i = 0; i < HOSTSEG_MAX && !m; i++) if (!g_hostseg[i].busy) {
-        if (!g_hostseg[i].mem) g_hostseg[i].mem = malloc(HOSTSEG_SZ);
-        g_hostseg[i].busy = 1; g_hostseg[i].frame = f; m = g_hostseg[i].mem; }
-    unsigned t = ++total;
+    if (on) {
+        int in_seg = 0;
+        for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && cur <= (uintptr_t)g_hostseg[i].mem + g_hostseg[i].sz) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
+        if (!in_seg && o && o->recording && o->cur) { lo = o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur + 16; }
+        if (!in_seg && e && e->host_control && e->ctl_anchor) { lo = e->ctl_anchor; hi = lo + 16; }
+    } else for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].frame + 8 < f) g_hostseg[i].busy = 0;   // the old model
+    for (int i = 0; i < g_nhostseg && !m; i++)
+        if (!g_hostseg[i].busy && g_hostseg[i].sz == sz) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi, sz }; m = g_hostseg[i].mem; }
+    if (!m && (on ? g_hostseg_bytes + sz <= HOSTSEG_CAP : g_nhostseg < HOSTSEG_MAX)) {
+        if (g_nhostseg == g_caphostseg) { int cap = g_caphostseg ? g_caphostseg * 2 : 64; hostseg_t *t = realloc(g_hostseg, sizeof *t * (size_t)cap); if (t) { g_hostseg = t; g_caphostseg = cap; } }
+        if (g_nhostseg < g_caphostseg && (m = malloc(sz))) { g_hostseg_bytes += sz; g_hostseg[g_nhostseg++] = (hostseg_t){ m, f, 1, lo, hi, sz }; }
+    }
+    unsigned t = ++total, mb = (unsigned)(g_hostseg_bytes >> 20); int n = g_nhostseg; unsigned long long freed = (unsigned long long)g_hostseg_freed;
     pthread_mutex_unlock(&g_hostseg_mu);
-    if (!m) die("NVN 命令内存：游戏池已空，宿主补段 %d 段也用完（8 帧内）", HOSTSEG_MAX);
-    if (t == 1 || t % 256 == 0) LOG("[nvn] 游戏的命令内存池已空，宿主补段（累计 %u 次，帧 %llu）", t, (unsigned long long)f);
+    if (!m && !on) die("NVN 命令内存：游戏池已空，宿主补段 %d 段也用完（8 帧内）", HOSTSEG_MAX);
+    if (!m) die("NVN command memory: the game's pool is empty and host-lent segments reached %u MB without being reclaimed by the game's blocks (DM_NVN_CTLMEM)", HOSTSEG_CAP >> 20);
+    if (t == 1 || t % 1024 == 0) LOG("[nvn] 宿主补段: the game's command memory ran short, the host lends a segment (%u times so far, frame %llu, segment pool %d segments, %u MB, %llu reclaimed by the game's memory; %s)",
+        t, (unsigned long long)f, n, mb, freed, on ? "lifetime = guest range / control anchor" : "DM_NVN_CTLMEM=0: reclaimed 8 frames after lending");
     return m;
+}
+// The game gives out [lo, hi) again (command memory with a pool, or control memory): segments whose recording's guest bytes overlap it are dead
+static void hostseg_release(uintptr_t lo, uintptr_t hi) {
+    if (!ctlmem_on()) return;
+    pthread_mutex_lock(&g_hostseg_mu);
+    for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) { g_hostseg[i].busy = 0; g_hostseg_freed++; }
+    pthread_mutex_unlock(&g_hostseg_mu);
+}
+// After AddCommandMemory with a pool: [end - n, end) is where the records go now (the pool; D16: its cached shadow, the same address space as
+// the recordings' origins). It reclaims what hung off those bytes, and the command buffer leaves control-owned recording.
+static void ctl_granted(cmd_t *o, size_t n) {
+    if (!ctlmem_on()) return;
+    hostseg_release((uintptr_t)(o->end - n), (uintptr_t)o->end);
+    if (__atomic_load_n(&g_ctl_host, __ATOMIC_RELAXED)) { ctl_t *e = ctl_get(o, 0); if (e) { e->host_control = 0; e->ctl_anchor = 0; } }
 }
 // [zc-cmdshadow] Issue #3 (POCO X7 Pro, MT6899 / Mali-G720, v0.5.2): with uncached zero-copy (dma-heap system-uncached, write-combined CPU
 // pages) the translation thread got ~13 ms per frame slower (submit_cpu_ms 15 -> 28, nvn-translate 30-38 % -> 51-60 % of a core at fewer fps)
@@ -816,19 +895,62 @@ static void cmd_shadow_drop(const pool_t *pl) {
 }
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
     const pool_t *pl = (const pool_t *)p;
-    if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } cmd_new_segment(CB(c), hostseg_take(), HOSTSEG_SZ); return; }
+    if (!pl && ctlmem_on() && !CB(c)->recording) {   // [pc nvn-ctlmem] empty pool + guest control memory: each recording gets an anchor there and its own host chain (cmd_alloc)
+        ctl_t *e = __atomic_load_n(&g_ctl_n, __ATOMIC_RELAXED) ? ctl_get(c, 0) : NULL;
+        if (e && e->ctl_mem) {   // not while recording: the guest command bytes the recording started in still own its overflow chain
+            uint32_t sz = HOSTSEG_MIN; while (sz < n && sz < HOSTSEG_SZ) sz <<= 1;
+            CB(c)->cur = CB(c)->end = NULL; e->host_control = 1; e->host_sz = sz; e->ctl_anchor = 0;
+            if (!__atomic_exchange_n(&g_ctl_host, 1, __ATOMIC_RELAXED)) LOG("[nvn] command buffer %p: empty command pool (length %#zx) with control memory %p+%#zx: every recording gets a 16-byte anchor there and its own host chain (DM_NVN_CTLMEM)", (void *)c, n, (void *)e->ctl_mem, (size_t)(e->ctl_end - e->ctl_mem));
+            return;
+        }
+    }
+    if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); }
+        uint32_t sz = HOSTSEG_SZ; if (!pl && n >= 64 && ctlmem_on()) { sz = HOSTSEG_MIN; while (sz < n && sz < HOSTSEG_SZ) sz <<= 1; }   // [pc nvn-ctlmem] as large as asked
+        cmd_new_segment(CB(c), hostseg_take(CB(c), sz), sz); return; }
     if (!pl->mem) { LOG("【红】AddCommandMemory 池没有 CPU 存储"); return; }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
     uint8_t *shadow = off >= 0 && (uint64_t)off + n <= pl->size ? cmd_shadow(pl) : NULL;   // [zc-cmdshadow]
     cmd_new_segment(CB(c), (shadow ? shadow : pl->mem) + off, n);
+    ctl_granted(CB(c), n);   // [pc nvn-ctlmem]
 }
-NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) { (void)c; (void)m; (void)n; }
+NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
+    const int on = ctlmem_on();
+    { void pc_note(const char *, int, const char *, ...); pc_note("nvn-ctlmem", on, "%s", on ? "AddControlMemory anchors host segments; segments live as long as the game's command / control memory (nx2android 7913b79); HLE-38" : "DM_NVN_CTLMEM=0: old host segments (8 frames, 64 x 1 MiB), AddControlMemory ignored"); }   // [pc]
+    if (!on || !m || n < 16) return;   // DM_NVN_CTLMEM=0: ignored, as before
+    hostseg_release((uintptr_t)m, (uintptr_t)m + n);   // the game gives these bytes out again: recordings anchored there are dead
+    ctl_t *e = ctl_get(c, 1); if (!e) return;
+    e->ctl_mem = m; e->ctl_end = (uint8_t *)m + n; e->ctl_used = 0;
+}
+// [pc nvn-ctlmem] A control-owned recording takes one aligned 16-byte identity in the control block, even if its first record is larger than the
+// whole block; our CPU records stay in host memory and never overwrite the game's control bytes. No room: ask the game as NVN does
+// (OUT_OF_CONTROL_MEMORY), else the lifetime stays unknown.
+static void cmd_host_anchor(cmd_t *o, ctl_t *e) {
+    for (int tries = 0; tries < 3; tries++) {
+        size_t size = e->ctl_mem ? (size_t)(e->ctl_end - e->ctl_mem) : 0;
+        if (e->ctl_mem && e->ctl_used <= size) {
+            uintptr_t p = ((uintptr_t)e->ctl_mem + e->ctl_used + 7) & ~(uintptr_t)7;
+            if (p <= (uintptr_t)e->ctl_end && (uintptr_t)e->ctl_end - p >= 16) { e->ctl_anchor = p; e->ctl_used = p + 16 - (uintptr_t)e->ctl_mem; return; }
+        }
+        if (!o->cb || tries == 2) return;
+        o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_CONTROL_MEMORY, 16, o->cb_data);
+    }
+}
 // 取一条记录的空间；不够则按 NVN 约定回调游戏补命令内存
 // Get space for one record; if not enough, call back into the game per the NVN convention to add command memory
 static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
     size = (size + 7) & ~7u;
+    if (!o->cur && o->recording && __atomic_load_n(&g_ctl_host, __ATOMIC_RELAXED)) {   // [pc nvn-ctlmem] first record of a control-owned recording: anchor, own host chain
+        ctl_t *e = ctl_get(o, 0);
+        if (e && e->host_control) { cmd_host_anchor(o, e); uint32_t sz = e->host_sz ? e->host_sz : HOSTSEG_MIN; while (sz < size + OP_RESERVE && sz < HOSTSEG_SZ) sz <<= 1; cmd_new_segment(o, hostseg_take(o, sz), sz); }
+    }
     for (int tries = 0; !o->cur || o->cur + size + OP_RESERVE > o->end; tries++) {
-        if (!o->cb || tries == 2) die("NVN 命令内存耗尽且无法补充（cb=%p）", (void *)o->cb);
+        if ((!o->cb || tries == 2) && !ctlmem_on()) die("NVN 命令内存耗尽且无法补充（cb=%p）", (void *)o->cb);
+        if (!o->cb || tries == 2) {   // [pc nvn-ctlmem] the game's callback added nothing usable (newer SDKs hand out small chunks, or manage memory without it): record on in a host segment
+            static int once; if (!once++) LOG("[nvn] command memory: the game's callback did not add enough (cb=%p, need %u bytes), using a host-lent segment", (void *)o->cb, size + OP_RESERVE);
+            const ctl_t *e = __atomic_load_n(&g_ctl_host, __ATOMIC_RELAXED) ? ctl_get(o, 0) : NULL;
+            uint32_t sz = e && e->host_control ? HOSTSEG_MIN : HOSTSEG_SZ; while (sz < size + OP_RESERVE) sz <<= 1;
+            cmd_new_segment(o, hostseg_take(o, sz), sz); break;
+        }
         if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.cbs++; pthread_mutex_unlock(&g_cs_mu); }
         o->cb((NVNcommandBuffer *)o, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY, size + OP_RESERVE, o->cb_data);
     }
@@ -839,6 +961,10 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
+    if (ctlmem_on()) {   // [pc nvn-ctlmem] no record of this recording yet: a segment taken now hangs off the write position, not the last recording
+        o->begin = NULL;
+        if (__atomic_load_n(&g_ctl_host, __ATOMIC_RELAXED)) { ctl_t *e = ctl_get(o, 0); if (e && e->host_control) { o->cur = o->end = NULL; e->ctl_anchor = 0; } }   // own anchor and chain each
+    }
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
@@ -1680,6 +1806,7 @@ static double present_menu_hz(void) {
     if (v < 0) { const char *e = getenv("DM_PRESENT_MENU_HZ"); v = e && *e ? atof(e) : 60; if (!(v >= 10 && v <= 240)) v = 0; }
     return v;
 }
+static int present_uneven(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_UNEVEN"); v = e && *e == '1'; } return v; }
 static _Atomic int g_menu_cap;   // 1 = outside gameplay: present_auto_hz uses present_menu_hz instead of the limit
 int dm_nvn_present_menu_capped(void) { return atomic_load_explicit(&g_menu_cap, memory_order_relaxed); }   // perf_android.c: keep the window's frame-rate vote
 static double present_auto_hz(double screen_hz) {
@@ -1690,7 +1817,14 @@ static double present_auto_hz(double screen_hz) {
     // 自适应目标是最高60，而旧Apple策略是至少60；两者不共用取整方向。首帧/刷新率改变也受上限约束。
     // Adaptive pacing caps at 60; the legacy Apple policy has a floor of 60. Cap the first frame and refresh changes too.
     if (pace_adapt_enabled() && screen_hz > 0) return screen_hz / nvn_adaptive_divisor(screen_hz, g_pa_k, g_pa_screen_hz);
-    if (present_cap_hz() > 0) return nvn_pace_cap_hz(screen_hz, atomic_load_explicit(&g_menu_cap, memory_order_relaxed) ? present_menu_hz() : present_cap_hz());
+    if (present_cap_hz() > 0) {
+        int menu = atomic_load_explicit(&g_menu_cap, memory_order_relaxed); double cap = menu ? present_menu_hz() : present_cap_hz(), h = nvn_pace_cap_hz(screen_hz, cap);
+        // [DOOM] issue #36, DM_PRESENT_UNEVEN=1 (the gear's "45 (uneven)"): a limit the screen cannot show evenly (45 at 60 Hz) presents at the
+        // limit itself instead of dropping to the next integer fraction (30); the swapchain shows the frames 1-1-2 refreshes (16.7/16.7/33.3 ms).
+        // The adaptive tick follows real frame time, so game time stays right. Even tiers (45 at 90 / 180 Hz) are unchanged.
+        if (!menu && present_uneven() && screen_hz > cap + 0.5 && h < cap - 0.5) return cap;
+        return h;
+    }
     return dm_pace_hz(screen_hz, 60);
 }
 static int g_hz = -1, g_display_mode, g_hz_auto;   // g_hz_auto：有窗口、没用 DM_PRESENT_HZ 钉住——帧率跟着窗口所在屏的刷新率取整除档（每帧重读，换屏即换） | g_hz_auto: has a window and not pinned by DM_PRESENT_HZ; the frame rate takes the evenly dividing tier of the refresh rate of the screen the window is on (re-read every frame, changes with the screen)
@@ -2334,9 +2468,11 @@ NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcom
 NVN(nvnCommandBufferGetCommandMemoryUsed, size_t, const NVNcommandBuffer *c) { const cmd_t *o = (const cmd_t *)c; return o->seg && o->cur > o->seg ? (size_t)(o->cur - o->seg) : 0; }
 NVN(nvnCommandBufferGetCommandMemoryFree, size_t, const NVNcommandBuffer *c) { const cmd_t *o = (const cmd_t *)c; return o->cur && o->end > o->cur + OP_RESERVE ? (size_t)(o->end - o->cur - OP_RESERVE) : 0; }
 NVN(nvnCommandBufferGetCommandMemorySize, size_t, const NVNcommandBuffer *c) { const cmd_t *o = (const cmd_t *)c; return o->seg && o->end > o->seg ? (size_t)(o->end - o->seg) : 0; }
-NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { (void)c; return 0; }
-NVN(nvnCommandBufferGetControlMemoryFree, size_t, const NVNcommandBuffer *c) { (void)c; return 1u << 20; }   // control memory is not used by the host
-NVN(nvnCommandBufferGetControlMemorySize, size_t, const NVNcommandBuffer *c) { (void)c; return 1u << 20; }
+// [pc nvn-ctlmem] Control memory: size = the block the game last added, used = the 16-byte anchors taken from it (DM_NVN_CTLMEM=0: 0 / 1 MiB / 1 MiB)
+NVN(nvnCommandBufferGetControlMemoryUsed, size_t, const NVNcommandBuffer *c) { if (!ctlmem_on()) return 0; const ctl_t *e = ctl_get(c, 0); return e ? (size_t)e->ctl_used : 0; }
+NVN(nvnCommandBufferGetControlMemorySize, size_t, const NVNcommandBuffer *c) { if (!ctlmem_on()) return 1u << 20; const ctl_t *e = ctl_get(c, 0); return e && e->ctl_mem ? (size_t)(e->ctl_end - e->ctl_mem) : 0; }
+NVN(nvnCommandBufferGetControlMemoryFree, size_t, const NVNcommandBuffer *c) { if (!ctlmem_on()) return 1u << 20;
+    size_t n = h_nvnCommandBufferGetControlMemorySize(c), used = h_nvnCommandBufferGetControlMemoryUsed(c); return used < n ? n - used : 0; }
 NVN(nvnCommandBufferGetMemoryCallback, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->cb; }
 NVN_NOPROTO(nvnCommandBufferGetMemoryCallbackData, void *, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->cb_data; }
 NVN_NOPROTO(nvnCommandBufferSetCommandMemoryCallbackEnabled, void, NVNcommandBuffer *c, uint32_t en) { (void)c; (void)en; }

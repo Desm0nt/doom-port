@@ -33,6 +33,10 @@ final class DoomGear {
     private DoomGear() {}
     static final float[] RES_FRACTIONS = {1.0f, 0.85f, 0.75f, 0.67f};
     static final String[] RES_LABELS = {"100% (720p)", "85% (612p)", "75% (540p)", "67% (480p)"};
+    // Frame rate limit (issue #36): 40 / 45 on top of the shared 30 / 60 / 90 / 120, each shown only where the display has a mode for it
+    // (40: 120 Hz, 45: 90 / 180 Hz; GearDisplay.needsMode). The game's adaptive tick follows (DM_DOOM_TICK_MAX = the limit).
+    static final int[] FPS_LIMITS = {30, 40, 45, 60, 90, 120};
+    static final int FPS_UNEVEN = 45;   // without a 90 / 180 Hz mode: "45 (uneven)", the pacer presents at 45 and a 60 Hz screen shows 1-1-2
     static final int[] DRS_FPS = {30, 45, 60};   // [r6] dynamic resolution target: rs_dropMilliseconds = 1000 / fps (hle_doom_drs.c)
     static final int DRS_FPS_DEFAULT = 60;
     static final float[] AA_STRENGTHS = {0f, 0.5f, 1.0f, 1.5f, 2.0f};
@@ -62,7 +66,7 @@ final class DoomGear {
         l.add(light);
         l.add(GearPages.sharpen());
         l.add(GearPages.upscale());
-        l.add(GearPages.fpsLimit("DM_DOOM_TICK_MAX"));   // the game's adaptive tick (hle_args.c) at the same value: game time stays real time
+        l.add(GearPages.fpsLimit(FPS_LIMITS, GearDisplay.FPS_LIMIT_DEFAULT, FPS_UNEVEN, "DM_DOOM_TICK_MAX"));   // + 40 / 45 (issue #36)   // the game's adaptive tick (hle_args.c) at the same value: game time stays real time
         l.add(aspect);
         if (a.drivers() != null) l.add(GearPages.driver(a.drivers()));
         l.add(GearPages.safeMode(a));   // [safe-mode] 2.57: off / auto / on on Mali / PowerVR only (no row elsewhere); DM_SAFE_MODE

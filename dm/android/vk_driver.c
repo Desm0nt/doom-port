@@ -343,13 +343,14 @@ static void load_driver(void) {
         // [DOOM] issue 45 (Xclipse 940, RADV-Xclipse 1.6-1.9: smeared level surfaces; Samsung's driver is clean). That RADV build has no
         // real BC4-BC7: it converts them on upload (BC5 -> EAC, BC7 -> BC3, BC4 -> EAC, BC6H -> B10G11R11, aliased memory), and that path
         // had fixes in 1.6 and 1.9 already. BC1-BC3 are native on both drivers. RADV_XCLIPSE_NO_BC_EMU=1 (README, "Runtime switches")
-        // hides BC4-BC7, so we decode them ourselves like on Samsung's driver (BUGS_AND_FIXES 2.68). DM_VK_RADV_BC_EMU=1 keeps the
-        // driver's own conversion; a RADV_XCLIPSE_NO_BC_EMU from dm/env is kept.
+        // hides BC4-BC7, so we decode them ourselves like on Samsung's driver (BUGS_AND_FIXES 2.68). The player's test (0.5.4-test1, 15.11):
+        // the smears stay with both, so the default is the driver's own conversion again (as up to 0.5.3); DM_VK_RADV_BC_EMU=0 hides
+        // BC4-BC7 for a test; a RADV_XCLIPSE_NO_BC_EMU from dm/env is kept.
         if (fam == FAM_XCLIPSE) {
             const char *be = getenv("DM_VK_RADV_BC_EMU");
-            if (!(be && *be == '1')) setenv("RADV_XCLIPSE_NO_BC_EMU", "1", 0);
+            if (be && *be == '0') setenv("RADV_XCLIPSE_NO_BC_EMU", "1", 0);
             LOG("[vk] RADV_XCLIPSE_NO_BC_EMU=%s (RADV-Xclipse: 1 = BC4-BC7 not exposed, decoded by us; DM_VK_RADV_BC_EMU=%s)",
-                getenv("RADV_XCLIPSE_NO_BC_EMU") ? getenv("RADV_XCLIPSE_NO_BC_EMU") : "(unset)", be ? be : "(unset: off)");
+                getenv("RADV_XCLIPSE_NO_BC_EMU") ? getenv("RADV_XCLIPSE_NO_BC_EMU") : "(unset)", be ? be : "(unset: driver converts)");
         }
         const char *slash = strrchr(drv, '/');
         char dir[1024], hookdir[1024];
