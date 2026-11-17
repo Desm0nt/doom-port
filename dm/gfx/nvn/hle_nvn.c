@@ -1809,7 +1809,7 @@ static double present_menu_hz(void) {
 static int present_uneven(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PRESENT_UNEVEN"); v = e && *e == '1'; } return v; }
 static _Atomic int g_menu_cap;   // 1 = outside gameplay: present_auto_hz uses present_menu_hz instead of the limit
 int dm_nvn_present_menu_capped(void) { return atomic_load_explicit(&g_menu_cap, memory_order_relaxed); }   // perf_android.c: keep the window's frame-rate vote
-static double present_auto_hz(double screen_hz) {
+static double present_auto_hz_m(double screen_hz, int menu) {
 #ifdef __ANDROID__
     // Android has no Metal display-link pacer, so apply the power-saving target here.
     if (mtl_fps_target() == 30) return dm_pace_hz(screen_hz, 30);
@@ -1818,7 +1818,7 @@ static double present_auto_hz(double screen_hz) {
     // Adaptive pacing caps at 60; the legacy Apple policy has a floor of 60. Cap the first frame and refresh changes too.
     if (pace_adapt_enabled() && screen_hz > 0) return screen_hz / nvn_adaptive_divisor(screen_hz, g_pa_k, g_pa_screen_hz);
     if (present_cap_hz() > 0) {
-        int menu = atomic_load_explicit(&g_menu_cap, memory_order_relaxed); double cap = menu ? present_menu_hz() : present_cap_hz(), h = nvn_pace_cap_hz(screen_hz, cap);
+        double cap = menu ? present_menu_hz() : present_cap_hz(), h = nvn_pace_cap_hz(screen_hz, cap);
         // [DOOM] issue #36, DM_PRESENT_UNEVEN=1 (the gear's "45 (uneven)"): a limit the screen cannot show evenly (45 at 60 Hz) presents at the
         // limit itself instead of dropping to the next integer fraction (30); the swapchain shows the frames 1-1-2 refreshes (16.7/16.7/33.3 ms).
         // The adaptive tick follows real frame time, so game time stays right. Even tiers (45 at 90 / 180 Hz) are unchanged.
@@ -1827,6 +1827,7 @@ static double present_auto_hz(double screen_hz) {
     }
     return dm_pace_hz(screen_hz, 60);
 }
+static double present_auto_hz(double screen_hz) { return present_auto_hz_m(screen_hz, atomic_load_explicit(&g_menu_cap, memory_order_relaxed)); }
 static int g_hz = -1, g_display_mode, g_hz_auto;   // g_hz_auto：有窗口、没用 DM_PRESENT_HZ 钉住——帧率跟着窗口所在屏的刷新率取整除档（每帧重读，换屏即换） | g_hz_auto: has a window and not pinned by DM_PRESENT_HZ; the frame rate takes the evenly dividing tier of the refresh rate of the screen the window is on (re-read every frame, changes with the screen)
 void nvn_present_config(int hz, int display_mode) { g_hz = hz; g_display_mode = display_mode; g_hz_auto = 0; }
 double front_display_refresh(char *name, size_t n);
@@ -1902,9 +1903,20 @@ static void pace_adapt_tick(double screen_hz) {
     else if (g_pa_k > kmin && now - stable_since > backoff) { g_pa_k--; probing = 1; skip = 20; LOG("[nvn] 出图档 试升 %.1f FPS", screen_hz / g_pa_k); }
     (void)need; (void)per;
 }
+// [DOOM] issue #55 (host hle_doom_tick.c, DM_DOOM_HZ_SUPPRESS; BUGS_AND_FIXES 4.10): while the game holds its tick hz (allowHzChange = 0 in
+// gameplay: a scripted, animation-synced sequence) it runs one game frame of 1/hz per present, so presents faster than that hz would run
+// the sequence fast. dm_doom_frozen_hz() = that hz (0 = not held); below the pacer's own rate it becomes the present rate itself (not an
+// integer fraction of the refresh: the swapchain shows such frames unevenly, as with DM_PRESENT_UNEVEN). dm_nvn_present_play_hz = the
+// gameplay rate without this cap, for the host's choice of a held hz.
+__attribute__((weak)) double dm_doom_frozen_hz(void) { return 0; }
+double dm_nvn_present_play_hz(void) { return g_hz < 0 ? 0 : g_hz_auto ? present_auto_hz_m(mtl_display_refresh(), 0) : g_hz; }
 static uint64_t present_period(const win_t *o) {
     present_cfg(o);
     int itv = g_display_mode ? 1 : o->interval > 0 ? o->interval : 1; double hz = g_hz_auto ? present_auto_hz(mtl_display_refresh()) : g_hz;
+    { double f = dm_doom_frozen_hz(); static double said; static unsigned n; double use = f >= 10 && hz > 0 && f < hz - 0.5 ? f : 0;
+      if (use != said) { said = use; if (n++ < 60) { if (use > 0) LOG("[nvn] present cap %.2f Hz: the game holds its tick at that hz (pacer rate %.2f; DM_DOOM_HZ_SUPPRESS)", use, hz);
+                                                 else LOG("[nvn] present cap back to the pacer rate %.2f Hz (held game hz %.0f)", hz, f); } }
+      if (use > 0) hz = use; }
     return hz > 0 ? (uint64_t)(itv * 1e9 / hz) : 0;
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
