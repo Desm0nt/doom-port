@@ -31,6 +31,7 @@
 #include <vulkan/vulkan.h>
 #include <unistd.h>
 #include "vk_tramp_names.h"
+#include "vk_ubwc_hint.h"   // [turnip-ubwc-hint] PNH-B-11 (port-common turnip-ubwc-hint)
 #ifdef DM_ADRENOTOOLS
 #include <adrenotools/driver.h>
 #endif
@@ -266,6 +267,30 @@ static PFN_vkGetInstanceProcAddr direct_icd(const char *lib, const char **why) {
 }
 #endif
 
+// [turnip-ubwc-hint] (vk_ubwc_hint.h; port-common turnip-ubwc-hint, KB PNH-B-11) Turnip on an Adreno 740 gets the system driver's texture-unit
+// UBWC flag hint in FD_DEV_FEATURES (appended to a value dm/env set; a value that names the feature is kept). DM_VK_TU_UBWC_HINT=0 leaves
+// FD_DEV_FEATURES alone. One log line, and the [pc] report where port-common's pc-core is linked (weak: absent elsewhere).
+#ifdef DM_ADRENOTOOLS
+extern void pc_note(const char *id, int applied, const char *fmt, ...) __attribute__((weak));
+static void ubwc_hint(void) {
+    char why[400], model[96]; int applied = 0; const char *sw = getenv("DM_VK_TU_UBWC_HINT"), *have = getenv("FD_DEV_FEATURES");
+    dm_ubwc_model(model, sizeof model);
+    if (sw && *sw == '0') snprintf(why, sizeof why, "DM_VK_TU_UBWC_HINT=0: FD_DEV_FEATURES left as it is (%s)", have ? have : "unset");
+    else if (!dm_ubwc_model_740(model)) snprintf(why, sizeof why, "gpu_model \"%s\" is not an Adreno 740: Mesa's default matches its system driver", model);
+    else {
+        const int v = dm_ubwc_system_version("/vendor/lib64/libGLESv2_adreno.so");
+        char val[512]; const int r = v ? dm_ubwc_compose(val, sizeof val, have, v >= 700) : -2;
+        if (r == 1) { setenv("FD_DEV_FEATURES", val, 1); applied = 1;
+                      snprintf(why, sizeof why, "Adreno 740 \"%s\", system driver V@%04d (%s): FD_DEV_FEATURES=%s", model, v, v >= 700 ? "v7xx sets the hint" : "v6xx leaves it off", val); }
+        else if (r == 0) snprintf(why, sizeof why, "FD_DEV_FEATURES=%s already names " DM_UBWC_FEATURE ": kept", have);
+        else if (r == -1) snprintf(why, sizeof why, "FD_DEV_FEATURES too long to append to: kept");
+        else snprintf(why, sizeof why, "Adreno 740 \"%s\": the system driver's version (V@ in /vendor/lib64/libGLESv2_adreno.so) not found: FD_DEV_FEATURES left alone", model);
+    }
+    LOG("[vk] turnip-ubwc-hint: %s (%s); PNH-B-11", applied ? "applied" : "skipped", why);
+    if (pc_note) pc_note("turnip-ubwc-hint", applied, "%s; PNH-B-11", why);
+}
+#endif
+
 static void load_driver(void) {
     void *lib = NULL; const char *reason = "ok", *req = getenv("DM_VK_DRIVER"), *force = getenv("DM_VK_DRIVER_FORCE");
     const int kgsl = kgsl_present(), mali = mali_present(), pvr = pvr_present(); char model[96]; gpu_model(model, sizeof model);
@@ -323,6 +348,7 @@ static void load_driver(void) {
         // twice); on Adreno 750 both modes were equal. TU_DEBUG= (empty) lets Turnip choose.
         if (fam == FAM_ADRENO || fam == FAM_ANY) {
             if (!getenv("TU_DEBUG")) setenv("TU_DEBUG", "sysmem", 0);
+            ubwc_hint();   // [turnip-ubwc-hint] PNH-B-11: before the driver reads FD_DEV_FEATURES at its first device
             LOG("[vk] TU_DEBUG=%s (Turnip reads it when the driver loads)", getenv("TU_DEBUG") ? getenv("TU_DEBUG") : "(unset)");
         }
         // [DOOM] PanVK (the JimVulkan kbase build) and the window's buffers (BUGS_AND_FIXES 2.58, issue #33: Mali-G57 MT6789, the whole
@@ -339,6 +365,23 @@ static void load_driver(void) {
             if (!(pl && *pl == '0')) setenv("MESA_GRALLOC_LINEAR", "1", 0);
             LOG("[vk] MESA_GRALLOC_LINEAR=%s (PanVK: 1 = plain window buffers, no AFBC; DM_VK_PANVK_LINEAR=%s)",
                 getenv("MESA_GRALLOC_LINEAR") ? getenv("MESA_GRALLOC_LINEAR") : "(unset)", pl ? pl : "(unset: on)");
+            // [DOS2 issue #7, KB DRV-12] PanVK JimVulkan r10 (panvk-jim-1.6.0) EMULATES BC on phone Malis, which have no BC decoder in the texture
+            // unit (ARM's driver reports textureCompressionBC = 0, so the engine decodes BC itself): src/panfrost/vulkan/panvk_bc_emu.[ch], profile
+            // "no BC decoder at all" = every BC format via a hidden second plane (BC1/2/3/7 -> ASTC 4x4 by a compute shader after each copy into the
+            // image, BC4/5 -> EAC, BC6H -> RGBA16F), and it reports textureCompressionBC = 1 and the BC format features, so the engine hands it raw
+            // BC images. On a Mali-G77 that gave wrong colours on some textures (bright green / red / yellow patches), the stock ARM driver on the
+            // same phone is clean. Owner's rule (23.11.2026): a driver never transcodes the game's compressed textures itself, the port has its
+            // own route (GPU BC decode / BC -> ASTC / ASTC cache). PANVK_NO_BC_EMU=1 (that driver's own switch, read once at device creation)
+            // turns the emulation off: the driver then reports what the hardware decodes and the engine takes the same BC route as on the stock
+            // driver. Other PanVK builds (zenith 26.3.1, upstream Mesa) do not emulate and ignore the variable. Reference: DOS2 dos2-vk 564ca480.
+            // DM_VK_PANVK_BC_EMU=1 keeps the driver's emulation (for an A/B); a PANVK_NO_BC_EMU from dm/env is kept.
+            {
+                const char *be = getenv("DM_VK_PANVK_BC_EMU");
+                const int keep_emu = be && *be == '1';
+                if (!keep_emu) setenv("PANVK_NO_BC_EMU", "1", 0);
+                LOG("[vk] PANVK_NO_BC_EMU=%s (PanVK JimVulkan: 1 = no in-driver BC emulation, the engine decodes BC as on the stock driver; DM_VK_PANVK_BC_EMU=%s)",
+                    getenv("PANVK_NO_BC_EMU") ? getenv("PANVK_NO_BC_EMU") : "(unset)", be ? be : "(unset: emulation off)");
+            }
         }
         // [DOOM] issue 45 (Xclipse 940, RADV-Xclipse 1.6-1.9: smeared level surfaces; Samsung's driver is clean). That RADV build has no
         // real BC4-BC7: it converts them on upload (BC5 -> EAC, BC7 -> BC3, BC4 -> EAC, BC6H -> B10G11R11, aliased memory), and that path

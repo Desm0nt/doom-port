@@ -88,7 +88,8 @@ void xbg_game_get_stats(xbg_game_stats *out);
  * then SPIR-V. Unknown source bindings are rejected by the exporter. */
 enum { XBG_SOURCE_SUPPORT=1,XBG_SOURCE_UNIFORM=2,XBG_SOURCE_STORAGE=3,
     XBG_SOURCE_C1=4,XBG_SOURCE_DRIVER0=5,XBG_SOURCE_DRIVER2=6,
-    XBG_SOURCE_TEXTURE=7,XBG_SOURCE_IMAGE=8 };
+    XBG_SOURCE_TEXTURE=7,XBG_SOURCE_IMAGE=8,
+    XBG_SOURCE_GSCLAIM=15 /* [gs-fix] engine-made: a geometry shader's claim words (xbg_gsfix.h), never in a bundle; 15: ETR / DOS2 / NieR use 9-14 for bindless */ };
 typedef struct xbg_shader_header {
     uint32_t magic,version,stage,binding_count,input_count,c1_bytes,spirv_bytes,reserved;
 } xbg_shader_header; /* magic 0x31534758 (XGS1), version 1, stage VS0..CS5 */

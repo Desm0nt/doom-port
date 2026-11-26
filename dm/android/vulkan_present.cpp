@@ -16,6 +16,8 @@ extern "C" void dm_aperf_frame_tid(int);   // [mt 2a] perf_android.c: the ADPF s
 #endif
 #include "../gfx/vulkan/nvn_vk.h"
 #include "../gfx/xtrace.h"
+#include "gpu_floor.h"   // [gpu-floor] PNH-C01: GPU clock floor while frames run late (port-common gpu-floor)
+#include "../gfx/vulkan/engine/xbg_device_fault.h"   // [device-fault] FN-64 (port-common device-fault)
 #include <android/log.h>
 #include <android/native_window.h>
 #include <dlfcn.h>
@@ -643,6 +645,8 @@ int present_body(VkImage source,VkFormat source_format,uint32_t width,uint32_t h
 #ifdef DM_GAME_DOOM
     dm_aperf_present(active,frame_rate_vote);   // ADPF work report + display rate vote (perf_android.c)
 #endif
+    dm_gpu_floor_present(physical,device,queue);   // [gpu-floor] PNH-C01: the floor while frames run late (DM_GPU_FLOOR=auto|1|0), at every present
+    {int a=0;const char *w=dm_gpu_floor_report(&a);if(w)pc_note("gpu-floor",a,"%s; PNH-C01",w);}   // [pc]
     XTRACE_BEGIN("dm-queue-present");VkResult pr;{QLock ql;pr=vkQueuePresentKHR(queue,&pi);}XTRACE_END();
     // 呈现失败时先排空，拆除路径要求队列空闲。
     // Drain a failed present before teardown, which requires an idle queue.
@@ -915,6 +919,7 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     // DM_GFX_BONES_SSBO on the stock Adreno 740 driver, BUGS_AND_FIXES 2.34).
     {const char *e=getenv("DM_VK_ROBUST");if(e && *e && !atoi(e)){features.features.robustBufferAccess=VK_FALSE;__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","robustBufferAccess off (DM_VK_ROBUST=0)");}}
     std::vector<const char*> dext={VK_KHR_SWAPCHAIN_EXTENSION_NAME};if(mirror)dext.push_back(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
+    if(dm_gpu_floor_want_hint(physical,available.data(),uint32_t(available.size()))){dext.push_back("VK_QCOM_queue_perf_hint");draw.pNext=dm_gpu_floor_chain(draw.pNext);}dm_gpu_floor_before_device();   // [gpu-floor] PNH-C01: Qualcomm's queue perf hint where the driver has it, else the KGSL contexts this process owns before the device (DM_GPU_FLOOR=0: off)
     if(want_astc_hdr){dext.push_back(VK_EXT_TEXTURE_COMPRESSION_ASTC_HDR_EXTENSION_NAME);astc_hdr.textureCompressionASTC_HDR=VK_TRUE;astc_hdr.pNext=draw.pNext;draw.pNext=&astc_hdr;}
     // NVN min/max reduction samplers (depth pyramids): extension only (the instance is Vulkan 1.1); without it reductions sample as average.
     if(minmax)dext.push_back(VK_EXT_SAMPLER_FILTER_MINMAX_EXTENSION_NAME);
@@ -970,6 +975,8 @@ extern "C" int dm_android_vk_initialize(const char *path,char *error,size_t byte
     auto pipe_stats_env=[]{const char *e=getenv("DM_GFX_PIPE_STATS");return e && *e && *e!='0';};
     bool pe=false;for(const auto &x:available)if(!strcmp(x.extensionName,VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME))pe=true;
     if(FILE *ps=[&]{std::string dir=path;size_t cut=dir.find_last_of('/');FILE *f=fopen(((cut==std::string::npos?dir:dir.substr(0,cut))+"/gfx-pipe-stats").c_str(),"rb");if(!f && pe && pipe_stats_env())f=fopen("/proc/self/stat","rb");return f;}()){fclose(ps);dext.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);pef.pipelineExecutableInfo=VK_TRUE;pef.pNext=draw.pNext;draw.pNext=&pef;}
+    xbg_device_fault_enable(physical,available,dext,&draw.pNext);__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","NVN device fault: %s",dm_vk_device_fault_why);   // [device-fault] FN-64: VK_EXT_device_fault when the driver has it (DM_GFX_DEVICE_FAULT=0: off)
+    pc_note("device-fault",dm_vk_device_fault,"%s; FN-64",dm_vk_device_fault_why);   // [pc]
     float priority[2]={1,0.5f};VkDeviceQueueCreateInfo qc{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};qc.queueFamilyIndex=family;qc.queueCount=1;qc.pQueuePriorities=priority;
     {const char *e=getenv("DM_TEX_DISCARD");const bool want=e && atoi(e)>0;if(want && q[family].queueCount>=2)qc.queueCount=2;   // [DOOM] restore worker queue (default off)
      if(want)__android_log_print(ANDROID_LOG_INFO,"dm-vulkan","DM_TEX_DISCARD: family %u has %u queues -> aux queue %s",family,q[family].queueCount,qc.queueCount==2?"created":"unavailable (texture discard stays off)");}

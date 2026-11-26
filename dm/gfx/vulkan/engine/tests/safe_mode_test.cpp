@@ -43,7 +43,7 @@ int main(){
     // switches
     CHECK(sw(0,XBG_GPU_MALI).empty() && sw(3,XBG_GPU_ADRENO).empty());
     CHECK(sw(1,XBG_GPU_MALI)=="DM_GFX_ZEROCOPY=0 DM_GFX_ZC3_SELFTEST=0 DM_GFX_FENCE_TRYLOCK=0 ");
-    CHECK(sw(1,XBG_GPU_POWERVR)=="DM_GFX_ZEROCOPY=0 DM_GFX_ZC3_SELFTEST=0 DM_GFX_FENCE_TRYLOCK=0 DM_GFX_UBO_DYNAMIC=0 ");
+    CHECK(sw(1,XBG_GPU_POWERVR)=="DM_GFX_ZEROCOPY=0 DM_GFX_ZC3_SELFTEST=0 DM_GFX_FENCE_TRYLOCK=0 DM_GFX_UBO_DYNAMIC=0 DM_GFX_PVR_CB_BARRIER=1 ");
     {const std::string s2=sw(2,XBG_GPU_POWERVR),s3=sw(3,XBG_GPU_MALI);
      CHECK(s2.find("DM_GFX_NOLOAD=0")!=std::string::npos && s2.find("DM_GFX_LAZY_CLEAR=0")!=std::string::npos && s2.find("DM_GFX_TILE_AREA=0")!=std::string::npos);
      CHECK(s2.find("COMPILE_LOCK")==std::string::npos);

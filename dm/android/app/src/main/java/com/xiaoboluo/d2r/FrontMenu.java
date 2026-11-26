@@ -262,9 +262,9 @@ final class FrontMenu implements PauseMenu.Listener {
         reset.setOnClickListener(v -> { pad.resetLayout(); Toast.makeText(act, t("Раскладка сброшена", "Layout reset"), Toast.LENGTH_SHORT).show(); });
         TextView lang = new TextView(act); lang.setPadding(0, 24, 0, 0); lang.setText(t("Язык меню: ", "Menu language: ")); box.addView(lang);
         RadioGroup lg = new RadioGroup(act); lg.setOrientation(RadioGroup.HORIZONTAL);
-        String[] ln = {t("Как в системе", "System"), "Русский", "English"}, lc = {"", "ru", "en"}; String lw = act.getSharedPreferences(Ui.PREFS, Activity.MODE_PRIVATE).getString("ui_lang", "");
-        for (int i = 0; i < 3; i++) { RadioButton b = new RadioButton(act); b.setId(6200 + i); b.setText(ln[i]); lg.addView(b); if (lc[i].equals(lw)) lg.check(6200 + i); }
-        lg.setOnCheckedChangeListener((gg, id) -> { act.getSharedPreferences(Ui.PREFS, Activity.MODE_PRIVATE).edit().putString("ui_lang", lc[Math.max(0, Math.min(2, id - 6200))]).apply(); rebuild(); });
+        String[] ln = {t("Как в системе", "System"), "Русский", "English", "简体中文"}, lc = {"", "ru", "en", "zh"}; String lw = act.getSharedPreferences(Ui.PREFS, Activity.MODE_PRIVATE).getString("ui_lang", "");
+        for (int i = 0; i < ln.length; i++) { RadioButton b = new RadioButton(act); b.setId(6200 + i); b.setText(ln[i]); lg.addView(b); if (lc[i].equals(lw)) lg.check(6200 + i); }
+        lg.setOnCheckedChangeListener((gg, id) -> { act.getSharedPreferences(Ui.PREFS, Activity.MODE_PRIVATE).edit().putString("ui_lang", lc[Math.max(0, Math.min(lc.length - 1, id - 6200))]).apply(); rebuild(); });
         box.addView(lg);
         ScrollView scroll = new ScrollView(act); scroll.addView(box);
         AlertDialog d = new AlertDialog.Builder(act).setTitle(t("Экранный геймпад", "On-screen gamepad")).setView(scroll).setPositiveButton(t("Готово", "Done"), null).create();

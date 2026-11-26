@@ -42,6 +42,11 @@ import java.util.Set;
 // one or all, Reset, Cancel, Save; places per preset in "pos_<game|phone|tablet>_<control>" = x;y;scale, x and y in fractions of the view - the
 // same keys as Xenoblade 3's PadView). The gear (menu button) opens the pause menu on a tap (FrontMenu) and moves where it is dragged; its look
 // (normal / faded to "gear_alpha" %) stays the gear dialog's.
+// [front] Players' own controls (owner 15.11.2026; PadEdit.java has the dialogs): the editor's Hide / Show takes the chosen control (or its group) out
+// of play (4th field of "pos_..." = 1); "Add…" lists the hidden ones, first the stand-alone L3 / R3 buttons ("ls" / "rs", BUTTON_THUMBL / THUMBR),
+// which every layout has, hidden by default where the layout itself had none (game preset: L3); "Rename…" gives the chosen button its own label
+// (at most 8 characters, "lbl_<game|phone|tablet>_<control>"; drawn in the classic look, scaled to fit). Saved with the places, Cancel rolls back,
+// Reset (editor or menu) returns every place, hide and label to the default. Layouts saved by older builds load unchanged.
 public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Painter {
     static final int PAD_DEVICE = 0x7d00;
     static final int SETTINGS = -1;   // not a key: the menu button
@@ -62,6 +67,8 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         int pointer = -1; float kx, ky, travel; long down; boolean onKnob; int dirBits;   // runtime: the finger, a stick's knob (px), a d-pad's held directions
         float bx = Float.NaN, by;                                                         // runtime: a floating stick's base (px) while a finger holds it
         float px = -1, py = -1, ps = 1;                                                   // the player's place (fractions of the view) and size
+        boolean hidden, defHidden;   // [front] the player hid it (editor Hide) / hidden until added (the stand-alone L3 / R3: editor "Add…")
+        String custom;               // [front] the player's label (editor "Rename…", K_BUTTON only), null = the default glyph / letter
         Ctl(String name, String label, int kind, int key, float fx, float fy, float ox, float oy, float hw, float hh, boolean win) {
             this.name = name; this.label = label; this.kind = kind; this.key = key; this.fx = fx; this.fy = fy; this.ox = ox; this.oy = oy; this.hw = hw; this.hh = hh; this.win = win;
         }
@@ -130,7 +137,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     private PadSurface surface;
     // The pad's surface, to add to the game's frame right under this view (above the game's SurfaceView); the same one on every call.
     PadSurface attachSurface() {
-        if (surface == null) { surface = new PadSurface(getContext(), this); surface.setVisibility(getVisibility()); setWillNotDraw(true); }
+        if (surface == null) { surface = new PadSurface(getContext(), this); surface.setVisibility(getVisibility()); setWillNotDraw(true); fpsView.sync(); }
         return surface;
     }
     // Back to drawing on the window (UI thread): the surface is taken out of its parent and its thread ends.
@@ -139,12 +146,15 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         synchronized (lock) { s = surface; surface = null; }
         if (s == null) return;
         if (s.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) s.getParent()).removeView(s);
-        setWillNotDraw(false); invalidate();
+        setWillNotDraw(false); invalidate(); fpsView.sync();
         android.util.Log.i("dm", "[java] pad drawn on the window again (HWUI)");
     }
     boolean drawsOnSurface() { return surface != null; }
     private void redraw() { PadSurface s = surface; if (s != null) s.request(); else invalidate(); }
-    @Override public void setVisibility(int v) { super.setVisibility(v); PadSurface s = surface; if (s != null) s.setVisibility(v); }
+    @Override public void setVisibility(int v) { super.setVisibility(v); PadSurface s = surface; if (s != null) s.setVisibility(v); fpsShown(); }
+    // [front] the frame counter's own view (FpsOverlay) goes into the parent with the pad and leaves with it
+    @Override protected void onAttachedToWindow() { super.onAttachedToWindow(); fpsView.sync(); }
+    @Override protected void onDetachedFromWindow() { super.onDetachedFromWindow(); fpsView.sync(); }
 
     // defaultPreset: PRESET_GAME (DOOM, Eternal, XC2) or PRESET_SWITCH (XC3); defaultSkin: PadSkin.CLASSIC or a pack; wheelKeyDefault: the weapon
     // wheel key without a saved "wheel_key" (0 = no wheel: the two shorter constructors; DOOM 2016: KeyEvent.KEYCODE_E); mapKeyDefault: the map key
@@ -164,6 +174,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         skin = new PadSkin(c);
         line.setStyle(Paint.Style.STROKE); line.setStrokeWidth(2 * dp);
         text.setTextAlign(Paint.Align.CENTER); text.setTextSize(15 * dp);
+        fpsView = new FpsOverlay(this, DmActivity::nativeFrameStats, this::legacyFps, this::drawsOnSurface);
         reloadSettings();
     }
     String defaultSkin() { return defSkin; }
@@ -207,8 +218,27 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
                 ctls.add(k);
             }
         }
+        addStickButtons(layout);
         if (!split) for (Ctl c : ctls) if (c.kind == K_BUTTON && ("a".equals(c.name) || "b".equals(c.name) || "x".equals(c.name) || "y".equals(c.name))) c.group = "abxy";
         loadPlaces();
+    }
+    // [front] Stand-alone L3 / R3 buttons (owner 15.11: a tap on a stick's knob is not always handy): every layout has "ls" and "rs" buttons that send
+    // BUTTON_THUMBL / THUMBR (front_android.c: DM_BTN_LS / DM_BTN_RS). The switch preset's theme layouts have them (overlay_default.tsv), the game
+    // preset has R3 (MELEE); a missing one is added here hidden (defHidden): the editor's "Add…" shows it, Hide takes it away again.
+    private void addStickButtons(int layout) {
+        for (int r = 0; r < 2; r++) {
+            String n = r == 0 ? "ls" : "rs"; boolean has = false;
+            for (Ctl c : ctls) if (n.equals(c.name)) { has = true; break; }
+            if (has) continue;
+            int key = r == 0 ? KeyEvent.KEYCODE_BUTTON_THUMBL : KeyEvent.KEYCODE_BUTTON_THUMBR; String lab = r == 0 ? "L3" : "R3";
+            Ctl k;
+            if (layout < 0) k = r == 0 ? new Ctl(n, lab, K_BUTTON, key, 0.12f, 0.42f, 92, -52, 24, 24, false) : new Ctl(n, lab, K_BUTTON, key, 0.86f, 0.79f, -88, 14, 28, 28, false);
+            else {   // nx2android's places of L3 / R3 (overlay_default.tsv), for a theme without them
+                boolean ph = layout == 1; float x = ph ? 0.6117f : 0.3974f, y = ph ? 0.4854f : 0.5079f, w = ph ? 0.1068f : 0.0684f;
+                k = new Ctl(n, lab, K_BUTTON, key, r == 0 ? 0 : 1, y, r == 0 ? x : -x, 0, w / 2, w / 2, true);
+            }
+            k.defHidden = true; ctls.add(k);
+        }
     }
     static int keyOf(int btn) {   // DM_BTN_* -> the keycode front_android.c maps to it
         switch (btn) {
@@ -221,24 +251,40 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     private int wantLayout() { return PRESET_SWITCH.equals(preset) && skin.theme != null && getHeight() > 0 ? (getWidth() >= PHONE_ASPECT * getHeight() ? 1 : 0) : -1; }
     private void ensureBuilt() { int l = wantLayout(); if (l != builtFor) { releaseAllLocked(); build(l); } }
     private String placeKey(Ctl c) { return "pos_" + (builtFor < 0 ? "game" : PadTheme.LAYOUT_NAMES[builtFor]) + "_" + c.name; }
+    // [front] the player's label of a button: "lbl_<game|phone|tablet>_<control>" (a missing key = the default label)
+    private String labelKey(Ctl c) { return "lbl_" + (builtFor < 0 ? "game" : PadTheme.LAYOUT_NAMES[builtFor]) + "_" + c.name; }
     private SharedPreferences prefs() { return getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE); }
+    // "pos_..." = x;y;scale[;hidden]: the 4th field (0 / 1, the editor's Hide / Add) is optional - a 3-field value (older builds) keeps the
+    // control's default (shown; the stand-alone L3 / R3 hidden), and older builds read a 4-field value's first three as before
     private void loadPlaces() {
         SharedPreferences p = prefs();
-        for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; String v = p.getString(placeKey(c), null);
-            if (v != null) try { String[] f = v.split(";"); c.px = Float.parseFloat(f[0]); c.py = Float.parseFloat(f[1]); c.ps = Float.parseFloat(f[2]); } catch (Exception e) { c.px = c.py = -1; c.ps = 1; } }
+        for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; c.hidden = c.defHidden; c.custom = c.kind == K_BUTTON ? PadEdit.clean(p.getString(labelKey(c), null)) : null;
+            String v = p.getString(placeKey(c), null);
+            if (v != null) try { String[] f = v.split(";"); c.px = Float.parseFloat(f[0]); c.py = Float.parseFloat(f[1]); c.ps = Float.parseFloat(f[2]);
+                if (f.length >= 4) c.hidden = "1".equals(f[3].trim()) && c.kind != K_MENU; } catch (Exception e) { c.px = c.py = -1; c.ps = 1; c.hidden = c.defHidden; } }
     }
     private void savePlaces() {
         SharedPreferences.Editor e = prefs().edit();
-        for (Ctl c : ctls) { String k = placeKey(c); if (c.px < 0 && c.ps == 1) e.remove(k); else e.putString(k, String.format(Locale.ROOT, "%.5f;%.5f;%.4f", c.px, c.py, c.ps)); }
+        for (Ctl c : ctls) { String k = placeKey(c); boolean hid = c.hidden && c.kind != K_MENU;
+            if (c.px < 0 && c.ps == 1 && hid == c.defHidden) e.remove(k); else e.putString(k, String.format(Locale.ROOT, "%.5f;%.5f;%.4f;%d", c.px, c.py, c.ps, hid ? 1 : 0));
+            if (c.custom == null) e.remove(labelKey(c)); else e.putString(labelKey(c), c.custom); }
         e.apply();
     }
+    private static void toDefault(Ctl c) { c.px = c.py = -1; c.ps = 1; c.hidden = c.defHidden; c.custom = null; }
 
     // A real controller is connected (DmActivity.updatePadVisibility): only the settings button stays; everything held is released.
     private boolean controllerMode;
     private int gearMode = GEAR_NORMAL, gearAlpha = GEAR_ALPHA_DEFAULT;
-    // Frame counter (gear dialog): fps, mean / max frame time and GPU time of the last 0.5 s, redrawn twice a second.
-    private boolean showFps; private final float[] fstats = new float[4];
-    private final Runnable fpsTick = new Runnable() { public void run() { if (!showFps) return; synchronized (lock) { try { DmActivity.nativeFrameStats(fstats); } catch (UnsatisfiedLinkError e) { fstats[0] = 0; } } redraw(); postDelayed(this, 500); } };
+    // Frame counter (gear dialog "fps"): fps, mean / max frame time and GPU time of the last 0.5 s, twice a second, and the throttle dot ("fps_dot").
+    // [front] Drawn by FpsOverlay in a small view of its own (PNH-C04: the pad is no longer drawn again twice a second for it). The pad draws the
+    // counter itself (drawFps, the old way) only when FpsOverlay hands it the numbers: DM_FPS_VIEW=0, or a parent that is not a FrameLayout.
+    private boolean showFps, legacyFps; private final float[] fstats = new float[4];
+    private final FpsOverlay fpsView;
+    private void legacyFps(float[] s) {   // UI thread (FpsOverlay.Legacy): the numbers for drawFps, null = the overlay draws them again
+        synchronized (lock) { legacyFps = s != null; if (s != null) System.arraycopy(s, 0, fstats, 0, 4); }
+        redraw();
+    }
+    private void fpsShown() { fpsView.shown(getVisibility() == VISIBLE && !edit); }
     // The top-left rounded screen corner and the cutout inset (Android 12+, from WindowInsets), so the FPS counter starts where the top of
     // its glyphs clears the corner arc (Poco F8 Ultra: a bigger radius than the Mi 14 Ultra cut off the start of the line; diablo3-port #1,
     // D3PadView 5941060). Android 10 / 11: 18 dp, as before (also the minimum).
@@ -258,7 +304,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         float dy = cornerCy - y; return dy >= cornerR ? cornerCx : cornerCx - (float) Math.sqrt(cornerR * cornerR - dy * dy);
     }
     private void drawFps(Canvas c) {
-        if (!showFps || fstats[0] <= 0) return;
+        if (!showFps || !legacyFps || fstats[0] <= 0) return;
         String t = String.format(Locale.ROOT, "%.0f fps  %.1f ms (max %.0f)%s", fstats[0], fstats[1], fstats[2],
             fstats[3] >= 0 ? String.format(Locale.ROOT, "  GPU %.1f", fstats[3]) : "");
         // top left corner, clear of the rounded screen corner (cornerLeft; at least 18 dp)
@@ -282,7 +328,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     @Override public void reloadSettings() { synchronized (lock) { reloadSettingsLocked(); } redraw(); }
     private void reloadSettingsLocked() {
         SharedPreferences p = prefs();
-        deadzone = p.getFloat("move_dz", 0f); showFps = p.getBoolean("fps", true); removeCallbacks(fpsTick); if (showFps) postDelayed(fpsTick, 500); lookGain = p.getFloat("look", 1.0f);
+        deadzone = p.getFloat("move_dz", 0f); showFps = p.getBoolean("fps", true); fpsView.set(showFps, p.getBoolean(FpsOverlay.PREF_DOT, true)); lookGain = p.getFloat("look", 1.0f);
         wheelKey = p.getInt("wheel_key", wheelDefault);
         mapKey = p.getInt("map_key", mapDefault); if (mapKey == 0) mapOn = false;
         floatOn = floatOffered && p.getBoolean("float_stick", floatDefault);
@@ -322,7 +368,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         float qx = Math.abs(dx) - hw + rad, qy = Math.abs(dy) - hh + rad, px = Math.max(qx, 0), py = Math.max(qy, 0);
         return (float) Math.sqrt(px * px + py * py) + Math.min(Math.max(qx, qy), 0) - rad;
     }
-    private boolean visible(Ctl c) { return c.kind == K_MENU || (shown && !controllerMode); }
+    private boolean visible(Ctl c) { return c.kind == K_MENU || (shown && !controllerMode && !c.hidden); }   // [front] a hidden control: neither drawn nor hit in play
     // the control a finger going down at (x, y) takes: the nearest button / d-pad / menu whose (enlarged) shape holds it, else a stick whose grab zone
     // holds it (any: every control, for the editor)
     private Ctl hit(float x, float y, boolean any) {
@@ -498,6 +544,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
                 if (wheelKey != 0 && c.key == wheelKey && wheelLook.pointer < 0) lookStart(wheelLook, id, x, y); }
             else if (c == null && floatOn && (ms = moveCtl()) != null && ms.pointer < 0 && visible(ms) && inFloatZone(ms, x, y)) grabFloat(ms, id, x, y);   // [issue #40]
             else if (lookOn && look.pointer < 0) lookStart(look, id, x, y);   // any other free spot turns the view
+            if (c == null && !holds(id)) fpsView.pressDown(id, x, y);   // [front] a long press on the counter: the throttle dot's explanation
             break;
         }
         case MotionEvent.ACTION_MOVE:
@@ -514,7 +561,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
                     lookMove(l, px, py);
                 }
             }
-            flushLook();
+            flushLook(); fpsView.pressMove(e);
             break;
         case MotionEvent.ACTION_UP: case MotionEvent.ACTION_POINTER_UP: case MotionEvent.ACTION_CANCEL: {
             boolean all = a == MotionEvent.ACTION_CANCEL || a == MotionEvent.ACTION_UP;
@@ -526,41 +573,50 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
             if (id == look.pointer || all) look.pointer = -1;
             if (id == fireLook.pointer || all) fireLook.pointer = -1;
             if (id == wheelLook.pointer || all) wheelLook.pointer = -1;
+            fpsView.pressUp(id, all);
             break;
         }
         }
         if (!controllerMode) { updateWheel(); sendKeys(); axes(); }
     }
+    private boolean holds(int id) { for (Ctl c : ctls) if (c.pointer == id) return true; return false; }   // a control (or the floating stick) has this finger
     private void menuDrag(Ctl c, float x, float y) {
         if (!menuMoved && Math.hypot(x - menuX0, y - menuY0) < DRAG_SLOP * getHeight()) return;
         menuMoved = true; c.px = Math.max(0, Math.min(1, (x + menuGX) / getWidth())); c.py = Math.max(0, Math.min(1, (y + menuGY) / getHeight()));
     }
 
     // ---- the layout editor (from Xenoblade 3's front end)
-    private boolean edit; private Ctl edSel; private int edPtr = -1, edPtr2 = -1, edBtnDown = -1; private float edGX, edGY, edD0, edS0; private float[][] edSaved;
+    private boolean edit; private Ctl edSel; private int edPtr = -1, edPtr2 = -1, edBtnDown = -1; private float edGX, edGY, edD0, edS0; private float[][] edSaved; private String[] edLabels;
+    // what Cancel goes back to: every control's place, size, hide and label
+    private void edSnapshot() {
+        edSaved = new float[ctls.size()][]; edLabels = new String[ctls.size()];
+        for (int i = 0; i < ctls.size(); i++) { Ctl c = ctls.get(i); edSaved[i] = new float[] {c.px, c.py, c.ps, c.hidden ? 1 : 0}; edLabels[i] = c.custom; }
+    }
     @Override public void startEdit(Runnable done) {
         synchronized (lock) {
         ensureBuilt(); releaseAllLocked(); edit = true; edSel = null; edPtr = edPtr2 = -1; editDone = done;
-        edSaved = new float[ctls.size()][]; for (int i = 0; i < ctls.size(); i++) { Ctl c = ctls.get(i); edSaved[i] = new float[] {c.px, c.py, c.ps}; }
+        edSnapshot();
         android.util.Log.i("dm", "[java] layout editor open (" + preset + ")");
         }
-        redraw();
+        fpsShown(); redraw();
     }
     @Override public boolean editing() { return edit; }
     @Override public void endEdit(boolean save) {
         synchronized (lock) {
         if (!edit) return;
-        if (save) savePlaces(); else for (int i = 0; i < ctls.size() && i < edSaved.length; i++) { Ctl c = ctls.get(i); c.px = edSaved[i][0]; c.py = edSaved[i][1]; c.ps = edSaved[i][2]; }
+        if (save) savePlaces(); else for (int i = 0; i < ctls.size() && i < edSaved.length; i++) { Ctl c = ctls.get(i); c.px = edSaved[i][0]; c.py = edSaved[i][1]; c.ps = edSaved[i][2]; c.hidden = edSaved[i][3] != 0; c.custom = edLabels[i]; }
         edit = false; edSel = null;
         }
-        redraw();
+        fpsShown(); redraw();
         android.util.Log.i("dm", "[java] layout editor " + (save ? "saved" : "cancelled"));
         Runnable d = editDone; editDone = null; if (d != null) d.run();
     }
-    @Override public void resetLayout() { synchronized (lock) { ensureBuilt(); for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; } savePlaces(); } redraw(); }
-    private static final int ED_BUTTONS = 6;
-    private RectF edButton(int k) {   // the toolbar at the top middle: - + Grouped/Separate Reset Cancel Save
-        float H = getHeight(), bw = H * 0.17f, bh = H * 0.085f, gap = H * 0.02f, total = ED_BUTTONS * bw + (ED_BUTTONS - 1) * gap, x0 = (getWidth() - total) / 2, y0 = H * 0.035f;
+    @Override public void resetLayout() { synchronized (lock) { ensureBuilt(); for (Ctl c : ctls) toDefault(c); savePlaces(); } redraw(); }
+    // the toolbar at the top middle: - + Grouped/Separate Hide/Show Add… Rename… Reset Cancel Save
+    private static final int ED_BUTTONS = 9, ED_SPLIT = 2, ED_HIDE = 3, ED_ADD = 4, ED_RENAME = 5, ED_RESET = 6, ED_CANCEL = 7;
+    private RectF edButton(int k) {
+        float H = getHeight(), W = getWidth(), gap = H * 0.02f, bw = Math.min(H * 0.17f, (W - 32 * dp - (ED_BUTTONS - 1) * gap) / ED_BUTTONS), bh = H * 0.085f;
+        float total = ED_BUTTONS * bw + (ED_BUTTONS - 1) * gap, x0 = (W - total) / 2, y0 = H * 0.035f;
         return new RectF(x0 + k * (bw + gap), y0, x0 + k * (bw + gap) + bw, y0 + bh);
     }
     private int edButtonAt(float x, float y) { for (int k = 0; k < ED_BUTTONS; k++) if (edButton(k).contains(x, y)) return k; return -1; }
@@ -569,7 +625,59 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         savePlaces(); split = !split; prefs().edit().putBoolean("split", split).apply();
         android.util.Log.i("dm", "[java] layout editor: " + (split ? "every button on its own" : "ABXY and d-pad grouped"));
         build(builtFor); edSel = null; edGroup.clear();
-        edSaved = new float[ctls.size()][]; for (int i = 0; i < ctls.size(); i++) { Ctl c = ctls.get(i); edSaved[i] = new float[] {c.px, c.py, c.ps}; }
+        edSnapshot();
+    }
+    // [front] Hide / Show: the chosen control (or its group); the gear never hides. Show when everything chosen is hidden.
+    private boolean edCanHide() { if (edSel != null) for (Ctl c : ctls) if (inSel(c) && c.kind != K_MENU) return true; return false; }
+    private boolean edSelHidden() { boolean any = false; if (edSel != null) for (Ctl c : ctls) if (inSel(c) && c.kind != K_MENU) { if (!c.hidden) return false; any = true; } return any; }
+    private void edToggleHide() {
+        if (!edCanHide()) return;
+        boolean hide = !edSelHidden();
+        for (Ctl c : ctls) if (inSel(c) && c.kind != K_MENU) c.hidden = hide;
+        android.util.Log.i("dm", "[java] layout editor: " + edSel.name + (hide ? " hidden" : " shown"));
+    }
+    private String edTitle(Ctl c) {   // a control's name in the Add list
+        boolean ru = Ui.ru(getContext());
+        switch (c.name) {
+            case "ls": return ru ? "L3 (нажатие левого стика)" : "L3 (left stick click)";
+            case "rs": return ru ? "R3 (нажатие правого стика)" : "R3 (right stick click)";
+            case "stick_l": return ru ? "Левый стик" : "Left stick";
+            case "stick_r": return ru ? "Правый стик" : "Right stick";
+            case "dpad": return ru ? "Крестовина" : "D-pad";
+            default: return c.custom != null ? c.custom + " (" + c.label + ")" : c.label;
+        }
+    }
+    // [front] Add…: the hidden controls (the stand-alone L3 / R3 first); a pick shows it (with its group while grouped) and chooses it
+    private void edAdd() {
+        final List<Ctl> hid = new ArrayList<>();
+        for (int pass = 0; pass < 2; pass++) for (Ctl c : ctls) if (c.hidden && c.kind != K_MENU && c.defHidden == (pass == 0)) hid.add(c);
+        List<String> labels = new ArrayList<>(); List<String> groupsSeen = new ArrayList<>(); final List<Ctl> pick = new ArrayList<>();
+        for (Ctl c : hid) {   // a group (the ABXY diamond, only while grouped) is one row
+            if (c.group != null) { if (groupsSeen.contains(c.group)) continue; groupsSeen.add(c.group); }
+            pick.add(c); labels.add(c.group != null ? "A B X Y" : edTitle(c));
+        }
+        Context x = getContext();
+        PadEdit.addMenu(x, Ui.t(x, "Добавить кнопку", "Add a button"), labels.toArray(new String[0]), Ui.t(x, "Все кнопки уже на экране", "Every button is already shown"), i -> {
+            synchronized (lock) {
+                if (!edit || i < 0 || i >= pick.size() || !ctls.contains(pick.get(i))) return;
+                Ctl c = pick.get(i); edSel = c;
+                for (Ctl k : ctls) if (inSel(k) && k.kind != K_MENU) k.hidden = false;
+                android.util.Log.i("dm", "[java] layout editor: added " + c.name);
+            }
+            redraw();
+        });
+    }
+    // [front] Rename…: the chosen button's own label (at most PadEdit.MAX_LABEL characters, empty / Default = its glyph or letter)
+    private void edRename() {
+        final Ctl c = edSel; Context x = getContext();
+        if (c == null || c.kind != K_BUTTON) { android.widget.Toast.makeText(x, Ui.t(x, "Сначала выберите кнопку", "Choose a button first"), android.widget.Toast.LENGTH_SHORT).show(); return; }
+        PadEdit.rename(x, Ui.t(x, "Имя кнопки", "Button name"),
+            Ui.t(x, "До " + PadEdit.MAX_LABEL + " символов; пусто — как было (" + c.label + ")", "Up to " + PadEdit.MAX_LABEL + " characters; empty = the default (" + c.label + ")"),
+            c.custom, c.label, Ui.t(x, "Готово", "OK"), Ui.t(x, "По умолчанию", "Default"), Ui.t(x, "Отмена", "Cancel"), s -> {
+                synchronized (lock) { if (!edit || !ctls.contains(c)) return; c.custom = PadEdit.clean(s); }
+                android.util.Log.i("dm", "[java] layout editor: " + c.name + " label " + (c.custom == null ? "default" : "set"));
+                redraw();
+            });
     }
     private void edResize(Ctl c, float s) { c.ps = Math.max(0.5f, Math.min(2.5f, s)); }
     private void edPlace(Ctl c, float cx, float cy) { c.px = Math.max(0, Math.min(1, cx / getWidth())); c.py = Math.max(0, Math.min(1, cy / getHeight())); }
@@ -614,9 +722,12 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
             int bt = edBtnDown; edPtr = edPtr2 = -1; edBtnDown = -1;
             if (bt >= 0 && a != MotionEvent.ACTION_CANCEL && bt == edButtonAt(e.getX(ai), e.getY(ai))) {
                 if (bt == 0 || bt == 1) { float f = bt == 1 ? 1.1f : 1 / 1.1f; if (edSel != null) { edGrab(edSel); edScaleGroup(f); } else for (Ctl c : ctls) edResize(c, c.ps * f); }
-                else if (bt == 2) edToggleSplit();
-                else if (bt == 3) { for (Ctl c : ctls) { c.px = c.py = -1; c.ps = 1; } edSel = null; }
-                else if (bt == 4) { endEdit(false); return; }
+                else if (bt == ED_SPLIT) edToggleSplit();
+                else if (bt == ED_HIDE) edToggleHide();
+                else if (bt == ED_ADD) post(this::edAdd);         // [front] dialogs outside the touch lock
+                else if (bt == ED_RENAME) post(this::edRename);
+                else if (bt == ED_RESET) { for (Ctl c : ctls) toDefault(c); edSel = null; }
+                else if (bt == ED_CANCEL) { endEdit(false); return; }
                 else { endEdit(true); return; }
             }
             redraw();
@@ -652,12 +763,14 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         s = s * 31 + Float.floatToIntBits(opacity); s = s * 31 + Float.floatToIntBits(sizeK); s = s * 31 + gearAlpha;
         s = s * 31 + skinPack.hashCode(); s = s * 31 + preset.hashCode();
         s = s * 31 + (edSel == null ? -1 : ctls.indexOf(edSel)); s = s * 31 + edBtnDown;
-        if (showFps && !edit) for (float f : fstats) s = s * 31 + Float.floatToIntBits(f);
+        if (showFps && legacyFps && !edit) for (float f : fstats) s = s * 31 + Float.floatToIntBits(f);
+        s = s * 31 + (legacyFps ? 1 : 0);
         for (Ctl k : ctls) {
             s = s * 31 + (k.pointer >= 0 ? 1 : 0); s = s * 31 + k.dirBits;
             s = s * 31 + Float.floatToIntBits(k.kx); s = s * 31 + Float.floatToIntBits(k.ky);
             s = s * 31 + Float.floatToIntBits(k.bx); s = s * 31 + Float.floatToIntBits(k.by);
             s = s * 31 + Float.floatToIntBits(k.px); s = s * 31 + Float.floatToIntBits(k.py); s = s * 31 + Float.floatToIntBits(k.ps);
+            s = s * 31 + (k.hidden ? 1 : 0); s = s * 31 + (k.custom == null ? 0 : k.custom.hashCode());
         }
         return s == PadSurface.NOT_READY ? s + 1 : s;
     }
@@ -673,7 +786,7 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
     private float alphaOf(Ctl k) {
         if (k.kind == K_MENU) return k.pointer >= 0 ? 1 : gearMode == GEAR_FADED ? gearAlpha / 100f : 1;
         float a = edit ? Math.max(opacity, 0.7f) : opacity;
-        return edit && inSel(k) ? 1 : a;
+        return (edit && inSel(k) ? 1 : a) * (edit && k.hidden ? 0.4f : 1);   // [front] the editor shows a hidden control dimmed (and struck through)
     }
     private boolean inSel(Ctl k) { return edSel != null && (k == edSel || (edSel.group != null && edSel.group.equals(k.group))); }
     private void drawCtl(Canvas c, Ctl k) {
@@ -684,8 +797,14 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         // the game preset's round buttons: a skin's shoulder (wide) sprites get a pill-shaped box of the same height
         float bw = b[2], bh = b[3];
         if (!k.win && (k.name.equals("l") || k.name.equals("r") || k.name.equals("zl") || k.name.equals("zr") || k.kind == K_MENU)) bw = b[2] * 1.6f;
-        if (skin.draw(c, k.name, b[0], b[1], bw, bh, held, k.dirBits, kx, ky, sa, getHeight())) return;
+        if (k.custom == null && skin.draw(c, k.name, b[0], b[1], bw, bh, held, k.dirBits, kx, ky, sa, getHeight())) { strike(c, k, b); return; }   // [front] a renamed button: the classic look with its label
         drawClassic(c, k, b, al, held);
+        strike(c, k, b);
+    }
+    private void strike(Canvas c, Ctl k, float[] b) {   // [front] the editor's mark on a hidden control: a red slash across it (PadEditor's)
+        if (!edit || !k.hidden) return;
+        float d = Math.min(b[2], b[3]) * 0.75f; line.setColor(0xffff5050); line.setAlpha(0xe0); line.setStrokeWidth(2 * dp);
+        c.drawLine(b[0] - d, b[1] + d, b[0] + d, b[1] - d, line);
     }
     private void drawClassic(Canvas c, Ctl k, float[] b, float al, boolean held) {
         float x = b[0], y = b[1];
@@ -710,15 +829,20 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
         text.setTextSize(Math.max(10 * dp, Math.min(15 * dp * sizeK, Math.min(b[2], b[3]) * 0.75f)));
         if (b[2] == b[3]) { c.drawCircle(x, y, b[2], fill); c.drawCircle(x, y, b[2], line); }
         else { RectF r = new RectF(x - b[2], y - b[3], x + b[2], y + b[3]); float rad = Math.min(b[2], b[3]); c.drawRoundRect(r, rad, rad, fill); c.drawRoundRect(r, rad, rad, line); }
-        c.drawText(k.label, x, y + text.getTextSize() * 0.35f, text);
+        String lab = k.custom != null ? k.custom : k.label;
+        PadEdit.fit(text, lab, b[2] == b[3] ? b[2] * 1.7f : b[2] * 2 - Math.min(b[2], b[3]) * 0.6f);   // [front] a long (player's) label fits the button
+        c.drawText(lab, x, y + text.getTextSize() * 0.35f, text);
     }
     private void drawEditor(Canvas c) {
         boolean ru = Ui.ru(getContext());
-        String[] names = ru ? new String[] {"−", "+", split ? "Раздельно" : "Группами", "Сброс", "Отмена", "Сохранить"} : new String[] {"−", "+", split ? "Separate" : "Grouped", "Reset", "Cancel", "Save"};
-        text.setTextSize(getHeight() * 0.04f); text.setColor(0xffffffff);
+        boolean sh = edSelHidden(), ch = edCanHide(), cr = edSel != null && edSel.kind == K_BUTTON;
+        String[] names = ru ? new String[] {"−", "+", split ? "Раздельно" : "Группами", sh ? "Показать" : "Скрыть", "Добавить…", "Имя…", "Сброс", "Отмена", "Сохранить"}
+                            : new String[] {"−", "+", split ? "Separate" : "Grouped", sh ? "Show" : "Hide", "Add…", "Rename…", "Reset", "Cancel", "Save"};
         for (int k = 0; k < ED_BUTTONS; k++) {
             RectF r = edButton(k); fill.setColor(k == edBtnDown ? 0xff1fb6c9 : k == ED_BUTTONS - 1 ? 0xe0157c8a : 0xd0202833); line.setColor(0xff7fe3f0); line.setStrokeWidth(1.5f * dp);
             float rad = r.height() / 2; c.drawRoundRect(r, rad, rad, fill); c.drawRoundRect(r, rad, rad, line);
+            text.setTextSize(getHeight() * 0.04f); PadEdit.fit(text, names[k], r.width() * 0.9f);
+            text.setColor(0xffffffff); text.setAlpha((k == ED_HIDE && !ch) || (k == ED_RENAME && !cr) ? 0x60 : 0xff);   // grey while nothing they act on is chosen
             c.drawText(names[k], r.centerX(), r.centerY() + text.getTextSize() * 0.35f, text);
         }
         if (edSel != null) {   // one frame around the chosen control, or around its whole group
@@ -727,9 +851,9 @@ public class DoomPadView extends View implements FrontMenu.Pad, PadSurface.Paint
             line.setColor(0xff7fe3f0); line.setStrokeWidth(2 * dp);
             c.drawRoundRect(new RectF(l - 4 * dp, t - 4 * dp, r + 4 * dp, bt + 4 * dp), 12 * dp, 12 * dp, line); }
         line.setStrokeWidth(2 * dp);
-        text.setTextSize(getHeight() * 0.032f); text.setAlpha(220);
-        c.drawText(ru ? (split ? "Тяните контрол пальцем (каждая кнопка отдельно)" : "Тяните контрол пальцем (ромб ABXY и крестовина — целиком)") + ", второй палец — размер; −/+ без выбора меняют все"
-                      : (split ? "Drag a control (every button on its own)" : "Drag a control (the ABXY diamond and the d-pad move as one)") + "; a second finger resizes it; − / + with none chosen resize all",
-            getWidth() / 2f, getHeight() * 0.18f, text);
+        String hint = ru ? (split ? "Тяните контрол пальцем (каждая кнопка отдельно)" : "Тяните контрол пальцем (ромб ABXY и крестовина — целиком)") + ", второй палец — размер; −/+ без выбора меняют все; «Добавить…» — L3/R3 и скрытые"
+                         : (split ? "Drag a control (every button on its own)" : "Drag a control (the ABXY diamond and the d-pad move as one)") + "; a second finger resizes it; − / + with none chosen resize all; Add… = L3 / R3 and hidden ones";
+        text.setTextSize(getHeight() * 0.032f); PadEdit.fit(text, hint, getWidth() * 0.96f); text.setColor(0xffffffff); text.setAlpha(220);
+        c.drawText(hint, getWidth() / 2f, getHeight() * 0.18f, text);
     }
 }

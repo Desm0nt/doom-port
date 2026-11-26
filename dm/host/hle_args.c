@@ -14,6 +14,8 @@
 //   DM_DOOM_DRS=<n>        debugging: +set rs_enable <n> at every launch. Unset (normal): nothing -- rs_enable's default is patched
 //                          to "0" and the Video menu / gear checkbox (one shared state, saved in the game profile) decide.
 //   DM_DOOM_GEOMCULL=1     keep DOOM's triangle culling (default off: it drops visible triangles on our GPU path).
+//   DM_DOOM_GEOMCULL=2     keep it only while the gs-fix claim is on (DM_GFX_GS_FIX unset or with bit 1: the culling GS appends each
+//                          visible triangle once per primitive, as on the Switch). For the A/B run before culling comes back by default.
 //   DM_DOOM_ADAPTIVE_TICK=0  keep the fixed 30 Hz game tic (default: adaptive tick, game time follows real frame time).
 //   DM_DOOM_TICK_MIN / DM_DOOM_TICK_MAX  adaptive tick Hz range (default 30 / 60; the gear's frame rate limit sets MAX = the limit,
 //                          together with DM_PRESENT_MAX_HZ, so game time keeps real time at the capped present rate).
@@ -279,8 +281,12 @@ static void build(void) {
     // DOOM's triangle culling (r_geometryCulling / r_smallTriangleCulling: the geometry shader of the depth pre-pass) drops visible
     // triangles here -- black holes in models (28.10, owner's play test: almost gone with both off, ~1 fps / ~1 ms GPU cost). Off
     // until that shader runs correctly; DM_DOOM_GEOMCULL=1 keeps the game's culling.
+    // [gs-fix] DM_DOOM_GEOMCULL=2: kept only with the claim of port-common/modules/gs-fix on (xbg_gsfix.h: Adreno ran the culling GS
+    // once per output vertex, so it appended each visible triangle 3 times and ran past its index range: gs_cull_fix.md rounds 2-7).
     const char *gc = getenv("DM_DOOM_GEOMCULL");
-    if (!(gc && atoi(gc))) { add("+set"); add("r_geometryCulling"); add("0"); add("+set"); add("r_smallTriangleCulling"); add("0"); }
+    int keep_cull = gc && atoi(gc) ? atoi(gc) : 0;
+    if (keep_cull == 2) { const char *gf = getenv("DM_GFX_GS_FIX"); keep_cull = !(gf && *gf) || (strtoul(gf, NULL, 0) & 1); }
+    if (!keep_cull) { add("+set"); add("r_geometryCulling"); add("0"); add("+set"); add("r_smallTriangleCulling"); add("0"); }
     // Game speed vs our frame rate (docs/research/game_speed.md). The game frame loop (update main 0x1ecfa80 / 0x1ed0f00) runs
     // with com_fixedTic 1 (registered default "1"): residual time is zeroed and exactly one game frame of 1000/gameHz ms runs per
     // render frame, gameHz pinned to 30 (0x1f2b630). On the Switch render = 30 fps (present interval 2), so that is real time; we

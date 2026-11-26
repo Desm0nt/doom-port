@@ -46,6 +46,9 @@ interface GearHost {
     default String forcedDriver() { return null; }
     // the repository files the driver code reads (null = no download): drivers/manifest.json (auto updates) and drivers/sources.json (the manager)
     default String driverManifestUrl() { return VkDrivers.MANIFEST_URL; }
+    // true: the port's onActivityResult hands the whole Intent to DriverManager.picked(host, Intent), so "Install from file" may pick several zips
+    // (EXTRA_ALLOW_MULTIPLE: the result may carry only ClipData, which picked(host, Uri) would read as "cancelled")
+    default boolean driverMultiPick() { return false; }
     default String driverSourcesUrl() { return VkDrivers.SOURCES_URL; }
     // the request code the driver manager's file picker uses; the port's onActivityResult hands it to DriverManager.picked
     default int driverZipRequest() { return DriverManager.REQ_ZIP; }

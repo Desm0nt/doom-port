@@ -276,6 +276,7 @@ DOOM Mobile stands on the work of others — thank you:
 - **[Mesa](https://mesa3d.org) Turnip** (MIT) — the default Vulkan driver, bundled in the APK as the adrenotools build
   by **[The412Banner](https://github.com/The412Banner/Banners-Turnip)** (Mesa main). Not stored in this repository:
   `tools/fetch_turnip.py` downloads it at build time with a pinned SHA-256.
+- **peanuts-native** (GPL-3.0-or-later): geometry shader fix (gs-fix), GPU clock floor (gpu-floor), long frame log (longframe-diag).
 - Khronos **Vulkan validation layers** (Apache-2.0) — used for debugging, not redistributed.
 
 Details per file: [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md).
@@ -286,7 +287,7 @@ unofficial, non-commercial fan project with no affiliation to any of them. Play 
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The d2r-mobile copyright notice is kept; third-party components keep their own licenses.
+GPL-3.0-or-later since v0.5.8: see [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md). Some code comes from peanuts-native (GPL-3.0-or-later). The d2r-mobile MIT notice is kept in NOTICE.md, and third-party components keep their own licenses.
 
 ---
 

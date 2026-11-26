@@ -54,6 +54,8 @@ final class VkDrivers {
     private File guardFile() { return new File(a().getFilesDir(), "driver-trying"); }
     private File fallbackFile() { return new File(a().getFilesDir(), "driver-fallback"); }   // 2.56: "<name>" of a driver whose start failed (restart path)
     private SharedPreferences prefs() { return host.gamePrefs(); }
+    // The player's "Allow drivers this phone does not support" switch (DriverManager): rejected packages stay selectable, DM_VK_DRIVER_FORCE=1.
+    boolean forcing() { return prefs().getBoolean("driver_force", false); }
 
     // ---- at the start, before the library loads
     // The environment vk_driver.c reads and the packages in files/drivers. The hooks adrenotools loads live in nativeLibraryDir.
@@ -82,7 +84,10 @@ final class VkDrivers {
             if (!failedBefore.isEmpty()) notice = GearText.s(a(), "toast_driver_init_failed", label(failedBefore)); }
         boolean turnipOk = turnipPossible();
         String why = drv.isEmpty() ? null : problem(drv);
-        if (why != null) {
+        boolean force = forcing();
+        if (why != null && force) {
+            host.crumb("driver: " + drv + " is forced past the hardware check (" + why + "), this phone has " + hardwareSummary());
+        } else if (why != null) {
             host.crumb("driver: saved choice " + drv + " cannot run here (" + why + "), this phone has " + hardwareSummary() + ": the system driver is used and the choice reset");
             p.edit().putString("driver", "").apply();
             notice = t("Драйвер Vulkan " + label(drv) + " не подходит: " + reasonText(why) + ". Используется системный драйвер.",
@@ -109,6 +114,7 @@ final class VkDrivers {
             catch (IOException e) { android.util.Log.e("dm", "driver guard: " + e); }
         }
         if (!drv.isEmpty()) Os.setenv("DM_VK_DRIVER", drv, true); else Os.unsetenv("DM_VK_DRIVER");
+        if (force && !drv.isEmpty()) Os.setenv("DM_VK_DRIVER_FORCE", "1", true); else Os.unsetenv("DM_VK_DRIVER_FORCE");   // vk_driver.c: skip its own family check
         return drv;
     }
     String defaultDriver() { return host.defaultDriver(this); }
@@ -226,8 +232,8 @@ final class VkDrivers {
         if (!turnipPossible()) return "";   // 2.25: non-Adreno: the bundled Turnip is never the default
         File dir = dir();
         int m = adrenoModel(gpuModel());
-        if (m == 0) return qualcommSoc() ? pkgIfPresent(dir, DEFAULT_DRIVER) : "";
-        if (m < 600) return "";
+        if (m <= 0) return qualcommSoc() ? pkgIfPresent(dir, DEFAULT_DRIVER) : "";
+        if (AdrenoModel.tooOldForTurnip(m)) return "";   // a two-digit model (Adreno22) falls through to DEFAULT_DRIVER
         String auto = autoDriverForGpu(dir); if (auto != null) return auto;
         if (m == 710 || m == 720 || m == 722) return pkgIfPresent(dir, DRIVER_A710);
         if (m >= 800 && m < 900) return pkgIfPresent(dir, DRIVER_A8XX);
@@ -248,15 +254,8 @@ final class VkDrivers {
     }
 
     // ---- this phone's GPU
-    // "Adreno750v2" -> 750; 0 = no readable model; -1 = a model that is not an Adreno.
-    static int adrenoModel(String gpu) {
-        if (gpu == null || gpu.isEmpty()) return 0;
-        String g = gpu.toLowerCase(Locale.ROOT); int at = g.indexOf("adreno"); if (at < 0) return -1;
-        int i = at + 6, v = 0, n = 0;
-        while (i < g.length() && !Character.isDigit(g.charAt(i)) && n == 0 && i < at + 12) i++;
-        while (i < g.length() && Character.isDigit(g.charAt(i)) && n < 4) { v = v * 10 + (g.charAt(i++) - '0'); n++; }
-        return n > 0 ? v : -1;
-    }
+    // "Adreno750v2" -> 750, "Adreno22" -> 22; 0 = no readable model; -1 = a model that is not an Adreno (AdrenoModel.of, Android-free).
+    static int adrenoModel(String gpu) { return AdrenoModel.of(gpu); }
     // Can Turnip (Mesa freedreno, Adreno only) work on this phone at all? It drives the GPU through Qualcomm's kernel driver KGSL, so the device
     // node (or its sysfs class) must exist, and the GPU must be an Adreno 6xx or newer (a readable gpu_model), or, when the model is unreadable,
     // the SoC must be a Qualcomm one. vk_driver.c repeats the KGSL check.
@@ -266,7 +265,8 @@ final class VkDrivers {
     static boolean turnipPossible() {
         if (!kgsl()) return false;
         int m = adrenoModel(gpuModel());
-        return m == 0 ? qualcommSoc() : m >= 600;
+        if (m <= 0) { return qualcommSoc(); }   // unreadable, or not an Adreno string
+        return !AdrenoModel.tooOldForTurnip(m);   // "Adreno22" (SG6275P) is newer than a6xx, not older
     }
     static boolean qualcommSoc() {
         String s = ((android.os.Build.VERSION.SDK_INT >= 31 ? android.os.Build.SOC_MANUFACTURER + " " : "") + android.os.Build.HARDWARE).toLowerCase(Locale.ROOT);
@@ -381,15 +381,21 @@ final class VkDrivers {
             for (File f : fs) if (f.getName().endsWith(".so")) { out.add(d.getName()); break; } }
         java.util.Collections.sort(out); return out.toArray(new String[0]);
     }
-    // "<meta.json name> (<folder>)", or just the folder name when there is no readable meta.json.
+    // "<meta.json name> (<folder>)", or just the folder name when there is no readable meta.json, or when another installed package has the
+    // same meta.json name (D3 issue #30: five builds of one PanVK commit for GameHub / Winlator / adrenotools / ... all say
+    // "Mesa-PanVK-26.3.0-devel-795ca7ff"; the folder names, taken from the zip names, are what tells them apart).
     String label(String name) {
+        String t = metaName(name);
+        if (t.isEmpty()) return name;
+        for (String o : packages()) if (!o.equals(name) && t.equals(metaName(o))) return name;
+        return t + " (" + name + ")";
+    }
+    private String metaName(String name) {
         File m = new File(new File(dir(), name), "meta.json");
         try (java.io.FileInputStream in = new java.io.FileInputStream(m)) {
             byte[] b = new byte[(int) Math.min(m.length(), 65536)]; int n = in.read(b);
-            String t = new org.json.JSONObject(new String(b, 0, Math.max(n, 0), "UTF-8")).optString("name", "");
-            if (!t.isEmpty()) return t + " (" + name + ")";
-        } catch (Exception e) { /* no or unreadable meta.json */ }
-        return name;
+            return new org.json.JSONObject(new String(b, 0, Math.max(n, 0), "UTF-8")).optString("name", "").trim();
+        } catch (Exception e) { return ""; }   // no or unreadable meta.json
     }
 
     // ---- files
@@ -506,6 +512,7 @@ final class VkDrivers {
                 org.json.JSONObject meta = null;
                 try (java.io.InputStream in = a().getAssets().open("drivers/" + n + "/meta.json")) { meta = new org.json.JSONObject(readStream(in)); } catch (Exception e) { /* no meta.json: the folder name decides */ }
                 String why = packageProblem(n, meta);
+                if (why != null && forcing()) { why = null; }   // the player allowed packages this phone does not support
                 if (why != null) {
                     if (out.isDirectory() && (org == null || "bundled".equals(org[0]))) { deleteDriverTree(out); android.util.Log.i("dm", "bundled driver " + n + ": removed, not for this phone (" + why + ")"); }
                     continue;

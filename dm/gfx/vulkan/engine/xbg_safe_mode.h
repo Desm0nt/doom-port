@@ -56,6 +56,7 @@ inline int xbg_safe_switches(int step,XbgGpuFamily f,XbgSafeSwitch *out,int max)
     if(!xbg_safe_family(f) || step<=0)return 0;
     add("DM_GFX_ZEROCOPY","0");add("DM_GFX_ZC3_SELFTEST","0");add("DM_GFX_FENCE_TRYLOCK","0");
     if(f==XBG_GPU_POWERVR)add("DM_GFX_UBO_DYNAMIC","0");   // 0.4.22: no dynamic UBOs on PowerVR (Mali: 1 then and now)
+    if(f==XBG_GPU_POWERVR)add("DM_GFX_PVR_CB_BARRIER","1");   // [pvr-cb-barrier] FN-63: full barrier at the start of every command buffer (GameNative)
     if(step>=2){add("DM_GFX_NOLOAD","0");add("DM_GFX_STORE_DEAD","0");add("DM_GFX_STORE_NONE","0");add("DM_GFX_LEAN_USAGE","0");
         add("DM_GFX_TILE_BARRIER","0");add("DM_GFX_LAZY_CLEAR","0");add("DM_GFX_TILE_AREA","0");}
     if(step>=3){add("DM_GFX_COMPILE_LOCK","2");add("DM_GFX_NOOUT_MASK","0");add("DM_GFX_GS_PASSTHRU","0");}

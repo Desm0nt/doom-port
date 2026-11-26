@@ -22,6 +22,7 @@
 // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
 #include "../../host/hle.h"
 #include "nvn_protos.h"
+#include "longframe_diag.h"   // [longframe-diag] PNH-C11: DM_LONGFRAME=1 names the busiest threads of a long frame (port-common/modules/longframe-diag)
 #include "nvn_pool_flags_registry.h"
 #include "nvn_count.h"
 #include "nvn_tex.h"
@@ -1994,6 +1995,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         double fr = (t0 - prev_in) / 1e6, wk = (t0 - prev_out) / 1e6, nv = atomic_exchange(&g_nvn_ns, 0) / 1e6;
         tpush(0, fr); tpush(1, wk); tpush(2, nv); XTRACE_COUNT("dm-game-frame", f); XTRACE_COUNT("dm-frame-ms", (int64_t)fr);
         trow(f, "@frame_ms", fr); trow(f, "@work_ms", wk); trow(f, "@nvn_ms", nv);
+        if (dm_lfd_on()) dm_lfd_frame(f, t0 - prev_in, present_period(o));   // [longframe-diag] a frame >= DM_LONGFRAME_X (2) x the period: the sampler logs its top 3 threads
+        { static int pcd; if (!pcd) { pcd = 1; void pc_note(const char *id, int applied, const char *fmt, ...); pc_note("longframe-diag", dm_lfd_on(), "%s", dm_lfd_why()); } }   // [pc]
         // 慢帧归因（只在开 DM_NVN_TSV 时取）：本帧出图线程 CPU 时间（换线程记 −1）、进程全部线程 CPU、取图等待按帧累计、出图调用时刻（与 GPU / 上屏时刻同基：进程起点 ms）
         // Slow-frame attribution (taken only when DM_NVN_TSV is on): this frame's present-thread CPU time (−1 if the thread changed), CPU of all threads in the process, acquire wait accumulated per frame, present call time (same base as the GPU / on-screen present times: ms since process start)
         trow(f, "@wait_ms", g_acq_wait_ns / 1e6); trow(f, "@pq_wait_ms", g_pq_wait_ns / 1e6);

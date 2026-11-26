@@ -17,6 +17,8 @@
 #include "xbg_game_internal.h"
 #include "xbg_cpu_timing.h"
 #include "xbg_completion_wait.h"
+#define XBG_CB_BARRIER_REPORT 1   // [pc] pvr-cb-barrier: its decision goes to boot.log through pc_note
+#include "xbg_cb_barrier.h"   // [pvr-cb-barrier] FN-63: optional full barrier at the start of every primary command buffer (port-common)
 #ifdef DM_COMPLETION_WAIT_SELFTEST
 extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #endif
@@ -42,6 +44,9 @@ extern "C" int xbg_completion_wait_selftest(char *report,size_t bytes);
 #include "xbg_bright_spv.h"
 #include "xbg_bc_gpu.h"
 #include "xbg_bc_decode_spv.h"
+#include "xbg_bc_astc.h"   // [nonadreno] bc-astc-gpu: GPU-decoded BC stored as ASTC 4x4 (port-common/modules/bc-astc-gpu)
+#include "xbg_bc_astc_tables.h"
+#include "xbg_bc_astc_encode_spv.h"
 #include "xbg_spirv_quad.h"
 #include "xbg_spirv_lone.h"
 #include "xbg_spirv_gscull.h"
@@ -466,6 +471,7 @@ std::atomic<double> perf_gpu_ms{-1},perf_cpu_ms{-1};
 extern "C" double xbg_recent_gpu_ms(void){return perf_gpu_ms.load();}
 extern std::atomic<uint64_t> drs_busy_total_ns;   // [r6] defined before retire_slot
 extern std::atomic<uint64_t> bones_ssbo_modules,bones_ssbo_realign,bones_ssbo_copied;namespace warm{extern std::atomic<uint64_t> ssbo_patched,ssbo_stale;}   // [DOOM] DM_GFX_BONES_SSBO (ssbo_rewrite)
+namespace gsfix{extern unsigned mask;extern std::atomic<uint64_t> claimed,refused,filled,linked;extern uint64_t draws_claimed,draws_open;}namespace warm{extern std::atomic<uint64_t> gsfix_patched;}   // [gs-fix] xbg_gsfix.h (NVN PERF gs_fix)
 extern "C" uint64_t xbg_gpu_busy_total_ns(void){return drs_busy_total_ns.load(std::memory_order_relaxed);}
 extern "C" double xbg_recent_cpu_ms(void){return perf_cpu_ms.load();}
 bool sync_mode=false; // diagnostic: marker files/gfx-sync-mode resolves all GPU results at each submit end
@@ -558,6 +564,7 @@ struct Buffer {
 };
 struct Arena {
     std::vector<ArenaChunk> chunks;size_t current=0;bool cached=false;VkDeviceSize used_total=0,peak=0;
+    VkDeviceSize chunk_bytes=0;bool zero_new=false;   // [gs-fix] Slot::gsclaim: its own chunk size (0 = arena_chunk_bytes) and chunks zeroed when made
     ArenaChunk make(VkDeviceSize bytes){
         CPU_SCOPE(Buffer);ArenaChunk c;c.size=bytes;
         VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};ci.size=bytes;ci.usage=arena_usage;ci.sharingMode=VK_SHARING_MODE_EXCLUSIVE;VK(vkCreateBuffer(cfg.device,&ci,nullptr,&c.buffer));
@@ -574,12 +581,14 @@ struct Arena {
         {static int logged[2];if(!logged[cached]++)xbg_logf("NVN arena chunk cached=%d memoryType=%u flags=%#x heap=%u",int(cached),type,unsigned(memories.memoryTypes[type].propertyFlags),memories.memoryTypes[type].heapIndex);}
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=type;
         VK(vkAllocateMemory(cfg.device,&ai,nullptr,&c.memory));VK(vkBindBufferMemory(cfg.device,c.buffer,c.memory,0));
-        void *p=nullptr;VK(vkMapMemory(cfg.device,c.memory,0,VK_WHOLE_SIZE,0,&p));c.mapped=static_cast<uint8_t*>(p);return c;
+        void *p=nullptr;VK(vkMapMemory(cfg.device,c.memory,0,VK_WHOLE_SIZE,0,&p));c.mapped=static_cast<uint8_t*>(p);
+        if(zero_new){memset(c.mapped,0,size_t(bytes));if(!c.coherent){VkMappedMemoryRange mr{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};mr.memory=c.memory;mr.size=VK_WHOLE_SIZE;VK(vkFlushMappedMemoryRanges(cfg.device,1,&mr));}}   // [gs-fix]
+        return c;
     }
     Buffer alloc(size_t n){
         need(n && n<=256ull*1024*1024,"Invalid or excessive buffer size");
         for(size_t i=current;;++i){
-            if(i==chunks.size())chunks.push_back(make(std::max<VkDeviceSize>(arena_chunk_bytes,(n+arena_alignment-1)&~(arena_alignment-1))));
+            if(i==chunks.size())chunks.push_back(make(std::max<VkDeviceSize>(chunk_bytes?chunk_bytes:arena_chunk_bytes,(n+arena_alignment-1)&~(arena_alignment-1))));
             ArenaChunk &c=chunks[i];VkDeviceSize at=(c.used+arena_alignment-1)&~(arena_alignment-1);
             if(at+n>c.size)continue;
             current=i; // leftovers in skipped chunks are abandoned until reset
@@ -1061,7 +1070,7 @@ void exec(const Hdr *h){
     drvc::Lock compile(compile_locked(h->op));   // [pvr] DM_GFX_COMPILE_LOCK
     switch(h->op){
     case K_SKIP:break;
-    case K_BEGIN:{VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;const VkResult r=vkBeginCommandBuffer(c,&b);if(r)fail(K_BEGIN,r);break;}
+    case K_BEGIN:{VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;const VkResult r=xbg_cb_begin(c,&b,properties.vendorID);if(r)fail(K_BEGIN,r);break;}
     case K_END:{const VkResult r=vkEndCommandBuffer(c);if(r)fail(K_END,r);break;}
     case K_SUBMIT:{const PSubmit &q=*reinterpret_cast<const PSubmit*>(p);
         if(!dead){zc::maint_clean();   /* [zc3mode] mode 3: what the CPU wrote reaches memory before the GPU reads it */
@@ -1203,7 +1212,7 @@ void slot_start(bool shared_pool){
     if((on && !want) || shared_pool)sync(W_SLOT);
     on=want;++slots_all;if(on){++slots_on;if(mode==1)start();}
 }
-void begin(VkCommandBuffer c){if(!on){VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;DRVC_CALL(K_BEGIN,VK(vkBeginCommandBuffer(c,&b)));return;}alloc(K_BEGIN,c,0);commit();}
+void begin(VkCommandBuffer c){if(!on){VkCommandBufferBeginInfo b{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};b.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;DRVC_CALL(K_BEGIN,VK(xbg_cb_begin(c,&b,properties.vendorID)));return;}alloc(K_BEGIN,c,0);commit();}
 void end(VkCommandBuffer c){if(!on){DRVC_CALL(K_END,VK(vkEndCommandBuffer(c)));return;}alloc(K_END,c,0);commit();}
 // The slot's queue submission (only with on); returns its ticket (Slot::rec_ticket).
 uint64_t submit(uint32_t n,const VkCommandBuffer *cbs,VkFence fence,bool pt){
@@ -1324,7 +1333,8 @@ void report(int ab,double f){
 // into bcgpu's input buffer, decoded by xbg_bc_decode.comp into bcgpu's output buffer, then copied into the image (copies: offsets in it).
 // verify: [nonadreno] DM_GFX_BC_VERIFY (bcv): the readbacks of this batch, null when not checked.
 struct BcVerify;
-struct BcJob{VkBuffer buffer;VkDeviceSize offset,size;VkPipeline pipeline;uint32_t regions,blocks,bpp,block_words;VkImage image;std::vector<VkBufferImageCopy> copies;std::shared_ptr<BcVerify> verify{};};
+struct BcAstcOut;   // [nonadreno] bc-astc-gpu: astc = the ASTC encoder (image stored as ASTC 4x4, xbg_bc_astc.inc), astc_flags its push flags, astc_out the [hook] sink readback
+struct BcJob{VkBuffer buffer;VkDeviceSize offset,size;VkPipeline pipeline;uint32_t regions,blocks,bpp,block_words;VkImage image;std::vector<VkBufferImageCopy> copies;std::shared_ptr<BcVerify> verify{};VkPipeline astc{};uint32_t astc_flags=0;std::shared_ptr<BcAstcOut> astc_out{};};
 namespace bcgpu{void record(VkCommandBuffer cmd,const BcJob &job);}
 struct Shader;
 struct Slot {
@@ -1343,7 +1353,8 @@ struct Slot {
     uint64_t serial=0;   // slot_serial of the pending submission (NVN PERF chunk: GPU spans in submission order)
     uint64_t rec_ticket=0;   // [mtb] DM_GFX_RECORD_THREAD: ticket of the pending submission's SUBMIT packet (0: submitted directly)
     std::vector<VkQueryPool> occlusion_pools,timestamp_pools;uint32_t occlusion_used=0,timestamp_used=0;
-    Retire retire;Arena stream,readback;Arena readback_alt;std::vector<VkDescriptorPool> pools;size_t pool_next=0;   // readback_alt: [r4] the parked readback arena of the rbcached A/B
+    Retire retire;Arena stream,readback;Arena readback_alt;std::vector<VkDescriptorPool> pools;size_t pool_next=0;
+    Arena gsclaim;   // [gs-fix] claim words of geometry shaders that write memory (xbg_gsfix.h region): never trimmed, chunks zeroed once   // readback_alt: [r4] the parked readback arena of the rbcached A/B
     // gfx-xview-guard (recording_slot, readback_buffer): ranges of this slot's readback buffers the other slot read through
     // pending views (viewed), the ranges guarded during this recording, and the copies and fills that write guarded
     // buffers from the GPU in a prologue command buffer submitted ahead of cmd.
@@ -1923,7 +1934,7 @@ void retire_slot(Slot &s){
     uint64_t c3=timing_clock();s.retire.run();release_descriptors(s);uint64_t c4=timing_clock();
     perf.arena_peak=std::max<uint64_t>(perf.arena_peak,s.stream.peak+s.readback.peak);s.stream.peak=s.readback.peak=0;
     if(r5_decay){s.stream.note_use();s.readback.note_use();}   // [r5] DM_GFX_ARENA_KEEP=decay: chunks this submission used
-    s.stream.reset();s.readback.reset();
+    s.stream.reset();s.readback.reset();s.gsclaim.reset();   // [gs-fix]
     // Every set is fully rewritten before use, so sets are recycled instead of resetting pools (vkAllocateDescriptorSets cost ~15 us/set on Maleoon).
     for(auto &u:s.used_sets){auto &sp=s.spare_sets[u.first];sp.insert(sp.end(),u.second.begin(),u.second.end());u.second.clear();}s.set_cache.clear();
     cleanup_ns[0]+=c1-c0;cleanup_ns[1]+=c2-c1;cleanup_ns[2]+=c3-c2;cleanup_ns[3]+=c4-c3;cleanup_ns[4]+=timing_clock()-c4;
@@ -2165,6 +2176,7 @@ void perf_frame(){
         for(unsigned i=0;i<XbgCpuTiming::Count && at<int(sizeof(line))-48;i++){const auto &c=timing.counters[i];if(c.calls<perf_timing_before[i].calls)perf_timing_before[i]=XbgCpuTiming::Counter{};uint64_t ns=c.exclusive_ns-perf_timing_before[i].exclusive_ns,calls=c.calls-perf_timing_before[i].calls;at+=snprintf(line+at,sizeof(line)-at," %s=%.2f/%.1f",names[i],double(ns)/1e6/tf,double(calls)/tf);perf_timing_before[i]=c;}
         xbg_logf("%s",line);
     }
+    if(gsfix::mask)perf_vlogf("NVN PERF gs_fix mask=%#x claimed=%llu refused=%llu filled=%llu linked=%llu draws claimed=%llu open=%llu warm_patched=%llu",gsfix::mask,(unsigned long long)gsfix::claimed.load(),(unsigned long long)gsfix::refused.load(),(unsigned long long)gsfix::filled.load(),(unsigned long long)gsfix::linked.load(),(unsigned long long)gsfix::draws_claimed,(unsigned long long)gsfix::draws_open,(unsigned long long)warm::gsfix_patched.load());   // [gs-fix]
     perf_vlogf("NVN PERF storage_snapshots_per_frame=%.1f union_mb_per_frame=%.2f",storage_snap_count/f,storage_pages.size()*4096.0/1048576.0/tf);storage_pages.clear();storage_snap_count=0;
     perf_vlogf("NVN PERF wtrack copied_kb_per_frame=%.1f dirty_pages_per_frame=%.1f mismatches=%llu fallbacks=%llu",wtrack::copied_bytes/1024.0/f,wtrack::dirty_pages/f,(unsigned long long)wtrack::mismatches,(unsigned long long)wtrack::fallbacks);wtrack::copied_bytes=wtrack::dirty_pages=0;
     perf_vlogf("NVN PERF uniform_trimmed_bindings=%llu snap_mb_per_frame other=%.2f vertex=%.2f index=%.2f storage=%.2f texel=%.2f uniform=%.2f requested vertex=%.2f index=%.2f storage=%.2f",(unsigned long long)uniform_trimmed,snap_site_bytes[0]/1048576.0/f,snap_site_bytes[1]/1048576.0/f,snap_site_bytes[2]/1048576.0/f,snap_site_bytes[3]/1048576.0/f,snap_site_bytes[4]/1048576.0/f,snap_site_bytes[5]/1048576.0/f,snap_site_req[1]/1048576.0/f,snap_site_req[2]/1048576.0/f,snap_site_req[3]/1048576.0/f);for(auto &b:snap_site_bytes)b=0;for(auto &b:snap_site_req)b=0;
@@ -2831,7 +2843,7 @@ uint64_t selftest(uint64_t usage,char *why,size_t why_n,int maint=ZC_MAINT_NONE,
          maint_ns+=timing_clock()-m0;}
         if(maint_fail){snprintf(why,why_n,"%s failed errno=%d",maint_fail,errno);return done(~0ull);}
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        vkResetCommandBuffer(cb,0);VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;vkBeginCommandBuffer(cb,&bi);
+        vkResetCommandBuffer(cb,0);VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;xbg_cb_begin(cb,&bi,properties.vendorID);
         VkMemoryBarrier hb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};hb.srcAccessMask=VK_ACCESS_HOST_WRITE_BIT;hb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT|VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_HOST_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,1,&hb,0,nullptr,0,nullptr);
         VkBufferCopy c{0,0,n/2};vkCmdCopyBuffer(cb,zb,rb,1,&c);vkCmdFillBuffer(cb,zb,n/2,n/2,xbg_zc_fill_word(round));
@@ -3200,6 +3212,7 @@ struct Image {
     bool subst=false;int64_t subst_bytes=0;   // [nonadreno] ASTC overlay: created in the substitute format of its BC format (bc_store BC_SUBST), blocks uploaded as they are
     bool subst_cpu=false;   // [nonadreno] 2.37 DM_GFX_ASTC_CPU: a substitute decoded on the CPU into the BC path's uncompressed format (decoded=true)
     bool bc_drop=false;     // [nonadreno] 2.37 DM_GFX_BC_SERIAL=<serial>=drop: decoded, every upload replaced by zero blocks
+    bool bc_astc=false;     // [nonadreno] bc-astc-gpu (DM_GFX_BC_ASTC): decoded on the GPU and stored as ASTC 4x4 (fmt), decided at creation (xbg_bc_astc.inc)
        // [DOOM] storage-only images (VT feedback) need no barrier between draws
     uint64_t cpu_hash=0,checked_submission=UINT64_MAX,last_write=0;uint32_t stable_checks=0;int64_t mem_bytes=0,bc_bytes=0,bc_data=0,dec_bytes=0,dec_native=0;bool bc_first_done=false;   // dec_*: decoded BC (decoded_bytes_live); bc_first_done: first full upload counted (bct_first_*)
     // 最近一次经 get_image 取用时的 slot_serial：等于当前值，说明这次提交里已有命令用过它（gfx-upload-prologue 据此判断能否提前上传）。
@@ -3228,7 +3241,7 @@ struct Image {
         if(decoded){
             need(xbg_bc_view_compatible(source.d.format,v->format),"BC texture view must retain compression and signedness");
             xbg_bc_format info;need(xbg_bc_format_info(v->format,&info)==0,"Invalid BC view format");
-            return decoded_format(info.pixels);
+            return bc_astc?xbg_bc_astc_vk_format(v->format):decoded_format(info.pixels);   // [nonadreno] bc-astc-gpu: UNORM / sRGB ASTC 4x4
         }
         if(subst){   // [nonadreno] ASTC overlay: a view keeps the substitute class (UNORM <-> sRGB of the same substitute); anything else is
                      // logged and viewed as the image's own format (wrong-looking at worst, never fatal: the blocks are not BC any more)
@@ -3829,6 +3842,8 @@ int bc_partial_flag=-1;size_t bc_batch=0;
 bool bc_partial_on(){if(bc_partial_flag<0){const char *e=getenv("DM_GFX_BC_PARTIAL");bc_partial_flag=e?atoi(e)!=0:1;}return bc_partial_flag!=0;}
 size_t bc_batch_bytes(){if(!bc_batch){const char *e=getenv("DM_GFX_BC_BATCH_MB");long mb=e?atol(e):32;if(mb<4)mb=4;if(mb>128)mb=128;bc_batch=size_t(mb)<<20;}return bc_batch;}
 namespace bcgpu{bool prepare();VkPipeline pipeline(uint32_t fmt,uint32_t opt);size_t in_cap();size_t out_cap();void shutdown();}
+namespace bcastc{VkFormat image_format(const tex_t *t,VkSampleCountFlagBits samples);void note_image(const Image &im,const tex_t *t);VkPipeline pipeline();void attach_out(BcJob &j,uint64_t serial,uint32_t fmt);void record(VkCommandBuffer cmd,const BcJob &j,bool full);void shutdown();const char *report(int store,int *on);}   // [nonadreno] bc-astc-gpu (xbg_bc_astc.inc, after bcgpu)
+extern "C" void pc_note(const char *id,int applied,const char *fmt,...);   // [pc]
 // [nonadreno] DM_GFX_BC_VERIFY (bcv, defined after bcgpu): mode 0 = off (the default; BcUpload only tests this int).
 namespace bcv{extern int mode;void init();void attach(BcJob &j,const XbgBcGpuBatch &gpu,const Image &im,uint64_t serial,uint32_t fmt,uint32_t bpp,uint32_t block_bytes,bool partial,bool pro,unsigned batch);}
 // Once, at the first decoded texture: the decoder (DM_GFX_BC_DECODE), E5B9G9R9 for unsigned BC6H (DM_GFX_BC6_E5) and the log line.
@@ -4061,12 +4076,14 @@ struct BcUpload {
     uint32_t fmt,bw=1,bh=1,block_bytes,bpp,opt=0;size_t cap;
     std::vector<uint8_t> data;std::vector<VkBufferImageCopy> copies;XbgBcGpuBatch gpu;VkPipeline pipe{};
     size_t bytes=0,raw_bytes=0,out_bytes=0;unsigned batches=0,rects=0;
+    VkPipeline enc{};   // [nonadreno] bc-astc-gpu: the ASTC encoder of an ASTC-stored image (GPU decode only), null otherwise
     BcUpload(Image &i,const tex_t *tex,bool prologue):im(i),t(tex),pro(prologue),fmt(tex->d.format),cap(bc_batch_bytes()){
         int w=1,h=1;const int b=nvn_fmt_bpb(fmt,&w,&h);bw=uint32_t(std::max(w,1));bh=uint32_t(std::max(h,1));
         if(!im.decoded){block_bytes=bpp=im.bpp;return;}
         need(b==8 || b==16,"BC block size");block_bytes=uint32_t(b);bpp=im.bpp;opt=(xbg_bc_8bit_channels && (fmt==0x49 || fmt==0x4b)?1u:0u)|(xbg_bc6_e5 && fmt==0x50?2u:0u);   // only where it changes the output: one pipeline per format
         mode=bc_mode==2 && !im.subst_cpu?2:1;
         if(mode==2){pipe=bcgpu::pipeline(fmt,opt);if(!pipe){mode=1;static bool told=false;if(!told){told=true;xbg_logf("NVN BC decode: no GPU pipeline for fmt=%#x opt=%u, decoding on the CPU",fmt,opt);}}}
+        if(im.bc_astc){need(mode==2,"bc-astc-gpu: ASTC-stored BC texture without its GPU decode pipeline");enc=bcastc::pipeline();need(enc!=VK_NULL_HANDLE,"bc-astc-gpu: ASTC encoder missing");}   // [nonadreno] bc-astc-gpu: never CPU-decoded RGBA8
     }
     // One block rectangle of a subresource: nbx x nby blocks x nz slices, tight rows of raw blocks (as nvn_deswizzle writes them), to
     // the pixel rectangle (x, y, z) w x h x d of level / layer. The one entry point of a BC upload, full or partial: the planned ASTC
@@ -4081,7 +4098,7 @@ struct BcUpload {
         if(mode==2){
             if(!gpu.fits(raw_n,out_n,bcgpu::in_cap(),bcgpu::out_cap(),16384,size_t(properties.limits.maxComputeWorkGroupCount[0])*64,uint32_t(n)))flush();
             need(raw_n+16384*32<=bcgpu::in_cap() && out_n<=bcgpu::out_cap(),"BC decode rectangle exceeds the GPU scratch");
-            c.bufferOffset=gpu.add(raw,nbx,nby,nz,block_bytes,bpp);copies.push_back(c);return;}
+            {const uint32_t first=gpu.blocks;const size_t o=gpu.add(raw,nbx,nby,nz,block_bytes,bpp);c.bufferOffset=enc?size_t(first)*16:o;}copies.push_back(c);return;}   // [nonadreno] bc-astc-gpu: ASTC blocks at first block * 16
         size_t at=(data.size()+15)&~size_t(15);
         if(!data.empty() && at+out_n>cap){flush();at=0;}
         data.resize(at+out_n);c.bufferOffset=at;copies.push_back(c);
@@ -4096,7 +4113,8 @@ struct BcUpload {
         Buffer staging;
         if(mode==2){staging=stream_buffer(gpu.input_bytes(),nullptr,0,false);gpu.write_input(staging.mapped);staging.flush();bytes+=gpu.input_bytes();
             BcJob j{staging.buffer,staging.offset,VkDeviceSize(gpu.input_bytes()),pipe,uint32_t(gpu.regions()),gpu.blocks,bpp,block_bytes/4,im.image,std::move(copies)};
-            if(bcv::mode>0)bcv::attach(j,gpu,im,t->serial,fmt,bpp,block_bytes,partial,pro,batches);   // [nonadreno] DM_GFX_BC_VERIFY
+            if(enc){j.astc=enc;j.astc_flags=xbg_bc_astc_flags(fmt);bcastc::attach_out(j,t->serial,fmt);}   // [nonadreno] bc-astc-gpu (DM_GFX_BC_VERIFY compares RGBA8 texels: not for ASTC batches)
+            else if(bcv::mode>0)bcv::attach(j,gpu,im,t->serial,fmt,bpp,block_bytes,partial,pro,batches);   // [nonadreno] DM_GFX_BC_VERIFY
             ++bcw_gpu_batches;bcw_gpu_blocks+=gpu.blocks;gpu.clear();copies.clear();
             if(pro){Slot &s=recording_slot();s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,VK_NULL_HANDLE,{}});im.layout=VK_IMAGE_LAYOUT_GENERAL;++mt_hz_gen;s.pro_bc.push_back(std::move(j));}
             else{Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);bcgpu::record(c.command,j);im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
@@ -4287,6 +4305,8 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         if(p->decoded){p->bpp=info.bytes_per_pixel;p->fmt=decoded_format(info.pixels);need(p->samples==VK_SAMPLE_COUNT_1_BIT,"BC texture cannot be multisampled");}
         else if(p->subst){const char *kept=nullptr;p->fmt=astc_ov_format(t,t->L.layers,&kept);p->bpp=t->L.bpb;}   // [nonadreno] ASTC overlay: same block size, blocks as they are
         else {p->fmt=format(t->d.format);p->bpp=t->L.bpb;if(t->d.format==0x32 && depth16_as_d24)p->fmt=VK_FORMAT_X8_D24_UNORM_PACK32;}
+        if(p->decoded && !p->subst_cpu){const VkFormat af=bcastc::image_format(t,p->samples);if(af!=VK_FORMAT_UNDEFINED){p->fmt=af;p->bc_astc=true;}}   // [nonadreno] bc-astc-gpu: BC1 / BC2 / BC3 / BC7 on the GPU decode path -> ASTC 4x4
+        {int on=0;if(const char *why=bcastc::report(int(store),&on))pc_note("bc-astc-gpu",on,"%s",why);}   // [pc]
         VkFormatProperties fp;vkGetPhysicalDeviceFormatProperties(cfg.physical,p->fmt,&fp);
         VkImageUsageFlags usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)usage|=VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -4318,6 +4338,7 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         afbc_note(*p);   // [nonadreno][afbc] the driver's compression decision, when the device can say (NVN afbc summary)
         p->mem_bytes=int64_t(r.size);image_bytes_live+=p->mem_bytes;if(xbg_bc_format_info(t->d.format,&info)==0){p->bc_bytes=p->mem_bytes;p->bc_data=int64_t(t->L.size);bc_image_bytes_live+=p->bc_bytes;bc_data_bytes_live+=p->bc_data;}
         if(p->decoded){p->dec_bytes=p->mem_bytes;p->dec_native=int64_t(t->L.size);decoded_bytes_live+=p->dec_bytes;decoded_native_live+=p->dec_native;bc_vram_note(*p,t);}
+        if(p->bc_astc)bcastc::note_image(*p,t);   // [nonadreno] bc-astc-gpu
         if(p->subst){p->subst_bytes=p->mem_bytes;astc_ov_bytes_live+=p->subst_bytes;astc_ov_note(t,p->layers,nullptr,p->fmt);}   // [nonadreno] ASTC overlay
         else if(astc_ov_mask && store!=BC_NOT){const char *kept=nullptr;astc_ov_format(t,t->L.layers,&kept);if(kept)astc_ov_note(t,p->layers,kept,VK_FORMAT_UNDEFINED);}
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};ai.allocationSize=r.size;ai.memoryTypeIndex=memory_type(r.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);VK(vkAllocateMemory(cfg.device,&ai,nullptr,&p->memory));VK(vkBindImageMemory(cfg.device,p->image,p->memory,0));
@@ -4520,8 +4541,9 @@ struct Shader {std::string key;uint32_t stage;VkShaderModule module{};VkShaderMo
     Buffer c1_buffer{};bool c1_ready=false;
     std::string unusable;   // [nonadreno] non-empty: the device lacks a capability this module needs; no VkShaderModule, its draws are skipped
     int gs_gate_slot=-1;uint32_t gs_gate_offset=0,gs_gate_value=0; // [perf3] pass-through GS: uniform slot / byte / value of its switch (xbg_spirv_gs_passthru_gate)
+    int gsfix_claim=-1;uint8_t gsfix_io[32]{};std::vector<uint32_t> gsfix_words;std::map<std::pair<const Shader*,const Shader*>,VkShaderModule> gsfix_links;   // [gs-fix] xbg_gsfix.h: claim binding, outputs (vs / gs) or inputs (ps) by location, a GS's words and its modules per vs / ps pair
     uint8_t tu_role=0;   // [2.74] DM_GFX_TU (xbg_tu.h): 1 the TAA resolve ps, 2 the viewcolorupsample ps, 3 a motion-vector pre-pass vs, [2.75] 4 the motion blur ps, 5 the postprocess ps (tu_shader_role)
-    ~Shader(){if(module)vkDestroyShaderModule(cfg.device,module,nullptr);for(VkShaderModule m:{module_ab,module_np,module_ab_np})if(m)vkDestroyShaderModule(cfg.device,m,nullptr);}};
+    ~Shader(){if(module)vkDestroyShaderModule(cfg.device,module,nullptr);for(VkShaderModule m:{module_ab,module_np,module_ab_np})if(m)vkDestroyShaderModule(cfg.device,m,nullptr);for(auto &l:gsfix_links)if(l.second)vkDestroyShaderModule(cfg.device,l.second,nullptr);}};
 // [r3] The module a pipeline takes: the A/B off phase of a round-3 shader rewrite uses the module without it (when the rewrite
 // changed this shader); np (DM_GFX_NO_PSIZE: vertex stage of a pipeline that rasterizes no points and has no later geometry
 // stage) the one without the gl_PointSize store. Without the switches: the module.
@@ -5095,6 +5117,7 @@ inline uint8_t tu_shader_role(const std::string &key,uint32_t stage){
     if(stage==4)return key=="615e5352a9db7427"?1:key=="270b1b7a7fe4d8ab"?2:key=="5b8eb6217af85abb"?4:key=="daa747b766d39197"?5:0;   // taa_vsps, viewcolorupsample_vsps; [2.75] motionblurlowq_vsps, postprocess_vsps (replayed at the output size)
     if(stage==0)return key=="e2ce6d304e5c6428" || key=="33d4832875fe8d4a" || key=="8ef76adc155d9a2a" || key=="95babbdb3b73dfd2"?3:0;   // prezdraw[deathfade]motionvector*: mvpmatrix + mvpmatrixnojitter
     return 0;}
+#include "xbg_gsfix.h"   // [gs-fix] port-common/modules/gs-fix: namespace gsfix (claim / fill / link of geometry shaders, PNH-B-03)
 Shader *load_shader(const void *control){
     std::string key=control_key(control);auto found=shaders.find(key);if(found!=shaders.end())return found->second.get();
     const uint64_t load_t0=timing_clock();
@@ -5113,7 +5136,7 @@ Shader *load_shader(const void *control){
     std::vector<uint32_t> words(h.spirv_bytes/4);memcpy(words.data(),bytes.data()+offset,h.spirv_bytes);spv_override(key,words);pgv2::note_sha(key,words);clip_rewrite(words,h.stage,key.c_str());
     {for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)b.flags&=~XBG_BIND_SSBO;   // [DOOM] DM_GFX_BONES_SSBO: the bit is ours, never the bundle's
      std::vector<uint32_t> conv;if(ssbo_rewrite(words,h.stage,key.c_str(),p->bindings,conv))for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b.source==XBG_SOURCE_UNIFORM && b.count==1 && std::binary_search(conv.begin(),conv.end(),b.binding))b.flags|=XBG_BIND_SSBO;}
-    gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());relaxed_rewrite(words,h.stage,key.c_str());gather_ext_rewrite(words,key.c_str());
+    gscull_rewrite(words,h.stage,key.c_str(),"runtime");lone_rewrite(words,h.stage,key.c_str(),"runtime");const int gsfix_cb=gsfix::rewrite(words,h.stage,p->bindings,key.c_str(),"runtime");early_tests_rewrite(words,h.stage,key.c_str());invariant_rewrite(words,h.stage,key.c_str());relaxed_rewrite(words,h.stage,key.c_str());gather_ext_rewrite(words,key.c_str());
     {std::string gap=module_gap(words,h.stage);if(!gap.empty()){p->unusable=gap;xbg_logf("NVN shader %s stage=%u needs %s, which this device lacks: no module, its draws/dispatches are skipped%s",key.c_str(),h.stage,gap.c_str(),h.stage==3?" unless the GS is dropped as a pass-through":"");}}
     // [perf3] DOOM's culling GS is a pure position pass-through while its switch word is off: remember where the switch lives
     // (on the bundle's own SPIR-V, before any rewrite) so draw() can drop the stage (DM_GFX_GS_PASSTHRU, perf_round3.md).
@@ -5141,6 +5164,7 @@ Shader *load_shader(const void *control){
     {bool kill=false;for(size_t i=5;i<words.size();){uint32_t n=words[i]>>16,op=words[i]&0xffff;if(op==252||op==4416||op==5380){kill=true;break;}if(!n)break;i+=n;}p->discards=kill;}
     p->raster=xbg_spirv_raster_facts(words.data(),words.size(),h.stage);
     {bool unknown=false;p->storage_writes=spirv_storage_writes(words,unknown);if(unknown){for(auto &b:p->bindings)if(b.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)p->storage_writes.insert(b.binding);}}
+    gsfix::note_shader(*p,words,gsfix_cb);   // [gs-fix] the claim binding (after storage_writes: not a guest buffer) and the interface for the link
     if(dead_box_on){bool fx=!p->storage_writes.empty();for(size_t i=5;i<words.size() && !fx;){uint32_t n=words[i]>>16,op=words[i]&0xffff;if(!n)break;if(op==99 || (op>=227 && op<=242) || op==5614 || op==5615 || op==6035)fx=true;i+=n;}p->effects=fx;}   // [r3] image stores, atomics
     if(h.stage==0){p->input_classes.resize(p->inputs.size());need(xbg_vertex_input_classes(words.data(),words.size(),p->inputs.data(),p->inputs.size(),p->input_classes.data())==0,"Unsupported vertex input scalar interface");}
     // [tileopt] DM_GFX_UBO_DYNAMIC=2 (PowerVR default): mark the uniform bindings this module, its A/B variant or its no-psize variants
@@ -5203,7 +5227,8 @@ static void fence_slot_log(const Slot &o,const char *what,uint64_t now){
 } // namespace
 
 extern "C" void xbg_logf(const char *fmt,...){CPU_SCOPE(Log);char text[1024];va_list a;va_start(a,fmt);vsnprintf(text,sizeof(text),fmt,a);va_end(a);if(cfg.log)cfg.log(cfg.userdata,text);else fprintf(stderr,"[xbg] %s\n",text);}
-extern "C" __attribute__((noreturn)) void xbg_fatalf(const char *fmt,...){va_list a;va_start(a,fmt);vsnprintf(error_text,sizeof(error_text),fmt,a);va_end(a);failed=true;xbg_logf("FATAL: %s",error_text);if(xbg_safe_text_device_lost(error_text)){char w[200];snprintf(w,sizeof w,"VK_ERROR_DEVICE_LOST fatal: %.150s",error_text);xbg_safe_mode_record(w);}crumbs::report("fatal");if(cfg.fatal)cfg.fatal(cfg.userdata,error_text);abort();}
+#include "xbg_device_fault.h"   // [device-fault] FN-64: the driver's report of a lost device (port-common device-fault)
+extern "C" __attribute__((noreturn)) void xbg_fatalf(const char *fmt,...){va_list a;va_start(a,fmt);vsnprintf(error_text,sizeof(error_text),fmt,a);va_end(a);failed=true;xbg_logf("FATAL: %s",error_text);if(xbg_device_fault_text(error_text))xbg_device_fault_report(cfg.device,xbg_logf,"fatal");if(xbg_safe_text_device_lost(error_text)){char w[200];snprintf(w,sizeof w,"VK_ERROR_DEVICE_LOST fatal: %.150s",error_text);xbg_safe_mode_record(w);}crumbs::report("fatal");if(cfg.fatal)cfg.fatal(cfg.userdata,error_text);abort();}
 // [safe-mode] 2.57, host/crash.c (weak), in the signal handler after the "crash thread" line and the pass detail: is this crash a graphics
 // failure? Inside a dm-record packet, a fault in zero-copy guest memory, a graphics / GPU-driver thread, pc (or lr) in a GPU driver library,
 // or an engine abort with VK_ERROR_DEVICE_LOST. Then counted (xbg_safe_mode_record). Only table reads and string compares.
@@ -5377,6 +5402,24 @@ std::vector<VkDescriptorSetLayout> set_layouts;
 struct SsboInfo{uint32_t stage=0;bool applied=false;std::vector<uint32_t> bindings;};std::unordered_map<std::string,SsboInfo> ssbo_info;
 std::atomic<uint64_t> ssbo_patched{0},ssbo_stale{0};
 VkShaderModule load_module(const std::string &key);
+// [gs-fix] per geometry module key (with its !ab / !np suffix): the claim binding gsfix::rewrite gave it (-1 none) and the one it would
+// take (gsfix::claim_binding). A list record made with the other DM_GFX_GS_FIX setting lacks the claim binding or has one the module
+// no longer reads: gsfix_patch inserts it where the draw's layout has it (last of the geometry stage's bindings) or takes it out, so
+// the ready pipeline is keyed by the words the draw builds (as ssbo_patch).
+std::unordered_map<std::string,std::pair<int,int>> gsfix_info;std::atomic<uint64_t> gsfix_patched{0};
+void gsfix_load(const std::string &key,const std::string &file,std::vector<uint32_t> &w,const xbg_shader_header &h,const std::vector<uint8_t> &b){
+    if(h.stage!=3)return;std::vector<xbg_shader_binding> hb(h.binding_count);if(h.binding_count)memcpy(hb.data(),b.data()+sizeof(h),hb.size()*sizeof(xbg_shader_binding));
+    const int cb=gsfix::rewrite(w,3,hb,file.c_str(),"warm");std::lock_guard<std::mutex> l(mu);gsfix_info[key]={cb,gsfix::claim_binding(hb,3)};}
+bool gsfix_patch(const std::vector<std::string> &keys,std::vector<uint32_t> &words){
+    if(words.size()<4 || words[0]!=1)return true;
+    for(auto &k:keys){std::pair<int,int> gi{-1,-1};if(!load_module(k))return true;{std::lock_guard<std::mutex> l(mu);auto it=gsfix_info.find(k);if(it==gsfix_info.end())continue;gi=it->second;}
+        const uint32_t ln=words[1];if(ln<2 || 2+size_t(ln)>words.size())return true;const uint32_t nb=words[3];if(4+size_t(nb)*4>2+size_t(ln))return true;
+        int at=-1;uint32_t ins=nb;
+        for(uint32_t j=0;j<nb;j++){const uint32_t *e=&words[4+size_t(j)*4];if(e[3]==VK_SHADER_STAGE_GEOMETRY_BIT && int(e[0])==gi.second)at=int(j);if(ins==nb && e[3]>VK_SHADER_STAGE_GEOMETRY_BIT)ins=j;}
+        if(gi.first>=0 && at<0){const uint32_t e[4]={uint32_t(gi.first),VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_GEOMETRY_BIT};words.insert(words.begin()+4+ptrdiff_t(ins)*4,e,e+4);words[3]=nb+1;words[1]=ln+4;++gsfix_patched;}
+        else if(gi.first<0 && at>=0){words.erase(words.begin()+4+ptrdiff_t(at)*4,words.begin()+8+ptrdiff_t(at)*4);words[3]=nb-1;words[1]=ln-4;++gsfix_patched;}
+        break;}   // one geometry stage
+    return true;}
 // The record's set layout must give each rewritten block the type the module now declares (UBO <-> SSBO, dynamic kept). A
 // record from before the switch was on (or the shipped seed) is patched to STORAGE_BUFFER(_DYNAMIC), and the ready pipeline is
 // then keyed by the patched words, which equal the key the draw builds. A STORAGE record for a module the switch left a uniform
@@ -5430,7 +5473,7 @@ VkShaderModule load_module(const std::string &key){
     std::vector<uint32_t> w(h.spirv_bytes/4);memcpy(w.data(),b.data()+off,h.spirv_bytes);spv_override(file,w);pgv2::note_sha(file,w);clip_rewrite(w,h.stage,file.c_str());
     {std::vector<xbg_shader_binding> hb(h.binding_count);if(h.binding_count)memcpy(hb.data(),b.data()+sizeof(h),hb.size()*sizeof(xbg_shader_binding));
      SsboInfo si;si.stage=h.stage;si.applied=ssbo_rewrite(w,h.stage,file.c_str(),hb,si.bindings);if(!si.bindings.empty()){std::lock_guard<std::mutex> l(mu);ssbo_info.emplace(key,std::move(si));}}
-    gscull_rewrite(w,h.stage,file.c_str(),"warm");lone_rewrite(w,h.stage,file.c_str(),"warm");early_tests_rewrite(w,h.stage,file.c_str());invariant_rewrite(w,h.stage,file.c_str());relaxed_rewrite(w,h.stage,file.c_str());gather_ext_rewrite(w,file.c_str());quad_rewrite(w,h.stage,file.c_str(),"warm");warp_rewrite(w,h.stage,file.c_str(),"warm");tidy_rewrite(w,vab?r3_ab_bit:0);
+    gscull_rewrite(w,h.stage,file.c_str(),"warm");lone_rewrite(w,h.stage,file.c_str(),"warm");gsfix_load(key,file,w,h,b);early_tests_rewrite(w,h.stage,file.c_str());invariant_rewrite(w,h.stage,file.c_str());relaxed_rewrite(w,h.stage,file.c_str());gather_ext_rewrite(w,file.c_str());quad_rewrite(w,h.stage,file.c_str(),"warm");warp_rewrite(w,h.stage,file.c_str(),"warm");tidy_rewrite(w,vab?r3_ab_bit:0);
     if(vnp){std::vector<uint32_t> o;if(h.stage!=0 || !xbg_spirv_strip_pointsize(w.data(),w.size(),o))return VK_NULL_HANDLE;w.swap(o);}
     if(keep_rewritten && !vab && !vnp){std::lock_guard<std::mutex> l(mu);rewritten.emplace(key,w);}
     if(!module_gap(w,h.stage).empty())return VK_NULL_HANDLE;   // [nonadreno] the device lacks a capability: the warm pipeline is not built
@@ -5461,6 +5504,7 @@ VkRenderPass make_pass(const uint32_t *w,uint32_t n){
 }
 bool build(const Rec &rec){
     std::vector<uint32_t> words=rec.words;if(!ssbo_patch(rec.keys,words))return false;   // [DOOM] DM_GFX_BONES_SSBO
+    if(!gsfix_patch(rec.keys,words))return false;   // [gs-fix] the claim binding of a geometry module
     Reader r{words.data(),words.size()};if(r.u()!=1)return false;
     uint32_t ln=r.u();if(r.i+ln>r.n)return false;VkPipelineLayout layout=make_layout(r.w+r.i,ln);r.i+=ln;
     uint32_t pn=r.u();if(r.i+pn>r.n)return false;VkRenderPass pass=make_pass(r.w+r.i,pn);r.i+=pn;if(!layout || !pass)return false;
@@ -6406,6 +6450,7 @@ void descriptors_build(Descriptors &out,Commands &commands,bool compute){CPU_SCO
                 else if(b.source==XBG_SOURCE_DRIVER0 || b.source==XBG_SOURCE_DRIVER2){n=0x1000;unsigned bank=b.source==XBG_SOURCE_DRIVER0?0:1;
                     Buffer &blk=driver_block(ns,bank);   // [mt S3] the memo-hit path's block cache (this was the same code inline)
                     data=blk.mapped;copy=n;buffer=out.keep(blk);}
+                else if(b.source==XBG_SOURCE_GSCLAIM){Buffer cb=gsfix::region(recording_slot());n=cb.size;data=cb.mapped;copy=n;buffer=out.keep(cb);}   // [gs-fix] this draw's claim words (xbg_gsfix.h)
                 else xbg_fatalf("Unsupported shader buffer source %u",b.source);
                 need(n && n<=size_t(is_storage?properties.limits.maxStorageBufferRange:properties.limits.maxUniformBufferRange),"Descriptor range exceeds device limit");
                 if(write.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || write.descriptorType==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC){buffer_infos.push_back({buffer->buffer,0,n});if(desc_memo_recording)desc_memo_dyn.push_back({(uint64_t(b.binding)<<32)|element,buffer->buffer,uint32_t(buffer->offset+buffer_offset),b.source==XBG_SOURCE_UNIFORM,uint8_t(b.source),uint8_t(ns),uint8_t(b.source==XBG_SOURCE_DRIVER0?0:1)});dynamic_list.push_back({(uint64_t(b.binding)<<32)|element,uint32_t(buffer->offset+buffer_offset)});}
@@ -7151,7 +7196,9 @@ bool skip_unusable(const char *what){   // [nonadreno] a bound module lacks a de
     for(unsigned st=0;st<6;st++){Shader *sh=state.shader[st];if(what[0]=='d' && st==5)continue;if(what[0]=='c' && st!=5)continue;
         if(sh && !sh->unusable.empty()){static std::unordered_set<std::string> told;if(told.insert(sh->key).second)xbg_logf("NVN %s skipped: shader %s stage %u needs %s",what,sh->key.c_str(),st,sh->unusable.c_str());return true;}}
     return false;}
-void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0,const GpuIndirect *gi=nullptr){DRAW_MARK(0);if(draw_reads_on){draw_reads.clear();draw_reads_overflow=false;}GsPassthru gs_passthru;if(skip_unusable("draw"))return;preflight_cpu_reads();
+void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instances=1,uint32_t first_instance=0,const GpuIndirect *gi=nullptr){DRAW_MARK(0);if(draw_reads_on){draw_reads.clear();draw_reads_overflow=false;}GsPassthru gs_passthru;
+    gsfix::Draw gsfix_draw(state.shader[3],uint32_t(count),indexed?uint32_t(indexed->instances):instances,gi!=nullptr,[&]{return topology(prim);});   // [gs-fix] the claim words this draw takes
+   if(skip_unusable("draw"))return;preflight_cpu_reads();
     // [tile] DM_GFX_TILE_BARRIER: the narrowed pass dependencies no longer order a vertex / geometry stage storage write after the
     // reads of earlier passes (write-after-read). Such a draw (DOOM: the culling GS with r_geometryCulling 1) gets the full barrier
     // the old dependencies implied, once per run of passes.
@@ -7171,6 +7218,7 @@ void draw(int prim,int first,int count,const p_draw_idx *indexed,uint32_t instan
     VkShaderModule modules[5]{};for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=state.shader[i]->module;
     if(r3_variants){const bool np=no_psize && prim!=0 && (state.poly.mode==1 || state.poly.mode==2) && !state.shader[1] && !state.shader[2] && !state.shader[3];   // [r3] no points rasterized, VS is the last geometry stage
         for(unsigned i=0;i<5;i++)if(state.shader[i])modules[i]=r3_module(*state.shader[i],i==0 && np);}
+    if(modules[3] && modules[3]==state.shader[3]->module)modules[3]=gsfix::link_module(*state.shader[3],state.shader[0],state.shader[4],modules[3]);   // [gs-fix] link
     uint32_t active_colors=0;for(int i=0;i<state.rt.n;i++)if(state.rt.color[i])active_colors|=1u<<i;
 #ifdef DM_GAME_DOOM
     // [DOOM] the load screen without a boot movie draws before any render target is set: nothing to draw into, skip it
@@ -7479,6 +7527,7 @@ void shutdown(){
     if(layout)vkDestroyPipelineLayout(cfg.device,layout,nullptr);if(set_layout)vkDestroyDescriptorSetLayout(cfg.device,set_layout,nullptr);
     for(VkBuffer b:{in_buf,out_buf})if(b)vkDestroyBuffer(cfg.device,b,nullptr);for(VkDeviceMemory m:{in_mem,out_mem})if(m)vkFreeMemory(cfg.device,m,nullptr);
     if(kat_pool)vkDestroyCommandPool(cfg.device,kat_pool,nullptr);if(kat_fence)vkDestroyFence(cfg.device,kat_fence,nullptr);kat_pool={};kat_fence={};kat_cb={};
+    bcastc::shutdown();   // [nonadreno] bc-astc-gpu
     in_buf=out_buf={};in_mem=out_mem={};module={};pool={};layout={};set_layout={};set={};in_bytes=out_bytes=0;tried=ok=false;
 }
 bool make_buffer(size_t n,VkBuffer &b,VkDeviceMemory &m){
@@ -7529,7 +7578,7 @@ bool selftest(VkPipeline pipe,uint32_t fmt,uint32_t opt){
     if(!kat_cb){VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};ca.commandPool=kat_pool;ca.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY;ca.commandBufferCount=1;
         if(vkAllocateCommandBuffers(cfg.device,&ca,&kat_cb)!=VK_SUCCESS){kat_cb={};arena.release();return true;}}
     VkCommandBuffer cb=kat_cb;vkResetCommandBuffer(cb,0);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;vkBeginCommandBuffer(cb,&bi);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;xbg_cb_begin(cb,&bi,properties.vendorID);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};mb.srcAccessMask=VK_ACCESS_MEMORY_WRITE_BIT;mb.dstAccessMask=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT;
     auto full=[&]{vkCmdPipelineBarrier(cb,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,1,&mb,0,nullptr,0,nullptr);};
     full();VkBufferCopy c{st.offset,0,in_b};vkCmdCopyBuffer(cb,st.buffer,in_buf,1,&c);full();
@@ -7596,11 +7645,13 @@ void record(VkCommandBuffer cmd,const BcJob &j){
     const uint32_t push[4]={j.regions,j.blocks,j.bpp,j.block_words};
     vkrec::CmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,j.pipeline);vkrec::CmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_COMPUTE,layout,0,1,&set,0,nullptr);
     vkrec::CmdPushConstants(cmd,layout,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof(push),push);vkrec::CmdDispatch(cmd,(j.blocks+63)/64,1,1);
+    if(j.astc){bcastc::record(cmd,j,full);return;}   // [nonadreno] bc-astc-gpu: encode, then the ASTC blocks into the image
     step_barrier(cmd,full,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_SHADER_WRITE_BIT,VK_ACCESS_TRANSFER_READ_BIT);
     vkrec::CmdCopyBufferToImage(cmd,out_buf,j.image,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,uint32_t(j.copies.size()),j.copies.data());
     if(j.verify)bcv::record_copies(cmd,j);   // [nonadreno] DM_GFX_BC_VERIFY
 }
 }
+#include "xbg_bc_astc.inc"   // [nonadreno] bc-astc-gpu: namespace bcastc (encoder, self-test, decisions)
 // [nonadreno] DM_GFX_BC_VERIFY (issue #6, BUGS_AND_FIXES §2.24): checks the GPU BC decode on the device itself. 0 = off, the default:
 // BcUpload::flush tests one int and nothing else runs. 1 = a sample (the first 64 partial-upload batches of each texture, then every
 // 8th; whole-upload batches: the first 2 of each texture, then every 16th); 2 = every batch. A checked batch reads back, right after
@@ -8051,6 +8102,7 @@ void copy_texture_buffer(const p_copy_b2t &request,bool to_buffer){preflight_cpu
         size_t bytes=size_t(p.r.width)*p.r.height*p.r.depth*im.bpp;
         if(!im.gpu_written && !(p.tex->d.flags&0x10)){invalidate_cpu_range(uint64_t(uintptr_t(p.tex->mem)),p.tex->L.size);
             if(guest_texture_write(p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image)){im.uploaded=false;++mt_hz_gen;im.checked_submission=UINT64_MAX;return;}}
+        if(im.bc_astc){bcastc::copy_from_buffer(im,p.tex,level,layer,p.r,reinterpret_cast<const uint8_t*>(p.src),row,image);im.gpu_written=true,provenance_write(im,__LINE__);return;}   // [nonadreno] bc-astc-gpu: GPU decode + encode, no RGBA8
         need(bytes<=256ull*1024*1024,"Decoded BC staging exceeds memory bound");std::vector<uint8_t> decoded(bytes);
         int result=xbg_decode_bc_linear(p.tex->d.format,p.r.width,p.r.height,p.r.depth,reinterpret_cast<const void*>(p.src),source_bytes,row,image,decoded.data(),decoded.size());
         if(result)xbg_fatalf("NVN BC staging decode failed format=%#x level=%u result=%d",p.tex->d.format,level,result);
@@ -8104,6 +8156,7 @@ void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();if(tu::rp.hdr || tu
             (unsigned long long)p.src->serial,p.src->d.format,int(s.subst),(unsigned long long)p.dst->serial,p.dst->d.format,int(d.subst));
         return;
     }
+    const int astc_route=bcastc::copy_route(s,d);if(astc_route==2)return;   // [nonadreno] bc-astc-gpu: 1 = ASTC 4x4 blocks into an ASTC-stored image, 2 = ASTC / RGBA8 mix skipped
     // 已知ASTC-pack源是ASTC4x4，目的BC3及既有RGBA BC目标从建图起解码，不迁移已有内容。
     // Known ASTC-pack sources use ASTC4x4; BC3 and existing RGBA BC destinations are decoded at creation without migrating contents.
     if(!s.decoded && d.decoded && s.fmt>=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.fmt<=VK_FORMAT_ASTC_4x4_SRGB_BLOCK && (d.fmt==VK_FORMAT_R8G8B8A8_UNORM || d.fmt==VK_FORMAT_R8G8B8A8_SRGB)
@@ -8123,7 +8176,7 @@ void copy_texture(const p_copy_t2t &p){preflight_cpu_reads();if(tu::rp.hdr || tu
         return;
     }
     need(!(s.fmt>=VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.fmt<=VK_FORMAT_ASTC_12x12_SRGB_BLOCK && d.source.d.format>=0x41 && d.source.d.format<=0x50 && !d.decoded && !d.subst),"ASTC blocks into a native BC texture: the ASTC pack needs decoded BC (marker gfx-native-bc = 0)");
-    if(s.decoded || d.decoded)need(s.decoded && d.decoded && xbg_bc_view_compatible(s.source.d.format,d.source.d.format),"BC texture copy must retain compression and signedness");
+    if((s.decoded || d.decoded) && astc_route!=1)need(s.decoded && d.decoded && xbg_bc_view_compatible(s.source.d.format,d.source.d.format),"BC texture copy must retain compression and signedness");   // [nonadreno] bc-astc-gpu
 #ifdef DM_GAME_DOOM
     // NVN CopyTextureToTexture between different colour formats runs on the 2D engine, which converts texels (DOOM: the
     // RGBA8 Bink frame -> the R11G11B10F scene target). A bit copy there reads RGBA8 bits as small floats (a green screen),
@@ -8187,6 +8240,7 @@ void partial_clear_texture(Image &im,const p_clear_tex &request,uint32_t level,u
 void clear_texture(const p_clear_tex &input){preflight_cpu_reads();
     p_clear_tex p=input;
     Image &im=get_image(p.tex,false);need((uint32_t(p.mask)&~15u)==0,"Invalid texture clear mask");if(!p.mask)return;
+    if(im.bc_astc){bcastc::clear_skipped(im);return;}   // [nonadreno] bc-astc-gpu: no clear of compressed images
     uint32_t level=p.has_view&&p.view.set_levels?p.view.base_level:0,layer=p.has_view&&p.view.set_layers?p.view.min_layer:0;
     region_check(im,level,layer,p.r);uint32_t w=std::max(1u,im.width>>level),h=std::max(1u,im.height>>level);
     need(p.is_uint>=0 && p.is_uint<=2,"Invalid texture clear scalar type");int scalar=p.is_uint==2?1:p.is_uint==1?2:0;
@@ -8548,7 +8602,7 @@ PerfCounts perf_counts(){return {pipeline_objects.size(),layout_cache.size(),sam
 void destroy_slots(){
     poolreset::drain();for(auto &s:slots)s.reset_queued=false;
     for(unsigned i=0;i<slot_max;i++)texel_evict(i,true);
-    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();s.readback_alt.release();s.viewed.clear();s.guard.clear();s.pro_ops.clear();s.pro=VK_NULL_HANDLE;if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
+    for(auto &s:slots){s.retire.run();release_descriptors(s);for(auto &v:s.texel_views)vkDestroyBufferView(cfg.device,v.second,nullptr);s.texel_views.clear();for(auto &f:s.framebuffers)vkDestroyFramebuffer(cfg.device,f.second,nullptr);s.framebuffers.clear();for(auto p:s.pools)vkDestroyDescriptorPool(cfg.device,p,nullptr);s.pools.clear();s.pool_next=0;s.stream.release();s.readback.release();s.readback_alt.release();s.gsclaim.release();s.viewed.clear();s.guard.clear();s.pro_ops.clear();s.pro=VK_NULL_HANDLE;if(s.fence)vkDestroyFence(cfg.device,s.fence,nullptr);if(s.timestamps)vkDestroyQueryPool(cfg.device,s.timestamps,nullptr);if(s.prof_pool)vkDestroyQueryPool(cfg.device,s.prof_pool,nullptr);for(auto q:s.occlusion_pools)vkDestroyQueryPool(cfg.device,q,nullptr);for(auto q:s.timestamp_pools)vkDestroyQueryPool(cfg.device,q,nullptr);if(s.pool)vkDestroyCommandPool(cfg.device,s.pool,nullptr);s=Slot{};}
     slot_index=0;snapshot_reset();
 }
 } // namespace
@@ -8631,6 +8685,7 @@ extern "C" int xbg_game_initialize(const xbg_game_config *c,char *error,size_t b
      xbg_logf("NVN gpu policy: pipe_serial=%d pipe_guard=%d ubo_dynamic=%d noout_mask=%d zero-copy default=%d (DM_GFX_PIPE_SERIAL / PIPE_GUARD / UBO_DYNAMIC: 0 none, 1 all that fit, 2 only blocks the stage reads / NOOUT_MASK / ZEROCOPY)",
               int(gpguard::serial),int(gpguard::guard),ubo_dynamic_level,int(noout_mask_on),int(xbg_zero_copy_default(gpu_policy)));
      bones_ssbo_decide();bones_ssbo_modules=0;bones_ssbo_realign=0;   // [DOOM] DM_GFX_BONES_SSBO, before the warm-up threads rewrite shaders
+     gsfix::decide(cfg.physical);warm::gsfix_patched=0;   // [gs-fix] DM_GFX_GS_FIX, before the warm-up threads rewrite shaders
      // [tile] tile-based GPU paths (xbg_vendor_policy.h, docs/research/tile_gpu_impl.md); DM_GFX_NOLOAD is read with its marker below.
      tile_area_on=xbg_env_or(getenv("DM_GFX_TILE_AREA"),xbg_tile_area_default(gpu_policy));tile_barrier_on=xbg_env_or(getenv("DM_GFX_TILE_BARRIER"),xbg_tile_barrier_default(gpu_policy));
      chunk_mid_split=xbg_env_or(getenv("DM_GFX_CHUNK_MID_SPLIT"),xbg_chunk_mid_split_default(gpu_policy));tile_poison=xbg_env_or(getenv("DM_GFX_TILE_POISON"),false);

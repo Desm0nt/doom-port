@@ -21,11 +21,12 @@ import java.util.ArrayList;
 //   safeMode       [safe-mode] safe graphics mode off / auto / on on Mali / PowerVR (pref "safe_mode", DM_SAFE_MODE; SafeMode.java)  next launch
 //   gameLanguage   the game's language (DM_LANG -> hle_oe.c GetDesiredLanguage); the codes / names are the game's                  next launch
 //   rumble         vibration (DM_RUMBLE, haptics_android.c; off by default)                                                       next launch
+//   localPlay      [mp] local co-op controllers (pref "mp_pads", DM_MP_PADS) and local wireless over the LAN (pref "mp_lan", DM_LDN)  next launch
 //   opmode         Switch mode docked / handheld (pref "front_opmode", DM_OPMODE=0; live through FrontMenu.Host.setDocked)         both
 //   pictureShape   16:9 with bars / stretched / the game's widescreen (pref "aspect"; GearDisplay.fitSurface + the port's env)      both
 //   look           look sensitivity (pad "look")                                                                                   immediately
 //   deadzone       move stick dead-zone compensation (pad "move_dz")                                                               immediately
-//   fpsCounter     the FPS / frame time counter (pad "fps")                                                                        immediately
+//   fpsCounter     the FPS / frame time counter (pad "fps") + the throttle dot beside it (pad "fps_dot"; FpsOverlay)           immediately
 //   gearButton     the menu (gear) button: normal / faded + the faded opacity slider (pad "gear_mode", "gear_alpha")               immediately
 //   padControls    the on-screen controls' opacity and size (live sliders), "Edit the layout…", "Reset the layout"                 immediately
 //   menuLanguage   the menu language (front ui_lang: this dialog, the pause menu, the pad dialogs; reopens in it)                   immediately
@@ -146,12 +147,16 @@ final class GearPages {
             void fill(GearSettings s, String want) {
                 drvBox.removeAllViews();
                 ArrayList<String> offered = new ArrayList<>(); StringBuilder hiddenWhy = new StringBuilder();
-                for (String n : d.packages()) { String why = d.problem(n); if (why == null) offered.add(n); else hiddenWhy.append("\n- ").append(d.label(n)).append(": ").append(d.reasonText(why)); }
+                boolean force = d.forcing();   // the manager's "allow" switch: every package is offered, a rejected one carries its reason on the label
+                for (String n : d.packages()) { String why = d.problem(n); if (why == null || force) offered.add(n); else hiddenWhy.append("\n- ").append(d.label(n)).append(": ").append(d.reasonText(why)); }
                 names = offered.toArray(new String[0]);
                 if (hiddenWhy.length() > 0) s.text(drvBox, s.t("Скрыты (не подходят этому телефону, " + VkDrivers.hardwareSummary() + "):",
                     "Hidden (cannot run on this phone, " + VkDrivers.hardwareSummary() + "):") + hiddenWhy);
                 String[] labels = new String[names.length + 1]; labels[0] = s.s("gear_driver_system");
-                for (int i = 0; i < names.length; i++) labels[i + 1] = d.label(names[i]);
+                for (int i = 0; i < names.length; i++) {
+                    String why = force ? d.problem(names[i]) : null;
+                    labels[i + 1] = why == null ? d.label(names[i]) : d.label(names[i]) + " (" + d.reasonText(why) + ")";
+                }
                 String cur = want != null && (want.isEmpty() || offered.contains(want)) ? want : s.gamePrefs().getString("driver", d.defaultDriver());
                 int at = 0; for (int i = 0; i < names.length; i++) if (names[i].equals(cur)) at = i + 1;
                 g = s.radios(drvBox, labels, at, false);
@@ -192,6 +197,33 @@ final class GearPages {
         };
     }
     // ---- vibration (haptics_android.c): off by default (DOOM 28.10: it only drains the battery); DM_RUMBLE=0 hides the vibration devices
+    // ---- [mp] multiplayer (port-kb HLE "local play"; D3 / TL2 first): local wireless play over the LAN (hle_ldn.c, nn::ldn served like ldn_mitm:
+    // pref "mp_lan", on by default -> DM_LDN=1; nothing opens until the game's local play does) and, for a game that has couch co-op on a docked
+    // Switch (pads = true), extra controllers as players 2-4 (pref "mp_pads" 0 off / 1 each controller / 2 touch = player 1 -> DM_MP_PADS,
+    // hle_hid.c npads No2..No4 + front_android.c routing). A port whose game has no local wireless play does not list this section.
+    static GearSettings.Section localPlay(boolean pads) {
+        return new GearSettings.Section() {
+            RadioGroup g; CheckBox lan;
+            public void build(GearSettings s, LinearLayout box) {
+                if (pads) {
+                    s.heading(box, s.whenKey("gear_mp_pads", false));
+                    g = s.radios(box, s.keys("gear_mp_pads_off", "gear_mp_pads_each", "gear_mp_pads_touch"), Math.max(0, Math.min(2, s.gamePrefs().getInt("mp_pads", 0))), false);
+                    s.note(box, s.s("gear_mp_pads_note"));
+                }
+                lan = s.check(box, s.whenKey("gear_mp_lan", false), s.gamePrefs().getBoolean("mp_lan", true));
+                s.note(box, s.s("gear_mp_lan_note"));
+            }
+            public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) {
+                if (g != null) game.putInt("mp_pads", GearSettings.picked(g));
+                game.putBoolean("mp_lan", lan.isChecked());
+            }
+            public void env(GearSettings s) throws ErrnoException {
+                if (pads) Os.setenv("DM_MP_PADS", String.valueOf(s.gamePrefs().getInt("mp_pads", 0)), true);
+                Os.setenv("DM_LDN", s.gamePrefs().getBoolean("mp_lan", true) ? "1" : "0", true);
+            }
+        };
+    }
+
     static GearSettings.Section rumble() {
         return new GearSettings.Section() {
             CheckBox c;
@@ -275,11 +307,19 @@ final class GearPages {
             public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) { pad.putFloat("move_dz", DEADZONES[GearSettings.picked(g)]); }
         };
     }
+    // the counter and, under it, the throttle dot beside it (FpsOverlay, pad "fps_dot", on by default; only with the counter, so greyed without it)
     static GearSettings.Section fpsCounter() {
         return new GearSettings.Section() {
-            CheckBox c;
-            public void build(GearSettings s, LinearLayout box) { c = s.check(box, s.whenKey("gear_fps_counter", true), s.padPrefs().getBoolean("fps", true)); }
-            public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) { pad.putBoolean("fps", c.isChecked()); }
+            CheckBox c, d;
+            public void build(GearSettings s, LinearLayout box) {
+                c = s.check(box, s.whenKey("gear_fps_counter", true), s.padPrefs().getBoolean("fps", true));
+                d = s.check(box, s.whenKey("gear_fps_dot", true), s.padPrefs().getBoolean(FpsOverlay.PREF_DOT, true));
+                int in = Math.round(28 * s.a.getResources().getDisplayMetrics().density);
+                ((LinearLayout.LayoutParams) d.getLayoutParams()).leftMargin = in;
+                final TextView n = s.text(box, s.s("gear_fps_dot_note")); ((LinearLayout.LayoutParams) n.getLayoutParams()).leftMargin = in;
+                d.setEnabled(c.isChecked()); n.setEnabled(c.isChecked()); c.setOnCheckedChangeListener((v, on) -> { d.setEnabled(on); n.setEnabled(on); });
+            }
+            public void save(GearSettings s, SharedPreferences.Editor game, SharedPreferences.Editor pad) { pad.putBoolean("fps", c.isChecked()).putBoolean(FpsOverlay.PREF_DOT, d.isChecked()); }
         };
     }
     // the menu (settings) button (DoomPadView.GEAR_*): normal / faded, with the faded opacity slider below (1..100 % of the usual alpha; saved and

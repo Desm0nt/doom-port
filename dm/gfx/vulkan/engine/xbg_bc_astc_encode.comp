@@ -1,0 +1,69 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// [nonadreno] bc-astc-gpu (DM_GFX_BC_ASTC): ASTC 4x4 LDR encode of a GPU BC decode batch, right after xbg_bc_decode.comp. One invocation
+// per 4x4 block of the batch: it finds its region in the decoder's region table (xbg_bc_gpu.h XbgBcGpuBatch, binding 0 = bcgpu's
+// input buffer: 8 words per region, then the raw BC blocks), reads its 16 decoded RGBA8 texels from the decoder's output (binding 1 =
+// bcgpu's output buffer: rows padded to whole blocks) and writes one 16-byte ASTC block to binding 2 at block index * 16: every
+// region's blocks are tight rows there (bufferRowLength = blocks_x * 4), so vkCmdCopyBufferToImage moves them into the ASTC image.
+// Encoder: xbg_bc_astc.glsl (ported from GameNative's wrapper_astc_encode.comp, Mesa, MIT; see that file).
+// Plain storage buffers (no buffer_reference / buffer device address), push constants 16 bytes; specialization constant 0 = candidates per
+// class (3, or 1 = GameNative's set: DM_GFX_BC_ASTC_CANDS).
+// Regenerate xbg_bc_astc_encode_spv.h after editing this file or xbg_bc_astc.glsl (the command is at the top of that header).
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint XBG_ASTC_CANDS = 3u;
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint words[]; } src;
+layout(std430, set = 0, binding = 1) readonly buffer Rgba { uint words[]; } rgba;
+layout(std430, set = 0, binding = 2) writeonly buffer Dst { uint words[]; } dst;
+layout(std430, set = 0, binding = 3) readonly buffer Tables { uint words[]; } tables;
+// regions: region count; first / end: the blocks [first, end) of the batch this dispatch encodes (a batch: 0 / blocks);
+// flags: bits 0-1 direct (0 none, 1 BC1 colour block in words 0-1, 2 BC2 / BC3 colour block in words 2-3), bits 8-15 words per BC block
+layout(push_constant) uniform Push { uint regions; uint first; uint end; uint flags; } pc;
+
+uint g_texel0;   // word of texel (0, 0) of this block in rgba
+uint g_row;      // words per texel row of its region
+vec4 xbg_astc_texel(uint i)
+{
+    uint v = rgba.words[g_texel0 + (i >> 2u) * g_row + (i & 3u)];
+    return vec4(float(v & 255u), float((v >> 8u) & 255u), float((v >> 16u) & 255u), float(v >> 24u));
+}
+uint xbg_astc_table(uint i) { return tables.words[i]; }
+
+#include "xbg_bc_astc.glsl"
+
+void main()
+{
+    uint g = pc.first + gl_GlobalInvocationID.x;
+    if (g >= pc.end)
+        return;
+    // Region of block g: the last one whose first block is <= g (first blocks ascend), as in xbg_bc_decode.comp.
+    uint lo = 0u, hi = pc.regions - 1u;
+    while (lo < hi)
+    {
+        uint mid = (lo + hi + 1u) >> 1;
+        if (src.words[mid * 8u] <= g) lo = mid; else hi = mid - 1u;
+    }
+    uint R = lo * 8u;
+    uint local = g - src.words[R];
+    uint bx_n = src.words[R + 1u], per_slice = src.words[R + 2u], by_n = src.words[R + 3u];
+    uint z = local / per_slice, rem = local - z * per_slice, by = rem / bx_n, bx = rem - by * bx_n;
+    g_row = src.words[R + 6u];   // RGBA8: one word per texel, blocks_x * 4 texels per row
+    g_texel0 = src.words[R + 5u] + (z * by_n + by) * 4u * g_row + bx * 4u;
+    uint direct = pc.flags & 3u, block_words = (pc.flags >> 8u) & 255u;
+    uvec4 bc = uvec4(0u);
+    if (direct != 0u)
+    {
+        uint s = src.words[R + 4u] + local * block_words;
+        bc.x = src.words[s];
+        bc.y = src.words[s + 1u];
+        if (block_words == 4u)
+        {
+            bc.z = src.words[s + 2u];
+            bc.w = src.words[s + 3u];
+        }
+    }
+    uvec4 o = xbg_astc_encode(direct, bc);
+    dst.words[g * 4u] = o.x;
+    dst.words[g * 4u + 1u] = o.y;
+    dst.words[g * 4u + 2u] = o.z;
+    dst.words[g * 4u + 3u] = o.w;
+}
